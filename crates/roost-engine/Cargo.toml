@@ -12,12 +12,17 @@ description = "Toolkit-neutral Roost workspace, PTY runtime, persistence, events
 # Experimental Swift-facing boundary (facade.rs). Unconsumed by the Rust
 # UIs; gated until a real adapter proves the seam (roadmap M5).
 facade = []
+# libghostty-vt: what the session tab task and roost-iced's in-process
+# tabs both read off a terminal — its ordered status events in the
+# composition layer's types (`program_status::drain`) and its memory
+# (`memory::of`). The composition layer itself needs no feature.
+vt = ["dep:roost-vt", "roost-vt/ffi"]
 # Host sessions: the per-tab authoritative server Terminal and its tab
 # task (`tab_task.rs`). The feature only makes the code AVAILABLE — a
 # workspace build unifies features, so a UI binary can link it. What
 # turns the pipeline on is the runtime opt-in
 # `PtySupervisor::enable_server_vt`, which only `roost-session` calls.
-server-vt = ["dep:roost-vt", "roost-vt/ffi"]
+server-vt = ["vt"]
 
 [dependencies]
 roost-ipc = { path = "../roost-ipc" }

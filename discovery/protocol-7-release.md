@@ -235,13 +235,17 @@ agents, and source reads of the others, summarised here.
 
 | Agent | 7501 | Probes first | Seen |
 |---|---|---|---|
-| Claude Code ≥ 2.1.302 | yes | yes; silent without a reply | `idle`; `working`, whose msg is an activity summary; `blocked` with kind=permission, whose msg is the command awaiting approval; `done`; three `clear`s on exit. Up to 32 background-task child records (inferred) |
+| Claude Code ≥ 2.1.302 | yes | yes; silent without a reply | `idle`; `working`, whose msg is an activity summary; `blocked` with kind=permission, whose msg is the command awaiting approval; `done`; three `clear`s on exit. No child records seen in the 2026-10-28 captures (*amended 2026-10-28:* this row said "up to 32 background-task child records (inferred)"; a background task produced none) |
 | Codex ≥ 2026-10-09 (#52725) | yes | no | `idle`; `working`; `blocked` with kind=permission and no msg; `done`. `clear` on exit **and on Ctrl-Z**. An idle→working→idle flash in the first ~0.7 s |
+| Grok CLI ≥ 1.0.70 | yes (`app=grok-build`) | yes | `blocked` with kind=permission at startup in an untrusted folder; `working` with an activity msg; `done` with a summary msg; `clear` on exit. *Amended 2026-10-28:* the first draft had no Grok row; the captures show it speaks 7501 |
 | opencode 2.x, crush ≥ 0.98, pi ≥ 1.1 | in source | mixed | not captured; installed versions predate support |
 | gx, cursor-agent | no | — | gx sends OSC 9;4 only |
 
 Esc mid-turn produces `idle` within ~0.1 s for both Claude and Codex.
 Hooks have no interrupt event (#622).
+
+The full decoded record is `discovery/agent-program-status.md`, and
+`tools/agent-status/` re-runs it.
 
 **Blocking first step:**
 1. Update every installed agent, and `git pull` their sources under
@@ -294,8 +298,15 @@ Both backends must reach parity on 7501 and on the memory query.
 effective state while either holds:
 - **a live record exists:** `working` or `blocked`, on the root or on
   any child;
-- **a root `idle`, `done` or `error` record exists, and no OSC 133 A
-  prompt mark has arrived since it was set.**
+- **a root `idle`, `done` or `error` record exists, and no prompt mark
+  has arrived since it was set.**
+
+*Amendment, 2026-10-28.* A prompt mark here (and in rule 6 and the
+acceptance tests) is OSC 133 **A, B or D**, not A alone. Roost's own
+bash and zsh integration emits only C and D, never A, so with A alone a
+crashed agent's `working` record would never drop for those users and
+would stay authoritative. A, B and D is the set the hook failsafe
+already uses (`agent.rs:339`).
 
 While authoritative:
 - **The state:** the highest-ranked live record decides, using
@@ -309,7 +320,14 @@ While authoritative:
   (`agent.rs:269-288`).
 
 After a prompt mark, `done` and `error` stay *displayed* as
-Finished/Failed, as the spec allows, but hooks regain authority. So a
+Finished/Failed, as the spec allows, but hooks regain authority.
+*Amendment, 2026-10-28 (Charlie's decision):* "displayed" now has an
+end. The next OSC 133 `C` after a prompt mark retires a kept root
+`done`/`error`. Without it a killed agent's `error` would show
+NeedsInput forever, and would come back after every later hook-only
+agent. Starting another command is the signal that the user has seen
+it. (Had this been declined, the alternative was retiring it when the
+tab becomes watched, focus plus active.) So a
 stale or forged record can't mute a later hook-driven agent. Any
 program can print a 7501 sequence. That's the same trust level as OSC
 0/2 titles and OSC 9 today, and it's accepted.
@@ -340,7 +358,8 @@ program can print a 7501 sequence. That's the same trust level as OSC
 
 **6. Records and lifetimes.**
 - **What drops records:**
-  - OSC 133 A drops `working` and `blocked` records;
+  - a prompt mark (OSC 133 A, B or D; see the amendment under rule 3)
+    drops `working` and `blocked` records;
   - so does the PTY child's exit;
   - `clear` removes the addressed record.
 - **No process-group monitor in M1.** Roost has none today: #519 is
@@ -368,9 +387,12 @@ program can print a 7501 sequence. That's the same trust level as OSC
 
 **8. On the wire.**
 - The winning record's state, `kind`, `msg`, `app` and `title` appear
-  as additive fields on the agent record that `agent_report.changed`,
-  `tab.list` and `tab.dump` already carry. That makes the "why"
-  survive reconnects.
+  as additive fields on the agent record that `agent_report.changed`
+  and `tab.list` already carry. That makes the "why" survive
+  reconnects. *Amended 2026-10-28:* the first draft also named
+  `tab.dump`, but it carries no agent record (`TabDumpResult`,
+  `crates/roost-ipc/src/messages.rs:478`); the reason rides `Tab` and
+  `agent_report.changed`.
 - Children are counted, not listed, in M1. Showing them in the Agents
   panel is a follow-up issue.
 - No consent step: answering the probe writes nothing into agent
@@ -383,6 +405,18 @@ program can print a 7501 sequence. That's the same trust level as OSC
   that didn't fire in the capture. If it fires inside Roost, rule 6
   would drop records mid-turn. Capture it, and if it fires, scope the
   drop to prompts from the shell.
+
+*Closed 2026-10-28 (Charlie's decision).* The marks fire, but only in
+Screen Reader Mode (`screenReader && !fullscreen && !decstbm && terminal
+!= WezTerm`). Nothing in the bytes or in libghostty's event tells them
+from a shell's: the semantic-prompt struct has no command id or redraw
+flag yet. So the drop is not scoped. Claude's marks are treated as
+prompt marks, and the resulting sequences are pinned with tests, with
+and without hooks. At turn start, `working, A, working` ends Working for
+any read split, and a lone `working, A` falls back to hooks and the
+shell until Claude's next report. At turn end, `C, D` ends `done`'s
+authority, so it becomes a kept record and shows Finished in both
+orders. The real fix is a command id upstream; it is noted, not filed.
 
 ##### Per-tab memory
 
@@ -419,7 +453,7 @@ set, on the UI socket and the session socket, and in `roostctl`.
 - banner dedupe;
 - debounce affecting banners only;
 - the record cap;
-- `done` surviving a prompt while authority returns to hooks;
+- `done` surviving a prompt mark (A, B or D) while authority returns to hooks;
 - `clear` on Ctrl-Z keeping the owner.
 
 **Hand check:** on the dev box's debug namespace, a real Claude Code

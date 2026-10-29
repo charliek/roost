@@ -27,6 +27,7 @@ use roost_ipc::messages::{
     ops, EventBatch, EventsSubscribeResult, IdentifyResult, Project, Response, SessionStopResult,
     Tab, TabListResult, TabState, SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
 };
+use roost_ipc::program_status::{DecidedBy, ProgramStatusSummary};
 use roost_ipc::{IpcClient, IpcServer, LocalBackendCell, LocalRoute};
 use tempfile::TempDir;
 use tokio::net::UnixStream;
@@ -821,6 +822,7 @@ fn every_workspace_event_has_a_wire_name() {
         ownership: None,
         password_input: false,
         dropped_reports: None,
+        program_status: None,
     };
     let project = Project {
         id: 1,
@@ -931,6 +933,7 @@ fn every_workspace_event_has_a_wire_name() {
             WorkspaceEvent::AgentChanged {
                 tab_id: 5,
                 agent: agent.clone(),
+                program_status: None,
             },
             ops::EVENT_AGENT_REPORT_CHANGED,
             vec![
@@ -994,10 +997,39 @@ fn every_workspace_event_has_a_wire_name() {
     assert_eq!(reordered.data["project_id"], serde_json::json!("1"));
 
     // The agent event carries its two projections pre-derived.
-    let agent_event = event_push::envelope(&WorkspaceEvent::AgentChanged { tab_id: 5, agent })
-        .expect("agent_report.changed");
+    let agent_event = event_push::envelope(&WorkspaceEvent::AgentChanged {
+        tab_id: 5,
+        agent: agent.clone(),
+        program_status: None,
+    })
+    .expect("agent_report.changed");
     assert_eq!(agent_event.data["state"], serde_json::json!("needs_input"));
     assert_eq!(agent_event.data["hook_active"], serde_json::json!(true));
+    assert!(agent_event.data.get("program_status").is_none());
+
+    // With program status, `state` is the composed lifecycle's projection,
+    // not the hook layer's, and the summary rides along.
+    let status = ProgramStatusSummary {
+        effective_lifecycle: AgentLifecycle::Working,
+        decided_by: DecidedBy::Records,
+        children: 0,
+        record: None,
+    };
+    let agent_event = event_push::envelope(&WorkspaceEvent::AgentChanged {
+        tab_id: 5,
+        agent,
+        program_status: Some(status),
+    })
+    .expect("agent_report.changed");
+    assert_eq!(agent_event.data["state"], serde_json::json!("running"));
+    assert_eq!(
+        agent_event.data["agent_lifecycle"],
+        serde_json::json!("waiting")
+    );
+    assert_eq!(
+        agent_event.data["program_status"]["decided_by"],
+        serde_json::json!("records")
+    );
 }
 
 /// `Resync` is an in-process recovery snapshot with no wire spelling.

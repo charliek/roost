@@ -133,11 +133,13 @@ jobs:
               - 'crates/roost-engine/resources/shell-integration/**'
               - 'mac/Sources/Roost/Resources/shell-integration/**'
             # Inputs of harness-unit's own tests only (test_release_dry_run.py reads
-            # release.yml through tools/release/dry_run.py), kept out of `tests` so
-            # they don't start the E2E lanes that `tests` also gates.
+            # release.yml through tools/release/dry_run.py; test_agent_status_capture.py
+            # imports tools/agent-status/capture.py), kept out of `tests` so they
+            # don't start the E2E lanes that `tests` also gates.
             harness:
               - 'tools/release/**'
               - '.github/workflows/release.yml'
+              - 'tools/agent-status/**'
             # roost-cli's `doc_anchors_resolve` test reads the site nav and
             # every page it links, so those files are inputs to a RUST test
             # even though no Rust file changes when they move. Without this,
@@ -812,6 +814,8 @@ jobs:
           tools/roosttest/test_context_menu.py
           tools/roosttest/test_device_queries.py
           tools/roosttest/test_selection_autoscroll.py
+          tools/roosttest/test_program_status.py
+          tools/roosttest/test_memory_usage.py
           tools/roosttest/test_password_input.py
           tools/roosttest/test_secure_input.py
           tools/roosttest/test_osc52.py
@@ -1094,6 +1098,8 @@ jobs:
           tools/roosttest/test_context_menu.py
           tools/roosttest/test_device_queries.py
           tools/roosttest/test_selection_autoscroll.py
+          tools/roosttest/test_program_status.py
+          tools/roosttest/test_memory_usage.py
           tools/roosttest/test_password_input.py
           tools/roosttest/test_secure_input.py
           -m 'not session_daemon and not host_client'
@@ -1314,6 +1320,8 @@ jobs:
           tools/roosttest/test_context_menu.py
           tools/roosttest/test_device_queries.py
           tools/roosttest/test_selection_autoscroll.py
+          tools/roosttest/test_program_status.py
+          tools/roosttest/test_memory_usage.py
           tools/roosttest/test_password_input.py
           tools/roosttest/test_secure_input.py
           tools/roosttest/test_osc52.py

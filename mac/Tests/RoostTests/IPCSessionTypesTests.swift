@@ -18,9 +18,9 @@ import XCTest
 
 final class IPCSessionTypesTests: XCTestCase {
     func testSessionProtocolVersionIsSeparateFromTheWireVersion() {
-        // Retiring the lease bumped the session protocol to 5; the
+        // Program status bumped the session protocol to 7; the
         // request/response wire version did not move with it.
-        XCTAssertEqual(ipcSessionProtocolVersion, 6)
+        XCTAssertEqual(ipcSessionProtocolVersion, 7)
         XCTAssertEqual(ipcProtocolVersion, 1)
     }
 
@@ -228,7 +228,7 @@ final class IPCSessionTypesTests: XCTestCase {
             XCTAssertEqual(line["attach"] as? String, "5", name)
             XCTAssertEqual(line["cols"] as? Int, 120, name)
             XCTAssertEqual(line["rows"] as? Int, 40, name)
-            XCTAssertEqual(line["protocol_version"] as? Int, 6, name)
+            XCTAssertEqual(line["protocol_version"] as? Int, 7, name)
             XCTAssertNotNil(line["session_id"] as? String, name)
             XCTAssertNotNil(line["kinds"] as? [String], name)
             XCTAssertNotNil(line["focus"] as? Bool, name)

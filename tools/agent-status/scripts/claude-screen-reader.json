@@ -1,0 +1,11 @@
+[{"quiet":3, "timeout":40},
+ {"send":"run this exact shell command and show me the status line: curl -sI https://example.com"},
+ {"sleep":1},
+ {"send":"\r"},
+ {"wait7501":"state=blocked", "timeout":120},
+ {"sleep":3},
+ {"send":"\r"},
+ {"wait7501":"state=(done|idle|error)", "timeout":120},
+ {"quiet":4, "timeout":30},
+ {"send":"\u0003"}, {"sleep":0.7}, {"send":"\u0003"},
+ {"sleep":4}]

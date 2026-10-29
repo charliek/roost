@@ -10,11 +10,15 @@
 
 use std::marker::PhantomData;
 use std::os::raw::c_void;
-use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::panic::AssertUnwindSafe;
+use std::ptr::{self, NonNull};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use crate::program_status::{
+    desktop_notification_trampoline, program_status_trampoline, semantic_prompt_trampoline,
+};
 use crate::sys;
-use crate::{Error, Result, TrackedRef};
+use crate::{Error, Result, TerminalEvent, TrackedRef};
 
 // Compile-time guards on the `ColorRgb` <-> `GhosttyColorRgb` cast in
 // `set_color_palette`. If a bindgen regen ever changes the size or
@@ -288,59 +292,128 @@ impl GridRef {
 
 pub struct Terminal {
     handle: sys::GhosttyTerminal,
-    /// Backing store for engine-emitted device-query replies. Installed
-    /// via [`Terminal::set_write_pty_buffer`]; the `Arc` is retained
-    /// here so the `Arc::as_ptr` handed to libghostty as `OPT_USERDATA`
-    /// stays valid for as long as the callback is live. `None` until a
-    /// buffer is installed.
-    write_pty_buffer: Option<Arc<Mutex<Vec<u8>>>>,
+    /// Leaked from a `Box` at construction and reclaimed in `Drop` after
+    /// the handle is freed. Boxed so the pointer libghostty holds as
+    /// `OPT_USERDATA` survives moves of the `Terminal`.
+    ctx: NonNull<CallbackCtx>,
     /// `!Sync` marker — libghostty-vt is single-threaded. Using
     /// `*const ()` makes the type `Send + !Sync`, which matches the
     /// Mac UI's `@MainActor`-only contract.
     _not_sync: PhantomData<std::cell::Cell<()>>,
 }
 
+/// The one `GHOSTTY_TERMINAL_OPT_USERDATA` value every callback receives.
+/// libghostty has a single userdata slot shared by all callbacks
+/// (`terminal.h`, "You cannot specify different userdata for different
+/// callbacks"), so each callback's sink is a field here, and the slot
+/// points at this context from construction until `Drop` — clearing one
+/// callback never touches it. A field that is `None` while its callback
+/// is still set is harmless: the trampoline does nothing.
+///
+/// # Drain contract (both sinks)
+///
+/// libghostty runs the callbacks synchronously inside the `Terminal`
+/// call that triggered them, and the trampolines lock the caller's sink.
+/// So a caller MUST NOT hold a sink's lock across [`Terminal::vt_write`],
+/// [`Terminal::resize`], or a theme push: a held guard self-deadlocks.
+/// Lock only to take the contents.
+///
+/// * The `write_pty` buffer fills from `vt_write` **and** `resize`
+///   (mode 2048 in-band size reports fire inside
+///   `ghostty_terminal_resize`), so drain it after every call of either.
+/// * The status sink fills only from `vt_write` (OSC 7501, OSC 133, OSC
+///   9 / 777, and RIS's `clear`); drain it after every `vt_write`, before acting on
+///   anything else that write produced, to keep reports and marks in
+///   byte order.
+#[derive(Default)]
+pub(crate) struct CallbackCtx {
+    pub(crate) write_pty: Mutex<Option<Arc<Mutex<Vec<u8>>>>>,
+    pub(crate) status: Mutex<Option<Arc<Mutex<Vec<TerminalEvent>>>>>,
+}
+
+const WRITE_PTY: sys::GhosttyTerminalOption =
+    sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_WRITE_PTY;
+const PROGRAM_STATUS: sys::GhosttyTerminalOption =
+    sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS;
+const SEMANTIC_PROMPT: sys::GhosttyTerminalOption =
+    sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT;
+const DESKTOP_NOTIFICATION: sys::GhosttyTerminalOption =
+    sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION;
+const STATUS_CALLBACKS: [sys::GhosttyTerminalOption; 3] =
+    [PROGRAM_STATUS, SEMANTIC_PROMPT, DESKTOP_NOTIFICATION];
+
+// The trampolines are set as `*const c_void`; these pin each one to the
+// callback type bindgen generated for its slot.
+const _: sys::GhosttyTerminalWritePtyFn = Some(write_pty_trampoline);
+const _: sys::GhosttyTerminalProgramStatusFn = Some(program_status_trampoline);
+const _: sys::GhosttyTerminalSemanticPromptFn = Some(semantic_prompt_trampoline);
+const _: sys::GhosttyTerminalDesktopNotificationFn = Some(desktop_notification_trampoline);
+
+/// Lock poison-tolerantly: a panic in another holder must never surface
+/// as an unwind across an `extern "C"` frame.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Append `items` to the sink in `slot`, if one is set.
+fn append<T>(slot: &Mutex<Option<Arc<Mutex<Vec<T>>>>>, items: impl IntoIterator<Item = T>) {
+    let slot = lock(slot);
+    let Some(sink) = slot.as_ref() else {
+        return;
+    };
+    lock(sink).extend(items);
+}
+
+/// Run a trampoline's body, dropping its event if anything in it panics:
+/// a panic reaching an `extern "C"` frame aborts the process, and code a
+/// trampoline can't vouch for runs inside it (a `tracing` subscriber).
+pub(crate) fn contain(body: impl FnOnce()) {
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(body));
+}
+
+impl CallbackCtx {
+    pub(crate) fn push_status(&self, event: TerminalEvent) {
+        append(&self.status, std::iter::once(event));
+    }
+}
+
 /// Trampoline installed as `GHOSTTY_TERMINAL_OPT_WRITE_PTY`. libghostty
 /// invokes this synchronously from inside `ghostty_terminal_vt_write`
-/// **and** `ghostty_terminal_resize` (mode 2048 in-band size reports),
-/// handing back the `OPT_USERDATA` pointer we installed alongside it —
-/// an `Arc::as_ptr(&arc)` i.e. a `*const Mutex<Vec<u8>>` into an Arc
-/// allocation pinned by [`Terminal::write_pty_buffer`].
+/// **and** `ghostty_terminal_resize` (mode 2048 in-band size reports).
 ///
-/// Hygiene contract (all load-bearing for FFI soundness):
-/// * Guards null `userdata`/`data` and `len == 0` — early return.
-/// * Poison-tolerant lock (`unwrap_or_else(|p| p.into_inner())`) so a
-///   panic in another holder can never surface as an unwind across this
-///   `extern "C"` frame.
-/// * Append-only. It must **never** call back into `vt_write`
-///   (`terminal.h:949-951` no-reentrancy contract).
+/// Hygiene contract (all load-bearing for FFI soundness), shared by every
+/// trampoline:
+/// * Guards null pointers and `len == 0` — early return.
+/// * Poison-tolerant locks, no `unwrap`/`expect`/indexing, and the body
+///   runs under [`contain`], so a panic drops the event instead of
+///   unwinding into this `extern "C"` frame. Out of memory aborts, as it
+///   does everywhere else in Rust.
+/// * Append-only. It must **never** call back into libghostty
+///   (`terminal.h`'s no-reentrancy contract).
 unsafe extern "C" fn write_pty_trampoline(
     _terminal: sys::GhosttyTerminal,
     userdata: *mut c_void,
     data: *const u8,
     len: usize,
 ) {
-    if userdata.is_null() || data.is_null() || len == 0 {
-        return;
-    }
-    let mutex = userdata as *const Mutex<Vec<u8>>;
-    // SAFETY: `userdata` is the `Arc::as_ptr` installed together with
-    // this callback; the owning `Arc` is pinned in the `Terminal`'s
-    // `write_pty_buffer` field for the whole time the callback is live
-    // (cleared before the Arc is dropped — see `clear_write_pty`).
-    let mutex = unsafe { &*mutex };
-    // Poison-tolerant: recover the guard rather than propagate a panic
-    // across the C boundary.
-    let mut guard = mutex.lock().unwrap_or_else(|p| p.into_inner());
-    // SAFETY: libghostty guarantees `data`/`len` describe a valid,
-    // initialized byte range for the duration of this call.
-    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-    guard.extend_from_slice(bytes);
+    contain(|| {
+        if userdata.is_null() || data.is_null() || len == 0 {
+            return;
+        }
+        // SAFETY: `userdata` is the `Terminal`'s `CallbackCtx`, set from
+        // construction and freed only after the terminal handle is.
+        let ctx = unsafe { &*userdata.cast::<CallbackCtx>() };
+        // SAFETY: libghostty guarantees `data`/`len` describe a valid,
+        // initialized byte range for the duration of this call.
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+        append(&ctx.write_pty, bytes.iter().copied());
+    });
 }
 
 // SAFETY: the underlying libghostty-vt handle can move between threads
-// as long as only one thread touches it at a time. Sync is intentionally
-// not implemented (enforced via PhantomData above).
+// as long as only one thread touches it at a time, and `ctx` is an owned
+// allocation of `Send + Sync` fields that moves with it. Sync is
+// intentionally not implemented (enforced via PhantomData above).
 unsafe impl Send for Terminal {}
 
 impl Terminal {
@@ -360,11 +433,8 @@ impl Terminal {
         }
         // Construct the RAII owner *before* configuring scrollback so a
         // failed `set` frees the terminal instead of leaking it.
-        let mut terminal = Self {
-            handle,
-            write_pty_buffer: None,
-            _not_sync: PhantomData,
-        };
+        // SAFETY: non-null, and freshly allocated, so uniquely owned.
+        let mut terminal = unsafe { Self::adopt(handle) };
         // Always applied, including `0` (= scrollback disabled):
         // otherwise the terminal keeps libghostty's own default limit,
         // not the one the caller asked for.
@@ -415,11 +485,36 @@ impl Terminal {
     ///   `Terminal` is dropped. [`crate::SnapshotDecoder`]'s `Drop` and
     ///   its `finish`/`abandon` paths are what guarantee that ordering.
     pub(crate) unsafe fn from_decoded(handle: sys::GhosttyTerminal) -> Self {
-        Self {
+        // SAFETY: the caller's contract is `adopt`'s.
+        unsafe { Self::adopt(handle) }
+    }
+
+    /// Wrap a handle and point its `OPT_USERDATA` at a fresh
+    /// [`CallbackCtx`]. Every construction path goes through here.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be non-null and owned by nothing else.
+    unsafe fn adopt(handle: sys::GhosttyTerminal) -> Self {
+        let ctx = NonNull::from(Box::leak(Box::new(CallbackCtx::default())));
+        let mut terminal = Self {
             handle,
-            write_pty_buffer: None,
+            ctx,
             _not_sync: PhantomData,
-        }
+        };
+        // libghostty rejects a `set` only for a null terminal, which this
+        // function's contract rules out.
+        let _ = terminal.set_opt(
+            sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_USERDATA,
+            ctx.as_ptr().cast_const().cast(),
+        );
+        terminal
+    }
+
+    fn ctx(&self) -> &CallbackCtx {
+        // SAFETY: `ctx` is live from `adopt` until `Drop`, and only ever
+        // shared — no `&mut` to it exists before `Drop` reclaims it.
+        unsafe { self.ctx.as_ref() }
     }
 
     /// Set the byte cap on retained VT continuation bytes; `0` disables
@@ -562,110 +657,56 @@ impl Terminal {
     /// Install `buf` as the sink for engine-emitted device-query
     /// replies. libghostty's `write_pty` effects callback fires from
     /// inside `vt_write` / `resize` and the [`write_pty_trampoline`]
-    /// appends every emitted byte to `buf`; the caller drains it (see
-    /// the drain contract below). This is what makes DA1/DA2, DSR,
-    /// DECRQM, XTVERSION, the Kitty keyboard query, and mode-2048
-    /// in-band size reports actually reach the PTY.
+    /// appends every emitted byte to `buf`; the caller drains it per
+    /// [`CallbackCtx`]'s drain contract. This is what makes DA1/DA2, DSR,
+    /// DECRQM, XTVERSION, the Kitty keyboard query, the OSC 7501 probe,
+    /// and mode-2048 in-band size reports actually reach the PTY.
     ///
-    /// # Drain contract
-    ///
-    /// Callers MUST drain `buf` after **every** [`Self::vt_write`] AND
-    /// after **every** [`Self::resize`]: mode 2048 (in-band size
-    /// reports) fires the callback synchronously inside
-    /// `ghostty_terminal_resize`, i.e. *outside* `vt_write`. Draining
-    /// only after `vt_write` would silently drop resize-triggered
-    /// reports.
-    ///
-    /// Callers MUST NOT hold `buf`'s lock across a call to
-    /// [`Self::vt_write`] or [`Self::resize`]: the trampoline locks the
-    /// same mutex synchronously inside those calls, so a held guard
-    /// self-deadlocks (or aborts, on a recursive-lock-panicking
-    /// implementation). Lock only to take/drain the bytes.
-    ///
-    /// # `OPT_USERDATA` exclusivity
-    ///
-    /// This API takes **exclusive** ownership of
-    /// `GHOSTTY_TERMINAL_OPT_USERDATA`, which libghostty documents as a
-    /// *single shared slot* for the userdata of ALL of its callbacks
-    /// (`terminal.h:63`). Wiring any second callback later (bell, title,
-    /// size, enquiry, color-scheme, …) cannot simply set its own
-    /// userdata — it must be multiplexed through one shared context
-    /// struct. That refactor is deliberately deferred until a second
-    /// callback actually exists.
-    ///
-    /// # Semantics
-    ///
-    /// * **Install** stores the `Arc` in the field (pinning the
-    ///   allocation `Arc::as_ptr` points at), sets `OPT_USERDATA` to
-    ///   that pointer, then installs the trampoline as `OPT_WRITE_PTY`.
-    /// * **Transactional:** if the trampoline install fails, the
-    ///   userdata is reset to null and the field cleared before the
-    ///   error is returned — never left half-installed.
-    /// * **Replacement:** calling again first tears down the current
-    ///   callback (clearing `OPT_WRITE_PTY`, then `OPT_USERDATA`, then
-    ///   dropping the old `Arc`) and installs the new buffer — the old
-    ///   `Arc`'s strong count drops naturally.
+    /// Calling again replaces the buffer; the old `Arc` is dropped. If
+    /// the callback can't be installed, nothing is left installed.
     pub fn set_write_pty_buffer(&mut self, buf: Arc<Mutex<Vec<u8>>>) -> Result<()> {
-        // Replacement: tear down the live callback first so it can never
-        // be observed pointing at the old Arc while the new one is being
-        // wired in. Drops the previous field Arc.
-        if self.write_pty_buffer.is_some() {
-            self.clear_write_pty()?;
-        }
+        *lock(&self.ctx().write_pty) = Some(buf);
+        self.set_callbacks(&[(WRITE_PTY, write_pty_trampoline as *const c_void)])
+            .inspect_err(|_| *lock(&self.ctx().write_pty) = None)
+    }
 
-        // Pointer to the `Mutex<Vec<u8>>` inside the Arc allocation —
-        // stable for the Arc's lifetime, which the field now pins.
-        let userdata = Arc::as_ptr(&buf) as *const c_void;
-        self.write_pty_buffer = Some(buf);
-
-        // 1. userdata slot — targets an allocation pinned by the field
-        // we just set.
-        if let Err(err) = self.set_opt(
-            sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_USERDATA,
-            userdata,
-        ) {
-            self.write_pty_buffer = None;
-            return Err(err);
-        }
-
-        // 2. callback slot. The header types callback-valued options as
-        // `const void *`; pass the trampoline's fn pointer cast to it.
-        let callback = write_pty_trampoline as *const c_void;
-        if let Err(err) = self.set_opt(
-            sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_WRITE_PTY,
-            callback,
-        ) {
-            // Transactional rollback: unset userdata, drop the field, so
-            // no stale userdata is left with no callback (or vice versa).
-            let _ = self.set_opt(
-                sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_USERDATA,
-                ptr::null(),
-            );
-            self.write_pty_buffer = None;
-            return Err(err);
-        }
-
+    /// Uninstall the `write_pty` callback, then drop the reply buffer.
+    /// The status sink, and `OPT_USERDATA`, are untouched.
+    pub fn clear_write_pty(&mut self) -> Result<()> {
+        self.clear_callbacks([WRITE_PTY])?;
+        *lock(&self.ctx().write_pty) = None;
         Ok(())
     }
 
-    /// Uninstall the `write_pty` callback and drop the reply buffer.
+    /// Install `sink` as the receiver of OSC 7501 program-status reports,
+    /// OSC 133 prompt marks **and** the places of OSC 9 / 777 desktop
+    /// notifications. All three callbacks push into the one sink, so it
+    /// holds them in the order libghostty parsed them; drain it per
+    /// [`CallbackCtx`]'s drain contract.
     ///
-    /// Clears `OPT_WRITE_PTY` (to null) **before** `OPT_USERDATA` and
-    /// before dropping the `Arc`, so the callback can never be live with
-    /// a stale userdata pointer.
-    pub fn clear_write_pty(&mut self) -> Result<()> {
-        // 1. Kill the callback first.
-        self.set_opt(
-            sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_WRITE_PTY,
-            ptr::null(),
-        )?;
-        // 2. Then clear the userdata pointer it referenced.
-        self.set_opt(
-            sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_USERDATA,
-            ptr::null(),
-        )?;
-        // 3. Finally drop the Arc (safe now that nothing points at it).
-        self.write_pty_buffer = None;
+    /// Setting the program-status callback is also what makes libghostty
+    /// answer the `OSC 7501 ; ?` support probe (through `write_pty`).
+    ///
+    /// Calling again replaces the sink; the old `Arc` is dropped. If any
+    /// callback can't be installed, none is left installed.
+    pub fn set_status_sink(&mut self, sink: Arc<Mutex<Vec<TerminalEvent>>>) -> Result<()> {
+        *lock(&self.ctx().status) = Some(sink);
+        self.set_callbacks(&[
+            (PROGRAM_STATUS, program_status_trampoline as *const c_void),
+            (SEMANTIC_PROMPT, semantic_prompt_trampoline as *const c_void),
+            (
+                DESKTOP_NOTIFICATION,
+                desktop_notification_trampoline as *const c_void,
+            ),
+        ])
+        .inspect_err(|_| *lock(&self.ctx().status) = None)
+    }
+
+    /// Uninstall the status callbacks, then drop the sink. The
+    /// `write_pty` buffer, and `OPT_USERDATA`, are untouched.
+    pub fn clear_status_sink(&mut self) -> Result<()> {
+        self.clear_callbacks(STATUS_CALLBACKS)?;
+        *lock(&self.ctx().status) = None;
         Ok(())
     }
 
@@ -1250,13 +1291,44 @@ impl Terminal {
         Error::from_result(rc)
     }
 
+    /// Set each `(slot, trampoline)` pair. If one fails, every slot in
+    /// `callbacks` is cleared, so none is left set, and its error returned.
+    fn set_callbacks(
+        &mut self,
+        callbacks: &[(sys::GhosttyTerminalOption, *const c_void)],
+    ) -> Result<()> {
+        let set = callbacks
+            .iter()
+            .try_for_each(|&(option, callback)| self.set_opt(option, callback));
+        if set.is_err() {
+            let _ = self.clear_callbacks(callbacks.iter().map(|&(option, _)| option));
+        }
+        set
+    }
+
+    /// Clear every slot in `options`, trying each even after a failure;
+    /// the first error is returned.
+    fn clear_callbacks(
+        &mut self,
+        options: impl IntoIterator<Item = sys::GhosttyTerminalOption>,
+    ) -> Result<()> {
+        let mut result = Ok(());
+        for option in options {
+            let cleared = self.set_opt(option, ptr::null());
+            if result.is_ok() {
+                result = cleared;
+            }
+        }
+        result
+    }
+
     /// Set a pointer-valued option (the userdata + callback slots).
     /// `value` may be null to clear a slot.
     fn set_opt(&mut self, option: sys::GhosttyTerminalOption, value: *const c_void) -> Result<()> {
         // SAFETY: handle non-null per the constructor; `value` is either
         // null (always valid to clear a slot) or a pointer valid for as
-        // long as libghostty needs it — the userdata pinned by
-        // `write_pty_buffer`, or the module-level `'static` trampoline.
+        // long as libghostty needs it — the `CallbackCtx`, which outlives
+        // the handle, or a module-level `'static` trampoline.
         let rc = unsafe { sys::ghostty_terminal_set(self.handle, option, value) };
         Error::from_result(rc)
     }
@@ -1264,16 +1336,15 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        // Clear the write_pty callback + userdata before free so
-        // libghostty can never invoke the trampoline against a freed
-        // handle or a dropped Arc. Reuses the clear ordering
-        // (callback → userdata → drop Arc); errors are ignored — there
-        // is nothing to recover to in Drop.
-        if self.write_pty_buffer.is_some() {
-            let _ = self.clear_write_pty();
-        }
+        // Errors are ignored — there is nothing to recover to in Drop,
+        // and the context outlives the handle regardless.
+        let _ = self.clear_callbacks(std::iter::once(WRITE_PTY).chain(STATUS_CALLBACKS));
         // SAFETY: handle non-null per constructor; freeing is the
         // documented destructor.
         unsafe { sys::ghostty_terminal_free(self.handle) };
+        // SAFETY: `ctx` came from `Box::leak` in `adopt`, and the only
+        // other holder of the pointer, the handle, was freed above.
+        // Dropping it releases both sinks.
+        drop(unsafe { Box::from_raw(self.ctx.as_ptr()) });
     }
 }

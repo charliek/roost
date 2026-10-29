@@ -83,6 +83,7 @@ from agent_jail import (
 from client import Roost, RoostError, scaled_timeout
 from eventstream import EventStream
 from host_probe import host_key, sibling_key  # noqa: F401  (re-exported)
+from test_program_status import PROBE, PROBE_REPLY, osc7501
 from util import (
     assert_opened_in,
     drain,
@@ -3932,3 +3933,183 @@ def test_a_hosts_agent_is_listed_under_its_host_qualified_key_and_names_its_host
             30.0,
             "the dropped host's agent to stay listed, dimmed, under the key it was listed under",
         )
+
+
+# ---------------------------------------------------------------------------
+# 22. Plan 082 B-3h — program status through the host mirror
+# ---------------------------------------------------------------------------
+
+
+def test_a_session_tabs_record_reaches_the_mirror_survives_a_reconnect_and_clears(host, roost):
+    """The session's terminal keeps the records; the client's mirror only
+    carries what they compose to (`agent_report.changed` live, `tab.list`
+    on a reconnect), and an event without `program_status` clears it. Read
+    through the Agents panel, which lists a record-only agent off the
+    mirror's tab (D8.1)."""
+    host.connect_and_wait()
+    with host.client() as session:
+        tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
+        key = wait_until(
+            lambda: host_tab_key(roost, host.saved_id, tab), 30.0, "the host's band to list the tab"
+        )
+        session.tab_feed_pty_bytes(tab, osc7501(state="blocked", app="pi", msg="approve Bash"))
+
+        def mirrored(key: str):
+            entry = panel_agent(roost, key)
+            if entry is None or entry["dimmed"] or entry["lifecycle"] != "waiting":
+                return None
+            return entry
+
+        entry = wait_until(lambda: mirrored(key), 30.0, "the record on the mirror's tab")
+        assert (entry["agent"], entry["status_text"]) == ("Pi", "Waiting · approve Bash"), entry
+
+        host.disconnect()
+        host.wait_not_connected()
+        host.connect_and_wait()
+        again = wait_until(
+            lambda: (k := host_tab_key(roost, host.saved_id, tab)) != key and k,
+            30.0,
+            "the reconnected band to list the tab under a fresh incarnation",
+        )
+        entry = wait_until(lambda: mirrored(again), 30.0, "the record on the re-listed tab")
+        assert entry["status_text"] == "Waiting · approve Bash", entry
+
+        session.tab_feed_pty_bytes(tab, osc7501(state="clear"))
+        wait_until(
+            lambda: panel_agent(roost, again) is None,
+            30.0,
+            "the cleared record to leave the mirror",
+        )
+
+
+def test_the_probe_is_answered_once_while_a_client_is_attached(host, roost):
+    """Only the session's terminal answers `OSC 7501 ; ?` (D4.2): the
+    client's hydrated terminal installs no status sink, and a host tab's
+    replies are discarded anyway. Keys typed into the attached tab after
+    the probe reached it ride the same input path a client reply would, so
+    once they arrive any second reply already has."""
+    host.connect_and_wait()
+    with host.client() as session:
+        tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
+        key = host_key(roost, tab)
+        ready = marker("ATTACHED")
+        session.tab_feed_pty_bytes(tab, f"{ready}\r\n".encode())
+        wait_dump_contains(roost, key, ready)
+        session.tab_capture_pty_input(tab, drain=True)
+
+        after = marker("PROBED")
+        session.tab_feed_pty_bytes(tab, PROBE + f"{after}\r\n".encode())
+        wait_dump_contains(roost, key, after)
+        roost.type_text("q")
+
+        seen = bytearray()
+
+        def typed() -> bool:
+            seen.extend(session.tab_capture_pty_input(tab, drain=True))
+            return b"q" in seen
+
+        wait_until(typed, 30.0, "the key typed into the attached tab to reach the session")
+        assert bytes(seen).count(PROBE_REPLY) == 1, bytes(seen)
+
+
+# ---------------------------------------------------------------------------
+# 23. Plan 082 B-7 — `tab.memory_usage` on a host tab, through the UI
+# ---------------------------------------------------------------------------
+
+
+def memory_line_labels(stdout: str) -> list[str]:
+    return [line.split(":", 1)[0] for line in stdout.splitlines()]
+
+
+def test_a_host_tabs_memory_is_the_sessions_figure_beside_the_windows_copy(host, roost, target):
+    """A host the harness added is never the local session slot, so this
+    is the forward to an arbitrary host (plan 082 §9 R6): the UI puts the
+    op to that host's session, fenced at the incarnation the key names,
+    echoes the key it was asked with, and adds its own attached copy as
+    `mirror`. A tab the window has not shown has no copy, so it gets the
+    session's figure alone."""
+    host.connect_and_wait()
+    with host.client() as session:
+        project = first_project(session)
+        tab = quiet_tab(session, project, host.env.launch_cwd)
+        key = host_key(roost, tab)
+        shown = marker("SHOWN")
+        session.tab_feed_pty_bytes(tab, f"{shown}\r\n".encode())
+        wait_dump_contains(roost, key, shown)
+
+        def settled():
+            answered = roost.tab_memory_usage(key)
+            served = session.tab_memory_usage(tab)
+            return answered if answered["terminal"] == served["terminal"] else None
+
+        answered = wait_until(settled, 30.0, "the UI's figure to be the session's")
+        assert answered["tab_id"] == key, "the caller's ref, not the session's bare id"
+        assert "mirror" in answered, answered
+        for usage in (answered["terminal"], answered["mirror"]):
+            assert usage["primary"]["pages"] >= 1, usage
+            assert usage["resident_bytes"] == (
+                usage["primary"]["resident_bytes"] + usage["alternate"]["resident_bytes"]
+            ), usage
+
+        ran = host.env.roostctl(
+            "--socket", str(ui.socket_path(target)), "tab", "memory", "--tab", key
+        )
+        assert ran.returncode == 0, ran
+        assert memory_line_labels(ran.stdout) == ["terminal", "mirror"], ran.stdout
+
+        parked = quiet_tab(session, project, host.env.launch_cwd)
+        unshown = wait_until(
+            lambda: host_tab_key(roost, host.saved_id, parked),
+            30.0,
+            "the client to list the parked tab",
+        )
+        alone = roost.tab_memory_usage(unshown)
+        assert alone["tab_id"] == unshown, alone
+        assert "mirror" not in alone, "the window holds no copy of a tab it has not shown"
+        assert alone["terminal"] == session.tab_memory_usage(parked)["terminal"], alone
+
+        ran = host.env.roostctl(
+            "--socket", str(ui.socket_path(target)), "tab", "memory", "--tab", unshown
+        )
+        assert ran.returncode == 0, ran
+        assert memory_line_labels(ran.stdout) == ["terminal"], ran.stdout
+
+
+def test_a_host_tab_memory_refusal_names_what_is_missing(host, roost):
+    """A closed tab is the session's own `not-found`, crossed unchanged; an
+    incarnation no connection holds — one nothing minted, or the one a
+    disconnect retired — is this UI's."""
+    refusal = refused(roost.tab_memory_usage, UNLISTED_HOST_TAB)
+    assert refusal.code == "not-found", refusal
+    assert refusal.message == "no connected host with that incarnation", refusal
+
+    host.connect_and_wait()
+    with host.client() as session:
+        project = first_project(session)
+        keep = quiet_tab(session, project, host.env.launch_cwd)
+        tab = quiet_tab(session, project, host.env.launch_cwd)
+        key = wait_until(
+            lambda: host_tab_key(roost, host.saved_id, tab), 30.0, "the band to list the tab"
+        )
+        roost.tab_memory_usage(key)
+        session.close_tab(tab)
+
+        def closed() -> RoostError | None:
+            try:
+                roost.tab_memory_usage(key)
+            except RoostError as error:
+                return error
+            return None
+
+        refusal = wait_until(closed, 30.0, "the closed tab's memory read to be refused")
+        assert refusal.code == "not-found", refusal
+        assert refusal.message.startswith(f"tab {tab} "), "the session's sentence, bare id"
+
+        kept = wait_until(
+            lambda: host_tab_key(roost, host.saved_id, keep), 30.0, "the band to list the tab"
+        )
+        host.disconnect()
+        host.wait_not_connected()
+        refusal = refused(roost.tab_memory_usage, kept)
+        assert refusal.code == "not-found", refusal
+        assert refusal.message == "no connected host with that incarnation", refusal

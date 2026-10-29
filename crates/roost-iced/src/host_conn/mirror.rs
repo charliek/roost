@@ -180,6 +180,7 @@ impl HostMirror {
                     // subscriber never re-runs the projection.
                     tab.state = data.state;
                     tab.hook_active = data.hook_active;
+                    tab.program_status = data.program_status.clone();
                 });
             }
             ops::EVENT_PROJECT_CREATED => {
@@ -408,6 +409,7 @@ mod tests {
             ownership: None,
             password_input: false,
             dropped_reports: None,
+            program_status: None,
         }
     }
 

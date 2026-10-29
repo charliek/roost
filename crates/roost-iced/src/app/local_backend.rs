@@ -4142,6 +4142,7 @@ mod tests {
             ownership: None,
             password_input: false,
             dropped_reports: None,
+            program_status: None,
         }
     }
 
@@ -4786,6 +4787,7 @@ mod switch_tests {
             ownership: None,
             password_input: false,
             dropped_reports: None,
+            program_status: None,
         }
     }
 
@@ -5599,6 +5601,7 @@ mod migration_tests {
                     ownership: None,
                     password_input: false,
                     dropped_reports: None,
+                    program_status: None,
                 })
                 .collect(),
         }

@@ -793,6 +793,13 @@ class Roost:
         `#RRGGBB` hex strings. Ungated — safe outside test mode."""
         return self.call("tab.dump_resolved", {"tab_id": str(tab_id)})
 
+    def tab_memory_usage(self, tab_id: int | str) -> dict:
+        """`tab.memory_usage`: `{tab_id, terminal, mirror?}`, each
+        figure libghostty's per-screen memory plus `resident_bytes` /
+        `virtual_bytes` totals. `tab_id` may be a host-qualified
+        `h<n>.<id>` on a UI socket."""
+        return self.call("tab.memory_usage", {"tab_id": str(tab_id)})
+
     def tab_dispatch_mouse_event(
         self,
         tab_id: int,

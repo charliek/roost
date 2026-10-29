@@ -32,7 +32,7 @@ path = "src/main.rs"
 # so every call it gets from here goes to the blocking pool.
 roost-agent = { path = "../roost-agent" }
 roost-agent-install = { path = "../roost-agent-install" }
-roost-engine = { path = "../roost-engine" }
+roost-engine = { path = "../roost-engine", features = ["vt"] }
 roost-ipc = { path = "../roost-ipc" }
 roost-ui-model = { path = "../roost-ui-model" }
 roost-url = { path = "../roost-url" }

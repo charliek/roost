@@ -1149,6 +1149,44 @@ convergence hypothesis and the (a)/(b) branches in
 [Direction (under evaluation)](#direction-under-evaluation) below, not a
 resolution of it.
 
+### DL-29: program status is a fourth per-tab axis, composed above the hook layer (2026-10-28)
+
+Plan 082 (protocol 7) lets an agent report its own state in the
+terminal with OSC 7501. It is not routed through `tab.agent_report`,
+and the pure functions of [DL-13](#dl-13-the-agent-state-model-four-axes-one-derivation-2026-07-27)
+keep their behavior and their shared fixtures (DL-13's axes are,
+counted this way, the shell, the hook layer and attention): the records
+are a separate per-tab layer in `roost-engine` (`program_status.rs`), and one
+composition reads that layer and the hook layer together into the
+lifecycle every surface shows (`Tab::effective_lifecycle()`, `Tab.state`
+on the wire). The tab's **authoritative terminal** is the only one that
+listens — a session tab's server terminal, an in-process iced tab's own;
+a host tab's client mirror and the Swift app keep no records — and it
+hands records and OSC 133 prompt marks to that layer as one stream in
+byte order, so the result never depends on where a PTY read split the
+bytes. While a record is mid-turn the program decides; hooks keep
+ownership and identity, their state changes are vetoed (counted, not
+dropped), and a claim from a different agent is refused (`foreign_app`).
+
+Two of the rules are Charlie's calls on departures from the release
+doc ([`protocol-7-release.md`](https://github.com/charliek/roost/blob/main/discovery/protocol-7-release.md)):
+
+- **(b) A kept `done`/`error` ends at the next command.** The release
+  doc keeps a finished root record displayed after a prompt with no end
+  condition, which would leave a killed agent's `error` showing
+  NeedsInput forever. The next OSC 133 `C` after a prompt — the user
+  starting another command — retires it.
+- **(c) Claude Code's Screen Reader marks count as prompt marks.** They
+  are indistinguishable from the shell's in the bytes and in
+  libghostty's event, so the record layer treats them alike and the
+  resulting sequences are pinned by tests. Scoping the drop to the
+  shell's own prompts needs a command id in OSC 133, upstream.
+
+Prompt marks are A, B and D, not only A, because Roost's bash and zsh
+integration never sends A. The user-facing rules are in
+[`guides/agents.md`](../guides/agents.md#program-status-osc-7501); the
+wire shape is [`Tab.program_status`](../reference/ipc.md#tabprogram_status-osc-7501).
+
 ## Direction (under evaluation)
 
 **Status: under evaluation — not a commitment.** Nothing in this section

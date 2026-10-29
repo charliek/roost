@@ -285,6 +285,7 @@ const OP_TYPES: &[Row] = &[
     op::<SidebarSetWidthParams, EmptyResult>(ops::SIDEBAR_SET_WIDTH),
     op::<SidebarSetAgentsFractionParams, EmptyResult>(ops::SIDEBAR_SET_AGENTS_FRACTION),
     op::<TabDumpResolvedParams, TabDumpResolvedResult>(ops::TAB_DUMP_RESOLVED),
+    op::<TabMemoryUsageParams, TabMemoryUsageResult>(ops::TAB_MEMORY_USAGE),
     op::<TabExpandSelectionAtParams, TabExpandSelectionAtResult>(ops::TAB_EXPAND_SELECTION_AT),
     op::<TabDispatchMouseEventParams, EmptyResult>(ops::TAB_DISPATCH_MOUSE_EVENT),
     op::<AppSetWindowFocusParams, EmptyResult>(ops::APP_SET_WINDOW_FOCUS),

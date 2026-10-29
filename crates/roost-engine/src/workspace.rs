@@ -34,6 +34,7 @@ use roost_ipc::agent::{
     DroppedReports, OwnershipAction, TabAgentReportParams, SOURCE_LEGACY, SOURCE_MANUAL,
 };
 use roost_ipc::messages::{Project, Tab, TabState};
+use roost_ipc::program_status::{ProgramStatusSummary, StatusEvent};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::warn;
@@ -42,6 +43,7 @@ use crate::persistence::{
     persist_state, read_state, HostSnapshot, HostTabMemory, ProjectSnapshot, SnapshotFile,
     WindowFrame,
 };
+use crate::program_status::{self, ProgramStatusRecords, RawOscAuthority, VetoStream};
 
 /// How many events the broadcast channel buffers per subscriber.
 /// Subscribers that fall behind get a `Lagged` and resync via
@@ -139,12 +141,18 @@ struct TabRow {
     /// Not persisted, like `has_notification`: a relaunch reopens fresh
     /// shells, and none of them starts at a prompt.
     password_input: bool,
-    /// Reports [`Workspace::agent_report`] dropped; see
-    /// `Tab.dropped_reports`. Not persisted.
+    /// The tab's program-status (OSC 7501) records, composed with
+    /// `agent` on the way out. Not persisted, like `agent`.
+    program_status: ProgramStatusRecords,
+    /// Reports [`Workspace::agent_report`] dropped, plus program-status
+    /// vetoes; see `Tab.dropped_reports`. Not persisted.
     dropped_reports: Option<DroppedReports>,
     /// The dropped-report streams already logged, most recent last;
     /// see [`record_drop`].
     logged_drop_streams: VecDeque<u64>,
+    /// The streams whose program-status veto is already counted, most
+    /// recent last; see [`record_veto`].
+    vetoed_streams: VecDeque<u64>,
     user_titled: bool,
     position: i32,
     created_at: i64,
@@ -425,12 +433,15 @@ pub enum WorkspaceEvent {
         tab_id: i64,
         password_input: bool,
     },
-    /// The full agent record after an accepted report or shell mark;
-    /// see [`roost_ipc::messages::AgentReportChangedEvent`].
+    /// The full agent record, and what program status composes it to,
+    /// after either changed; see
+    /// [`roost_ipc::messages::AgentReportChangedEvent`].
     AgentChanged {
         #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
         agent: AgentTabState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program_status: Option<ProgramStatusSummary>,
     },
     /// A notification the user has not seen — the banner half. Live-only
     /// (see [`Self::is_live_only`]); the pending bit that rides beside
@@ -1645,8 +1656,10 @@ impl Workspace {
             has_notification: false,
             notification_generation: 0,
             password_input: false,
+            program_status: ProgramStatusRecords::default(),
             dropped_reports: None,
             logged_drop_streams: VecDeque::new(),
+            vetoed_streams: VecDeque::new(),
             // Always start with user_titled=false. The caller-
             // supplied `title` is a placeholder (e.g. UI's
             // "roost-mac N" / CLI's "roostctl" default) that
@@ -1904,9 +1917,16 @@ impl Workspace {
         // `notification.create` / `roostctl notify` is never suppressed
         // this way (plan §3.4) — the agent's own adapter is what emits
         // those, so gating them would mute the very source it protects.
-        if source == AttentionSource::RawOsc && agent::suppress_raw_osc(&row.agent) {
-            tracing::debug!(tab_id, "raw OSC notification suppressed (agent owns tab)");
-            return Ok(false);
+        if let AttentionSource::RawOsc {
+            records_authoritative,
+        } = source
+        {
+            let records =
+                records_authoritative.unwrap_or_else(|| row.program_status.is_authoritative());
+            if agent::suppress_raw_osc(&row.agent) || records {
+                tracing::debug!(tab_id, "raw OSC notification suppressed (agent owns tab)");
+                return Ok(false);
+            }
         }
         if watched {
             return Ok(false);
@@ -2030,10 +2050,65 @@ impl Workspace {
         let Some(next) = agent::apply_shell_mark(&row.agent, body) else {
             return Ok(()); // undefined mark body — no change
         };
-        let events = replace_agent(row, next);
+        let records = row.program_status.clone();
+        let events = replace_axes(row, next, records);
         // Run state isn't in the persisted snapshot — emit only.
         self.commit(inner, events, Persist::Skip);
         Ok(())
+    }
+
+    /// Apply one ordered batch of OSC 7501 reports and OSC 133 prompt
+    /// marks from the tab's authoritative terminal to its program-status
+    /// records, under one lock, emitting the derived-state deltas once for
+    /// the net result. The hook layer is not touched: the caller still
+    /// hands the batch's OSC 133 marks to [`Self::apply_shell_mark`]
+    /// afterwards, as roost-osc reads them.
+    ///
+    /// A record banner for a tab the user is watching is dropped, like any
+    /// other raise. `now_ms` is the caller's: [`unix_now_ms`] in
+    /// production.
+    ///
+    /// Returns the records' authority at each notification the batch
+    /// placed, for the caller to hand the same chunk's raw OSC 9 / 777
+    /// through [`crate::application::apply_osc`].
+    pub fn apply_program_status(
+        &self,
+        tab_id: i64,
+        events: Vec<StatusEvent>,
+        now_ms: i64,
+    ) -> Result<RawOscAuthority, WorkspaceError> {
+        let mut inner = self.inner.lock().unwrap();
+        let watched = inner.tab_is_being_watched(tab_id);
+        let row = inner
+            .tabs
+            .get_mut(&tab_id)
+            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
+        let mut records = row.program_status.clone();
+        let mut applied = records.apply(&row.agent, events, now_ms);
+        let agent = row.agent.clone();
+        let mut events = replace_axes(row, agent, records);
+        if !watched {
+            for banner in &applied.banners {
+                let title = if banner.title.is_empty() {
+                    row.title.clone()
+                } else {
+                    banner.title.clone()
+                };
+                events.extend(raise_notification(row, title, banner.body.clone()));
+            }
+        }
+        // A program re-sending its status every chunk would otherwise
+        // spend a revision, and a replay-window slot, on each.
+        if events.is_empty() {
+            drop(inner);
+        } else {
+            // Run state isn't in the persisted snapshot — emit only.
+            self.commit(inner, events, Persist::Skip);
+        }
+        applied.emit_logs(tab_id);
+        Ok(RawOscAuthority::new(std::mem::take(
+            &mut applied.notifications,
+        )))
     }
 
     /// Apply `first` and then `then` under one lock, emitting the
@@ -2063,10 +2138,14 @@ impl Workspace {
         let mut attention = AttentionEffect::Unchanged;
         let mut drop_logs = Vec::new();
         for report in std::iter::once(first).chain(then) {
-            let outcome = agent::apply_report(&next, report, now);
+            let hook = program_status::apply_hook_report(&next, &row.program_status, report, now);
+            let outcome = hook.outcome;
             if let Some(reason) = outcome.dropped {
                 drop_logs.push(record_drop(row, &next, report, reason, now));
                 continue;
+            }
+            if let Some(stream) = &hook.vetoed {
+                record_veto(row, &next, report, stream, now);
             }
             accepted = true;
             next = outcome.state;
@@ -2075,7 +2154,8 @@ impl Workspace {
             }
         }
 
-        let mut events = replace_agent(row, next);
+        let records = row.program_status.clone();
+        let mut events = replace_axes(row, next, records);
         match attention {
             // Same watched predicate as `raise_attention`, applied here
             // rather than by delegating because the report's own
@@ -2577,11 +2657,16 @@ impl Workspace {
 
 /// Where an attention-raise came from. The only behavioral difference
 /// is the agent gate: raw OSC is dropped while a live agent owns the tab
-/// (plan §3.4), a structured `notification.create` / `roostctl notify`
-/// never is.
+/// (plan §3.4) or program-status records decide it (D5.8), a structured
+/// `notification.create` / `roostctl notify` never is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttentionSource {
-    RawOsc,
+    RawOsc {
+        /// Whether the records were authoritative at the notification's
+        /// own bytes ([`crate::program_status::RawOscAuthority`]); `None`
+        /// reads them as they stand.
+        records_authoritative: Option<bool>,
+    },
     Structured,
 }
 
@@ -2996,6 +3081,12 @@ fn retained_tabs(saved: &RestoreProject) -> Vec<crate::persistence::TabSnapshot>
 /// How many dropped-report streams a tab remembers having logged.
 const LOGGED_DROP_STREAMS: usize = 16;
 
+/// How many vetoed streams a tab remembers having counted. A bound so a
+/// client minting session ids can't grow a row without limit; a stream
+/// evicted past it and vetoed again is counted again. An agent session is
+/// one stream, so a tab reaches it only after 64 vetoed agent sessions.
+const VETOED_STREAMS: usize = 64;
+
 /// Count a dropped report on its tab, and return its log line: INFO for
 /// the first drop of each `(source, session_id, reason)` stream the tab
 /// remembers, DEBUG for the repeats, so a nested agent's whole session, or
@@ -3048,6 +3139,49 @@ fn record_drop(
     }
 }
 
+/// Count a program-status veto: an accepted report whose lifecycle change
+/// or notification a deciding record overrode. Each `(source, session_id)`
+/// stream counts once. A veto never replaces `last`, so a real drop stays
+/// what doctor reads; only a tab with no drop yet gets the veto as its
+/// `last`, since the record has to name one.
+fn record_veto(
+    row: &mut TabRow,
+    seen: &AgentTabState,
+    report: &TabAgentReportParams,
+    stream: &VetoStream,
+    now: i64,
+) {
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        stream.hash(&mut hasher);
+        hasher.finish()
+    };
+    if row.vetoed_streams.contains(&key) {
+        return;
+    }
+    if row.vetoed_streams.len() == VETOED_STREAMS {
+        row.vetoed_streams.pop_front();
+    }
+    row.vetoed_streams.push_back(key);
+    match &mut row.dropped_reports {
+        Some(dropped) => dropped.count += 1,
+        None => {
+            row.dropped_reports = Some(DroppedReports {
+                count: 1,
+                last: DroppedReport {
+                    source: report.source.clone(),
+                    session_id: report.session_id.clone(),
+                    ownership_action: report.ownership_action,
+                    reason: DropReason::ProgramStatus,
+                    tab_had_owner: agent::is_live(seen),
+                    at: now,
+                },
+            });
+        }
+    }
+}
+
 /// An agent-supplied string, capped for a log line. Fields are written
 /// with `?`, which escapes control characters, so none can forge a line.
 fn log_clip(value: &str) -> String {
@@ -3089,12 +3223,13 @@ impl DropLog {
 }
 
 fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
+    let status = program_status::summary(&row.agent, &row.program_status);
     Tab {
         id: row.id,
         project_id: row.project_id,
         title: row.title.clone(),
         cwd: row.cwd.clone(),
-        state: agent::effective(&row.agent),
+        state: roost_ipc::program_status::effective(&row.agent, status.as_ref()),
         has_notification: row.has_notification,
         is_active,
         user_titled: row.user_titled,
@@ -3107,6 +3242,7 @@ fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
         ownership: row.agent.ownership.clone(),
         password_input: row.password_input,
         dropped_reports: row.dropped_reports.clone(),
+        program_status: status,
     }
 }
 
@@ -3137,33 +3273,60 @@ fn raise_notification(row: &mut TabRow, title: String, body: String) -> Vec<Work
     ]
 }
 
-/// Swap a tab's agent record and return the events the swap implies.
+/// Swap a tab's hook record and program-status records, and return the
+/// events the swap implies.
 ///
-/// `AgentChanged` carries the full record; `TabStateChanged` and
-/// `HookActiveChanged` carry its two derived projections and each fires
-/// only when its own projection moved. An identical record emits
-/// nothing — repeated prompt marks are the common case and should not
-/// churn the UI.
-fn replace_agent(row: &mut TabRow, next: AgentTabState) -> Vec<WorkspaceEvent> {
-    if row.agent == next {
+/// `AgentChanged` carries the full hook record and the program-status
+/// summary, and fires when either changed; `TabStateChanged` and
+/// `HookActiveChanged` carry the composed state and the hook layer's
+/// liveness, and each fires only when its own projection moved. An
+/// unchanged hook record and summary emit nothing: repeated prompt marks
+/// are the common case and should not churn the UI. A summary differing
+/// only in `updated_at` is unchanged, so a program re-sending the same
+/// report costs no event.
+fn replace_axes(
+    row: &mut TabRow,
+    next_agent: AgentTabState,
+    next_records: ProgramStatusRecords,
+) -> Vec<WorkspaceEvent> {
+    let tab_id = row.id;
+    let prev_status = program_status::summary(&row.agent, &row.program_status);
+    let prev_state = roost_ipc::program_status::effective(&row.agent, prev_status.as_ref());
+    let prev_live = agent::is_live(&row.agent);
+    let agent_changed = row.agent != next_agent;
+    row.agent = next_agent;
+    row.program_status = next_records;
+    let status = program_status::summary(&row.agent, &row.program_status);
+    if !agent_changed && same_summary(prev_status.as_ref(), status.as_ref()) {
         return Vec::new();
     }
-    let tab_id = row.id;
-    let prev = std::mem::replace(&mut row.agent, next);
     let mut events = Vec::with_capacity(3);
-    let state = agent::effective(&row.agent);
-    if state != agent::effective(&prev) {
+    let state = roost_ipc::program_status::effective(&row.agent, status.as_ref());
+    if state != prev_state {
         events.push(WorkspaceEvent::TabStateChanged { tab_id, state });
     }
     let active = agent::is_live(&row.agent);
-    if active != agent::is_live(&prev) {
+    if active != prev_live {
         events.push(WorkspaceEvent::HookActiveChanged { tab_id, active });
     }
     events.push(WorkspaceEvent::AgentChanged {
         tab_id,
         agent: row.agent.clone(),
+        program_status: status,
     });
     events
+}
+
+fn same_summary(a: Option<&ProgramStatusSummary>, b: Option<&ProgramStatusSummary>) -> bool {
+    let untimed = |summary: Option<&ProgramStatusSummary>| {
+        summary.cloned().map(|mut summary| {
+            if let Some(record) = &mut summary.record {
+                record.updated_at = 0;
+            }
+            summary
+        })
+    };
+    untimed(a) == untimed(b)
 }
 
 fn unix_now() -> i64 {
@@ -3171,6 +3334,13 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// The engine's millisecond wall clock: program status's `now_ms`.
+pub fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// A saved host's stable id: 64 bits of OS entropy as 16 lowercase hex
@@ -4402,7 +4572,14 @@ mod tests {
     fn prompt_mark_reopens_raw_osc_for_a_dead_agent() {
         let (ws, tid) = owned_ws(AgentLifecycle::Working);
         assert!(!ws
-            .raise_attention(tid, "Wrapper", "noise", AttentionSource::RawOsc)
+            .raise_attention(
+                tid,
+                "Wrapper",
+                "noise",
+                AttentionSource::RawOsc {
+                    records_authoritative: None,
+                }
+            )
             .unwrap());
         assert!(!ws.tab(tid).unwrap().has_notification);
 
@@ -4412,7 +4589,14 @@ mod tests {
         assert!(tab.hook_active, "ownership survives as a label");
         assert_eq!(tab.state, TabState::None, "falls through to shell");
         assert!(ws
-            .raise_attention(tid, "Build", "done", AttentionSource::RawOsc)
+            .raise_attention(
+                tid,
+                "Build",
+                "done",
+                AttentionSource::RawOsc {
+                    records_authoritative: None,
+                }
+            )
             .unwrap());
         assert!(ws.tab(tid).unwrap().has_notification);
     }
@@ -4932,13 +5116,27 @@ mod tests {
         let (ws, tid) = owned_ws(AgentLifecycle::Working);
 
         assert!(!ws
-            .raise_attention(tid, "Wrapper", "noise", AttentionSource::RawOsc)
+            .raise_attention(
+                tid,
+                "Wrapper",
+                "noise",
+                AttentionSource::RawOsc {
+                    records_authoritative: None,
+                }
+            )
             .unwrap());
         assert!(!ws.tab(tid).unwrap().has_notification);
 
         ws.apply_shell_mark(tid, "D;0").unwrap();
         assert!(ws
-            .raise_attention(tid, "Build", "done", AttentionSource::RawOsc)
+            .raise_attention(
+                tid,
+                "Build",
+                "done",
+                AttentionSource::RawOsc {
+                    records_authoritative: None,
+                }
+            )
             .unwrap());
         assert!(ws.tab(tid).unwrap().has_notification);
     }
@@ -6505,7 +6703,14 @@ mod tests {
         ws.publish_tab_effect(tab, TabEffectKind::Bell);
         let effects_only = ws.revision();
         assert!(ws
-            .raise_attention(tab, "title", "body", AttentionSource::RawOsc)
+            .raise_attention(
+                tab,
+                "title",
+                "body",
+                AttentionSource::RawOsc {
+                    records_authoritative: None,
+                }
+            )
             .unwrap());
         let fired = ws.revision();
 
@@ -7085,5 +7290,492 @@ mod tests {
             2,
             "the batch is retained — empty — because the revision is the gap check"
         );
+    }
+
+    /// Plan 082 B4: program status (OSC 7501) wired into the workspace.
+    mod program_status {
+        use std::sync::Arc;
+
+        use super::*;
+        use roost_ipc::program_status::{
+            DecidedBy, ProgramStatusKind, ProgramStatusReport, ProgramStatusState as S, PromptMark,
+        };
+
+        /// Well past the startup guard of a record first seen at `T0`.
+        const T0: i64 = 1_793_158_450_000;
+        const LATE: i64 = T0 + 60_000;
+
+        fn status(state: S, id: &str, app: &str, msg: &str) -> StatusEvent {
+            StatusEvent::Report(ProgramStatusReport {
+                state,
+                kind: None,
+                progress: None,
+                id: id.into(),
+                app: app.into(),
+                title: String::new(),
+                msg: msg.into(),
+            })
+        }
+
+        fn claude(state: S, msg: &str) -> StatusEvent {
+            status(state, "", "claude-code", msg)
+        }
+
+        /// The place libghostty reports for `OSC 9 ; text`.
+        fn osc9(text: &str) -> StatusEvent {
+            StatusEvent::Notification {
+                title: String::new(),
+                body: text.into(),
+            }
+        }
+
+        fn banners(events: &[WorkspaceEvent]) -> Vec<(String, String)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    WorkspaceEvent::NotificationFired { title, body, .. } => {
+                        Some((title.clone(), body.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn agent_changes(events: &[WorkspaceEvent]) -> Vec<Option<ProgramStatusSummary>> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    WorkspaceEvent::AgentChanged { program_status, .. } => {
+                        Some(program_status.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn state_changes(events: &[WorkspaceEvent]) -> Vec<TabState> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    WorkspaceEvent::TabStateChanged { state, .. } => Some(*state),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Every state on `Tab.state` and `program_status`, each batch one
+        /// commit: one `AgentChanged` carrying the summary, a
+        /// `TabStateChanged` only when the composed state moved, and the
+        /// field absent once the last record clears.
+        #[test]
+        fn each_state_composes_onto_the_tab_and_its_events() {
+            let (ws, tid) = agent_ws();
+            let mut rx = ws.subscribe();
+            for (state, lifecycle, tab_state) in [
+                (S::Working, AgentLifecycle::Working, TabState::Running),
+                (S::Blocked, AgentLifecycle::Waiting, TabState::NeedsInput),
+                (S::Error, AgentLifecycle::Failed, TabState::NeedsInput),
+                (S::Done, AgentLifecycle::Finished, TabState::Idle),
+                (S::Idle, AgentLifecycle::Inactive, TabState::None),
+            ] {
+                let before = ws.tab(tid).unwrap().state;
+                ws.apply_program_status(tid, vec![claude(state, "")], LATE)
+                    .unwrap();
+                let tab = ws.tab(tid).unwrap();
+                let summary = tab.program_status.clone().expect("a record is listed");
+                assert_eq!(summary.effective_lifecycle, lifecycle, "{state:?}");
+                assert_eq!(summary.decided_by, DecidedBy::Records, "{state:?}");
+                assert_eq!(tab.state, tab_state, "{state:?}");
+                assert_eq!(tab.effective_lifecycle(), lifecycle, "{state:?}");
+                assert_eq!(
+                    tab.agent_lifecycle,
+                    AgentLifecycle::Inactive,
+                    "hooks untouched"
+                );
+
+                let events = drain(&mut rx);
+                assert_eq!(agent_changes(&events), vec![Some(summary)], "{state:?}");
+                let moved: Vec<TabState> = (before != tab_state)
+                    .then_some(tab_state)
+                    .into_iter()
+                    .collect();
+                assert_eq!(state_changes(&events), moved, "{state:?}");
+            }
+
+            ws.apply_program_status(tid, vec![status(S::Clear, "", "", "")], LATE)
+                .unwrap();
+            let tab = ws.tab(tid).unwrap();
+            assert_eq!(tab.program_status, None);
+            assert_eq!(tab.state, TabState::None);
+            assert_eq!(agent_changes(&drain(&mut rx)), vec![None]);
+        }
+
+        /// Plan 082 D5.9: a message change alone is an `AgentChanged`; the
+        /// same report again is nothing, though its `updated_at` moved.
+        #[test]
+        fn a_message_change_alone_emits_and_a_repeat_does_not() {
+            let (ws, tid) = agent_ws();
+            ws.apply_program_status(tid, vec![claude(S::Working, "reading")], T0)
+                .unwrap();
+            let mut rx = ws.subscribe();
+
+            ws.apply_program_status(tid, vec![claude(S::Working, "writing")], T0 + 5_000)
+                .unwrap();
+            let events = drain(&mut rx);
+            let changes = agent_changes(&events);
+            assert_eq!(changes.len(), 1, "{events:?}");
+            let record = changes[0].as_ref().unwrap().record.as_ref().unwrap();
+            assert_eq!(record.msg, "writing");
+            assert!(state_changes(&events).is_empty(), "still Running");
+
+            let mut versioned = ws.subscribe_versioned();
+            ws.apply_program_status(tid, vec![claude(S::Working, "writing")], T0 + 9_000)
+                .unwrap();
+            assert!(
+                agent_changes(&drain(&mut rx)).is_empty(),
+                "a repeat moves only updated_at"
+            );
+            assert!(
+                versioned.try_recv().is_err(),
+                "and spends no revision either"
+            );
+        }
+
+        /// The child's blocked record outranks the root's working one, and
+        /// its id, kind and message are what the wire carries.
+        #[test]
+        fn a_blocked_child_outranks_a_working_root_on_the_wire() {
+            let (ws, tid) = agent_ws();
+            let child = StatusEvent::Report(ProgramStatusReport {
+                state: S::Blocked,
+                kind: Some(ProgramStatusKind::Permission),
+                progress: Some(40),
+                id: "build/test".into(),
+                app: String::new(),
+                title: String::new(),
+                msg: "approve Bash".into(),
+            });
+            ws.apply_program_status(tid, vec![claude(S::Working, "root"), child], LATE)
+                .unwrap();
+            let tab = ws.tab(tid).unwrap();
+            let summary = tab.program_status.unwrap();
+            assert_eq!(summary.children, 1);
+            let record = summary.record.unwrap();
+            assert_eq!(
+                (record.id.as_str(), record.kind, record.msg.as_str()),
+                (
+                    "build/test",
+                    Some(ProgramStatusKind::Permission),
+                    "approve Bash"
+                )
+            );
+            assert_eq!(record.app, "claude-code", "inherited from the root");
+            assert_eq!(tab.state, TabState::NeedsInput);
+        }
+
+        /// A record banner goes through the watched check like any other
+        /// raise: dropped whole for the tab the user is looking at.
+        #[test]
+        fn a_record_banner_for_a_watched_tab_is_dropped() {
+            let (ws, tid) = agent_ws();
+            ws.apply_program_status(tid, vec![claude(S::Working, "")], T0)
+                .unwrap();
+            ws.set_window_focused(true);
+            let mut rx = ws.subscribe();
+            ws.apply_program_status(tid, vec![claude(S::Blocked, "approve")], LATE)
+                .unwrap();
+            let events = drain(&mut rx);
+            assert!(banners(&events).is_empty(), "{events:?}");
+            assert!(!has_attention_events(&events));
+            let tab = ws.tab(tid).unwrap();
+            assert!(!tab.has_notification);
+            assert_eq!(tab.state, TabState::NeedsInput, "the state still moves");
+
+            // The control: the same change on an unwatched tab raises.
+            let (ws, tid) = agent_ws();
+            ws.apply_program_status(tid, vec![claude(S::Working, "")], T0)
+                .unwrap();
+            let mut rx = ws.subscribe();
+            ws.apply_program_status(tid, vec![claude(S::Blocked, "approve")], LATE)
+                .unwrap();
+            assert_eq!(
+                banners(&drain(&mut rx)),
+                vec![("Claude Code".to_string(), "approve".to_string())]
+            );
+            assert!(ws.tab(tid).unwrap().has_notification);
+        }
+
+        /// A record naming no title and no app raises under the tab's own
+        /// title (plan 082 D5.7 amendment).
+        #[test]
+        fn an_untitled_appless_banner_takes_the_tabs_title() {
+            let (ws, tid) = agent_ws();
+            ws.set_tab_title(tid, "deploy").unwrap();
+            let mut rx = ws.subscribe();
+            ws.apply_program_status(tid, vec![status(S::Blocked, "", "", "")], LATE)
+                .unwrap();
+            assert_eq!(
+                banners(&drain(&mut rx)),
+                vec![("deploy".to_string(), "Needs your input".to_string())]
+            );
+        }
+
+        /// Plan 082 D5.8: an agent's own OSC 9 can't double the record's
+        /// banner. Records decide with no hook owner at all here, and a
+        /// prompt mark ending their authority re-opens raw OSC.
+        #[test]
+        fn raw_osc_is_suppressed_while_records_are_authoritative() {
+            let (ws, tid) = agent_ws();
+            ws.apply_program_status(tid, vec![claude(S::Working, "")], LATE)
+                .unwrap();
+            assert!(!ws.tab(tid).unwrap().hook_active, "no hook owns the tab");
+            assert!(!ws
+                .raise_attention(
+                    tid,
+                    "codex",
+                    "turn done",
+                    AttentionSource::RawOsc {
+                        records_authoritative: None,
+                    }
+                )
+                .unwrap());
+            assert!(!ws.tab(tid).unwrap().has_notification);
+            // Structured attention is never gated this way.
+            assert!(ws
+                .raise_attention(tid, "n", "b", AttentionSource::Structured)
+                .unwrap());
+            ws.clear_notification(tid, None).unwrap();
+
+            ws.apply_program_status(tid, vec![StatusEvent::Prompt(PromptMark::CommandEnd)], LATE)
+                .unwrap();
+            assert_eq!(ws.tab(tid).unwrap().program_status, None);
+            assert!(ws
+                .raise_attention(
+                    tid,
+                    "Build",
+                    "done",
+                    AttentionSource::RawOsc {
+                        records_authoritative: None,
+                    }
+                )
+                .unwrap());
+        }
+
+        /// Plan 082 D5.8's amendment, the branch review's sequence: a raw
+        /// OSC 9 is judged against the records at its own bytes. Here it
+        /// follows `blocked` and precedes the `A` that ends the records'
+        /// authority, so it is suppressed though the chunk ends with no
+        /// record deciding. A raw notification libghostty placed nowhere
+        /// falls back to the records as they stand.
+        #[test]
+        fn raw_osc_is_judged_at_its_place_in_the_chunk() {
+            let (ws, tid) = agent_ws();
+            let mut rx = ws.subscribe();
+            let mut authority = ws
+                .apply_program_status(
+                    tid,
+                    vec![
+                        status(S::Blocked, "", "pi", ""),
+                        osc9("turn over"),
+                        StatusEvent::Prompt(PromptMark::PromptStart),
+                    ],
+                    LATE,
+                )
+                .unwrap();
+            crate::application::apply_osc(&ws, tid, 9, "turn over", &mut authority);
+            assert_eq!(
+                banners(&drain(&mut rx)),
+                vec![("Pi".to_string(), "Needs your input".to_string())],
+                "the record's banner alone"
+            );
+
+            crate::application::apply_osc(&ws, tid, 9, "unplaced", &mut authority);
+            assert_eq!(
+                banners(&drain(&mut rx)),
+                vec![("unplaced".to_string(), String::new())],
+                "no record decides at the chunk's end"
+            );
+            ws.clear_notification(tid, None).unwrap();
+
+            // A notification placed before the record that now decides.
+            let mut authority = ws
+                .apply_program_status(
+                    tid,
+                    vec![osc9("before"), status(S::Working, "", "pi", "")],
+                    LATE,
+                )
+                .unwrap();
+            assert!(ws.tab(tid).unwrap().program_status.is_some());
+            crate::application::apply_osc(&ws, tid, 9, "before", &mut authority);
+            assert_eq!(
+                banners(&drain(&mut rx)),
+                vec![("before".to_string(), String::new())]
+            );
+        }
+
+        /// Plan 082 B-4: the child-record cap's warning reaches the log
+        /// through the workspace, once for a burst.
+        #[test]
+        fn the_child_cap_warns_in_the_log_once() {
+            let (ws, tid) = agent_ws();
+            let children: Vec<StatusEvent> = (0..=crate::program_status::MAX_CHILDREN + 1)
+                .map(|i| status(S::Working, &format!("c{i}"), "", ""))
+                .collect();
+            assert_eq!(children.len(), 257);
+
+            let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let writer = Arc::clone(&captured);
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || CapturedLog(Arc::clone(&writer)))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                ws.apply_program_status(tid, children, LATE).unwrap();
+            });
+
+            let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                log.matches("the tab is at its child-record cap").count(),
+                1,
+                "{log}"
+            );
+            assert!(log.contains(&format!("tab_id={tid}")), "{log}");
+            assert!(log.contains("id=\"c255\""), "{log}");
+        }
+
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// A claim from an agent other than the deciding record's is a
+        /// real drop: `accepted: false`, and `last` names it.
+        #[test]
+        fn a_foreign_claim_is_refused_and_recorded() {
+            let (ws, tid) = agent_ws();
+            ws.apply_program_status(tid, vec![claude(S::Working, "")], LATE)
+                .unwrap();
+            let claim = report(
+                tid,
+                "codex",
+                "c1",
+                OwnershipAction::Claim,
+                Some(AgentLifecycle::Working),
+            );
+            let (accepted, tab) = ws.agent_report(&claim).unwrap();
+            assert!(!accepted);
+            assert_eq!(tab.ownership, None, "the claim changed nothing");
+            let dropped = tab.dropped_reports.unwrap();
+            assert_eq!(dropped.count, 1);
+            assert_eq!(dropped.last.reason, DropReason::ForeignApp);
+            assert_eq!(dropped.last.source, "codex");
+        }
+
+        /// Plan 082 D5.5 (amended): a veto is counted once per
+        /// `(source, session)` stream and never becomes `last` over a real
+        /// drop; a tab with no drop yet takes it as `last`.
+        #[test]
+        fn vetoes_count_once_per_stream_and_leave_a_real_drop_as_last() {
+            let (ws, tid) = agent_ws();
+            let lost = report(tid, "claude", "old", OwnershipAction::Preserve, None);
+            assert!(!ws.agent_report(&lost).unwrap().0);
+            ws.agent_report(&report(
+                tid,
+                "claude",
+                "s1",
+                OwnershipAction::Claim,
+                Some(AgentLifecycle::Inactive),
+            ))
+            .unwrap();
+            ws.apply_program_status(tid, vec![claude(S::Working, "")], LATE)
+                .unwrap();
+            let real_drop = ws.tab(tid).unwrap().dropped_reports.unwrap();
+            assert_eq!(real_drop.count, 1);
+
+            let mut waiting = report(
+                tid,
+                "claude",
+                "s1",
+                OwnershipAction::Preserve,
+                Some(AgentLifecycle::Waiting),
+            );
+            waiting.attention = AttentionOp::Set;
+            waiting.title = "Claude Code".into();
+            waiting.body = "needs permission".into();
+            for _ in 0..3 {
+                let (accepted, tab) = ws.agent_report(&waiting).unwrap();
+                assert!(accepted, "a veto is accepted");
+                assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive, "vetoed");
+                assert!(!tab.has_notification, "its banner too");
+                let dropped = tab.dropped_reports.unwrap();
+                assert_eq!(dropped.count, 2, "one stream, counted once");
+                assert_eq!(dropped.last, real_drop.last, "last is the real drop");
+            }
+
+            // A report the veto changed nothing for isn't counted.
+            let quiet = report(tid, "claude", "s1", OwnershipAction::Preserve, None);
+            ws.agent_report(&quiet).unwrap();
+            assert_eq!(ws.tab(tid).unwrap().dropped_reports.unwrap().count, 2);
+
+            // A second session of the same agent is its own stream.
+            ws.agent_report(&report(tid, "claude", "s2", OwnershipAction::Claim, None))
+                .unwrap();
+            waiting.session_id = "s2".into();
+            ws.agent_report(&waiting).unwrap();
+            let dropped = ws.tab(tid).unwrap().dropped_reports.unwrap();
+            assert_eq!(dropped.count, 3);
+            assert_eq!(dropped.last, real_drop.last);
+
+            // With no drop on record, the veto is what `last` names.
+            let (ws, tid) = agent_ws();
+            ws.agent_report(&report(tid, "claude", "s1", OwnershipAction::Claim, None))
+                .unwrap();
+            ws.apply_program_status(tid, vec![claude(S::Working, "")], LATE)
+                .unwrap();
+            waiting.tab_id = tid;
+            waiting.session_id = "s1".into();
+            ws.agent_report(&waiting).unwrap();
+            let dropped = ws.tab(tid).unwrap().dropped_reports.unwrap();
+            assert_eq!(dropped.count, 1);
+            assert_eq!(dropped.last.reason, DropReason::ProgramStatus);
+            assert!(dropped.last.tab_had_owner);
+        }
+
+        /// A hook change under a record carries the summary with it, so a
+        /// mirror assigning `program_status` unconditionally never loses
+        /// it to an unrelated event.
+        #[test]
+        fn a_hook_change_under_a_record_carries_the_summary() {
+            let (ws, tid) = agent_ws();
+            ws.apply_program_status(tid, vec![claude(S::Blocked, "approve")], LATE)
+                .unwrap();
+            let mut rx = ws.subscribe();
+            ws.agent_report(&report(tid, "claude", "s1", OwnershipAction::Claim, None))
+                .unwrap();
+            let events = drain(&mut rx);
+            let changes = agent_changes(&events);
+            assert_eq!(changes.len(), 1, "{events:?}");
+            assert_eq!(changes[0], ws.tab(tid).unwrap().program_status);
+            assert!(changes[0].is_some());
+            assert!(state_changes(&events).is_empty(), "still NeedsInput");
+        }
+
+        #[test]
+        fn program_status_for_a_missing_tab_is_an_error() {
+            let ws = Workspace::new();
+            assert!(matches!(
+                ws.apply_program_status(99, vec![claude(S::Working, "")], LATE),
+                Err(WorkspaceError::TabNotFound(99))
+            ));
+        }
     }
 }

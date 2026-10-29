@@ -266,7 +266,7 @@ pub fn is_live(state: &AgentTabState) -> bool {
 /// [`effective_lifecycle`] and [`suppress_raw_osc`] are both this
 /// predicate, so a dead agent can never keep driving one of them while
 /// having released the other.
-fn agent_drives(state: &AgentTabState) -> bool {
+pub fn agent_drives(state: &AgentTabState) -> bool {
     is_live(state) && state.lifecycle != AgentLifecycle::Inactive
 }
 
@@ -384,6 +384,12 @@ pub enum DropReason {
     /// A claim from an agent the owner is running; see
     /// [`is_nested_claim`].
     NestedClaim,
+    /// A report accepted while a program-status record decided the tab,
+    /// whose lifecycle change or notification that record overrode.
+    ProgramStatus,
+    /// A claim from an agent other than the one whose program-status
+    /// record decides the tab.
+    ForeignApp,
 }
 
 /// One report a server dropped, as `Tab.dropped_reports` shows it.
@@ -575,7 +581,7 @@ fn is_nested_claim(current: &AgentTabState, report: &TabAgentReportParams) -> bo
         && is_agent_source(&report.source)
 }
 
-fn is_agent_source(source: &str) -> bool {
+pub fn is_agent_source(source: &str) -> bool {
     !source.is_empty() && source != SOURCE_MANUAL && source != SOURCE_LEGACY
 }
 

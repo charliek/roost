@@ -13,10 +13,7 @@ use std::iter;
 
 use roost_ipc::agent::{self, AgentLifecycle};
 
-use crate::agent_palette::{
-    agent_display_name, agent_owner, elapsed_text, normalize_line, row_name, status_text,
-    AgentSource,
-};
+use crate::agent_palette::{elapsed_text, normalize_line, row_agent, tab_status_text, AgentSource};
 use crate::keys::{HostId, ProjectKey, TabKey};
 
 /// Between a row's host and its project: `local › roost`.
@@ -119,11 +116,10 @@ pub fn panel_rows(sources: &[AgentSource<'_>], now: i64) -> Vec<PanelAgentRow> {
         let palette_label = source.label.map(str::to_string);
         for project in source.projects {
             for tab in &project.tabs {
-                let axes = tab.agent_state();
-                let Some(owner) = agent_owner(&axes) else {
+                let Some(row) = row_agent(tab) else {
                     continue;
                 };
-                let lifecycle = agent::effective_lifecycle(&axes);
+                let lifecycle = tab.effective_lifecycle();
                 rows.push(PanelAgentRow {
                     tab: TabKey::new(source.host, tab.id),
                     project: ProjectKey::new(source.host, project.id),
@@ -134,12 +130,12 @@ pub fn panel_rows(sources: &[AgentSource<'_>], now: i64) -> Vec<PanelAgentRow> {
                     source_index,
                     tab_position: tab.position,
                     tab_id: tab.id,
-                    agent: agent_display_name(&owner.source).to_string(),
+                    agent: row.agent,
                     lifecycle,
-                    name: row_name(tab, owner),
-                    status_text: status_text(lifecycle, tab.agent_lifecycle, &owner.detail),
-                    time_text: elapsed_text(now, owner.last_event_at),
-                    last_event_at: owner.last_event_at,
+                    name: row.name,
+                    status_text: tab_status_text(tab, lifecycle, &row.detail),
+                    time_text: elapsed_text(now, row.last_event_at),
+                    last_event_at: row.last_event_at,
                     dimmed: source.dimmed,
                 });
             }
@@ -299,6 +295,7 @@ mod tests {
             }),
             password_input: false,
             dropped_reports: None,
+            program_status: None,
         }
     }
 

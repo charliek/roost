@@ -228,7 +228,7 @@ async fn a_session_socket_cannot_send_files_into_a_tab() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_socket_refuses_host_qualified_tab_refs() {
     let f = fixture(true);
-    for op in [ops::TAB_DUMP, ops::TAB_DUMP_RESOLVED] {
+    for op in [ops::TAB_DUMP, ops::TAB_DUMP_RESOLVED, ops::TAB_MEMORY_USAGE] {
         let err = call(&f.handler, op, serde_json::json!({"tab_id": "h3.7"}))
             .await
             .expect_err("a host-qualified ref must be refused");

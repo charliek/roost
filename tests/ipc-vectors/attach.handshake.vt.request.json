@@ -1,6 +1,6 @@
 {
   "attach": "5",
-  "protocol_version": 6,
+  "protocol_version": 7,
   "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
   "kinds": [
     "ghostty-snapshot",

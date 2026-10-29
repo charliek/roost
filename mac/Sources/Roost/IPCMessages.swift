@@ -756,7 +756,11 @@ let ipcProtocolVersion: UInt32 = 1
 /// nothing, and the client reading a tab answers its
 /// `notification.fired` with a generation-checked
 /// `tab.clear_notification` — the `session.set_focus` op that used to
-/// mute a tab for everyone is deleted (#474).
+/// mute a tab for everyone is deleted (#474). `7` puts program status
+/// (OSC 7501) on the wire: `Tab.program_status`, a composed `Tab.state`,
+/// and two new `DroppedReport.reason` values (plan 082). This app keeps
+/// no program-status records, so a tab it serves never carries them and
+/// its `Tab.state` is never composed.
 ///
 /// The rule: a **session-socket change bumps this when a pre-bump peer
 /// could not refuse it meaningfully**, in either direction. A new event
@@ -765,7 +769,7 @@ let ipcProtocolVersion: UInt32 = 1
 /// **equality** and refuses anything else, so it is the whole
 /// negotiation; what each generation changed is `CHANGELOG.md`'s to
 /// tell.
-let ipcSessionProtocolVersion: UInt32 = 6
+let ipcSessionProtocolVersion: UInt32 = 7
 
 /// Maximum length of a single framed line. Matches roost-ipc's
 /// `MAX_FRAME_BYTES`.

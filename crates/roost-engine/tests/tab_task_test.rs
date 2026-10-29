@@ -19,12 +19,19 @@ use std::time::Duration;
 
 use roost_engine::ipc::{DumpData, ResolvedCellData, ResolvedCellsData};
 use roost_engine::osc::{OscColorSnapshot, OscRgb};
+use roost_engine::program_status::RawOscAuthority;
 use roost_engine::tab_task::{
     ServerVtConfig, ServerVtWorkspace, TabCmd, TabError, SERVER_VT_CONTINUATION_MAX,
 };
-use roost_engine::{Geometry, PtyOutputEvent, PtySupervisor, TabEffectKind};
+use roost_engine::{
+    Geometry, PtyOutputEvent, PtySupervisor, TabEffectKind, Workspace, WorkspaceEvent,
+};
+use roost_ipc::agent::{AgentLifecycle, OwnershipAction, TabAgentReportParams};
 use roost_ipc::messages::{
-    bytes_base64, AttachPayloadKind, ClipboardEffectTarget, CLIPBOARD_EFFECT_MAX_BYTES,
+    bytes_base64, AttachPayloadKind, ClipboardEffectTarget, Tab, CLIPBOARD_EFFECT_MAX_BYTES,
+};
+use roost_ipc::program_status::{
+    DecidedBy, ProgramStatusKind, ProgramStatusReport, ProgramStatusState, PromptMark, StatusEvent,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -40,6 +47,9 @@ const BUDGET: Duration = Duration::from_secs(10);
 #[derive(Default)]
 struct TestWorkspace {
     osc: Mutex<Vec<(i64, u32, String)>>,
+    /// Every seam call that carries an OSC 133 mark or a program-status
+    /// batch, in call order: where the two axes' inputs interleave.
+    order: Mutex<Vec<Seam>>,
     closed: Mutex<Vec<i64>>,
     effects: Mutex<Vec<(i64, TabEffectKind)>>,
     gate: Mutex<bool>,
@@ -67,10 +77,32 @@ impl TestWorkspace {
     fn effects(&self) -> Vec<(i64, TabEffectKind)> {
         self.effects.lock().unwrap().clone()
     }
+
+    fn order(&self) -> Vec<Seam> {
+        self.order.lock().unwrap().clone()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Seam {
+    Osc133(String),
+    Status(Vec<StatusEvent>),
 }
 
 impl ServerVtWorkspace for TestWorkspace {
-    fn apply_osc(&self, tab_id: i64, command: u32, payload: &str) {
+    fn apply_osc(
+        &self,
+        tab_id: i64,
+        command: u32,
+        payload: &str,
+        _authority: &mut RawOscAuthority,
+    ) {
+        if command == 133 {
+            self.order
+                .lock()
+                .unwrap()
+                .push(Seam::Osc133(payload.to_string()));
+        }
         self.osc
             .lock()
             .unwrap()
@@ -87,6 +119,16 @@ impl ServerVtWorkspace for TestWorkspace {
 
     fn tab_effect(&self, tab_id: i64, effect: TabEffectKind) {
         self.effects.lock().unwrap().push((tab_id, effect));
+    }
+
+    fn apply_program_status(
+        &self,
+        _tab_id: i64,
+        events: Vec<StatusEvent>,
+        _now_ms: i64,
+    ) -> RawOscAuthority {
+        self.order.lock().unwrap().push(Seam::Status(events));
+        RawOscAuthority::default()
     }
 }
 
@@ -411,6 +453,38 @@ async fn dump_and_dump_resolved_match_the_shared_densifier() {
 
     drop(commands);
     sup.close(913);
+}
+
+/// `tab.memory_usage`'s session half (plan 082 D6.2): the task reads its
+/// own terminal, so history written through the tab grows the figure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_usage_reads_the_tabs_own_terminal() {
+    let (sup, _workspace) = enabled_supervisor(false);
+    let _output = sup
+        .spawn(935, "/tmp", &sh("exec sleep 30"), 80, 24, &socket("memory"))
+        .expect("spawn");
+    let commands = sup.tab_commands(935).expect("server-vt tab task");
+
+    let before = ask(&commands, TabCmd::MemoryUsage).await.expect("memory");
+    let history: String = (0..2000)
+        .map(|line| format!("history line {line}\r\n"))
+        .collect();
+    feed(&commands, history.as_bytes()).await;
+    quiesce(&commands).await;
+    let after = ask(&commands, TabCmd::MemoryUsage).await.expect("memory");
+
+    assert!(before.primary.pages > 0, "{before:?}");
+    assert!(
+        after.primary.pages > before.primary.pages,
+        "{before:?} -> {after:?}"
+    );
+    assert_eq!(
+        after.resident_bytes,
+        after.primary.resident_bytes + after.alternate.resident_bytes
+    );
+
+    drop(commands);
+    sup.close(935);
 }
 
 /// D6's ring validity window, at all four boundaries. `last_assigned + 1`
@@ -1514,4 +1588,381 @@ fn theme(foreground: OscRgb, background: OscRgb) -> OscColorSnapshot {
         *entry = (value, value, value);
     }
     OscColorSnapshot::new(foreground, background, foreground, palette)
+}
+
+fn osc7501(body: &str) -> Vec<u8> {
+    format!("\x1b]7501;{body}\x1b\\").into_bytes()
+}
+
+/// Plan 082 D4.1: a session tab's terminal answers the program-status
+/// probe itself, once, byte for byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_program_status_probe_is_answered_once() {
+    let (sup, _workspace) = enabled_supervisor(true);
+    let _output = sup
+        .spawn(930, "/tmp", &sh("exec sleep 30"), 80, 24, &socket("probe"))
+        .expect("spawn");
+    let commands = sup.tab_commands(930).expect("server-vt tab task");
+
+    feed(&commands, b"\x1b]7501;?\x1b\\").await;
+    quiesce(&commands).await;
+    assert_eq!(
+        capture(&commands, true).await,
+        b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\"
+    );
+
+    drop(commands);
+    sup.close(930);
+}
+
+/// Plan 082 D4.3: a chunk's reports and prompt marks reach the record
+/// layer, in byte order, before the same chunk's OSC 133 reaches the hook
+/// layer through the OSC actions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chunks_status_events_precede_its_osc_actions() {
+    let (sup, workspace) = enabled_supervisor(false);
+    let _output = sup
+        .spawn(931, "/tmp", &sh("exec sleep 30"), 80, 24, &socket("order"))
+        .expect("spawn");
+    let commands = sup.tab_commands(931).expect("server-vt tab task");
+
+    let mut chunk = osc7501("state=working:app=claude-code");
+    chunk.extend_from_slice(b"\x1b]133;A\x07");
+    chunk.extend_from_slice(&osc7501("state=blocked:kind=permission"));
+    feed(&commands, &chunk).await;
+    feed(&commands, b"plain output, no events\r\n").await;
+    quiesce(&commands).await;
+
+    let report = |state, kind, app: &str| ProgramStatusReport {
+        state,
+        kind,
+        progress: None,
+        id: String::new(),
+        app: app.into(),
+        title: String::new(),
+        msg: String::new(),
+    };
+    assert_eq!(
+        workspace.order(),
+        vec![
+            Seam::Status(vec![
+                StatusEvent::Report(report(ProgramStatusState::Working, None, "claude-code")),
+                StatusEvent::Prompt(PromptMark::PromptStart),
+                StatusEvent::Report(report(
+                    ProgramStatusState::Blocked,
+                    Some(ProgramStatusKind::Permission),
+                    ""
+                )),
+            ]),
+            Seam::Osc133("A".into()),
+        ],
+        "one batch per chunk with events, ahead of the chunk's OSC actions"
+    );
+
+    drop(commands);
+    sup.close(931);
+}
+
+/// What one run of a byte stream left on its tab, minus the clock.
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    tab: Tab,
+    banners: Vec<(String, String)>,
+}
+
+/// Feed `chunks` to a fresh session tab of a real workspace and read back
+/// its `tab.list` row and the banners it raised. With `hook_owner`, a hook
+/// owner still saying Waiting holds the tab first, so the marks move the
+/// hook layer under the records (the B3 review's sequence).
+async fn run_stream(
+    sup: &PtySupervisor,
+    workspace: &Arc<Workspace>,
+    project: i64,
+    hook_owner: bool,
+    chunks: &[&[u8]],
+) -> Outcome {
+    let tab_id = workspace.open_tab(project, "/tmp", "t", false).unwrap().id;
+    if hook_owner {
+        let claim = TabAgentReportParams {
+            session_id: "s1".into(),
+            ..TabAgentReportParams::sessionless(
+                tab_id,
+                "claude",
+                OwnershipAction::Claim,
+                Some(AgentLifecycle::Waiting),
+            )
+        };
+        assert!(workspace.agent_report(&claim).unwrap().0);
+    }
+    let mut events = workspace.subscribe();
+    let _output = sup
+        .spawn(
+            tab_id,
+            "/tmp",
+            &sh("exec sleep 30"),
+            80,
+            24,
+            &socket("partition"),
+        )
+        .expect("spawn");
+    let commands = sup.tab_commands(tab_id).expect("server-vt tab task");
+    for chunk in chunks {
+        feed(&commands, chunk).await;
+    }
+    quiesce(&commands).await;
+    let mut tab = workspace.tab(tab_id).unwrap();
+    drop(commands);
+    sup.close(tab_id);
+
+    let mut banners = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let WorkspaceEvent::NotificationFired {
+            tab_id: id,
+            title,
+            body,
+            ..
+        } = event
+        {
+            if id == tab_id {
+                banners.push((title, body));
+            }
+        }
+    }
+    if let Some(record) = tab
+        .program_status
+        .as_mut()
+        .and_then(|status| status.record.as_mut())
+    {
+        record.updated_at = 0;
+    }
+    if let Some(owner) = tab.ownership.as_mut() {
+        owner.last_event_at = 0;
+    }
+    tab.id = 0;
+    tab.position = 0;
+    tab.created_at = 0;
+    tab.last_active = 0;
+    Outcome { tab, banners }
+}
+
+/// Plan 082 B-4's partition invariance, through the real tab task: one
+/// byte stream fed whole, split at every byte, and split at random gives
+/// the same tab. The stream moves both axes: its OSC 133 marks reach the
+/// hook layer through roost-osc and the record layer through libghostty,
+/// under a hook owner whose lifecycle the first mark ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn program_status_does_not_depend_on_read_boundaries() {
+    let workspace = Arc::new(Workspace::new());
+    workspace.set_window_focused(false);
+    let project = workspace.create_project("p", "/tmp").unwrap().id;
+    // A row no run closes, so closing a run's tab never takes the project.
+    workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+    let sup = PtySupervisor::new();
+    sup.enable_server_vt(ServerVtConfig::new(workspace.clone()))
+        .expect("server-vt enables once");
+
+    // The blocked child right after the prompt mark is the B3 review's
+    // sequence: its banner exists only if the record layer sees the hook
+    // layer the mark left behind, whichever read the mark arrived in.
+    let mut stream = Vec::new();
+    for part in [
+        osc7501("state=working:app=claude-code:msg=dGhpbmtpbmc="),
+        b"\x1b]133;A\x07".to_vec(),
+        osc7501("state=blocked:id=build/test:kind=permission:msg=YXBwcm92ZSBCYXNo"),
+        b"some output\r\n".to_vec(),
+        b"\x1b]133;C\x07".to_vec(),
+        osc7501("state=clear:id=build/test"),
+        osc7501("state=working:app=claude-code"),
+        osc7501("state=done:app=claude-code:title=VGVzdHM="),
+        b"\x1b]133;D;0\x07\x1b]133;A\x07".to_vec(),
+    ] {
+        stream.extend_from_slice(&part);
+    }
+
+    let whole = run_stream(&sup, &workspace, project, true, &[&stream]).await;
+    for cut in 1..stream.len() {
+        let split = run_stream(
+            &sup,
+            &workspace,
+            project,
+            true,
+            &[&stream[..cut], &stream[cut..]],
+        )
+        .await;
+        assert_eq!(split, whole, "split at byte {cut}");
+    }
+
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for round in 0..16 {
+        let mut cuts: Vec<usize> = (0..1 + next() % 12)
+            .map(|_| 1 + (next() as usize) % (stream.len() - 1))
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let bounds: Vec<usize> = [0]
+            .into_iter()
+            .chain(cuts.iter().copied())
+            .chain([stream.len()])
+            .collect();
+        let chunks: Vec<&[u8]> = bounds.windows(2).map(|w| &stream[w[0]..w[1]]).collect();
+        let random = run_stream(&sup, &workspace, project, true, &chunks).await;
+        assert_eq!(random, whole, "round {round}, cuts {cuts:?}");
+    }
+
+    let status = whole.tab.program_status.as_ref();
+    assert_eq!(
+        status.map(|status| (status.effective_lifecycle, status.decided_by)),
+        Some((AgentLifecycle::Finished, DecidedBy::KeptRecord)),
+        "the stream ends on a kept done: {whole:?}"
+    );
+    assert_eq!(
+        whole.banners,
+        vec![("t".to_string(), "approve Bash".to_string())],
+        "the blocked child announced, under the tab's title since the mark \
+         dropped the root it would inherit an app from; the done fell in the \
+         startup guard"
+    );
+}
+
+/// Plan 082 D5.8's amendment, the branch review's sequence through the
+/// real tab task: on an unwatched tab no hook owns, a `blocked` record, the
+/// program's own OSC 9, then the `A` that ends the record's authority. The
+/// OSC 9 falls inside the authority, so the record's banner is the only
+/// one, whether the three arrive in one read or the read splits anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_raw_notification_is_judged_where_it_falls_whatever_the_reads() {
+    let workspace = Arc::new(Workspace::new());
+    workspace.set_window_focused(false);
+    let project = workspace.create_project("p", "/tmp").unwrap().id;
+    workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+    let sup = PtySupervisor::new();
+    sup.enable_server_vt(ServerVtConfig::new(workspace.clone()))
+        .expect("server-vt enables once");
+
+    let mut stream = osc7501("state=blocked:app=pi");
+    stream.extend_from_slice(b"\x1b]9;turn over\x07");
+    stream.extend_from_slice(b"\x1b]133;A\x07");
+
+    let whole = run_stream(&sup, &workspace, project, false, &[&stream]).await;
+    assert_eq!(
+        whole.banners,
+        vec![("Pi".to_string(), "Needs your input".to_string())],
+        "the record's banner, and not the OSC 9 it covered: {whole:?}"
+    );
+    for cut in 1..stream.len() {
+        let split = run_stream(
+            &sup,
+            &workspace,
+            project,
+            false,
+            &[&stream[..cut], &stream[cut..]],
+        )
+        .await;
+        assert_eq!(split, whole, "split at byte {cut}");
+    }
+}
+
+/// The banners a session tab raises for `lead`, a `blocked` record, an
+/// `OSC 9` both parsers accept, and the `A` ending the record, in one read,
+/// on an unwatched tab no hook owns.
+async fn banners_after(lead: &[u8]) -> Vec<(String, String)> {
+    let workspace = Arc::new(Workspace::new());
+    workspace.set_window_focused(false);
+    let project = workspace.create_project("p", "/tmp").unwrap().id;
+    workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+    let sup = PtySupervisor::new();
+    sup.enable_server_vt(ServerVtConfig::new(workspace.clone()))
+        .expect("server-vt enables once");
+    let mut stream = lead.to_vec();
+    stream.extend_from_slice(&osc7501("state=blocked:app=pi"));
+    stream.extend_from_slice(b"\x1b]9;inside\x07\x1b]133;A\x07");
+    run_stream(&sup, &workspace, project, false, &[&stream])
+        .await
+        .banners
+}
+
+/// Plan 082 D5.8's amendment: OSC 777 with a title alone is a form only
+/// roost-osc raises. It finds no place and is judged at the chunk's end,
+/// where nothing decides, so it fires; the agreeing OSC 9 after it keeps
+/// its own place inside the record's authority, so it doesn't.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_roost_osc_only_form_does_not_take_another_notifications_place() {
+    assert_eq!(
+        banners_after(b"\x1b]777;notify;Roost only\x07").await,
+        vec![
+            ("Pi".to_string(), "Needs your input".to_string()),
+            ("Roost only".to_string(), String::new()),
+        ]
+    );
+}
+
+/// Plan 082 D5.8's amendment: a bare `OSC 9;4` is a form only libghostty
+/// places (roost-osc reads it as ConEmu). Its place, outside the record's
+/// authority, is claimed by nobody, and the agreeing OSC 9 after it still
+/// gets its own, inside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_libghostty_only_place_does_not_shift_another_notifications() {
+    assert_eq!(
+        banners_after(b"\x1b]9;4\x07").await,
+        vec![("Pi".to_string(), "Needs your input".to_string())]
+    );
+}
+
+/// The banners `stream` raises on an unwatched session tab no hook owns,
+/// fed whole and split at every byte: the same each time.
+async fn banners_whatever_the_reads(stream: &[u8]) -> Vec<(String, String)> {
+    let workspace = Arc::new(Workspace::new());
+    workspace.set_window_focused(false);
+    let project = workspace.create_project("p", "/tmp").unwrap().id;
+    workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+    let sup = PtySupervisor::new();
+    sup.enable_server_vt(ServerVtConfig::new(workspace.clone()))
+        .expect("server-vt enables once");
+    let whole = run_stream(&sup, &workspace, project, false, &[stream]).await;
+    for cut in 1..stream.len() {
+        let split = run_stream(
+            &sup,
+            &workspace,
+            project,
+            false,
+            &[&stream[..cut], &stream[cut..]],
+        )
+        .await;
+        assert_eq!(split, whole, "split at byte {cut}");
+    }
+    whole.banners
+}
+
+/// The B7 review's first collision: a bare `OSC 9;4` (a place libghostty
+/// reports with the text `4`, ConEmu to roost-osc) ahead of a real
+/// `OSC 777;notify;4;` inside a `blocked` record's authority. The real one
+/// must not claim the ConEmu one's place, from before the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conemu_place_is_not_claimed_by_a_notification_with_its_text() {
+    let mut stream = b"\x1b]9;4\x07".to_vec();
+    stream.extend_from_slice(&osc7501("state=blocked:app=pi"));
+    stream.extend_from_slice(b"\x1b]777;notify;4;\x07\x1b]133;A\x07");
+    assert_eq!(
+        banners_whatever_the_reads(&stream).await,
+        vec![("Pi".to_string(), "Needs your input".to_string())]
+    );
+}
+
+/// The B7 review's second collision: a tab inside the two bytes of `¢`.
+/// libghostty drops it before decoding; roost-osc must too, or the texts
+/// differ and the OSC 9 is judged at the chunk's end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_control_inside_a_utf8_sequence_leaves_the_same_text_on_both_sides() {
+    let mut stream = osc7501("state=blocked:app=pi");
+    stream.extend_from_slice(b"\x1b]9;A\xc2\t\xa2\x07\x1b]133;A\x07");
+    assert_eq!(
+        banners_whatever_the_reads(&stream).await,
+        vec![("Pi".to_string(), "Needs your input".to_string())]
+    );
 }

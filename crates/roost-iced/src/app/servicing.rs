@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 
 use roost_engine::ipc::{DumpError, HostOpFailure, HostOpReply};
+use roost_engine::program_status::RawOscAuthority;
 use roost_ipc::codes;
 use roost_ipc::messages::{
     ActivationOutcome, AppContextMenuDumpResult, AppContextMenuTarget, AppSecureInputResult,
-    HostActionResult, SentFile, SkippedFile, TabSendFileResult, WireProjectRef,
+    HostActionResult, MemoryUsage, SentFile, SkippedFile, TabMemoryUsageParams,
+    TabMemoryUsageResult, TabSendFileResult, WireProjectRef, WireTabRef,
 };
 use roost_ui_model::context_menu::{ContextAction, ContextTarget};
 use roost_ui_model::file_transfer::{status, Refusal, Skipped, Target};
@@ -127,6 +129,82 @@ fn slot_unavailable<T>() -> Result<T, HostOpFailure> {
         roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
         roost_ipc::local_route::SLOT_UNAVAILABLE,
     ))
+}
+
+/// Where host-tab `tab.memory_usage` callers wait, keyed by dispatch id
+/// — see [`EngineOpResult::HostTabMemory`].
+#[derive(Default)]
+pub(super) struct MemoryReplies(HashMap<u64, HostOpReply<TabMemoryUsageResult>>);
+
+impl MemoryReplies {
+    pub(super) fn park(&mut self, op: u64, reply: HostOpReply<TabMemoryUsageResult>) {
+        self.0.insert(op, reply);
+    }
+
+    /// Answer, and forget, the caller parked under `op`. `serving` is
+    /// whether the incarnation the op went to is still its host's
+    /// current, connected one ([`crate::host_conn::HostConnSet::serves`]);
+    /// `mirror` is read only for an answer that is going to be sent.
+    pub(super) fn answer(
+        &mut self,
+        op: u64,
+        serving: bool,
+        sent: WireTabRef,
+        answer: Result<serde_json::Value, HostOpFailure>,
+        mirror: impl FnOnce() -> Option<roost_vt::Result<MemoryUsage>>,
+    ) {
+        let Some(reply) = self.0.remove(&op) else {
+            return;
+        };
+        let _ = reply.send(host_tab_memory(serving, answer, sent, mirror));
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A host tab's `tab.memory_usage`, finished on the UI thread (plan 082
+/// D6.2): the session's figure, the ref the caller sent, and `mirror` —
+/// this window's own copy of the tab, read when the answer landed, if it
+/// held one then.
+///
+/// A refusal crosses as [`host_op_failure`] made it: the session's
+/// `not-found` for a tab it does not run, `host-unavailable` for a
+/// connection that dropped or was replaced while the op was queued. An
+/// answer that arrives after its incarnation stopped `serving` is
+/// `host-unavailable` too, whatever it says: a worker winding down can
+/// still deliver one after the host was disconnected or replaced.
+fn host_tab_memory(
+    serving: bool,
+    answer: Result<serde_json::Value, HostOpFailure>,
+    sent: WireTabRef,
+    mirror: impl FnOnce() -> Option<roost_vt::Result<MemoryUsage>>,
+) -> Result<TabMemoryUsageResult, HostOpFailure> {
+    if !serving {
+        return Err(host_unavailable(format!(
+            "tab {sent}: the host's connection ended before it answered"
+        )));
+    }
+    let mut result: TabMemoryUsageResult = serde_json::from_value(answer?).map_err(|error| {
+        HostOpFailure::new(
+            codes::INTERNAL,
+            format!("tab {sent}: the host's memory usage did not decode: {error}"),
+        )
+    })?;
+    result.tab_id = sent;
+    result.mirror = mirror()
+        .transpose()
+        .map_err(|error| memory_unreadable(sent, &error))?;
+    Ok(result)
+}
+
+fn memory_unreadable(tab: WireTabRef, error: &roost_vt::Error) -> HostOpFailure {
+    HostOpFailure::new(
+        codes::INTERNAL,
+        format!("tab {tab}: reading its terminal's memory usage failed: {error}"),
+    )
 }
 
 /// How far a tab ref gets towards a terminal this UI holds.
@@ -555,9 +633,34 @@ pub(super) struct TabOutputBatch {
     /// snapshot needs rebuilding. Every other tab renders the snapshot it
     /// already has.
     pub(super) touched: HashSet<TabKey>,
-    pub(super) osc_actions: Vec<(TabKey, Vec<OscAction>)>,
+    /// Per chunk, in arrival order: what the batch tail applies.
+    pub(super) effects: Vec<ChunkEffects>,
     pub(super) exited: Vec<TabKey>,
     pub(super) error: Option<String>,
+}
+
+/// One chunk's program-status events and its OSC actions, applied in that
+/// order — a session tab task's ingest order (plan 082 D4.3), so the
+/// record layer sees the chunk's prompt marks before the hook layer does.
+#[derive(Debug, PartialEq)]
+pub(super) struct ChunkEffects {
+    pub(super) key: TabKey,
+    pub(super) status: Vec<StatusEvent>,
+    pub(super) actions: Vec<OscAction>,
+}
+
+impl TabOutputBatch {
+    fn push_effects(&mut self, key: TabKey, status: Vec<StatusEvent>, actions: Vec<OscAction>) {
+        // Most chunks of a flood carry neither; an empty entry would
+        // still cost a push and a hop at the tail.
+        if !status.is_empty() || !actions.is_empty() {
+            self.effects.push(ChunkEffects {
+                key,
+                status,
+                actions,
+            });
+        }
+    }
 }
 
 pub(super) fn collect_tab_output(
@@ -582,16 +685,13 @@ pub(super) fn collect_tab_output(
         // (now-removed) GTK UI's — and cannot occur on this path; treat
         // it as a chunk with no actions rather than asserting.
         TabOutput::Bytes(bytes) => {
-            tab.write_vt(&bytes);
+            let status = tab.write_vt(&bytes);
+            collected.push_effects(key, status, Vec::new());
             collected.touched.insert(key);
         }
         TabOutput::Scanned { data, actions } => {
-            tab.write_vt(&data);
-            // Most chunks of a flood carry no OSC at all; an empty entry
-            // would still cost a push and an `apply_osc_actions` hop.
-            if !actions.is_empty() {
-                collected.osc_actions.push((key, actions));
-            }
+            let status = tab.write_vt(&data);
+            collected.push_effects(key, status, actions);
             collected.touched.insert(key);
         }
         TabOutput::Exit { status, reason } => {
@@ -605,6 +705,53 @@ pub(super) fn collect_tab_output(
             tracing::error!(tab_id, %error, "PTY output stream lost bytes");
         }
     }
+}
+
+/// `tab.feed_pty_bytes`' write, ordered with the batch it lands in. The
+/// chunks already queued in `pty` were written to the terminal before these
+/// bytes, so their effects come first, then the injected chunk's: the
+/// workspace sees statuses in the order the terminal parsed them, wherever
+/// the batch boundary fell. `None` when the tab has no live terminal (and
+/// then nothing is taken from `pty`).
+pub(super) fn inject_pty_bytes(
+    tabs: &mut HashMap<TabKey, TerminalTab>,
+    pty: &mut TabOutputBatch,
+    key: TabKey,
+    data: &[u8],
+) -> Option<Vec<ChunkEffects>> {
+    let (status, actions) = tabs.get_mut(&key)?.scan_and_write_vt(data);
+    let mut effects = std::mem::take(&mut pty.effects);
+    effects.push(ChunkEffects {
+        key,
+        status,
+        actions,
+    });
+    Some(effects)
+}
+
+/// A chunk's program-status events, to the workspace whose terminal
+/// produced them, and the records' authority at each notification they
+/// placed, for the chunk's OSC actions. Only an in-process tab has a
+/// status sink, so a key from any other instance never carries any.
+fn apply_program_status(
+    workspace: &Workspace,
+    key: TabKey,
+    events: Vec<StatusEvent>,
+) -> RawOscAuthority {
+    if events.is_empty() {
+        return RawOscAuthority::default();
+    }
+    let Some(tab_id) = key.local_tab() else {
+        tracing::debug!(?key, "program status from another instance");
+        return RawOscAuthority::default();
+    };
+    let now_ms = roost_engine::workspace::unix_now_ms();
+    workspace
+        .apply_program_status(tab_id, events, now_ms)
+        .unwrap_or_else(|error| {
+            tracing::debug!(tab_id, %error, "program status for a tab whose row is gone");
+            RawOscAuthority::default()
+        })
 }
 
 /// A click on the OS notification banner, decided off the core alone so it
@@ -2330,7 +2477,7 @@ impl App {
                         batch.mark_reconciled();
                     }
                     self.attach_ready_pending();
-                    task = task.then(self.apply_ui_request(request));
+                    task = task.then(self.apply_ui_request(request, &mut pty));
                     // The request may itself have mutated the workspace
                     // (`tab.open`, `palette.activate`), and the reconcile
                     // above — if it ran — predates that.
@@ -2583,8 +2730,8 @@ impl App {
         // so a vanished tab is a no-op rather than a panic. The
         // touched-tab refresh below and the exit list further down are
         // guarded the same way.
-        for (key, actions) in pty.osc_actions {
-            task = task.then(self.apply_osc_actions(key, actions));
+        for chunk in pty.effects {
+            task = task.then(self.apply_chunk_effects(chunk));
         }
         for key in &pty.touched {
             if let Some(tab) = self.tabs.get_mut(key) {
@@ -3566,7 +3713,7 @@ impl App {
     /// one of the local backend's bare ids — `backend.tab_key` is the
     /// joint that qualifies them, exactly as the workspace's active
     /// selection is qualified.
-    fn apply_ui_request(&mut self, request: UiRequest) -> UiTask {
+    fn apply_ui_request(&mut self, request: UiRequest, pty: &mut TabOutputBatch) -> UiTask {
         let mut task = UiTask::None;
         match request {
             UiRequest::Activate => {
@@ -3609,13 +3756,13 @@ impl App {
                 let result = if !self.test_mode {
                     Err("ROOST_TEST_MODE=1 is required".to_string())
                 } else {
-                    let scanned = key.and_then(|key| {
-                        let actions = self.tabs.get_mut(&key)?.scan_and_write_vt(&data);
-                        Some((key, actions))
-                    });
-                    match scanned {
-                        Some((key, actions)) => {
-                            task = task.then(self.apply_osc_actions(key, actions));
+                    let effects =
+                        key.and_then(|key| inject_pty_bytes(&mut self.tabs, pty, key, &data));
+                    match (key, effects) {
+                        (Some(key), Some(effects)) => {
+                            for chunk in effects {
+                                task = task.then(self.apply_chunk_effects(chunk));
+                            }
                             self.tabs
                                 .get_mut(&key)
                                 .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
@@ -3623,7 +3770,7 @@ impl App {
                                     tab.refresh_snapshot().map_err(|error| error.to_string())
                                 })
                         }
-                        None => Err(format!("tab {tab_id} has no live terminal")),
+                        _ => Err(format!("tab {tab_id} has no live terminal")),
                     }
                 };
                 let _ = reply.send(result);
@@ -3712,6 +3859,13 @@ impl App {
                     .map(TerminalTab::resolved_cells)
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);
+            }
+            UiRequest::TabMemoryUsage {
+                tab_id,
+                sent,
+                reply,
+            } => {
+                task = task.then(self.tab_memory_usage(tab_id, sent, reply));
             }
             UiRequest::AppRenderStats { reset, reply } => {
                 let stats = crate::perf::snapshot();
@@ -4551,6 +4705,89 @@ impl App {
         )
     }
 
+    /// `tab.memory_usage` on the UI socket (plan 082 D6.2).
+    ///
+    /// An in-process tab's terminal is the authoritative one and is read
+    /// here. A host tab's is its session's, so the op is put to that
+    /// host — any host, not only the slot — fenced at the incarnation the
+    /// ref names, so a reconnect between this dispatch and the send
+    /// cannot read whatever tab the replacement session numbers the same.
+    /// The answer is finished in [`App::host_tab_memory_answered`].
+    fn tab_memory_usage(
+        &mut self,
+        tab_id: WireTabRef,
+        sent: WireTabRef,
+        reply: HostOpReply<TabMemoryUsageResult>,
+    ) -> UiTask {
+        let Some(key) = self.wire_tab_key(tab_id) else {
+            let _ = reply.send(slot_unavailable());
+            return UiTask::None;
+        };
+        if key.local_tab().is_some() {
+            let answer = match self.tabs.get(&key) {
+                Some(tab) => roost_engine::memory::of(&tab.terminal)
+                    .map(|terminal| TabMemoryUsageResult {
+                        tab_id: sent,
+                        terminal,
+                        mirror: None,
+                    })
+                    .map_err(|error| memory_unreadable(sent, &error)),
+                None => Err(HostOpFailure::new(
+                    codes::NOT_FOUND,
+                    format!("tab {sent} has no live terminal"),
+                )),
+            };
+            let _ = reply.send(answer);
+            return UiTask::None;
+        }
+        let Some(queue) = self.hosts.ops_for(key.host) else {
+            let _ = reply.send(Err(no_connected_host()));
+            return UiTask::None;
+        };
+        let params = match serde_json::to_value(TabMemoryUsageParams {
+            tab_id: WireTabRef::Local(key.tab),
+        }) {
+            Ok(params) => params,
+            Err(error) => {
+                let _ = reply.send(Err(HostOpFailure::new(codes::INTERNAL, error.to_string())));
+                return UiTask::None;
+            }
+        };
+        let call = queue.call_at(key.host, roost_ipc::messages::ops::TAB_MEMORY_USAGE, params);
+        let op = self.take_engine_op_id();
+        self.memory_replies.park(op, reply);
+        self.engine_op(
+            async move { Ok::<_, String>(call.await.map_err(|error| host_op_failure(&error))) },
+            move |joined| EngineOpResult::HostTabMemory {
+                op,
+                tab: key,
+                sent,
+                answer: Box::new(
+                    joined.unwrap_or_else(|error| Err(HostOpFailure::new(codes::INTERNAL, error))),
+                ),
+            },
+        )
+    }
+
+    /// [`EngineOpResult::HostTabMemory`], on the UI thread: whether the
+    /// incarnation still serves, and the mirror — whatever terminal this
+    /// window holds for the tab *now* — are both read here, which is what
+    /// makes "connected and attached at completion" one main-thread fact.
+    pub(super) fn host_tab_memory_answered(
+        &mut self,
+        op: u64,
+        tab: TabKey,
+        sent: WireTabRef,
+        answer: Result<serde_json::Value, HostOpFailure>,
+    ) {
+        let serving = self.hosts.serves(tab.host);
+        let tabs = &self.tabs;
+        self.memory_replies.answer(op, serving, sent, answer, || {
+            tabs.get(&tab)
+                .map(|attached| roost_engine::memory::of(&attached.terminal))
+        });
+    }
+
     fn host_reorder_op(
         &self,
         host: HostId,
@@ -4707,7 +4944,17 @@ impl App {
         }
     }
 
-    pub(super) fn apply_osc_actions(&mut self, key: TabKey, actions: Vec<OscAction>) -> UiTask {
+    fn apply_chunk_effects(&mut self, chunk: ChunkEffects) -> UiTask {
+        let mut authority = apply_program_status(&self.workspace, chunk.key, chunk.status);
+        self.apply_osc_actions(chunk.key, chunk.actions, &mut authority)
+    }
+
+    fn apply_osc_actions(
+        &mut self,
+        key: TabKey,
+        actions: Vec<OscAction>,
+        authority: &mut RawOscAuthority,
+    ) -> UiTask {
         let tab_id = key.tab;
         for action in actions {
             match action {
@@ -4716,7 +4963,10 @@ impl App {
                 // title/cwd/agent claim to whatever local tab shares its
                 // number. HS-2 sends it to that host's client instead.
                 OscAction::Workspace { command, payload } => match key.local_tab() {
-                    Some(local_tab) => self.client.apply_osc(local_tab, command, &payload),
+                    Some(local_tab) => {
+                        self.client
+                            .apply_osc(local_tab, command, &payload, authority);
+                    }
                     None => tracing::debug!(
                         ?key,
                         %command,
@@ -4880,6 +5130,143 @@ mod tests {
             slot_unavailable::<()>().unwrap_err().code,
             "host-unavailable"
         );
+    }
+
+    // ── plan 082 D6.2: a host tab's `tab.memory_usage` completion ────
+
+    const SENT: WireTabRef = WireTabRef::Host { host: 3, tab: 7 };
+
+    fn usage(resident: u64) -> MemoryUsage {
+        MemoryUsage::new(
+            false,
+            roost_ipc::messages::ScreenMemory {
+                pages: 1,
+                resident_bytes: resident,
+                virtual_bytes: resident * 2,
+                ..Default::default()
+            },
+            roost_ipc::messages::ScreenMemory::default(),
+        )
+    }
+
+    /// What the session sends: its own bare id, and no mirror.
+    fn session_reply(resident: u64) -> serde_json::Value {
+        serde_json::to_value(TabMemoryUsageResult {
+            tab_id: WireTabRef::Local(7),
+            terminal: usage(resident),
+            mirror: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_host_tab_with_no_local_terminal_answers_the_sessions_figure_alone() {
+        let answered =
+            host_tab_memory(true, Ok(session_reply(4096)), SENT, || None).expect("answered");
+        assert_eq!(
+            answered,
+            TabMemoryUsageResult {
+                tab_id: SENT,
+                terminal: usage(4096),
+                mirror: None,
+            }
+        );
+    }
+
+    #[test]
+    fn an_attached_host_tab_adds_the_windows_copy_beside_the_sessions() {
+        let answered = host_tab_memory(true, Ok(session_reply(4096)), SENT, || {
+            Some(Ok(usage(1024)))
+        })
+        .expect("answered");
+        assert_eq!(
+            answered.tab_id, SENT,
+            "the caller's ref, not the session's bare id"
+        );
+        assert_eq!(answered.terminal, usage(4096));
+        assert_eq!(answered.mirror, Some(usage(1024)));
+    }
+
+    #[test]
+    fn a_malformed_session_reply_is_internal() {
+        for reply in [
+            serde_json::json!({"tab_id": "7"}),
+            serde_json::json!({"tab_id": "7", "terminal": "lots"}),
+            serde_json::Value::Null,
+        ] {
+            let failure = host_tab_memory(true, Ok(reply.clone()), SENT, || None).unwrap_err();
+            assert_eq!(failure.code, codes::INTERNAL, "{reply}");
+            assert!(failure.message.starts_with("tab h3.7: "), "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn a_disconnect_is_host_unavailable_and_the_sessions_not_found_crosses() {
+        use crate::host_conn::HostOpError;
+        use roost_ipc::client::ServerCode;
+
+        let dropped = host_op_failure(&HostOpError::Disconnected);
+        let failure = host_tab_memory(true, Err(dropped), SENT, || Some(Ok(usage(1)))).unwrap_err();
+        assert_eq!(failure.code, codes::HOST_UNAVAILABLE);
+
+        let gone = host_op_failure(&HostOpError::Rejected {
+            code: ServerCode::from_wire("not-found"),
+            message: "tab 7 has no live terminal".into(),
+        });
+        let failure = host_tab_memory(true, Err(gone), SENT, || None).unwrap_err();
+        assert_eq!(
+            (failure.code.as_str(), failure.message.as_str()),
+            ("not-found", "tab 7 has no live terminal")
+        );
+    }
+
+    /// The race a fabricated `Disconnected` cannot reach: the op left on a
+    /// connected incarnation, the host was disconnected while its answer
+    /// was outstanding, and the answer still arrived as `Ok` — a worker
+    /// winding down can deliver one inside its shutdown grace. The
+    /// completion asks the set whether the incarnation still serves, as
+    /// [`App::host_tab_memory_answered`] does, and refuses.
+    #[tokio::test]
+    async fn an_answer_that_outlives_its_connection_is_host_unavailable() {
+        use crate::host_conn::fixtures::a_set;
+        use crate::host_conn::{ConnectMode, HostConnState, HostOpError, HostTransport};
+
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-memory-race.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+        );
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        assert!(set.serves(incarnation));
+
+        let mut replies = MemoryReplies::default();
+        let (reply, caller) = tokio::sync::oneshot::channel();
+        replies.park(1, reply);
+        let (release, held) = tokio::sync::oneshot::channel::<Result<_, HostOpError>>();
+        let dispatched = tokio::spawn(async move {
+            held.await
+                .unwrap_or(Err(HostOpError::Disconnected))
+                .map_err(|error| host_op_failure(&error))
+        });
+
+        set.disconnect("h1");
+        release.send(Ok(session_reply(4096))).unwrap();
+        let answer = dispatched.await.unwrap();
+        assert!(answer.is_ok(), "the session did answer");
+
+        replies.answer(1, set.serves(incarnation), SENT, answer, || {
+            Some(Ok(usage(1)))
+        });
+        let answered = caller.await.expect("answered");
+        assert!(
+            matches!(&answered, Err(failure) if failure.code == codes::HOST_UNAVAILABLE),
+            "{answered:?}"
+        );
+        assert!(replies.is_empty(), "the parked sender is gone");
     }
 
     /// `app.sidebar_dump`'s band strip, one row per plan 063 §D2
@@ -5802,6 +6189,7 @@ mod tests {
             ownership: None,
             password_input: false,
             dropped_reports: None,
+            program_status: None,
         }
     }
 
@@ -6315,7 +6703,7 @@ mod tests {
 
         assert_eq!(collected.touched, HashSet::from([TabKey::local(70)]));
         assert!(
-            collected.osc_actions.is_empty(),
+            collected.effects.is_empty(),
             "plain output carries no OSC, so the tail has nothing to apply"
         );
         assert!(collected.exited.is_empty());
@@ -6348,11 +6736,12 @@ mod tests {
 
         assert_eq!(collected.touched, HashSet::from([TabKey::local(75)]));
         assert_eq!(
-            collected.osc_actions,
-            vec![(
-                TabKey::local(75),
-                vec![OscAction::PointerShape("pointer".into())]
-            )]
+            collected.effects,
+            vec![ChunkEffects {
+                key: TabKey::local(75),
+                status: Vec::new(),
+                actions: vec![OscAction::PointerShape("pointer".into())],
+            }]
         );
         let tab = tabs
             .get_mut(&TabKey::local(75))
@@ -6360,6 +6749,152 @@ mod tests {
         tab.refresh_snapshot().expect("refresh the touched tab");
         assert_eq!(tab.snapshot.grid[0].text, "hello");
         supervisor.close(75);
+    }
+
+    /// Plan 082 D4.3: each chunk's program-status events ride with its OSC
+    /// actions, chunk by chunk in arrival order, so the tail applies them
+    /// in a session tab task's order — the records, then the actions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_chunks_program_status_rides_ahead_of_its_actions() {
+        let (mut tabs, supervisor) = attached(76);
+        let mut collected = TabOutputBatch::default();
+        let key = TabKey::local(76);
+
+        for output in [
+            TabOutput::Scanned {
+                data: b"\x1b]7501;state=blocked:app=pi\x1b\\".to_vec(),
+                actions: vec![OscAction::PointerShape("pointer".into())],
+            },
+            TabOutput::Bytes(b"quiet".to_vec()),
+            TabOutput::Scanned {
+                data: b"\x1b]133;A\x07".to_vec(),
+                actions: Vec::new(),
+            },
+        ] {
+            collect_tab_output(&mut tabs, &mut collected, key, output);
+        }
+
+        let shape: Vec<(usize, usize)> = collected
+            .effects
+            .iter()
+            .map(|chunk| (chunk.status.len(), chunk.actions.len()))
+            .collect();
+        assert_eq!(shape, vec![(1, 1), (1, 0)], "{:?}", collected.effects);
+        assert!(collected.effects.iter().all(|chunk| chunk.key == key));
+        assert!(matches!(
+            collected.effects[1].status.as_slice(),
+            [StatusEvent::Prompt(
+                roost_ipc::program_status::PromptMark::PromptStart
+            )]
+        ));
+        supervisor.close(76);
+    }
+
+    /// Review of B5: a PTY chunk still queued in the batch, then an
+    /// injected `tab.feed_pty_bytes` for the same tab. The terminal parsed
+    /// `working` then `clear`, so the workspace must see them in that order
+    /// — not the feed's `clear` first and the queued `working` at the tail,
+    /// which would bring the cleared record back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_injected_feed_applies_after_the_chunks_queued_ahead_of_it() {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("p", "/tmp").unwrap();
+        let tab_id = workspace
+            .open_tab(project.id, "/tmp", "t", true)
+            .unwrap()
+            .id;
+        let (mut tabs, supervisor) = attached(tab_id);
+        let key = TabKey::local(tab_id);
+        let mut pty = TabOutputBatch::default();
+
+        collect_tab_output(
+            &mut tabs,
+            &mut pty,
+            key,
+            TabOutput::Scanned {
+                data: b"\x1b]7501;state=working:app=pi\x1b\\".to_vec(),
+                actions: Vec::new(),
+            },
+        );
+        let effects = inject_pty_bytes(&mut tabs, &mut pty, key, b"\x1b]7501;state=clear\x1b\\")
+            .expect("the tab is attached");
+        let queued: Vec<usize> = effects
+            .iter()
+            .chain(&pty.effects)
+            .map(|chunk| chunk.status.len())
+            .collect();
+        assert_eq!(queued, vec![1, 1], "both reports reached a queue");
+        // What the App does: the feed's effects now, the batch tail later.
+        for chunk in effects.into_iter().chain(std::mem::take(&mut pty.effects)) {
+            apply_program_status(&workspace, chunk.key, chunk.status);
+        }
+
+        let listed = workspace.tab(tab_id).expect("the tab is listed");
+        assert_eq!(
+            listed.program_status, None,
+            "the clear came last: {listed:?}"
+        );
+        supervisor.close(tab_id);
+    }
+
+    /// Plan 082 D5.8's amendment, the branch review's sequence on an
+    /// in-process tab: a `blocked` record, the program's own OSC 9, then the
+    /// `A` ending the record's authority, on an unwatched tab no hook owns.
+    /// Each chunk is applied as `App::apply_chunk_effects` applies it, and
+    /// the record's banner is the only one however the bytes were read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_raw_notification_is_judged_where_it_falls_whatever_the_reads() {
+        let workspace = Workspace::new();
+        workspace.set_window_focused(false);
+        let project = workspace.create_project("p", "/tmp").unwrap().id;
+        let mut stream = b"\x1b]7501;state=blocked:app=pi\x1b\\".to_vec();
+        stream.extend_from_slice(b"\x1b]9;turn over\x07\x1b]133;A\x07");
+
+        let banners = |chunks: &[&[u8]]| {
+            let tab_id = workspace.open_tab(project, "/tmp", "t", false).unwrap().id;
+            let (mut tabs, supervisor) = attached(tab_id);
+            let key = TabKey::local(tab_id);
+            let mut events = workspace.subscribe();
+            for chunk in chunks {
+                let mut pty = TabOutputBatch::default();
+                for effects in inject_pty_bytes(&mut tabs, &mut pty, key, chunk).unwrap() {
+                    let mut authority = apply_program_status(&workspace, key, effects.status);
+                    for action in effects.actions {
+                        if let OscAction::Workspace { command, payload } = action {
+                            roost_engine::application::apply_osc(
+                                &workspace,
+                                tab_id,
+                                command,
+                                &payload,
+                                &mut authority,
+                            );
+                        }
+                    }
+                }
+            }
+            supervisor.close(tab_id);
+            let mut fired = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let WorkspaceEvent::NotificationFired { title, body, .. } = event {
+                    fired.push((title, body));
+                }
+            }
+            fired
+        };
+
+        let whole = banners(&[&stream]);
+        assert_eq!(
+            whole,
+            vec![("Pi".to_string(), "Needs your input".to_string())],
+            "the record's banner, and not the OSC 9 it covered"
+        );
+        for cut in 1..stream.len() {
+            assert_eq!(
+                banners(&[&stream[..cut], &stream[cut..]]),
+                whole,
+                "split at byte {cut}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6379,7 +6914,7 @@ mod tests {
         }
 
         assert!(collected.touched.is_empty());
-        assert!(collected.osc_actions.is_empty());
+        assert!(collected.effects.is_empty());
         assert!(collected.exited.is_empty());
         assert!(collected.error.is_none());
         supervisor.close(71);
@@ -6413,7 +6948,7 @@ mod tests {
         }
 
         assert!(collected.touched.is_empty());
-        assert!(collected.osc_actions.is_empty());
+        assert!(collected.effects.is_empty());
         assert!(collected.exited.is_empty());
         assert!(collected.error.is_none());
         let tab = tabs

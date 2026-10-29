@@ -54,10 +54,10 @@ use roost_ipc::messages::{
     TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
     TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
     TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams,
-    TabSendFileResult, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
-    TabWriteParams, WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef,
-    WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
+    TabMemoryUsageParams, TabMemoryUsageResult, TabOpenParams, TabOpenResult, TabReorderParams,
+    TabResizeParams, TabSendFileParams, TabSendFileResult, TabSetHookActiveParams,
+    TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    WindowResizeParams, WireProjectRef, WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{AttachHandshake, SessionSetThemeResult};
@@ -383,6 +383,18 @@ pub enum UiRequest {
     TabDumpResolved {
         tab_id: WireTabRef,
         reply: DumpResolvedReply,
+    },
+    /// `tab.memory_usage` (plan 082 D6.2). `tab_id` is the ref to read,
+    /// already rewritten onto the slot where the mode asks for it; `sent`
+    /// is the ref the caller wrote, which the result echoes.
+    ///
+    /// Like [`UiRequest::HostTabReorder`] a host tab's answer cannot be
+    /// given inside `update` — the app has to await its session — so the
+    /// reply travels with the dispatch.
+    TabMemoryUsage {
+        tab_id: WireTabRef,
+        sent: WireTabRef,
+        reply: HostOpReply<TabMemoryUsageResult>,
     },
     /// `tab.expand_selection_at` — run the production
     /// double-/triple-click word/line dispatch against `(col, row)`
@@ -2284,8 +2296,8 @@ fn project_reorder_route(
     Ok((ReorderInstance::Host(host), project_ids))
 }
 
-/// The four terminal-reading ops a session answers from its own tab
-/// tasks instead of from a UI it does not have.
+/// The terminal-reading ops a session answers from its own tab tasks
+/// instead of from a UI it does not have.
 ///
 /// `None` means "not a session socket, keep the UI path" — the whole of
 /// what makes these additive: a UI handler reaches `ui_call` exactly as
@@ -2297,6 +2309,7 @@ mod served {
         HandlerError, IpcHandler, ResolvedCellsData, WireTabRef,
     };
     use crate::tab_task::TabCmd;
+    use roost_ipc::messages::MemoryUsage;
 
     pub(super) async fn dump(
         h: &IpcHandler,
@@ -2317,6 +2330,17 @@ mod served {
         h.session.as_ref()?;
         Some(match bare(tab) {
             Ok(tab_id) => tab_ask(h, tab_id, TabCmd::DumpResolved).await,
+            Err(error) => Err(error),
+        })
+    }
+
+    pub(super) async fn memory_usage(
+        h: &IpcHandler,
+        tab: WireTabRef,
+    ) -> Option<Result<MemoryUsage, HandlerError>> {
+        h.session.as_ref()?;
+        Some(match bare(tab) {
+            Ok(tab_id) => tab_ask(h, tab_id, TabCmd::MemoryUsage).await,
             Err(error) => Err(error),
         })
     }
@@ -2402,6 +2426,13 @@ mod served {
         _: &IpcHandler,
         _: WireTabRef,
     ) -> Option<Result<ResolvedCellsData, HandlerError>> {
+        None
+    }
+
+    pub(super) async fn memory_usage(
+        _: &IpcHandler,
+        _: WireTabRef,
+    ) -> Option<Result<roost_ipc::messages::MemoryUsage, HandlerError>> {
         None
     }
 
@@ -3234,6 +3265,14 @@ async fn forward_to_local_session(
     Ok(reply)
 }
 
+/// The `tab_id` a request named before [`dispatch`]'s slot rewrite, for
+/// `tab.memory_usage`, whose result echoes the ref as the caller wrote it
+/// (plan 082 D6.1). `None` for a field that does not decode, which the
+/// op's own decode then refuses.
+fn sent_tab_ref(params: &serde_json::Value) -> Option<WireTabRef> {
+    serde_json::from_value(params.get("tab_id")?.clone()).ok()
+}
+
 /// The slot tab a `tab.dump` names, as `(incarnation, the session's own
 /// id)`, when it names one on the slot this route is connected to.
 fn slot_tab(route: &LocalRoute, tab: WireTabRef) -> Option<(u32, i64)> {
@@ -3292,6 +3331,9 @@ async fn dispatch(
     // That is why this runs per-op off the table rather than as one
     // "session mode ⇒ forward" test.
     let (route, _admitted) = admit_mutation(h, op).await?;
+    let sent_tab = (op == ops::TAB_MEMORY_USAGE)
+        .then(|| sent_tab_ref(&params))
+        .flatten();
     let params = if route.mode == LocalBackendMode::Session {
         match roost_ipc::local_route::classify(op) {
             Some(roost_ipc::OpClass::Forward) => {
@@ -4066,6 +4108,25 @@ async fn dispatch(
                 cells,
             })
         }
+        ops::TAB_MEMORY_USAGE => {
+            let p: TabMemoryUsageParams = decode(params)?;
+            let sent = sent_tab.unwrap_or(p.tab_id);
+            if let Some(served) = served::memory_usage(h, p.tab_id).await {
+                return encode(&TabMemoryUsageResult {
+                    tab_id: sent,
+                    terminal: served?,
+                    mirror: None,
+                });
+            }
+            encode(
+                &h.ui_call(|reply| UiRequest::TabMemoryUsage {
+                    tab_id: p.tab_id,
+                    sent,
+                    reply,
+                })
+                .await??,
+            )
+        }
         ops::TAB_DISPATCH_MOUSE_EVENT => {
             let p: TabDispatchMouseEventParams = decode(params)?;
             let kind = match p.kind.as_str() {
@@ -4556,6 +4617,7 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
         (ops::SIDEBAR_SET_WIDTH, &[NeedsUi, TestMode]),
         (ops::SIDEBAR_SET_AGENTS_FRACTION, &[NeedsUi, TestMode]),
         (ops::TAB_DUMP_RESOLVED, &[NeedsATerminal]),
+        (ops::TAB_MEMORY_USAGE, &[NeedsATerminal]),
         (ops::TAB_DISPATCH_MOUSE_EVENT, &[NeedsUi, TestMode]),
         (ops::APP_SET_WINDOW_FOCUS, &[NeedsUi, TestMode]),
         (ops::APP_CURSOR_SHAPE, &[NeedsUi]),
@@ -5813,6 +5875,7 @@ mod tests {
         "tab.dump_resolved",
         "tab.focus",
         "tab.list",
+        "tab.memory_usage",
         "tab.open",
         "tab.reorder",
         "tab.resize",
@@ -5890,7 +5953,12 @@ mod tests {
     ];
 
     /// What a session built with `server-vt` — every shipped one — adds.
-    const SESSION_SERVER_VT: &[&str] = &["session.set_theme", "tab.dump", "tab.dump_resolved"];
+    const SESSION_SERVER_VT: &[&str] = &[
+        "session.set_theme",
+        "tab.dump",
+        "tab.dump_resolved",
+        "tab.memory_usage",
+    ];
 
     fn on_this_platform(seams: &'static [&'static str]) -> &'static [&'static str] {
         if cfg!(target_os = "macos") {
@@ -6347,6 +6415,60 @@ mod tests {
             .await
             .expect("the slot answered");
         assert_eq!(listed, serde_json::json!({"projects": []}));
+    }
+
+    /// Plan 082 D6.1: the app reads the ref the slot rewrite produced and
+    /// echoes the one the caller wrote, so a bare id answered from the
+    /// slot comes back bare.
+    #[tokio::test]
+    async fn tab_memory_usage_hands_the_app_the_routed_ref_and_the_sent_one() {
+        for (session, sent, routed) in [
+            (true, "7", "h2.7"),
+            (true, "h2.7", "h2.7"),
+            (true, "h5.1", "h5.1"),
+            (false, "7", "7"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (h, mut ui) = with_a_ui(match session {
+                true => forwarding_handler(dir.path(), Some(2)),
+                false => identify_handler(dir.path()),
+            });
+            let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::clone(&asked);
+            tokio::spawn(async move {
+                while let Some(request) = ui.recv().await {
+                    if let UiRequest::TabMemoryUsage {
+                        tab_id,
+                        sent,
+                        reply,
+                    } = request
+                    {
+                        seen.lock().unwrap().push((tab_id, sent));
+                        let _ = reply.send(Ok(TabMemoryUsageResult {
+                            tab_id: sent,
+                            terminal: roost_ipc::messages::MemoryUsage::default(),
+                            mirror: None,
+                        }));
+                    }
+                }
+            });
+            let answered = dispatch(
+                &h,
+                ops::TAB_MEMORY_USAGE,
+                serde_json::json!({"tab_id": sent}),
+            )
+            .await
+            .expect("the app answered");
+            assert_eq!(answered["tab_id"], sent, "{sent}");
+            assert_eq!(
+                *asked.lock().unwrap(),
+                vec![(
+                    WireTabRef::parse(routed).unwrap(),
+                    WireTabRef::parse(sent).unwrap()
+                )],
+                "{sent}"
+            );
+        }
     }
 
     // ── #511: a `tab.dump` the app cannot answer, on the slot ────────

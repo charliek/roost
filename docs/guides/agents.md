@@ -5,7 +5,9 @@ five coding agents — Claude Code, Codex, OpenCode, grok (and its fork
 gx), and cursor-agent — by wiring one hook entry per lifecycle event into
 each agent's own configuration file. A sixth, craze, needs no wiring at
 all: it reports its own state over the socket, which any agent can do
-([Reporting directly, without a hook](#reporting-directly-without-a-hook)). Roost **asks before it wires
+([Reporting directly, without a hook](#reporting-directly-without-a-hook)).
+Agents that speak OSC 7501 also report through the terminal itself, with
+nothing to wire ([Program status](#program-status-osc-7501)). Roost **asks before it wires
 anything**: the first time the UI starts with no answer on file and at
 least one supported agent installed, a consent dialog opens naming
 what it found, and nothing is written into any agent's config until you
@@ -144,6 +146,65 @@ validating against the pinned schema:
 {"tab_id": "7", "source": "craze", "session_id": "acp-9f2",
  "ownership_action": "release"}
 ```
+
+## Program status (OSC 7501)
+
+Some agents also say what they are doing in the terminal itself, with
+the `OSC 7501` program-status sequence: a state (`working`, `blocked`,
+`done`, `error`, `idle`), what a blocked agent needs (`permission`,
+`question`, `auth`), and a one-line message. Roost reads it from the
+terminal that owns the tab — its own in-process terminal, or a host
+session's — and answers the `OSC 7501 ; ?` probe agents send to ask
+whether it is listened to. Nothing is installed and nothing is asked:
+an agent that speaks it is heard the moment it starts.
+
+| Agent | Speaks 7501 | `app` it names |
+|---|---|---|
+| Claude Code | yes | `claude-code` |
+| Codex | yes | `codex` |
+| Grok CLI (1.0.70 or later) | yes | `grok-build` |
+| crush | yes | `crush` |
+| pi | yes | `pi` |
+| gx, cursor-agent, OpenCode (1.19) | no — hooks only | |
+
+What it gives you, beside the hooks:
+
+- **The why.** The tab's message shows in the Agents panel and the
+  agents palette: `Waiting · approve Bash: npm test`, `Working ·
+  reading src/`, `Failed · <reason>`.
+- **Agents without hooks get a row.** A tab whose only signal is a
+  program-status record — crush, pi, or a Claude Code you declined hook
+  wiring for — is listed in the Agents panel under the agent's name
+  (Crush, Pi, Claude Code) and the tab's title.
+- **Interrupts and exits land.** Hooks have no interrupt event; an
+  agent that reports `idle` on Esc, or `clear` on exit, settles the tab
+  at once.
+
+The rules you see:
+
+- **The program decides while it is mid-turn.** While a record says
+  `working` or `blocked`, or the agent's last word was `idle`, `done`
+  or `error` and the shell hasn't shown a prompt since, the tab shows
+  the record — and the hooks for that tab keep who owns it but stop
+  moving its state. A hook from a *different* agent trying to claim the
+  tab then is refused (`foreign_app` in `roostctl doctor`).
+- **A shell prompt hands it back.** An OSC 133 prompt mark (`A`, `B` or
+  `D`; Roost's shell integration sends them) ends a `working` or
+  `blocked` record, the way a crashed agent's state should end. A
+  finished `done` or `error` stays on the tab after the prompt until
+  you start the next command. Claude Code sends prompt marks of its own
+  only in Screen Reader Mode, and they count the same way.
+- **One banner per change.** A record moving the tab into Waiting,
+  Failed or Finished raises one desktop banner, titled with the
+  record's title (else the agent's name) and carrying its message (else
+  "Needs your input", "Failed" or "Finished"). The hook that reports
+  the same moment raises nothing more, a program's own OSC 9 alongside
+  it is dropped, and a tab you are looking at stays quiet as always.
+  A Finished banner in an agent's first second is skipped — Codex
+  flashes through states at startup.
+
+`roostctl tab list --json` carries the summary as `program_status` on
+each tab ([`ipc.md`](../reference/ipc.md#tabprogram_status-osc-7501)).
 
 ## Roost asks once
 

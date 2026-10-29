@@ -158,7 +158,18 @@ merely a new vector:
 * `AttachMode` — the [attach handshake](ipc.md#the-handshake)'s mode;
 * the agent enums — `AgentLifecycle` and the `ownership_action`,
   `attention`, and `severity` values on
-  [`tab.agent_report`](ipc.md#tabagent_report).
+  [`tab.agent_report`](ipc.md#tabagent_report);
+* `DroppedReport.reason` on `Tab.dropped_reports` — `program_status` and
+  `foreign_app` joined it at generation `7`. A client that can't read
+  the record treats `dropped_reports` as absent, but it still loses the
+  diagnostic, so a new reason is a bump.
+
+`Tab.program_status` and its copy on `agent_report.changed` are the
+opposite: an **open shape with open enum values**. Its `state`, `kind`
+and `decided_by` values, and fields added to it, may grow without a
+bump, because a client that can't read the object reads it as absent
+(the presented lifecycle then falls back to the hook layer's) rather
+than failing the tab or the event.
 
 `TabEffect` — the same envelope's `effect` kind — was in this list
 through generation 6's design but was **opened** before release (plan
@@ -358,6 +369,23 @@ change still gets its one CHANGELOG entry — a rewritten "Session
 protocol 2 → 6" bullet describing the resulting contract, not a bullet
 per step — and the fixtures below were re-cut once, at `6`, not once
 per absorbed step.
+
+**`6` → `7` put program status (OSC 7501) on the session wire (plan
+082), breaking in both directions.** `Tab.state` and
+`agent_report.changed`'s `state` became the projection of the lifecycle
+program status composes with the hook layer, so a pre-bump client that
+derives the tab's state from `agent_lifecycle` + `shell_state` +
+`ownership` disagrees with the session about the same tab; a
+`program_status` object rides beside them; and `DroppedReport.reason`,
+a closed enum, gained `program_status` and `foreign_app`. A Swift UI
+target keeps no records, so its `Tab.state` is never composed. `7` is
+unreleased, so it may still be amended in place under the rule above,
+and it was once: the session socket's `tab.memory_usage` (plan 082 D6)
+rides the same generation rather than spending one of its own, and
+`session.identify.ops.response.v7.json` was re-cut to list it.
+The identify vectors were re-cut at `7`
+(`session.identify{,.ops,.persist_error}.response.v7.json`) beside the
+frozen `v6` files, and the attach handshake vectors carry `7`.
 
 ## Fixtures are the contract
 

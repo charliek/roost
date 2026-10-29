@@ -237,6 +237,9 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
         "tab.capture_pty_input",
         OpClass::Rewrite(SlotIds::Tab("tab_id")),
     ),
+    // The slot's terminal answers, through the app: a host tab's figure
+    // is the session's, and the window adds its own copy beside it.
+    ("tab.memory_usage", OpClass::Rewrite(SlotIds::Tab("tab_id"))),
     ("tab.focus", OpClass::Rewrite(SlotIds::Tab("tab_id"))),
     ("tab.send_file", OpClass::Rewrite(SlotIds::Tab("tab"))),
     ("tab.reorder", OpClass::Rewrite(SlotIds::TabOrder)),
@@ -656,6 +659,10 @@ mod tests {
         assert_eq!(
             classify("tab.send_file"),
             Some(OpClass::Rewrite(SlotIds::Tab("tab")))
+        );
+        assert_eq!(
+            classify("tab.memory_usage"),
+            Some(OpClass::Rewrite(SlotIds::Tab("tab_id")))
         );
         for op in [
             "selection.set",

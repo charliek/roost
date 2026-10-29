@@ -38,14 +38,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use portable_pty::PtySize;
-use roost_ipc::messages::{AttachPayloadKind, ClipboardEffectTarget, CLIPBOARD_EFFECT_MAX_BYTES};
-use roost_vt::{Cell, Colors, CursorInfo, RenderState, RenderedRow, Terminal, TerminalOptions};
+use roost_ipc::messages::{
+    AttachPayloadKind, ClipboardEffectTarget, MemoryUsage, CLIPBOARD_EFFECT_MAX_BYTES,
+};
+use roost_ipc::program_status::StatusEvent;
+use roost_vt::{
+    Cell, Colors, CursorInfo, RenderState, RenderedRow, Terminal, TerminalEvent, TerminalOptions,
+};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
 use tracing::{debug, warn};
 
 use crate::ipc::{DumpData, ResolvedCellData, ResolvedCellsData};
 use crate::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscColorState, OscRgb, OscRouter};
+use crate::program_status::RawOscAuthority;
 use crate::pty::{Geometry, PtyOutputEvent, WriterCmd};
 use crate::workspace::TabEffectKind;
 
@@ -105,7 +111,9 @@ const HEADLESS_BG: roost_vt::ColorRgb = roost_vt::ColorRgb { r: 0, g: 0, b: 0 };
 /// without standing up a persisted workspace.
 pub trait ServerVtWorkspace: Send + Sync + 'static {
     /// Apply one `OscAction::Workspace` — same routing a UI does.
-    fn apply_osc(&self, tab_id: i64, command: u32, payload: &str);
+    /// `authority` is what [`Self::apply_program_status`] returned for the
+    /// same chunk.
+    fn apply_osc(&self, tab_id: i64, command: u32, payload: &str, authority: &mut RawOscAuthority);
     /// The tab's PTY is gone; drop its workspace row.
     fn close_row(&self, tab_id: i64);
     /// Publish one client-local effect (plan 037 §3.6) — a bell or an
@@ -115,11 +123,21 @@ pub trait ServerVtWorkspace: Send + Sync + 'static {
     /// changes around it. A clipboard write's text is user content: it
     /// goes on the wire and into no log line.
     fn tab_effect(&self, tab_id: i64, effect: TabEffectKind);
+    /// Apply one chunk's OSC 7501 reports and OSC 133 prompt marks, in
+    /// byte order, to the tab's program-status records. Called after the
+    /// chunk's `vt_write` and before its OSC actions, so the hook layer
+    /// sees the chunk's marks after the records do (plan 082 D4.3).
+    fn apply_program_status(
+        &self,
+        tab_id: i64,
+        events: Vec<StatusEvent>,
+        now_ms: i64,
+    ) -> RawOscAuthority;
 }
 
 impl ServerVtWorkspace for crate::Workspace {
-    fn apply_osc(&self, tab_id: i64, command: u32, payload: &str) {
-        crate::application::apply_osc(self, tab_id, command, payload);
+    fn apply_osc(&self, tab_id: i64, command: u32, payload: &str, authority: &mut RawOscAuthority) {
+        crate::application::apply_osc(self, tab_id, command, payload, authority);
     }
 
     fn close_row(&self, tab_id: i64) {
@@ -130,6 +148,20 @@ impl ServerVtWorkspace for crate::Workspace {
 
     fn tab_effect(&self, tab_id: i64, effect: TabEffectKind) {
         self.publish_tab_effect(tab_id, effect);
+    }
+
+    fn apply_program_status(
+        &self,
+        tab_id: i64,
+        events: Vec<StatusEvent>,
+        now_ms: i64,
+    ) -> RawOscAuthority {
+        crate::Workspace::apply_program_status(self, tab_id, events, now_ms).unwrap_or_else(
+            |error| {
+                debug!(tab_id, %error, "program status for a tab whose row is gone");
+                RawOscAuthority::default()
+            },
+        )
     }
 }
 
@@ -467,6 +499,8 @@ pub enum TabCmd {
         reply: oneshot::Sender<Result<DumpData, TabError>>,
     },
     DumpResolved(oneshot::Sender<Result<ResolvedCellsData, TabError>>),
+    /// `tab.memory_usage` — this tab's terminal, as libghostty measures it.
+    MemoryUsage(oneshot::Sender<Result<MemoryUsage, TabError>>),
     /// Test-mode byte injection — the same pipeline a real chunk takes.
     FeedBytes(Vec<u8>),
     /// Test-mode: everything the task has queued toward the PTY writer
@@ -511,6 +545,9 @@ pub(crate) struct TabVt {
     state: Arc<ServerVtState>,
     terminal: Terminal,
     replies: Arc<Mutex<Vec<u8>>>,
+    /// OSC 7501 reports and OSC 133 marks, in byte order. Drained after
+    /// every `vt_write`, like `replies`.
+    status: Arc<Mutex<Vec<TerminalEvent>>>,
     router: OscRouter,
     colors: OscColorState,
     render: RenderState,
@@ -554,12 +591,17 @@ impl TabVt {
         // Installed before the first byte: a device query in the very
         // first chunk must be answered like any other.
         terminal.set_write_pty_buffer(Arc::clone(&replies))?;
+        // Beside it, for the same reason: this terminal answers the
+        // program-status probe and is the one whose reports count.
+        let status = Arc::new(Mutex::new(Vec::new()));
+        terminal.set_status_sink(Arc::clone(&status))?;
         let colors = OscColorState::new(color_seed(&terminal)?);
         let render = RenderState::new()?;
         Ok(Self {
             state: Arc::clone(state),
             terminal,
             replies,
+            status,
             router: OscRouter::new(),
             colors,
             render,
@@ -918,12 +960,13 @@ impl TabTask {
             self.last_byte_seq = seq;
             seq
         });
-        // 2. the authoritative terminal.
+        // 2. the authoritative terminal, then its program-status records.
         self.vt.terminal.vt_write(&data);
+        let mut authority = self.take_status();
         // 3. OSC scan, applied in wire order.
         let actions = self.vt.router.feed_stateful(&data, &mut self.vt.colors);
         for action in actions {
-            self.apply_action(action);
+            self.apply_action(action, &mut authority);
         }
         // One `bell` per chunk that carried at least one BEL, not one
         // per byte: a program that rings twenty times in a burst wants
@@ -947,13 +990,13 @@ impl TabTask {
         }
     }
 
-    fn apply_action(&self, action: OscAction) {
+    fn apply_action(&self, action: OscAction, authority: &mut RawOscAuthority) {
         match action {
             OscAction::Workspace { command, payload } => {
                 self.vt
                     .state
                     .workspace
-                    .apply_osc(self.tab_id, command, &payload);
+                    .apply_osc(self.tab_id, command, &payload, authority);
             }
             // Client-local effects. A session has no view, so the only
             // thing it can do with one is hand it to whoever is
@@ -993,6 +1036,19 @@ impl TabTask {
                 );
             }
         }
+    }
+
+    /// Apply whatever the status sink collected.
+    fn take_status(&mut self) -> RawOscAuthority {
+        let events = crate::program_status::drain(&self.vt.status);
+        if events.is_empty() {
+            return RawOscAuthority::default();
+        }
+        self.vt.state.workspace.apply_program_status(
+            self.tab_id,
+            events,
+            crate::workspace::unix_now_ms(),
+        )
     }
 
     /// Move whatever libghostty emitted into the pending queue. The lock
@@ -1334,6 +1390,9 @@ impl TabTask {
             }
             TabCmd::DumpResolved(reply) => {
                 let _ = reply.send(self.dump_resolved());
+            }
+            TabCmd::MemoryUsage(reply) => {
+                let _ = reply.send(crate::memory::of(&self.vt.terminal).map_err(TabError::from));
             }
             TabCmd::FeedBytes(data) => self.ingest(data),
             TabCmd::CaptureInput { drain, reply } => {

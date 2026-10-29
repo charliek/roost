@@ -1,0 +1,11 @@
+[{"quiet":4, "timeout":40},
+ {"send":"create a file named agent-status-perm.txt containing hi"},
+ {"sleep":1},
+ {"send":"\r"},
+ {"wait7501":"state=blocked", "timeout":150},
+ {"sleep":3},
+ {"send":"\r"},
+ {"wait7501":"state=(done|idle|error)", "timeout":150},
+ {"quiet":4, "timeout":30},
+ {"send":"\u0003"}, {"sleep":0.7}, {"send":"\u0003"},
+ {"sleep":4}]

@@ -1,0 +1,7 @@
+[{"quiet":3, "timeout":40},
+ {"send":"start the shell command `sleep 25` as a background task (do not wait for it), then reply with just ok"},
+ {"sleep":1}, {"send":"\r"},
+ {"wait7501":"state=(done|idle)", "timeout":120},
+ {"sleep":30},
+ {"quiet":3, "timeout":40},
+ {"send":"\u0003"}, {"sleep":0.7}, {"send":"\u0003"}, {"sleep":3}]

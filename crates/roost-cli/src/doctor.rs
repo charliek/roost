@@ -35,10 +35,11 @@ use roost_agent_install::{
     ALL_AGENTS as ALL_INSTALL_AGENTS,
 };
 use roost_ipc::agent::{
-    effective_lifecycle, is_live, suppress_raw_osc, AgentLifecycle, DropReason, DroppedReports,
-    OwnershipAction, ShellState,
+    is_live, AgentLifecycle, DropReason, DroppedReports, OwnershipAction, ShellState,
 };
+use roost_ipc::format_chars::is_format;
 use roost_ipc::messages::{ops, IdentifyParams, IdentifyResult, Tab, TabListResult};
+use roost_ipc::program_status::{suppress_raw_osc, DecidedBy};
 use roost_ipc::session_launch::timeout_scale;
 use roost_ipc::socket_state::{self, describe_file_type, SocketState};
 use roost_ipc::target::{TargetError, TargetOrigin, TargetSelector};
@@ -1628,44 +1629,6 @@ fn escape_controls(s: &str) -> String {
     out
 }
 
-/// `General_Category=Cf`, as ranges. `char` exposes `is_control` (Cc) and
-/// nothing else, and a Unicode-table crate is a large dependency to carry
-/// for one diagnostic string, so the category is spelled out here:
-/// Unicode 16.0's Cf, coalesced from a full scalar-by-scalar walk of
-/// `UnicodeData.txt`.
-///
-/// Two ranges are widened past the real category to keep the table short.
-/// U+2065 and U+E0002–U+E001F are unassigned holes inside a format block;
-/// over-broad is the safe direction here, since escaping an unassigned
-/// scalar costs a diagnostic nothing while a missed range costs it the
-/// vector in [`escape_controls`].
-const FORMAT_RANGES: [(u32, u32); 19] = [
-    (0x00ad, 0x00ad),           // SOFT HYPHEN
-    (0x0600, 0x0605),           // ARABIC NUMBER SIGN … ARABIC NUMBER MARK ABOVE
-    (0x061c, 0x061c),           // ARABIC LETTER MARK
-    (0x06dd, 0x06dd),           // ARABIC END OF AYAH
-    (0x070f, 0x070f),           // SYRIAC ABBREVIATION MARK
-    (0x0890, 0x0891),           // ARABIC POUND / PIASTRE MARK ABOVE
-    (0x08e2, 0x08e2),           // ARABIC DISPUTED END OF AYAH
-    (0x180e, 0x180e),           // MONGOLIAN VOWEL SEPARATOR
-    (0x200b, 0x200f),           // ZWSP, ZWNJ, ZWJ, LRM, RLM
-    (0x202a, 0x202e),           // LRE, RLE, PDF, LRO, RLO — the bidi overrides
-    (0x2060, 0x206f),           // WORD JOINER … the deprecated format controls
-    (0xfeff, 0xfeff),           // ZERO WIDTH NO-BREAK SPACE (BOM)
-    (0xfff9, 0xfffb),           // INTERLINEAR ANNOTATION ANCHOR/SEPARATOR/TERMINATOR
-    (0x0001_10bd, 0x0001_10bd), // KAITHI NUMBER SIGN
-    (0x0001_10cd, 0x0001_10cd), // KAITHI NUMBER SIGN ABOVE
-    (0x0001_3430, 0x0001_343f), // EGYPTIAN HIEROGLYPH format controls
-    (0x0001_bca0, 0x0001_bca3), // SHORTHAND FORMAT letter overlap … up step
-    (0x0001_d173, 0x0001_d17a), // MUSICAL SYMBOL BEGIN BEAM … END PHRASE
-    (0x000e_0001, 0x000e_007f), // LANGUAGE TAG + the TAG characters
-];
-
-fn is_format(c: char) -> bool {
-    let cp = c as u32;
-    FORMAT_RANGES.iter().any(|(lo, hi)| cp >= *lo && cp <= *hi)
-}
-
 /// Escape, then cap for display — counted in characters, with the true
 /// length shown so a truncation is never mistaken for the whole value.
 fn redact(raw: &str) -> String {
@@ -2730,7 +2693,11 @@ fn tab_checks(
     };
 
     let state = tab.agent_state();
-    let lifecycle = effective_lifecycle(&state);
+    let lifecycle = tab.effective_lifecycle();
+    let records_decide = tab
+        .program_status
+        .as_ref()
+        .is_some_and(|status| status.decided_by != DecidedBy::Hooks);
 
     let ownership = match &tab.ownership {
         Some(owner) => observation(
@@ -2785,14 +2752,18 @@ fn tab_checks(
                 crate::format_state(tab.state),
                 tab.hook_active,
                 lifecycle_name(lifecycle),
-                inactive_explanation(&state, lifecycle),
+                if records_decide {
+                    " — the tab's program status (OSC 7501) decides it".to_string()
+                } else {
+                    inactive_explanation(&state, lifecycle)
+                },
             ),
         ),
         observation(
             "tab.raw_osc",
             "Raw OSC suppression",
-            if suppress_raw_osc(&state) {
-                "raw OSC 9/99/777 notifications are suppressed while this agent drives the tab"
+            if suppress_raw_osc(&state, tab.program_status.as_ref()) {
+                "raw OSC 9/99/777 notifications are suppressed while an agent drives the tab"
             } else {
                 "raw OSC 9/99/777 notifications are delivered"
             },
@@ -2824,6 +2795,8 @@ fn describe_dropped(now: i64, tab: &Tab, dropped: &DroppedReports) -> String {
     let reason = match last.reason {
         DropReason::NotOwner => "not_owner",
         DropReason::NestedClaim => "nested_claim",
+        DropReason::ProgramStatus => "program_status",
+        DropReason::ForeignApp => "foreign_app",
     };
     let owns_it_now = tab
         .ownership
@@ -3875,6 +3848,7 @@ mod tests {
     use super::*;
     use crate::session::fixtures::fake_launcher;
     use roost_ipc::agent::{AgentLifecycle, Ownership, ShellState};
+    use roost_ipc::format_chars::FORMAT_RANGES;
     use roost_ipc::messages::TabState;
     use roost_ipc::LocalBackendMode;
 
@@ -3918,6 +3892,7 @@ mod tests {
             ownership: None,
             password_input: false,
             dropped_reports: None,
+            program_status: None,
         }
     }
 
@@ -4918,6 +4893,44 @@ mod tests {
             .contains("delivered"));
     }
 
+    /// Plan 082 D5.6: the row reads the composed predicate, so a tab whose
+    /// program-status records decide reports suppression with no hook
+    /// owner at all, and its derived state names the records.
+    #[test]
+    fn raw_osc_suppression_and_the_derived_state_follow_program_status() {
+        use roost_ipc::program_status::ProgramStatusSummary;
+        let status = |decided_by| ProgramStatusSummary {
+            effective_lifecycle: AgentLifecycle::Working,
+            decided_by,
+            children: 0,
+            record: None,
+        };
+        let records = Inputs {
+            tab_list: Ok(tab_list(&[Tab {
+                state: TabState::Running,
+                program_status: Some(status(DecidedBy::Records)),
+                ..tab(7)
+            }])),
+            ..healthy()
+        };
+        let checks = evaluate(&records);
+        assert!(find(&checks, "tab.raw_osc").detail.contains("suppressed"));
+        let derived = find(&checks, "tab.derived").detail.clone();
+        assert!(derived.contains("lifecycle=working"), "{derived}");
+        assert!(derived.contains("program status"), "{derived}");
+
+        let hooks = Inputs {
+            tab_list: Ok(tab_list(&[Tab {
+                program_status: Some(status(DecidedBy::Hooks)),
+                ..tab(7)
+            }])),
+            ..healthy()
+        };
+        assert!(find(&evaluate(&hooks), "tab.raw_osc")
+            .detail
+            .contains("delivered"));
+    }
+
     // ------------------------------------------------------------ ui legs
 
     #[test]
@@ -5309,12 +5322,6 @@ mod tests {
         // Ordinary non-ASCII text, spelled the way a user would have it.
         for raw in ["/Users/münchen/日本語/bin/zsh", "café ✓ 🐦 — ok"] {
             assert_eq!(redact(raw), raw);
-        }
-        // Sorted, non-empty and disjoint, so `is_format`'s linear scan is a
-        // table anyone can read against `UnicodeData.txt` rather than a pile.
-        for pair in FORMAT_RANGES.windows(2) {
-            assert!(pair[0].0 <= pair[0].1, "{pair:?}");
-            assert!(pair[0].1 < pair[1].0, "{pair:?}");
         }
 
         // End to end, with the review's own repro: the reversal must not

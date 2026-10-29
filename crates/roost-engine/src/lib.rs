@@ -23,10 +23,13 @@ pub mod events;
 pub mod facade;
 pub mod git_metrics;
 pub mod ipc;
+#[cfg(feature = "vt")]
+pub mod memory;
 pub mod osc;
 pub mod persistence;
 pub mod pointer;
 pub mod process;
+pub mod program_status;
 pub mod pty;
 pub mod reconcile;
 pub mod session;

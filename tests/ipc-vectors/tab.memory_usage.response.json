@@ -1,0 +1,49 @@
+{
+  "id": "14",
+  "ok": true,
+  "result": {
+    "tab_id": "h3.7",
+    "terminal": {
+      "compression_supported": true,
+      "primary": {
+        "pages": 2,
+        "virtual_bytes": 3211264,
+        "resident_bytes": 802816,
+        "compressed_pages": 0,
+        "compressed_bytes": 0,
+        "image_bytes": 0
+      },
+      "alternate": {
+        "pages": 0,
+        "virtual_bytes": 0,
+        "resident_bytes": 0,
+        "compressed_pages": 0,
+        "compressed_bytes": 0,
+        "image_bytes": 0
+      },
+      "resident_bytes": 802816,
+      "virtual_bytes": 3211264
+    },
+    "mirror": {
+      "compression_supported": true,
+      "primary": {
+        "pages": 1,
+        "virtual_bytes": 1605632,
+        "resident_bytes": 401408,
+        "compressed_pages": 0,
+        "compressed_bytes": 0,
+        "image_bytes": 0
+      },
+      "alternate": {
+        "pages": 0,
+        "virtual_bytes": 0,
+        "resident_bytes": 0,
+        "compressed_pages": 0,
+        "compressed_bytes": 0,
+        "image_bytes": 0
+      },
+      "resident_bytes": 401408,
+      "virtual_bytes": 1605632
+    }
+  }
+}
