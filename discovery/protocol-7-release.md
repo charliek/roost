@@ -173,6 +173,8 @@ own feature branch.
 
 ### M1. Ghostty main, Zig 0.17, program status, per-tab memory
 
+**Status: merged: #647, #648.**
+
 Two PRs, in order. Landing the pin bump on its own keeps any churn in
 `swift-mac` or the byte-exact VT tests separate from feature changes.
 
@@ -293,6 +295,30 @@ Both backends must reach parity on 7501 and on the memory query.
 - The composition sits above the pure functions. The hook-derived
   lifecycle, and with it `is_nested_claim`, is computed exactly as
   today. Records override only the final effective result.
+
+*Amendment, 2026-10-28 (plan 083, #650).* Plan 082's D4.3 kept the hook
+layer reading OSC 133 through `roost-osc` while the records read
+libghostty's ordered stream. That is reversed: on a terminal with a
+status sink (every session tab, every in-process iced tab) the hook
+layer takes its marks from the same stream, advanced in byte order
+inside the one `apply_program_status` call, and `roost-osc`'s 133 maps
+to no action. The two parsers disagreed on `133;P;k=i`, `133;N`,
+`133;I`, `133;A;k=s` and malformed bodies, so a banner could depend on
+the read split. With one reading, a raw OSC 9 / 777 libghostty places is
+judged where it falls against both layers, through 082's pairing of
+roost-osc's notifications with libghostty's places. That pairing needs
+the two parsers to start and end every OSC at the same bytes, so
+roost-osc now follows libghostty's parser through escapes, CSIs, DCSs
+and SOS/PM/APC strings, 8-bit controls included: an OSC starts where
+libghostty starts one, a BEL or an `ESC` ends it whatever follows the
+`ESC` (it no longer waits for an ST's `\`, which a read can split off),
+and CAN or SUB cancel it. A differential test holds the two to it. A
+form only one parser accepts is still judged at its chunk's end. `agent.rs`
+and the shared fixtures are unchanged; the forms that count on sink
+terminals are now libghostty's (`docs/guides/agents.md`, "Which marks
+count"), including a known limit: a mark over libghostty's 2048-byte OSC
+buffer is dropped. Host mirrors take the result from the wire; the
+frozen Swift app keeps its own scanner and first-letter rule.
 
 **3. When a record is authoritative.** Program status decides a tab's
 effective state while either holds:

@@ -124,9 +124,9 @@ pub trait ServerVtWorkspace: Send + Sync + 'static {
     /// goes on the wire and into no log line.
     fn tab_effect(&self, tab_id: i64, effect: TabEffectKind);
     /// Apply one chunk's OSC 7501 reports and OSC 133 prompt marks, in
-    /// byte order, to the tab's program-status records. Called after the
-    /// chunk's `vt_write` and before its OSC actions, so the hook layer
-    /// sees the chunk's marks after the records do (plan 082 D4.3).
+    /// byte order, to the tab's program-status records and its hook
+    /// layer's shell axis. Called after the chunk's `vt_write` and before
+    /// its OSC actions (plan 082 D4.3, plan 083 D-B1).
     fn apply_program_status(
         &self,
         tab_id: i64,

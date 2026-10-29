@@ -283,10 +283,14 @@ fn map_events(events: Vec<OscEvent>) -> Vec<OscAction> {
                 };
                 actions.push(OscAction::Workspace { command, payload });
             }
-            OscEvent::CommandMark(payload) => actions.push(OscAction::Workspace {
-                command: 133,
-                payload,
-            }),
+            // No action (plan 083 D-B2). A router only ever scans bytes
+            // bound for a terminal with a status sink: a session tab's,
+            // which installs it before the first byte, or an in-process
+            // iced tab's, which is scanned exactly when its replies drain
+            // to the PTY, the case that installs one; a host mirror's
+            // bytes are never scanned. The hook layer reads OSC 133 from
+            // that sink, so reading it here too would be a second parser.
+            OscEvent::CommandMark(_) => {}
             OscEvent::Clipboard { target, text } => {
                 actions.push(OscAction::ClipboardWrite { target, text });
             }
@@ -356,7 +360,7 @@ mod tests {
     #[test]
     fn actions_preserve_wire_order_and_separate_ui_ports() {
         let mut router = OscRouter::new();
-        let bytes = b"\x1b]0;build\x07\x1b]133;C\x07\x1b]22;pointer\x07";
+        let bytes = b"\x1b]0;build\x07\x1b]7;file:///w\x07\x1b]22;pointer\x07";
         assert_eq!(
             router.feed(bytes),
             vec![
@@ -365,12 +369,44 @@ mod tests {
                     payload: "build".into(),
                 },
                 OscAction::Workspace {
-                    command: 133,
-                    payload: "C".into(),
+                    command: 7,
+                    payload: "file:///w".into(),
                 },
                 OscAction::PointerShape("pointer".into()),
             ]
         );
+    }
+
+    /// Plan 083 D-B2: the scanner still reads OSC 133, every form of it,
+    /// and the router maps none of it to an action, on either feed path.
+    #[test]
+    fn a_command_mark_produces_no_action() {
+        let marks = b"\x1b]133;A\x07\x1b]133;C;cmdline_url=ls\x07\x1b]133;D;0\x07\x1b]133;Z\x07";
+        let mut bytes = b"\x1b]0;before\x07".to_vec();
+        bytes.extend_from_slice(marks);
+        bytes.extend_from_slice(b"\x1b]0;after\x07");
+        let titles = vec![
+            OscAction::Workspace {
+                command: 0,
+                payload: "before".into(),
+            },
+            OscAction::Workspace {
+                command: 0,
+                payload: "after".into(),
+            },
+        ];
+        assert_eq!(
+            roost_osc::OscScanner::new()
+                .feed(marks)
+                .into_iter()
+                .filter(|event| matches!(event, OscEvent::CommandMark(_)))
+                .count(),
+            4,
+            "the scanner reads them"
+        );
+        assert_eq!(OscRouter::new().feed(&bytes), titles);
+        let mut state = OscColorState::new(colors());
+        assert_eq!(OscRouter::new().feed_stateful(&bytes, &mut state), titles);
     }
 
     /// The contract since upstream `14c829883`: a color query is

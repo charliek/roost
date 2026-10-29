@@ -641,7 +641,8 @@ pub(super) struct TabOutputBatch {
 
 /// One chunk's program-status events and its OSC actions, applied in that
 /// order — a session tab task's ingest order (plan 082 D4.3), so the
-/// record layer sees the chunk's prompt marks before the hook layer does.
+/// chunk's OSC 9 / 777 are judged against the records and the hook layer
+/// its prompt marks moved.
 #[derive(Debug, PartialEq)]
 pub(super) struct ChunkEffects {
     pub(super) key: TabKey,
@@ -730,9 +731,9 @@ pub(super) fn inject_pty_bytes(
 }
 
 /// A chunk's program-status events, to the workspace whose terminal
-/// produced them, and the records' authority at each notification they
-/// placed, for the chunk's OSC actions. Only an in-process tab has a
-/// status sink, so a key from any other instance never carries any.
+/// produced them, and whether a raw notification is suppressed at each
+/// place they put one, for the chunk's OSC actions. Only an in-process tab
+/// has a status sink, so a key from any other instance never carries any.
 fn apply_program_status(
     workspace: &Workspace,
     key: TabKey,
@@ -752,6 +753,19 @@ fn apply_program_status(
             tracing::debug!(tab_id, %error, "program status for a tab whose row is gone");
             RawOscAuthority::default()
         })
+}
+
+/// One chunk's effects in a session tab task's ingest order (plan 082
+/// D4.3): its program-status events to the workspace, then its OSC actions
+/// through `apply_actions`, judged against the places those events put.
+/// Free of `App`, so the unit tests run the order production runs.
+fn apply_chunk<T>(
+    workspace: &Workspace,
+    chunk: ChunkEffects,
+    apply_actions: impl FnOnce(TabKey, Vec<OscAction>, &mut RawOscAuthority) -> T,
+) -> T {
+    let mut authority = apply_program_status(workspace, chunk.key, chunk.status);
+    apply_actions(chunk.key, chunk.actions, &mut authority)
 }
 
 /// A click on the OS notification banner, decided off the core alone so it
@@ -4945,8 +4959,10 @@ impl App {
     }
 
     fn apply_chunk_effects(&mut self, chunk: ChunkEffects) -> UiTask {
-        let mut authority = apply_program_status(&self.workspace, chunk.key, chunk.status);
-        self.apply_osc_actions(chunk.key, chunk.actions, &mut authority)
+        let workspace = Arc::clone(&self.workspace);
+        apply_chunk(&workspace, chunk, |key, actions, authority| {
+            self.apply_osc_actions(key, actions, authority)
+        })
     }
 
     fn apply_osc_actions(
@@ -6839,62 +6855,370 @@ mod tests {
 
     /// Plan 082 D5.8's amendment, the branch review's sequence on an
     /// in-process tab: a `blocked` record, the program's own OSC 9, then the
-    /// `A` ending the record's authority, on an unwatched tab no hook owns.
-    /// Each chunk is applied as `App::apply_chunk_effects` applies it, and
-    /// the record's banner is the only one however the bytes were read.
+    /// `A` ending the record's authority, on an unwatched tab no hook owns:
+    /// the record's banner is the only one however the bytes were read, the
+    /// OSC 9's ST included.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_raw_notification_is_judged_where_it_falls_whatever_the_reads() {
-        let workspace = Workspace::new();
-        workspace.set_window_focused(false);
-        let project = workspace.create_project("p", "/tmp").unwrap().id;
-        let mut stream = b"\x1b]7501;state=blocked:app=pi\x1b\\".to_vec();
-        stream.extend_from_slice(b"\x1b]9;turn over\x07\x1b]133;A\x07");
+        let mut runs = InProcessRuns::new(false);
+        for terminator in TERMINATORS {
+            let mut stream = b"\x1b]7501;state=blocked:app=pi\x1b\\".to_vec();
+            stream.extend(osc("9;turn over", terminator));
+            stream.extend_from_slice(b"\x1b]133;A\x07");
+            assert_eq!(
+                runs.however_split(&stream).1,
+                vec![("Pi".to_string(), "Needs your input".to_string())],
+                "the record's banner, and not the OSC 9 it covered: {terminator:?}"
+            );
+        }
+    }
 
-        let banners = |chunks: &[&[u8]]| {
-            let tab_id = workspace.open_tab(project, "/tmp", "t", false).unwrap().id;
-            let (mut tabs, supervisor) = attached(tab_id);
-            let key = TabKey::local(tab_id);
-            let mut events = workspace.subscribe();
+    /// The OSC terminators: BEL, and ST (`ESC \`), which a read can split
+    /// between its `ESC` and its `\`.
+    const TERMINATORS: [&[u8]; 2] = [b"\x07", b"\x1b\\"];
+
+    /// `ESC ] body`, ended by `terminator`.
+    fn osc(body: &str, terminator: &[u8]) -> Vec<u8> {
+        [b"\x1b]", body.as_bytes(), terminator].concat()
+    }
+
+    /// One in-process terminal fed run after run, each chunk applied
+    /// through [`apply_chunk`], as `App::apply_chunk_effects` applies it, to
+    /// a fresh unwatched workspace row; with `hook_owner`, one a hook owner
+    /// holds, Waiting.
+    /// Every run is whole sequences, so the terminal's parser is back at
+    /// ground between runs and one PTY serves them all.
+    struct InProcessRuns {
+        workspace: Workspace,
+        project: i64,
+        tabs: HashMap<TabKey, TerminalTab>,
+        supervisor: Arc<PtySupervisor>,
+        key: TabKey,
+        hook_owner: bool,
+    }
+
+    impl InProcessRuns {
+        fn new(hook_owner: bool) -> Self {
+            let workspace = Workspace::new();
+            workspace.set_window_focused(false);
+            let project = workspace.create_project("p", "/tmp").unwrap().id;
+            workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+            let (tabs, supervisor) = attached(9_000);
+            Self {
+                workspace,
+                project,
+                tabs,
+                supervisor,
+                key: TabKey::local(9_000),
+                hook_owner,
+            }
+        }
+
+        /// The tab `chunks` leave on a fresh row and the banners they
+        /// raised there, minus what differs between two rows.
+        fn run(&mut self, chunks: &[&[u8]]) -> (roost_ipc::messages::Tab, Vec<(String, String)>) {
+            let row = self
+                .workspace
+                .open_tab(self.project, "/tmp", "t", false)
+                .unwrap()
+                .id;
+            if self.hook_owner {
+                let claim = roost_ipc::agent::TabAgentReportParams {
+                    session_id: "s1".into(),
+                    ..roost_ipc::agent::TabAgentReportParams::sessionless(
+                        row,
+                        "claude",
+                        roost_ipc::agent::OwnershipAction::Claim,
+                        Some(roost_ipc::agent::AgentLifecycle::Waiting),
+                    )
+                };
+                assert!(self.workspace.agent_report(&claim).unwrap().0);
+            }
+            let mut events = self.workspace.subscribe();
             for chunk in chunks {
                 let mut pty = TabOutputBatch::default();
-                for effects in inject_pty_bytes(&mut tabs, &mut pty, key, chunk).unwrap() {
-                    let mut authority = apply_program_status(&workspace, key, effects.status);
-                    for action in effects.actions {
-                        if let OscAction::Workspace { command, payload } = action {
-                            roost_engine::application::apply_osc(
-                                &workspace,
-                                tab_id,
-                                command,
-                                &payload,
-                                &mut authority,
-                            );
+                let effects = inject_pty_bytes(&mut self.tabs, &mut pty, self.key, chunk)
+                    .expect("the terminal is attached");
+                for effects in effects {
+                    let chunk = ChunkEffects {
+                        key: TabKey::local(row),
+                        ..effects
+                    };
+                    apply_chunk(&self.workspace, chunk, |_, actions, authority| {
+                        for action in actions {
+                            if let OscAction::Workspace { command, payload } = action {
+                                roost_engine::application::apply_osc(
+                                    &self.workspace,
+                                    row,
+                                    command,
+                                    &payload,
+                                    authority,
+                                );
+                            }
                         }
+                    });
+                }
+            }
+            let mut banners = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let WorkspaceEvent::NotificationFired {
+                    tab_id,
+                    title,
+                    body,
+                    ..
+                } = event
+                {
+                    if tab_id == row {
+                        banners.push((title, body));
                     }
                 }
             }
-            supervisor.close(tab_id);
-            let mut fired = Vec::new();
-            while let Ok(event) = events.try_recv() {
-                if let WorkspaceEvent::NotificationFired { title, body, .. } = event {
-                    fired.push((title, body));
-                }
+            let mut tab = self.workspace.tab(row).unwrap();
+            self.workspace.close_tab(row).unwrap();
+            if let Some(owner) = tab.ownership.as_mut() {
+                owner.last_event_at = 0;
             }
-            fired
-        };
+            if let Some(record) = tab
+                .program_status
+                .as_mut()
+                .and_then(|status| status.record.as_mut())
+            {
+                record.updated_at = 0;
+            }
+            tab.id = 0;
+            tab.position = 0;
+            tab.created_at = 0;
+            tab.last_active = 0;
+            (tab, banners)
+        }
 
-        let whole = banners(&[&stream]);
-        assert_eq!(
-            whole,
-            vec![("Pi".to_string(), "Needs your input".to_string())],
-            "the record's banner, and not the OSC 9 it covered"
-        );
-        for cut in 1..stream.len() {
+        /// [`Self::run`] on `stream` whole, then split at every byte: the
+        /// same each time.
+        fn whatever_the_reads(
+            &mut self,
+            stream: &[u8],
+        ) -> (roost_ipc::messages::Tab, Vec<(String, String)>) {
+            let whole = self.run(&[stream]);
+            for cut in 1..stream.len() {
+                assert_eq!(
+                    self.run(&[&stream[..cut], &stream[cut..]]),
+                    whole,
+                    "{:?} split at byte {cut}",
+                    String::from_utf8_lossy(&stream[..stream.len().min(40)])
+                );
+            }
+            whole
+        }
+
+        /// [`Self::whatever_the_reads`], and split at every byte with an
+        /// empty feed between the halves.
+        fn however_split(
+            &mut self,
+            stream: &[u8],
+        ) -> (roost_ipc::messages::Tab, Vec<(String, String)>) {
+            let whole = self.whatever_the_reads(stream);
+            for cut in 0..=stream.len() {
+                assert_eq!(
+                    self.run(&[&stream[..cut], b"", &stream[cut..]]),
+                    whole,
+                    "{:?} split at byte {cut} around an empty feed",
+                    String::from_utf8_lossy(&stream[..stream.len().min(40)])
+                );
+            }
+            whole
+        }
+    }
+
+    impl Drop for InProcessRuns {
+        fn drop(&mut self) {
+            self.supervisor.close(self.key.tab);
+        }
+    }
+
+    fn osc133(body: &[u8]) -> Vec<u8> {
+        let mut bytes = b"\x1b]133;".to_vec();
+        bytes.extend_from_slice(body);
+        bytes.push(0x07);
+        bytes
+    }
+
+    /// Plan 083 B-1, on an in-process tab: each D-B3 row moves the hook
+    /// layer of a tab a hook owner holds, Waiting, as libghostty reads the
+    /// mark, fed whole and split at every byte. `cmdline_url` bodies sit on
+    /// either side of libghostty's 2048-byte OSC buffer, past which the
+    /// whole sequence is dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_osc_133_form_moves_the_hook_layer_as_libghostty_reads_it() {
+        use roost_ipc::agent::{AgentLifecycle as L, ShellState};
+        const OSC_BUFFER: usize = 2048;
+        let prompt = (ShellState::AtPrompt, L::Inactive);
+        let command = (ShellState::ForegroundProcess, L::Waiting);
+        let ignored = (ShellState::Unknown, L::Waiting);
+        let cmdline = |len: usize| {
+            let mut body = b"C;cmdline_url=".to_vec();
+            body.resize(len, b'a');
+            osc133(&body)
+        };
+        let rows = [
+            (osc133(b"A"), prompt),
+            (b"\x1b]133;A;k=i\x1b\\".to_vec(), prompt),
+            (osc133(b"A;redraw=0"), prompt),
+            (osc133(b"P;k=i"), prompt),
+            (osc133(b"N"), prompt),
+            (osc133(b"A;k=s"), ignored),
+            (osc133(b"A;k=r"), ignored),
+            (osc133(b"A;k=c"), ignored),
+            (osc133(b"P;k=s"), ignored),
+            (osc133(b"P;k=r"), ignored),
+            (osc133(b"P;k=c"), ignored),
+            (osc133(b"B"), prompt),
+            (osc133(b"I"), prompt),
+            (osc133(b"C"), command),
+            (osc133(b"C;cmdline_url=ls%20-la"), command),
+            (cmdline(OSC_BUFFER), command),
+            (cmdline(OSC_BUFFER + 1), ignored),
+            (osc133(b"D"), prompt),
+            (b"\x1b]133;D;0\x1b\\".to_vec(), prompt),
+            (osc133(b"D;127"), prompt),
+            (osc133(b"Axyz"), ignored),
+            (osc133(b"Cxyz"), ignored),
+            (osc133(b"D0"), ignored),
+            (osc133(b"L"), ignored),
+            (osc133(b""), ignored),
+            (osc133(b"Z"), ignored),
+            (b"\x1b]133\x07".to_vec(), ignored),
+        ];
+        let mut runs = InProcessRuns::new(true);
+        for (bytes, want) in rows {
+            let (tab, _) = runs.whatever_the_reads(&bytes);
             assert_eq!(
-                banners(&[&stream[..cut], &stream[cut..]]),
-                whole,
-                "split at byte {cut}"
+                (tab.shell_state, tab.agent_lifecycle),
+                want,
+                "{:?} ({} bytes)",
+                String::from_utf8_lossy(&bytes[..bytes.len().min(24)]),
+                bytes.len()
+            );
+            assert!(tab.hook_active, "ownership is kept");
+        }
+    }
+
+    /// #650's scenarios, on an in-process tab: a prompt mark only
+    /// libghostty took (`P;k=i`, `N`) or only roost-osc took (`A;k=s`), in
+    /// the same read as a record change, under a hook owner still Waiting.
+    /// One banner set for every read split.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_third_party_prompt_mark_beside_a_record_banners_the_same_whatever_the_reads() {
+        let announced = vec![("Pi".to_string(), "Needs your input".to_string())];
+        let mut runs = InProcessRuns::new(true);
+        for (mark, banners) in [
+            (osc133(b"P;k=i"), announced.clone()),
+            (osc133(b"N"), announced),
+            (osc133(b"A;k=s"), Vec::new()),
+        ] {
+            let mut stream = mark.clone();
+            stream.extend_from_slice(b"\x1b]7501;state=blocked:app=pi\x1b\\");
+            assert_eq!(
+                runs.whatever_the_reads(&stream).1,
+                banners,
+                "{}",
+                String::from_utf8_lossy(&mark)
             );
         }
+    }
+
+    /// Plan 083 B-4, on an in-process tab: under a hook owner and no
+    /// record, an `OSC 9` and an `OSC 777` before the mark that ends the
+    /// agent's turn are suppressed and the pair after it is not, however
+    /// the bytes were read — between an ST's `ESC` and `\` included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_notifications_around_a_prompt_mark_are_judged_where_they_fall() {
+        let mut runs = InProcessRuns::new(true);
+        for terminator in TERMINATORS {
+            for mark in [&b"A"[..], b"B", b"D;0"] {
+                let mut stream = osc("9;nine before", terminator);
+                stream.extend(osc("777;notify;seven;before", terminator));
+                stream.extend_from_slice(&osc133(mark));
+                stream.extend(osc("9;nine after", terminator));
+                stream.extend(osc("777;notify;seven;after", terminator));
+                let (tab, banners) = runs.however_split(&stream);
+                assert_eq!(
+                    banners,
+                    vec![
+                        ("nine after".to_string(), String::new()),
+                        ("seven".to_string(), "after".to_string()),
+                    ],
+                    "{} ended by {terminator:?}",
+                    String::from_utf8_lossy(mark)
+                );
+                assert_eq!(tab.program_status, None, "no record decided");
+            }
+        }
+    }
+
+    /// The astra review's sequences (plan 083 B1, all three rounds), on an
+    /// in-process tab, each fed whole, split at every byte, and split at
+    /// every byte around an empty feed. Every one turns on where a
+    /// sequence ends: libghostty and roost-osc end it at the same `ESC`,
+    /// whatever follows, so each notification is judged at its own place.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn notifications_ended_at_an_esc_are_judged_where_they_fall() {
+        let st = b"\x1b\\".as_slice();
+        for (hook_owner, stream, banners) in esc_cases(st) {
+            let mut runs = InProcessRuns::new(hook_owner);
+            assert_eq!(
+                runs.however_split(&stream).1,
+                banners,
+                "{:?}",
+                String::from_utf8_lossy(&stream)
+            );
+        }
+    }
+
+    /// The `(title, body)` of each banner a stream raised, in order.
+    type Banners = Vec<(String, String)>;
+
+    /// The review's sequences: (hook owner, bytes, the banners they raise).
+    fn esc_cases(st: &[u8]) -> Vec<(bool, Vec<u8>, Banners)> {
+        let x = || vec![("x".to_string(), String::new())];
+        let working = b"\x1b]7501;state=working:app=pi\x07".as_slice();
+        let a = b"\x1b]133;A\x07".as_slice();
+        // A notification ended by an `ESC [`: a real one, to both parsers.
+        let cut_short = b"\x1b]9;x\x1b[m".as_slice();
+        vec![
+            // Round 1 and 2: an ST-ended notification under a driving agent,
+            // then the mark that ends its turn.
+            (true, [&osc("9;x", st), a].concat(), Vec::new()),
+            (true, [&osc("777;notify;t;b", st), a].concat(), Vec::new()),
+            // The same under a working record and no agent.
+            (false, [working, &osc("9;x", st), a].concat(), Vec::new()),
+            // Round 2: a notification before a working record, then another
+            // with its text under it, in a form only roost-osc accepts (a
+            // title-only OSC 777, an OSC 9 libghostty's CAN cancels) or
+            // one both accept.
+            (
+                false,
+                [cut_short, working, &osc("777;notify;x", st)].concat(),
+                x(),
+            ),
+            (
+                false,
+                [cut_short, working, &osc("9;x\x18", st)].concat(),
+                x(),
+            ),
+            (false, [cut_short, working, &osc("9;x", st)].concat(), x()),
+            // Under a driving agent instead: the first is suppressed, and
+            // the one after the mark that ends the turn is not.
+            (true, [cut_short, a, &osc("777;notify;x", st)].concat(), x()),
+        ]
+        .into_iter()
+        // Round 3: a C0 control or DEL between the `ESC` that ends a
+        // title and the `]` that opens a notification after it, under a
+        // driving agent, then the mark that ends its turn and another.
+        .chain([b'\n', 0x00, b'\t', 0x7f].map(|between| {
+            let first = [&b"\x1b]0;t\x1b"[..], &[between], b"]9;x\x07"].concat();
+            (true, [&first[..], a, b"\x1b]9;x\x07"].concat(), x())
+        }))
+        .collect()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

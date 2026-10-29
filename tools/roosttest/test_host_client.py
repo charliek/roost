@@ -3982,6 +3982,62 @@ def test_a_session_tabs_record_reaches_the_mirror_survives_a_reconnect_and_clear
         )
 
 
+def test_the_mirror_shows_the_sessions_reading_of_a_prompt_mark(host, roost):
+    """Plan 083 B-2: the client runs no hook path for a host tab; its
+    mirror takes the shell axis and lifecycle off the wire, so it shows
+    what the session's sink terminal made of the mark. A secondary prompt
+    (`A;k=s`, which libghostty filters and roost-osc used to read as `A`)
+    leaves a Working owner working; Ghostty's own prompt form (`P;k=i`,
+    which libghostty reads as a prompt start and roost-osc used to ignore)
+    ends its turn. An OSC 0 title in the same feed is the mirror's
+    ordering barrier: once the band shows it, the mark before it has been
+    applied too. Read through the Agents panel, like the record case
+    above."""
+    host.connect_and_wait()
+    with host.client() as session:
+        tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
+        session.agent_report(
+            tab, "claude", "claim", session_id=uuid.uuid4().hex, lifecycle="working"
+        )
+        key = wait_until(
+            lambda: host_tab_key(roost, host.saved_id, tab), 30.0, "the host's band to list the tab"
+        )
+
+        def shown(lifecycle: str):
+            entry = panel_agent(roost, key)
+            if entry is None or entry["dimmed"] or entry["lifecycle"] != lifecycle:
+                return None
+            return entry
+
+        def band_title() -> str | None:
+            band = roost.sidebar_host(host.saved_id) or {"projects": []}
+            return next(
+                (
+                    listed["title"]
+                    for project in band["projects"]
+                    for listed in project["tabs"]
+                    if listed["key"] == key
+                ),
+                None,
+            )
+
+        wait_until(lambda: shown("working"), 30.0, "the owner working on the mirror")
+
+        session.tab_feed_pty_bytes(tab, b"\x1b]133;A;k=s\x07\x1b]0;after-secondary\x07")
+        wait_until(
+            lambda: band_title() == "after-secondary", 30.0, "the barrier title on the mirror"
+        )
+        assert shown("working") is not None, panel_agent(roost, key)
+        assert session.tab(tab)["agent_lifecycle"] == "working", session.tab(tab)
+
+        session.tab_feed_pty_bytes(tab, b"\x1b]133;P;k=i\x07")
+        wait_until(lambda: shown("inactive"), 30.0, "the prompt start to end the turn on the mirror")
+        listed = session.tab(tab)
+        assert (listed["agent_lifecycle"], listed["shell_state"]) == ("inactive", "at_prompt"), (
+            listed
+        )
+
+
 def test_the_probe_is_answered_once_while_a_client_is_attached(host, roost):
     """Only the session's terminal answers `OSC 7501 ; ?` (D4.2): the
     client's hydrated terminal installs no status sink, and a host tab's

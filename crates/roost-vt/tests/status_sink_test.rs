@@ -332,6 +332,72 @@ fn only_a_primary_prompt_start_is_a_mark() {
     );
 }
 
+/// libghostty's OSC parser captures a sequence's data past its number into
+/// a fixed buffer of this many bytes (`Parser.MAX_BUF`, `osc.zig`, at the
+/// pinned SHA), and drops a sequence whose data overflows it.
+const OSC_BUFFER: usize = 2048;
+
+/// Plan 083 D-B3: the OSC 133 bodies libghostty reports, and the ones it
+/// doesn't, as the hook layer now reads them on a sink terminal.
+#[test]
+fn which_osc_133_bodies_are_marks() {
+    use PromptMark::{CommandEnd, InputStart, OutputStart, PromptStart};
+    let cmdline = |len: usize| {
+        let mut body = b"C;cmdline_url=".to_vec();
+        body.resize(len, b'a');
+        body
+    };
+    let rows: Vec<(Vec<u8>, Option<PromptMark>)> = vec![
+        (b"A".to_vec(), Some(PromptStart)),
+        (b"A;k=i".to_vec(), Some(PromptStart)),
+        (b"A;redraw=0".to_vec(), Some(PromptStart)),
+        (b"A;aid=7;k=x".to_vec(), Some(PromptStart)),
+        (b"P".to_vec(), Some(PromptStart)),
+        (b"P;k=i".to_vec(), Some(PromptStart)),
+        (b"N".to_vec(), Some(PromptStart)),
+        (b"A;k=s".to_vec(), None),
+        (b"A;k=r".to_vec(), None),
+        (b"A;k=c".to_vec(), None),
+        (b"P;k=s".to_vec(), None),
+        (b"N;k=r".to_vec(), None),
+        (b"B".to_vec(), Some(InputStart)),
+        (b"I".to_vec(), Some(InputStart)),
+        (b"C".to_vec(), Some(OutputStart)),
+        (b"C;cmdline_url=ls%20-la".to_vec(), Some(OutputStart)),
+        (cmdline(OSC_BUFFER), Some(OutputStart)),
+        (cmdline(OSC_BUFFER + 1), None),
+        (b"D".to_vec(), Some(CommandEnd)),
+        (b"D;0".to_vec(), Some(CommandEnd)),
+        (b"D;127".to_vec(), Some(CommandEnd)),
+        (b"Axyz".to_vec(), None),
+        (b"Cxyz".to_vec(), None),
+        (b"D0".to_vec(), None),
+        (b"L".to_vec(), None),
+        (b"".to_vec(), None),
+        (b"Z".to_vec(), None),
+        ("\u{106}".as_bytes().to_vec(), None),
+    ];
+    let mut term = new_terminal();
+    let sink = install_sink(&mut term);
+    for (body, mark) in rows {
+        let mut bytes = b"\x1b]133;".to_vec();
+        bytes.extend_from_slice(&body);
+        bytes.push(0x07);
+        term.vt_write(&bytes);
+        let shown = String::from_utf8_lossy(&body[..body.len().min(24)]).into_owned();
+        assert_eq!(
+            take(&sink),
+            mark.map(TerminalEvent::Prompt)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "{shown:?} ({} bytes)",
+            body.len()
+        );
+    }
+    term.vt_write(b"\x1b]133\x07");
+    assert!(take(&sink).is_empty(), "a bare 133");
+}
+
 /// The captured Claude turn start: `working, A, working` in one read
 /// must come out in that order, not reports first and marks after.
 #[test]

@@ -199,7 +199,15 @@ terminal from. It shares the socket path but not the framing; see
 exposed — the server always picks a concrete state.
 
 `ShellState` is a JSON string with values: `"unknown"`, `"at_prompt"`,
-`"foreground_process"` — written only by OSC 133 shell marks.
+`"foreground_process"` — written only by OSC 133 shell marks. On a
+session tab and a Roost-Iced in-process tab the marks are read by
+libghostty, from the same ordered stream as
+[`program_status`](#tabprogram_status-osc-7501), so a secondary prompt
+(`133;A;k=s`), a malformed body (`133;Axyz`) or one over libghostty's
+2048-byte OSC buffer writes nothing, while `133;P;k=i`, `133;N` and
+`133;I` count as a prompt; a host tab's mirror carries the session's
+value. The Swift Mac app reads marks with its own scanner, by first
+letter ([which marks count](../guides/agents.md#which-marks-count)).
 `AgentLifecycle` is a JSON string with values: `"inactive"`,
 `"working"`, `"waiting"`, `"finished"`, `"failed"` — written only by
 agent adapters through `tab.agent_report` (below). The two axes are

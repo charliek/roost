@@ -666,15 +666,9 @@ pub fn apply_osc(
             // the check and the commit.
             let (title, body) = parse_notification_payload(command, payload);
             let source = AttentionSource::RawOsc {
-                records_authoritative: authority.claim(tab_id, &title, &body),
+                suppressed_at_place: authority.claim(tab_id, &title, &body),
             };
             let _ = workspace.raise_attention(tab_id, &title, &body, source);
-        }
-        133 => {
-            // OSC 133 prompt/command mark → the shell axis. Never
-            // gated: the shell and agent axes are independent, and
-            // derivation decides which one the tab shows.
-            let _ = workspace.apply_shell_mark(tab_id, payload);
         }
         _ => {
             tracing::debug!(tab_id, command, "ignored OSC");
@@ -757,8 +751,9 @@ pub(crate) fn spawn_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roost_ipc::agent::{AgentLifecycle, OwnershipAction, TabAgentReportParams};
+    use roost_ipc::agent::{AgentLifecycle, OwnershipAction, ShellState, TabAgentReportParams};
     use roost_ipc::messages::TabState;
+    use roost_ipc::program_status::{PromptMark, StatusEvent};
 
     // ---- password_input's owner half (plan 074 §D2) -----------------
 
@@ -976,10 +971,14 @@ mod tests {
         }
 
         // The `D` failsafe re-opens the gate even though ownership
-        // survives as a label.
-        client.apply_osc(tab_id, 133, "D;0", &mut RawOscAuthority::default());
+        // survives as a label. A sink terminal hands it over in the
+        // chunk's program-status batch, ahead of the chunk's OSC actions.
+        let mut authority = client
+            .workspace
+            .apply_program_status(tab_id, vec![StatusEvent::Prompt(PromptMark::CommandEnd)], 0)
+            .unwrap();
         assert!(client.workspace.tab(tab_id).unwrap().hook_active);
-        client.apply_osc(tab_id, 9, "Build done", &mut RawOscAuthority::default());
+        client.apply_osc(tab_id, 9, "Build done", &mut authority);
         assert!(client.workspace.tab(tab_id).unwrap().has_notification);
     }
 
@@ -1000,19 +999,32 @@ mod tests {
         assert!(client.workspace.tab(tab_id).unwrap().has_notification);
     }
 
+    /// Plan 083 D-B2: the shell axis moves through the program-status
+    /// batch, and an OSC action numbered 133 — which no router produces
+    /// any more — moves nothing.
     #[test]
-    fn osc133_writes_the_shell_axis_through_apply_osc() {
+    fn osc133_writes_the_shell_axis_only_through_the_program_status_batch() {
         let (client, tab_id) = client_with_tab();
-        client.apply_osc(tab_id, 133, "C", &mut RawOscAuthority::default());
+        let shell = |client: &LocalClient| {
+            let tab = client.workspace.tab(tab_id).unwrap();
+            (tab.shell_state, tab.state)
+        };
+        let mark = |mark| {
+            client
+                .workspace
+                .apply_program_status(tab_id, vec![StatusEvent::Prompt(mark)], 0)
+                .unwrap();
+        };
+        mark(PromptMark::OutputStart);
         assert_eq!(
-            client.workspace.tab(tab_id).unwrap().state,
-            TabState::Running
+            shell(&client),
+            (ShellState::ForegroundProcess, TabState::Running)
         );
-        client.apply_osc(tab_id, 133, "D;0", &mut RawOscAuthority::default());
-        assert_eq!(client.workspace.tab(tab_id).unwrap().state, TabState::None);
-        // Undefined mark bodies are no-change.
-        client.apply_osc(tab_id, 133, "Z", &mut RawOscAuthority::default());
-        assert_eq!(client.workspace.tab(tab_id).unwrap().state, TabState::None);
+        mark(PromptMark::CommandEnd);
+        assert_eq!(shell(&client), (ShellState::AtPrompt, TabState::None));
+
+        client.apply_osc(tab_id, 133, "C", &mut RawOscAuthority::default());
+        assert_eq!(shell(&client), (ShellState::AtPrompt, TabState::None));
     }
 
     #[test]
