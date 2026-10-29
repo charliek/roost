@@ -498,6 +498,39 @@ turn shows blocked with its message, then done.
 
 ### M2. G1: the Linux session socket under the home directory
 
+**Status: merged: #653** (plan 083; #651, the one-OSC-133-parser fix
+for #650, shipped beside it).
+
+*How it shipped (plan 083 corrections to this section):*
+- **No `roostctl session restart` exists.** The restart flow is the iced
+  UI's Restart from its `needs-restart` prompt (reason "old socket
+  path"), plus a new explicit `roostctl session stop --old-path
+  <socket>`. Nothing stops an old-path session on its own.
+- **The old-path probe fails closed.** It never runs under
+  `ROOST_SESSION_SOCKET_DIR` or `ROOST_TEST_MODE`, or on a debug build
+  using the release names. The exception is the single scratch
+  candidate a debug build names with `ROOST_TEST_OLD_SESSION_DIR`.
+  `roost-session start` refuses while an old-path session answers,
+  before taking the locks.
+- **The bridge fallback is a restricted proxy.** It forwards only
+  `session.identify` and `session.stop`, decoded as the session's own
+  envelope, so it can't attach to an old-path daemon. An older laptop
+  that reaches an older daemon through a newer remote `roost-session`
+  is refused past identify. So upgrade the laptop together with the
+  remote.
+- **The override is honoured on macOS too** (the harness needs it), and
+  it names the socket directory itself.
+- **`<ns>` and `run/` are checked one level at a time**, through
+  directory fds. `<ns>` must be owned and not group/world-writable,
+  since it is also the log dir. `run/` must be exactly 0700.
+- **The home's ancestors (`~/.local`, `~/.local/state`) are the user's
+  own**, so they aren't checked.
+- **A non-UTF-8 socket path is refused**, as is one over 107 bytes on
+  Linux or 103 on macOS.
+- **The uploads fallback stays in `/tmp/<ns>-<uid>/files`.**
+- **`e2e-old-session` is local only.** Its pinned releases must predate
+  M2. #652 retires the probe and the bridge fallback one release later.
+
 #### The path
 
 On Linux, the session socket path is resolved as follows:
