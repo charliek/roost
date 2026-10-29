@@ -246,9 +246,19 @@ fail_with_log() {
   die "$*"
 }
 
+# Set only once this script has made it; cleanup never acts on a value it
+# merely inherited.
+session_dir=""
 cleanup() {
   if [ -n "${UI_PID}" ]; then
     terminate "${UI_PID}" "${EXIT_TICKS}" --group || true
+  fi
+  # A session the upgraded UI spawned daemonized out of its process group,
+  # so the kill above never reached it. A socket in this directory exists
+  # only once the new build has run, so the installed roostctl is that
+  # build by then, and honours the override.
+  if [ -n "${session_dir}" ] && [ -S "${session_dir}/roost.sock" ] && [ -x "${ROOSTCTL:-}" ]; then
+    ROOST_SESSION_SOCKET_DIR="${session_dir}" "${ROOSTCTL}" session stop >/dev/null 2>&1 || true
   fi
   if [ -n "${DBUS_SESSION_BUS_PID}" ]; then
     kill -TERM "${DBUS_SESSION_BUS_PID}" 2>/dev/null || true
@@ -274,14 +284,23 @@ trap cleanup EXIT
 # other three are inherited when this is run from inside a Roost tab, and
 # would silently point the CLI (or state.json) at the developer's own live
 # session instead of the sandbox.
-unset ROOST_BUNDLE_PROFILE ROOST_SOCKET ROOST_TAB_ID ROOST_STATE_DIR
+#
+# The session socket is isolated by ROOST_SESSION_SOCKET_DIR, not by
+# XDG_RUNTIME_DIR, so any session the upgraded UI reaches gets one of its own
+# too — even in the disposable container this is meant to run in.
+unset ROOST_BUNDLE_PROFILE ROOST_SOCKET ROOST_TAB_ID ROOST_STATE_DIR \
+  ROOST_TEST_PASSWD_HOME ROOST_TEST_OLD_SESSION_DIR
 export XDG_RUNTIME_DIR="${work}/runtime"
 export XDG_STATE_HOME="${work}/state"
 export XDG_DATA_HOME="${work}/data"
 export XDG_CONFIG_HOME="${work}/config"
-rm -rf "${XDG_RUNTIME_DIR}" "${XDG_STATE_HOME}" "${XDG_DATA_HOME}" "${XDG_CONFIG_HOME}"
-mkdir -p "${XDG_RUNTIME_DIR}" "${XDG_STATE_HOME}" "${XDG_DATA_HOME}" "${XDG_CONFIG_HOME}"
-chmod 700 "${XDG_RUNTIME_DIR}"
+session_dir="${work}/session"
+export ROOST_SESSION_SOCKET_DIR="${session_dir}"
+rm -rf "${XDG_RUNTIME_DIR}" "${XDG_STATE_HOME}" "${XDG_DATA_HOME}" "${XDG_CONFIG_HOME}" \
+  "${session_dir}"
+mkdir -p "${XDG_RUNTIME_DIR}" "${XDG_STATE_HOME}" "${XDG_DATA_HOME}" "${XDG_CONFIG_HOME}" \
+  "${session_dir}"
+chmod 700 "${XDG_RUNTIME_DIR}" "${session_dir}"
 
 # One persistent display for the whole run, rather than xvfb-run per launch:
 # the WM_CLASS check needs a display that outlives a single UI process, and

@@ -33,10 +33,9 @@ A binary the bootstrap job *starts* inside the jail is a real
 `roost-session` daemon — `roost-session identify`/`start`/`client-bridge`
 answer for real, and a project + a tab come up for real
 (`roost-session/src/hydrate.rs`'s first-ever-start seed). Its socket is
-computed the same way `paths.rs` computes one from a bare `$HOME` (no
-`XDG_*`, because `run-remote`'s `env -i` only ever hands the remote four
-names): `~/Library/Caches/RoostSessionDev/roost.sock` on macOS,
-`/tmp/roost-session-dev-<uid>/roost.sock` on Linux. Reading a jailed
+the jail's own `ROOST_SESSION_SOCKET_DIR`, which `run-remote`'s `env -i`
+hands the remote beside its four names, so no scenario's session can
+answer for another's or reach this machine's own. Reading a jailed
 tab's content is therefore done the way `test_host_ssh.py` does it too —
 a direct connection to the session's own socket — but *writing* to one
 uses a real shell's real `echo` rather than `tab.feed_pty_bytes`,
@@ -259,6 +258,9 @@ class BootstrapJail:
         self.home = self.fs_root / "home" / "fixture"
         #: The far side's entire `$PATH`.
         self.stub_bin = self.root / "stub-bin"
+        #: The far side's `ROOST_SESSION_SOCKET_DIR`: every session either
+        #: side starts or dials over there lives in this jail.
+        self.session_socket_dir = sessionlib.socket_dir(self.root)
         for directory in (self.fs_root, self.home, self.stub_bin):
             directory.mkdir(parents=True, exist_ok=True)
         if platform.system() == "Darwin":
@@ -335,7 +337,8 @@ class BootstrapJail:
             f"PATH={sh_quote(str(self.stub_bin))}",
             "USER=fixture",
             f"ROOST_BOOTSTRAP_FS_ROOT={sh_quote(str(self.fs_root))}",
-            "export HOME PATH USER ROOST_BOOTSTRAP_FS_ROOT",
+            f"{sessionlib.SESSION_SOCKET_DIR_ENV}={sh_quote(str(self.session_socket_dir))}",
+            f"export HOME PATH USER ROOST_BOOTSTRAP_FS_ROOT {sessionlib.SESSION_SOCKET_DIR_ENV}",
         ]
         test_mode = os.environ.get("ROOST_TEST_MODE")
         if test_mode is not None:
@@ -363,6 +366,7 @@ class BootstrapJail:
             "PATH": str(self.stub_bin),
             "USER": "fixture",
             "ROOST_BOOTSTRAP_FS_ROOT": str(self.fs_root),
+            sessionlib.SESSION_SOCKET_DIR_ENV: str(self.session_socket_dir),
         }
         test_mode = os.environ.get("ROOST_TEST_MODE")
         if test_mode is not None:
@@ -371,24 +375,13 @@ class BootstrapJail:
         return env
 
     def socket(self) -> Path:
-        """Where a `roost-session` daemon started under `daemon_env()`
-        binds, replicating `paths.rs`'s bare-`$HOME` default (no
-        `XDG_*`) the same way `session.py`'s `_dir_names`/`_is_debug_build`
-        already do for `make_env()`'s fuller environment.
-
-        **On Linux this path is outside the jail and shared.**
-        `paths.rs`'s Linux fallback is `/tmp/<namespace>-<uid>/roost.sock`
-        — no `$HOME` in it — so every scenario in this module, and the
-        X11 and Wayland steps of the same CI job, compute the *same*
-        socket. That is why [`stop_session`] is run on the way in as
-        well as on the way out: a daemon left holding it would make the
-        next scenario's "it connected" vacuous.
+        """Where a `roost-session` daemon started under `daemon_env()`, or
+        over `run-remote` under `session_env_text()`, binds: the jail's
+        own `ROOST_SESSION_SOCKET_DIR`, on every platform. Each scenario
+        gets its own, so nothing one leaves can answer for the next —
+        [`stop_session`] still runs on the way in, as the cheap proof.
         """
-        debug = sessionlib._is_debug_build(sessionlib.session_binary())
-        label, namespace = sessionlib._dir_names(debug)
-        if platform.system() == "Darwin":
-            return self.home / "Library" / "Caches" / label / "roost.sock"
-        return Path(f"/tmp/{namespace}-{os.getuid()}") / "roost.sock"
+        return self.session_socket_dir / "roost.sock"
 
     def stop_session(self, timeout: float = 30.0) -> None:
         """Stop whatever is serving on this jail's socket, and **wait for

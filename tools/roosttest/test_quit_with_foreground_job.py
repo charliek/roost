@@ -113,6 +113,8 @@ def test_one_sigterm_ends_the_ui_and_its_foreground_job(
     dirs = {name: tmp_path / name for name in ("data", "state", "cache", "state-dir")}
     for path in dirs.values():
         path.mkdir()
+    # Private, though an in-process UI reaches no session through it.
+    dirs["session-socket"] = short_root / "sock"
 
     marker_value = uuid.uuid4().hex
     marker = f"{MARKER_ENV}={marker_value}".encode()
@@ -128,6 +130,7 @@ def test_one_sigterm_ends_the_ui_and_its_foreground_job(
             "XDG_DATA_HOME": str(dirs["data"]),
             "XDG_STATE_HOME": str(dirs["state"]),
             "XDG_CACHE_HOME": str(dirs["cache"]),
+            ui.SESSION_SOCKET_DIR_ENV: str(dirs["session-socket"]),
             "SHELL": "/bin/sh",
             "RUST_LOG": "info",
             MARKER_ENV: marker_value,

@@ -1,7 +1,8 @@
 //! The hints a launcher hands the `roost-session` it spawns — the state
 //! dir ([#397](https://github.com/charliek/roost/issues/397)) and the
-//! no-seed flag (plan 063 §D8 phase 1) — driven over a real child
-//! process.
+//! no-seed flag (plan 063 §D8 phase 1) — and the one it must hand on
+//! untouched, the session socket directory (plan 083 D-A1), driven over
+//! a real child process.
 //!
 //! # Why these live in their own binary, and must stay there
 //!
@@ -65,8 +66,11 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use roost_ipc::paths::STATE_DIR_ENV;
-use roost_ipc::session_launch::{spawn_and_read_verdict, FirstProject, Verdict, BIN_NAME};
+use roost_ipc::paths::{SESSION_SOCKET_DIR_ENV, STATE_DIR_ENV};
+use roost_ipc::session_launch::{
+    spawn_and_read_verdict, spawn_and_read_verdict_capturing_stderr, FirstProject, Verdict,
+    BIN_NAME,
+};
 
 /// Generous on purpose: the stand-in prints and exits at once, so
 /// nothing here waits on the clock — the budget only bounds a hang, and
@@ -247,5 +251,85 @@ async fn a_seam_the_resolver_ignores_sets_nothing_on_the_child() {
     for raw in ["", "relative/state"] {
         let (_dir, seen) = state_dir_handed_to(Some(OsStr::new(raw))).await;
         assert_eq!(seen, ambient_state_dir(), "{raw:?}");
+    }
+}
+
+/// The stand-in's record of `ROOST_SESSION_SOCKET_DIR`, spawned through
+/// `roostctl session start`'s entry point or, with `capture_stderr`, the
+/// UI connect ladder's — the two launchers every local spawn (`roostctl`,
+/// the UI's local backend, a `localhost` restart) goes through.
+async fn socket_dir_handed_to(capture_stderr: bool) -> (tempfile::TempDir, OsString) {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bin = dir.path().join(BIN_NAME);
+    std::fs::write(
+        bin.with_extension("conf"),
+        format!(
+            "printf '%s' \"${{{SESSION_SOCKET_DIR_ENV}-UNSET}}\" > \"$ROOST_SESSION_LAUNCH_CWD/seen\"\n\
+             echo 'ready pid=4321'\n"
+        ),
+    )
+    .expect("write the stand-in's body");
+    std::os::unix::fs::symlink(fixture_path(), &bin).expect("link the stand-in session");
+
+    let verdict = if capture_stderr {
+        spawn_and_read_verdict_capturing_stderr(
+            &bin,
+            dir.path(),
+            None,
+            FirstProject::Seed,
+            SEAM_BUDGET,
+        )
+        .await
+    } else {
+        spawn_and_read_verdict(&bin, dir.path(), None, FirstProject::Seed, SEAM_BUDGET).await
+    };
+    assert_eq!(
+        verdict.expect("the stand-in reports a verdict"),
+        Verdict::Ready(4321)
+    );
+
+    let seen =
+        std::fs::read(dir.path().join("seen")).expect("the stand-in records what it was handed");
+    (dir, OsString::from_vec(seen))
+}
+
+/// Sets `ROOST_SESSION_SOCKET_DIR` on *this* process for its lifetime and
+/// puts back whatever was there (the gate exports one of its own). The
+/// only case in this binary that reads or writes it.
+struct SocketDirVar(Option<OsString>);
+
+impl SocketDirVar {
+    fn set(value: &str) -> Self {
+        let previous = std::env::var_os(SESSION_SOCKET_DIR_ENV);
+        std::env::set_var(SESSION_SOCKET_DIR_ENV, value);
+        Self(previous)
+    }
+}
+
+impl Drop for SocketDirVar {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(previous) => std::env::set_var(SESSION_SOCKET_DIR_ENV, previous),
+            None => std::env::remove_var(SESSION_SOCKET_DIR_ENV),
+        }
+    }
+}
+
+/// **Inherited, byte for byte.** Unlike `ROOST_STATE_DIR` there is
+/// nothing to derive: a session spawned under the override has to bind
+/// exactly the socket its launcher, and every client beside it, will
+/// dial.
+#[tokio::test]
+async fn the_session_socket_dir_reaches_a_spawned_session_unchanged() {
+    let _inherited = SocketDirVar::set("/tmp/roost-ss-inherited");
+    for capture_stderr in [false, true] {
+        let (_dir, seen) = socket_dir_handed_to(capture_stderr).await;
+        assert_eq!(
+            seen,
+            OsString::from("/tmp/roost-ss-inherited"),
+            "capture_stderr={capture_stderr}"
+        );
     }
 }

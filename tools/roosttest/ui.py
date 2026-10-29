@@ -7,6 +7,7 @@ the explicit capability table below instead of two-target conditionals.
 
 from __future__ import annotations
 
+import atexit
 import fcntl
 import os
 import platform
@@ -88,12 +89,25 @@ ICED_BUNDLE_APP_ID = "ai.stridelabs.Roost.iced"
 # `mac/Sources/Roost/App.swift` — both share this wording).
 _STATE_LOCK_REFUSAL = "is using this state directory"
 
+# MIRRORS `roost_ipc::paths::{SESSION_SOCKET_DIR_ENV, TEST_PASSWD_HOME_ENV,
+# TEST_OLD_SESSION_DIR_ENV}`, frozen on the Rust side by
+# `paths::tests::the_session_socket_env_names_are_frozen`. The first names a
+# session socket's directory; the other two are debug-only test knobs. A
+# test-mode process that would resolve the default session socket with none
+# of them is refused by the product itself, so every process this harness
+# starts carries the harness's own choice — see `claim_session_isolation`.
+SESSION_SOCKET_DIR_ENV = "ROOST_SESSION_SOCKET_DIR"
+TEST_PASSWD_HOME_ENV = "ROOST_TEST_PASSWD_HOME"
+TEST_OLD_SESSION_DIR_ENV = "ROOST_TEST_OLD_SESSION_DIR"
+SESSION_ISOLATION_ENV = (SESSION_SOCKET_DIR_ENV, TEST_PASSWD_HOME_ENV, TEST_OLD_SESSION_DIR_ENV)
+
 # Env vars to strip from a harness-launched Rust UI's inherited environment.
 # These are either per-tab values Roost injects itself (a stale inherited
 # value would leak into every tab — `pty.rs` keeps a pre-set
 # ROOST_SHELL_FEATURES instead of injecting the default) or selectors the
-# harness sets explicitly (config/profile/state). Keeps a UI launched from
-# inside a Roost tab, or from a shell with these exported, hermetic.
+# harness sets explicitly (config/profile/state/session socket). Keeps a UI
+# launched from inside a Roost tab, or from a shell with these exported,
+# hermetic.
 _UI_ENV_SANITIZE = (
     "ROOST_SHELL_FEATURES",
     "ROOST_SHELL_INTEGRATION",
@@ -104,6 +118,7 @@ _UI_ENV_SANITIZE = (
     "ROOST_STATE_DIR",
     "ROOST_CONFIG",
     "ROOST_TEST_SESSION_DIR_NAMES",
+    *SESSION_ISOLATION_ENV,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -174,6 +189,38 @@ def _clear_mac_test_defaults() -> None:
         stderr=subprocess.DEVNULL,
         check=False,
     )
+
+
+def claim_session_isolation() -> tuple[Path, str | None]:
+    """Give this harness process a session socket directory of its own, and
+    with it every UI, `roostctl` and session it starts.
+
+    Whatever the process inherited is dropped first — the gate's, CI's, or a
+    developer's own `ROOST_SESSION_SOCKET_DIR` must not decide where this
+    run's sessions live, and a stray passwd-home or old-session knob would
+    let a test-mode process past the product's guard. Called once, by
+    `conftest.py` at import, so before any test module: a module that lends
+    a session root re-exports its own directory afterwards
+    (`session.socket_dir`), and the old-session lane trades the override for
+    a scratch passwd home. Returns the directory and the value it replaced.
+    """
+    inherited = os.environ.get(SESSION_SOCKET_DIR_ENV)
+    for name in SESSION_ISOLATION_ENV:
+        os.environ.pop(name, None)
+    # `/tmp` and resolved: short for `sun_path`, and `validate_runtime_dir`
+    # refuses a socket directory with a symlinked component.
+    owned = Path(tempfile.mkdtemp(prefix="roost-ss-", dir="/tmp")).resolve()
+    atexit.register(shutil.rmtree, owned, ignore_errors=True)
+    os.environ[SESSION_SOCKET_DIR_ENV] = str(owned)
+    return owned, inherited
+
+
+def session_isolation_env() -> dict[str, str]:
+    """The session isolation a UI launch carries: this process's own, as
+    `claim_session_isolation` and the modules after it left it. Launch
+    builders strip the three names (`_UI_ENV_SANITIZE`) and set them from
+    here."""
+    return {name: os.environ[name] for name in SESSION_ISOLATION_ENV if name in os.environ}
 
 
 def needs_shared_ui(marker_sets) -> bool:
@@ -1077,6 +1124,7 @@ def launch(
         }
         for leaked in _UI_ENV_SANITIZE:
             env.pop(leaked, None)
+        env.update(session_isolation_env())
         env["ROOST_BUNDLE_PROFILE"] = spec.profile
         env["ROOST_CONFIG"] = str(_session_config_path() if state_dir is not None else SEED_CONFIG)
         if state_dir is not None:
@@ -1182,13 +1230,16 @@ def _launch_iced_bundle(app: Path, *, state_dir: Path | None = None) -> None:
     # import, before this launch): the UI reads it once per tunnel, out of
     # its own environment, so a bundle that did not receive it would exec
     # the real `ssh`. The bare-binary launch above inherits it via
-    # `**os.environ` and needs no entry.
+    # `**os.environ` and needs no entry. `ROOST_SESSION_SOCKET_DIR` is the
+    # harness's own (`claim_session_isolation`): without it a test-mode
+    # bundle on a session backend is refused its session socket.
     for name in (
         "ROOST_TEST_MODE",
         "ROOST_TEST_TIMEOUT_SCALE",
         "ICED_BACKEND",
         "ROOST_SPARKLE_FEED_URL",
         "ROOST_SSH_BIN",
+        SESSION_SOCKET_DIR_ENV,
     ):
         _forward_env(argv, name)
     # RUST_LOG is forwarded with a floor (see `_floor_roost_iced_info`):

@@ -218,6 +218,7 @@ def _session_backend_ui(target: str):
         "XDG_DATA_HOME": str(root / "data"),
         "XDG_STATE_HOME": str(root / "state"),
         "XDG_CACHE_HOME": str(root / "cache"),
+        sessionlib.SESSION_SOCKET_DIR_ENV: str(sessionlib.socket_dir(root)),
         "ROOST_SESSION_BIN": str(sessionlib.session_binary()),
     }
     saved = {key: os.environ.get(key) for key in private}

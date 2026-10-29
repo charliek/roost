@@ -379,6 +379,13 @@ class BundlePidVerificationTests(unittest.TestCase):
         argv = self._launch_argv_with_env({})
         self.assertFalse(any(a.startswith("RUST_LOG=") for a in argv))
 
+    def test_the_harness_session_socket_dir_reaches_the_bundle(self) -> None:
+        """`open` drops the caller's environment, so a bundle that missed
+        the harness's own session socket dir would be refused its session
+        socket under test mode."""
+        argv = self._launch_argv_with_env({ui.SESSION_SOCKET_DIR_ENV: "/tmp/roost-ss-x"})
+        self.assertIn(f"{ui.SESSION_SOCKET_DIR_ENV}=/tmp/roost-ss-x", argv)
+
     def test_executable_outside_the_bundle_refuses_to_adopt_the_pid(self) -> None:
         """Same executable *name* as the bundle, but not living inside it —
         e.g. a `Roost-Iced` on $PATH from an unrelated build. Must not be

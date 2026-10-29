@@ -1360,8 +1360,8 @@ def test_roostctl_tab_prompt_submits_and_waits_for_the_turn(env):
 # ---------------------------------------------------------------------------
 #
 # `env.roostctl(...)` already runs against `env.command_env()` — the
-# jailed `HOME` / `XDG_RUNTIME_DIR` this env's daemon itself resolved its
-# socket from (`session.py`'s `make_env`). `--target session` reads that
+# jailed `HOME` / `ROOST_SESSION_SOCKET_DIR` this env's daemon itself
+# resolved its socket from (`session.py`'s `make_env`). `--target session` reads that
 # same environment to resolve `BundleProfile::session()`'s socket path,
 # so a call through it lands on exactly the daemon `started()` brought
 # up, with no `--socket` in sight — that convergence is what each case

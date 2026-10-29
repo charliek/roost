@@ -90,6 +90,15 @@ os.environ["XDG_RUNTIME_DIR"] = str(_RUN)
 os.environ["XDG_DATA_HOME"] = str(_ROOT / "data")
 os.environ["XDG_STATE_HOME"] = str(_ROOT / "state")
 os.environ["XDG_CACHE_HOME"] = str(_ROOT / "cache")
+# A released session predates `ROOST_SESSION_SOCKET_DIR` and binds under
+# the private `XDG_RUNTIME_DIR` above, so today's UI, the session its
+# restart spawns and `roostctl` resolve that same default path: no
+# override, and a scratch passwd home, which is what lets a test-mode
+# debug build reach the default at all (`roost_ipc::paths`).
+_PASSWD_HOME = _ROOT / "passwd-home"
+_PASSWD_HOME.mkdir()
+os.environ.pop(sessionlib.SESSION_SOCKET_DIR_ENV, None)
+os.environ[sessionlib.TEST_PASSWD_HOME_ENV] = str(_PASSWD_HOME)
 # The shell the restart's session reopens every tab with, as on the old
 # side (`make_env`): nothing may rewrite the titles and cwds compared.
 os.environ["SHELL"] = "/bin/sh"
@@ -390,6 +399,7 @@ class Worlds:
             state_dir=state_dir / ui.DERIVED_SESSION_SUBDIR,
             binary=release.binary,
             dir_names=DIR_NAMES,
+            honours_socket_dir=False,
         )
         assert env.namespace == "roost-session", env.namespace
         assert env.answering() is None, f"something already answers {env.socket}"

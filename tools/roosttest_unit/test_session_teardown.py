@@ -24,6 +24,7 @@ ROOSTTEST_DIR = Path(__file__).resolve().parents[1] / "roosttest"
 sys.path.insert(0, str(ROOSTTEST_DIR))
 
 import session as sessionlib  # noqa: E402
+import ui  # noqa: E402
 
 
 def _fake_session_binary(root: Path) -> Path:
@@ -45,6 +46,11 @@ class TeardownTests(unittest.TestCase):
         patched = mock.patch.dict(os.environ, {"ROOST_SESSION_BIN": str(binary)})
         patched.start()
         self.addCleanup(patched.stop)
+        # A lent root must agree with any override its lender exported, and
+        # these roots are lent by nobody: an inherited value is the outer
+        # shell's, not a lender's.
+        for name in ui.SESSION_ISOLATION_ENV:
+            os.environ.pop(name, None)
 
     def _tracked_process(self, env: sessionlib.SessionEnv) -> subprocess.Popen:
         proc = env.track_proc(subprocess.Popen(["sleep", "120"]))
@@ -71,6 +77,7 @@ class TeardownTests(unittest.TestCase):
 
         # What the daemon would have made, had one run.
         ours = [
+            sessionlib.socket_dir(root),
             root / "run" / env.namespace,
             root / "data" / env.namespace,
             root / "state" / env.namespace,

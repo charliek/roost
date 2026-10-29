@@ -103,6 +103,9 @@ class Jail:
         self.record = self.home / ".config/roost/agent-hooks.json"
         self.state_dir = self.root / "state"
         self.runtime_dir = self.root / "run"
+        # Created by whatever session binds it, as `$XDG_RUNTIME_DIR/<ns>`
+        # would be.
+        self.session_socket_dir = self.root / "sock"
         self.agent_dirs = {name: self.root / "agents" / name for name in AGENT_CONFIG_DIR_ENV}
         # Distinct log file per launch, so a relaunch's boot output does
         # not overwrite the evidence of the launch before it.
@@ -177,9 +180,9 @@ class Jail:
 
 def jailed_ui_env(jail: Jail, *, force: bool = True, extra: "dict | None" = None) -> dict:
     """The environment a jailed UI launch gets: the agent jail, XDG dirs
-    inside it (so the socket, the log and the caches land there too), and
-    the two variables that let the install engine run under
-    `ROOST_TEST_MODE`.
+    and a session socket dir inside it (so the socket, the log, the caches
+    and any session it reaches land there too), and the two variables that
+    let the install engine run under `ROOST_TEST_MODE`.
 
     `force=False` drops `ROOST_AGENT_HOOKS_FORCE`, leaving the harness
     fence in force — the shape every OTHER lane in this suite runs in,
@@ -203,6 +206,7 @@ def jailed_ui_env(jail: Jail, *, force: bool = True, extra: "dict | None" = None
             "XDG_DATA_HOME": str(jail.home / ".local/share"),
             "XDG_STATE_HOME": str(jail.home / ".local/state"),
             "XDG_CACHE_HOME": str(jail.home / ".cache"),
+            ui.SESSION_SOCKET_DIR_ENV: str(jail.session_socket_dir),
             "ROOST_BUNDLE_PROFILE": ui.TARGET_SPECS["iced"].profile,
             "ROOST_CONFIG": str(jail.config),
             "ROOST_STATE_DIR": str(jail.state_dir),

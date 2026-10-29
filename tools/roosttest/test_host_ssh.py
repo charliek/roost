@@ -32,8 +32,9 @@ cross a network, which is the one part of the chain a test cannot own.
   without relaunching anything.
 * **`FAKE_SSH_SESSION_ENV`** is how the far side finds *this test's*
   session. The bridge child inherits the UI's environment, whose `HOME`
-  (and `XDG_RUNTIME_DIR`) belong to the developer — so without an
-  override every bridge would dial the developer's own session socket.
+  belongs to the developer and whose `ROOST_SESSION_SOCKET_DIR` is the
+  harness run's, not this test's — so without an override every bridge
+  would dial some other session's socket.
   The file this module writes reproduces `session.make_env`'s
   derivations, and unsets the profile selectors the UI carries, so
   `BundleProfile::session()` on the far side resolves the throwaway
@@ -134,6 +135,7 @@ FAKE_SSH_LOG = _RUN_ROOT / "invocations.log"
 _SESSION_ENV_KEYS = (
     "HOME",
     "SHELL",
+    sessionlib.SESSION_SOCKET_DIR_ENV,
     "XDG_RUNTIME_DIR",
     "XDG_DATA_HOME",
     "XDG_STATE_HOME",
@@ -153,6 +155,8 @@ _SESSION_ENV_UNSET = (
     "ROOST_SOCKET",
     "ROOST_TAB_ID",
     "XDG_CONFIG_HOME",
+    sessionlib.TEST_PASSWD_HOME_ENV,
+    sessionlib.TEST_OLD_SESSION_DIR_ENV,
 )
 
 # The classified copy each failure mode must produce

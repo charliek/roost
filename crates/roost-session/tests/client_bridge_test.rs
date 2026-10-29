@@ -13,46 +13,28 @@
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
+use roost_ipc::paths::{SESSION_SOCKET_DIR_ENV, TEST_OLD_SESSION_DIR_ENV, TEST_PASSWD_HOME_ENV};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-/// The socket `BundleProfile::session()` resolves to when the child's
-/// environment is rooted at `root`. A deliberate mirror of
-/// `roost_ipc::paths` for the one profile this lane drives — the
-/// resolver itself is pinned by that crate's own golden tests, and the
-/// alternative here is mutating process-global env that every other test
-/// in this binary also reads.
+/// The socket `BundleProfile::session()` resolves to when the child is
+/// handed `root` as its `ROOST_SESSION_SOCKET_DIR` — on every platform,
+/// since the override names the socket's directory itself.
 fn session_socket_path(root: &Path) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        let label = if cfg!(debug_assertions) {
-            "RoostSessionDev"
-        } else {
-            "RoostSession"
-        };
-        root.join("Library/Caches").join(label).join("roost.sock")
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let namespace = if cfg!(debug_assertions) {
-            "roost-session-dev"
-        } else {
-            "roost-session"
-        };
-        root.join(namespace).join("roost.sock")
-    }
+    root.join("roost.sock")
 }
 
-/// Point a child's path resolution at `root`: HOME on macOS,
-/// `XDG_RUNTIME_DIR` on Linux — the inputs each platform's resolver
-/// reads for the socket.
+/// Point a child's session socket at `root`, under `ROOST_TEST_MODE=1`:
+/// a fixture that lost its override then fails closed on the product's
+/// own guard instead of dialing this user's real session socket.
 fn root_env(command: &mut Command, root: &Path) {
-    #[cfg(target_os = "macos")]
-    command.env("HOME", root);
-    #[cfg(not(target_os = "macos"))]
-    command.env("XDG_RUNTIME_DIR", root);
+    command
+        .env(SESSION_SOCKET_DIR_ENV, root)
+        .env("ROOST_TEST_MODE", "1")
+        .env_remove(TEST_PASSWD_HOME_ENV)
+        .env_remove(TEST_OLD_SESSION_DIR_ENV);
 }
 
 /// A root under `/tmp` rather than `$TMPDIR`: macOS hands out deep
@@ -96,8 +78,6 @@ impl Fixture {
     fn start() -> Self {
         let root = root_dir();
         let socket_path = session_socket_path(root.path());
-        std::fs::create_dir_all(socket_path.parent().expect("socket dir"))
-            .expect("create the socket dir");
         let listener = UnixListener::bind(&socket_path).expect("bind the fake session");
         let mut child = spawn_bridge(root.path());
         let stdin = child.stdin.take().expect("child stdin");

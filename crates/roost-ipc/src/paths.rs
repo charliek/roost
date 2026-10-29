@@ -36,8 +36,17 @@
 //! they would be one file, and the second `flock` would contend with
 //! the first — `flock` is per-open-file-description, so a process
 //! would refuse to start against itself.
+//!
+//! # The session socket's own knobs
+//!
+//! The session profile alone answers to [`SESSION_SOCKET_DIR_ENV`] and
+//! to two debug-only test knobs, [`TEST_PASSWD_HOME_ENV`] and
+//! [`TEST_OLD_SESSION_DIR_ENV`], and it refuses a test-shaped process
+//! the default socket path (see `session_socket`). The frozen Swift
+//! mirror (`BundleProfile.swift`) honours none of them.
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 #[cfg(not(target_os = "macos"))]
 use anyhow::Context;
@@ -114,6 +123,159 @@ fn build_session_dir_names() -> (&'static str, &'static str) {
         cfg!(debug_assertions),
         std::env::var(SESSION_DIR_NAMES_ENV).ok().as_deref(),
     )
+}
+
+/// Names the session profile's socket **directory** itself: the socket is
+/// `<dir>/roost.sock` and its lock `<dir>/roost.lock`, with no namespace
+/// appended, so a debug and a release process handed one value share one
+/// socket and one lock — the caller owns that isolation. Empty is unset;
+/// a relative value is an error. Honoured on every platform, and by the
+/// session profile only.
+///
+/// A cross-process contract like [`STATE_DIR_ENV`]: a launcher's spawned
+/// session inherits it unchanged, and the test harness sets it on every
+/// process that can reach a session. Frozen by a test.
+pub const SESSION_SOCKET_DIR_ENV: &str = "ROOST_SESSION_SOCKET_DIR";
+
+/// Test-only, and honoured by **debug** builds only, exactly like
+/// [`SESSION_DIR_NAMES_ENV`]: an absolute directory standing in for this
+/// user's passwd home. It moves no path; what it does is let a
+/// test-shaped process resolve the session socket's default path at all
+/// (see `session_socket`). Frozen by a test.
+pub const TEST_PASSWD_HOME_ENV: &str = "ROOST_TEST_PASSWD_HOME";
+
+/// Test-only, debug builds only: the one absolute directory whose
+/// `roost.sock` a debug build may probe for a session on an old path,
+/// instead of any real candidate. Frozen by a test.
+pub const TEST_OLD_SESSION_DIR_ENV: &str = "ROOST_TEST_OLD_SESSION_DIR";
+
+/// [`SESSION_SOCKET_DIR_ENV`]'s rule. Silent for unset and empty, like
+/// `ROOST_STATE_DIR` and the XDG dirs; loud for a relative value, which
+/// would otherwise bind a session socket against the process CWD.
+fn session_socket_dir(raw: Option<&OsStr>) -> anyhow::Result<Option<PathBuf>> {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let dir = PathBuf::from(raw);
+    if !dir.is_absolute() {
+        anyhow::bail!("{SESSION_SOCKET_DIR_ENV} must be an absolute path (got {raw:?})");
+    }
+    Ok(Some(dir))
+}
+
+/// A debug-only test knob's value: an absolute path in a debug build,
+/// nothing otherwise. A value this drops reads as unset, which is safe
+/// for both knobs because each only ever *widens* what a test-shaped
+/// process may reach — dropped, it fails closed.
+fn debug_test_path(debug_build: bool, raw: Option<&OsStr>) -> Option<PathBuf> {
+    if !debug_build {
+        return None;
+    }
+    let path = PathBuf::from(raw?);
+    path.is_absolute().then_some(path)
+}
+
+/// One environment lookup. The readers below take one rather than call
+/// `std::env` themselves, so a test can hand them a map keyed by the real
+/// names and catch a reader that asks for the wrong one.
+type GetEnv<'a> = &'a dyn Fn(&str) -> Option<std::ffi::OsString>;
+
+fn process_env(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name)
+}
+
+/// [`TEST_OLD_SESSION_DIR_ENV`] as this build reads it.
+pub fn test_old_session_dir() -> Option<PathBuf> {
+    test_old_session_dir_from(&process_env)
+}
+
+fn test_old_session_dir_from(getenv: GetEnv) -> Option<PathBuf> {
+    debug_test_path(
+        cfg!(debug_assertions),
+        getenv(TEST_OLD_SESSION_DIR_ENV).as_deref(),
+    )
+}
+
+/// The shapes of process the session socket's default path is refused to
+/// (`session_socket`), read once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SessionTestShape {
+    /// `ROOST_TEST_MODE=1`, whatever the build profile.
+    test_mode: bool,
+    /// A debug build that [`SESSION_DIR_NAMES_ENV`] pointed at the
+    /// shipped session's directory names.
+    shipped_names_in_debug: bool,
+}
+
+impl SessionTestShape {
+    fn new(debug_build: bool, test_mode: Option<&OsStr>, dir_names: Option<&str>) -> Self {
+        Self {
+            test_mode: test_mode.is_some_and(|value| value == "1"),
+            shipped_names_in_debug: debug_build
+                && session_dir_names(true, dir_names) == session_dir_names(false, None),
+        }
+    }
+
+    fn from_env(getenv: GetEnv) -> Self {
+        let dir_names = getenv(SESSION_DIR_NAMES_ENV).and_then(|value| value.into_string().ok());
+        Self::new(
+            cfg!(debug_assertions),
+            getenv("ROOST_TEST_MODE").as_deref(),
+            dir_names.as_deref(),
+        )
+    }
+}
+
+/// The macOS session socket: no passwd home there (macOS keeps `$HOME`),
+/// so the knob has nothing to stand in for and must not let a
+/// test-shaped process past.
+#[cfg(any(target_os = "macos", test))]
+fn mac_session_socket(default: PathBuf, getenv: GetEnv) -> anyhow::Result<PathBuf> {
+    session_socket(
+        default,
+        getenv(SESSION_SOCKET_DIR_ENV).as_deref(),
+        None,
+        SessionTestShape::from_env(getenv),
+    )
+}
+
+/// The session socket: `<override>/roost.sock` when
+/// [`SESSION_SOCKET_DIR_ENV`] is set, else `default` — which a
+/// test-shaped process may only reach with a scratch passwd home in
+/// hand.
+///
+/// Fail closed, not warn: a test-mode process (either build profile), or
+/// a debug build pointed at the shipped names, that resolved the default
+/// would be addressing this user's real session — the one a developer
+/// runs the suite from inside of.
+fn session_socket(
+    default: PathBuf,
+    socket_dir: Option<&OsStr>,
+    passwd_home: Option<&Path>,
+    shape: SessionTestShape,
+) -> anyhow::Result<PathBuf> {
+    if let Some(dir) = session_socket_dir(socket_dir)? {
+        return Ok(dir.join("roost.sock"));
+    }
+    if passwd_home.is_none() {
+        if shape.test_mode {
+            anyhow::bail!(
+                "ROOST_TEST_MODE=1 and {SESSION_SOCKET_DIR_ENV} is unset: a test-mode process \
+                 must name its own session socket directory (or, in a debug build, \
+                 {TEST_PASSWD_HOME_ENV}) rather than reach this user's session at {}",
+                default.display()
+            );
+        }
+        if shape.shipped_names_in_debug {
+            anyhow::bail!(
+                "{SESSION_DIR_NAMES_ENV}=release points this debug build at the shipped \
+                 session's directories: set {SESSION_SOCKET_DIR_ENV} (or \
+                 {TEST_PASSWD_HOME_ENV}) so it cannot reach this user's session at {}",
+                default.display()
+            );
+        }
+    }
+    Ok(default)
 }
 
 /// Resolved paths for one bundle profile.
@@ -268,7 +430,8 @@ impl BundleProfile {
 
     /// flock guarding the IPC socket: the probe→unlink→bind sequence
     /// and the bound socket's lifetime. Lives next to the socket, so
-    /// it follows `XDG_RUNTIME_DIR` and a `ROOST_STATE_DIR` override
+    /// it follows `XDG_RUNTIME_DIR` (the session's, its
+    /// [`SESSION_SOCKET_DIR_ENV`]) and a `ROOST_STATE_DIR` override
     /// never moves it.
     ///
     /// The filename stays `roost.lock` — it is the path external
@@ -424,16 +587,36 @@ pub fn derived_session_state_dir(raw: Option<&std::ffi::OsStr>) -> Option<PathBu
 
 #[cfg(target_os = "macos")]
 fn resolve_paths(
-    _kind: BundleProfileKind,
+    kind: BundleProfileKind,
     app_label: &str,
 ) -> anyhow::Result<(PathBuf, PathBuf, PathBuf)> {
+    resolve_paths_mac(kind, app_label, &process_env)
+}
+
+/// The macOS path contract, over an injected environment so its literal
+/// output is pinnable whatever the test process itself carries.
+#[cfg(target_os = "macos")]
+fn resolve_paths_mac(
+    kind: BundleProfileKind,
+    app_label: &str,
+    getenv: GetEnv,
+) -> anyhow::Result<(PathBuf, PathBuf, PathBuf)> {
+    let (socket, state, log) = mac_default_paths(app_label, getenv("HOME").as_deref());
+    if kind != BundleProfileKind::Session {
+        return Ok((socket, state, log));
+    }
+    Ok((mac_session_socket(socket, getenv)?, state, log))
+}
+
+#[cfg(target_os = "macos")]
+fn mac_default_paths(app_label: &str, home: Option<&OsStr>) -> (PathBuf, PathBuf, PathBuf) {
     // Sandboxed launchd processes can inherit `HOME=""` (set but
     // empty) or no HOME at all. Mirror the Swift companion's
     // `/tmp/<appLabel>/...` fallback rather than erroring — the
     // alternative is the process refusing to launch at all in that
     // environment. The two implementations are tested against each
     // other to stay in lockstep.
-    if let Some(raw) = std::env::var_os("HOME") {
+    if let Some(raw) = home {
         let home = PathBuf::from(raw);
         if !home.as_os_str().is_empty() && home.is_absolute() {
             let socket = home
@@ -442,11 +625,11 @@ fn resolve_paths(
                 .join("roost.sock");
             let state = home.join("Library/Application Support").join(app_label);
             let log = home.join("Library/Logs").join(app_label);
-            return Ok((socket, state, log));
+            return (socket, state, log);
         }
     }
     let tmp = PathBuf::from("/tmp").join(app_label);
-    Ok((tmp.join("roost.sock"), tmp.clone(), tmp))
+    (tmp.join("roost.sock"), tmp.clone(), tmp)
 }
 
 #[cfg(target_os = "macos")]
@@ -489,17 +672,35 @@ struct LinuxPathEnv {
     data_home: Option<std::ffi::OsString>,
     state_home: Option<std::ffi::OsString>,
     cache_home: Option<std::ffi::OsString>,
+    /// [`SESSION_SOCKET_DIR_ENV`], raw: validated where the session
+    /// socket is resolved, so a bad value fails the session profile and
+    /// nothing else.
+    session_socket_dir: Option<std::ffi::OsString>,
+    /// The home the session socket's default path is resolved for. Only
+    /// [`TEST_PASSWD_HOME_ENV`] fills it today, and it moves no path.
+    passwd_home: Option<PathBuf>,
+    session_test_shape: SessionTestShape,
 }
 
 #[cfg(not(target_os = "macos"))]
 impl LinuxPathEnv {
     fn from_process() -> Self {
+        Self::from_env(&process_env)
+    }
+
+    fn from_env(getenv: GetEnv) -> Self {
         Self {
-            home: std::env::var_os("HOME"),
-            runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
-            data_home: std::env::var_os("XDG_DATA_HOME"),
-            state_home: std::env::var_os("XDG_STATE_HOME"),
-            cache_home: std::env::var_os("XDG_CACHE_HOME"),
+            home: getenv("HOME"),
+            runtime_dir: getenv("XDG_RUNTIME_DIR"),
+            data_home: getenv("XDG_DATA_HOME"),
+            state_home: getenv("XDG_STATE_HOME"),
+            cache_home: getenv("XDG_CACHE_HOME"),
+            session_socket_dir: getenv(SESSION_SOCKET_DIR_ENV),
+            passwd_home: debug_test_path(
+                cfg!(debug_assertions),
+                getenv(TEST_PASSWD_HOME_ENV).as_deref(),
+            ),
+            session_test_shape: SessionTestShape::from_env(getenv),
         }
     }
 }
@@ -525,6 +726,16 @@ fn resolve_paths_linux(
     let socket = match valid_dir(env.runtime_dir.as_deref()) {
         Some(dir) => dir.join(namespace).join("roost.sock"),
         None => PathBuf::from(format!("/tmp/{namespace}-{uid}")).join("roost.sock"),
+    };
+    let socket = if kind == BundleProfileKind::Session {
+        session_socket(
+            socket,
+            env.session_socket_dir.as_deref(),
+            env.passwd_home.as_deref(),
+            env.session_test_shape,
+        )?
+    } else {
+        socket
     };
     let state = match valid_dir(env.data_home.as_deref()) {
         Some(dir) => dir.join(namespace),
@@ -680,6 +891,266 @@ mod tests {
         assert_eq!(SESSION_DIR_NAMES_ENV, "ROOST_TEST_SESSION_DIR_NAMES");
     }
 
+    /// Cross-process contracts: a launcher's spawned session inherits the
+    /// override, the harness sets all three on the processes it starts,
+    /// and `tools/roosttest/ui.py` spells them again.
+    #[test]
+    fn the_session_socket_env_names_are_frozen() {
+        assert_eq!(SESSION_SOCKET_DIR_ENV, "ROOST_SESSION_SOCKET_DIR");
+        assert_eq!(TEST_PASSWD_HOME_ENV, "ROOST_TEST_PASSWD_HOME");
+        assert_eq!(TEST_OLD_SESSION_DIR_ENV, "ROOST_TEST_OLD_SESSION_DIR");
+    }
+
+    const SAFE_DEFAULT: &str = "/run/user/1000/roost-session-dev/roost.sock";
+
+    /// `session_socket` the way a process resolves it: the passwd knob
+    /// reduced to what this build honours, the shape read off the same
+    /// raw values the process would have.
+    fn resolve_session_socket(
+        debug_build: bool,
+        test_mode: Option<&str>,
+        dir_names: Option<&str>,
+        socket_dir: Option<&str>,
+        passwd_home: Option<&str>,
+    ) -> anyhow::Result<PathBuf> {
+        let passwd_home = debug_test_path(debug_build, passwd_home.map(OsStr::new));
+        session_socket(
+            PathBuf::from(SAFE_DEFAULT),
+            socket_dir.map(OsStr::new),
+            passwd_home.as_deref(),
+            SessionTestShape::new(debug_build, test_mode.map(OsStr::new), dir_names),
+        )
+    }
+
+    #[test]
+    fn the_override_names_the_socket_directory_itself() {
+        let socket = resolve_session_socket(true, None, None, Some("/tmp/roost-ss"), None)
+            .expect("an absolute override resolves");
+        assert_eq!(socket, PathBuf::from("/tmp/roost-ss/roost.sock"));
+    }
+
+    /// No namespace is appended, so the debug and the shipped directory
+    /// names under one override land on one socket — the property that
+    /// lets a lane hand a debug UI and a released daemon the same value.
+    #[test]
+    fn debug_and_release_names_share_one_socket_under_one_override() {
+        let override_dir = Some(std::ffi::OsStr::new("/tmp/roost-ss"));
+        let resolved: Vec<PathBuf> = [
+            session_dir_names(true, None),
+            session_dir_names(false, None),
+        ]
+        .into_iter()
+        .map(|(_, namespace)| {
+            let default = PathBuf::from(format!("/run/user/1000/{namespace}/roost.sock"));
+            session_socket(default, override_dir, None, SessionTestShape::default())
+                .expect("resolve")
+        })
+        .collect();
+        assert_eq!(resolved[0], resolved[1]);
+        assert_eq!(resolved[0], PathBuf::from("/tmp/roost-ss/roost.sock"));
+    }
+
+    #[test]
+    fn an_empty_override_is_unset_and_a_relative_one_is_an_error() {
+        assert_eq!(
+            resolve_session_socket(true, None, None, Some(""), None).expect("empty is unset"),
+            PathBuf::from(SAFE_DEFAULT)
+        );
+        let error = resolve_session_socket(true, None, None, Some("relative/dir"), None)
+            .expect_err("a relative override is refused");
+        assert!(
+            format!("{error:#}").contains(SESSION_SOCKET_DIR_ENV),
+            "{error:#}"
+        );
+    }
+
+    /// Plan 083 D-A6's two fail-closed guards over every knob they read:
+    /// `(debug build, ROOST_TEST_MODE, DIR_NAMES, override, passwd knob)`.
+    /// The scratch passwd home is honoured by a debug build only, so the
+    /// release rows that carry one still refuse.
+    #[test]
+    fn a_test_shaped_process_never_reaches_the_default_session_socket() {
+        type Knobs = (
+            bool,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        const TEST: Option<&str> = Some("1");
+        const SHIPPED: Option<&str> = Some("release");
+        const OVR: Option<&str> = Some("/tmp/roost-ss");
+        const HOME: Option<&str> = Some("/tmp/scratch-home");
+        const BAD_HOME: Option<&str> = Some("relative-home");
+        let resolve = |(debug, test_mode, names, socket_dir, home): Knobs| {
+            resolve_session_socket(debug, test_mode, names, socket_dir, home)
+        };
+
+        let to_the_override: [Knobs; 4] = [
+            (true, TEST, None, OVR, None),
+            (false, TEST, None, OVR, None),
+            (true, None, SHIPPED, OVR, None),
+            (true, TEST, SHIPPED, OVR, HOME),
+        ];
+        for knobs in to_the_override {
+            let socket = resolve(knobs).unwrap_or_else(|e| panic!("{knobs:?}: {e:#}"));
+            assert_eq!(
+                socket,
+                PathBuf::from("/tmp/roost-ss/roost.sock"),
+                "{knobs:?}"
+            );
+        }
+
+        let to_the_default: [Knobs; 8] = [
+            (true, TEST, None, None, HOME),
+            (true, None, SHIPPED, None, HOME),
+            (false, None, SHIPPED, None, HOME),
+            (false, None, SHIPPED, None, None),
+            (true, None, Some("dev"), None, None),
+            (true, Some("0"), None, None, None),
+            (true, None, None, None, None),
+            (false, None, None, None, None),
+        ];
+        for knobs in to_the_default {
+            let socket = resolve(knobs).unwrap_or_else(|e| panic!("{knobs:?}: {e:#}"));
+            assert_eq!(socket, PathBuf::from(SAFE_DEFAULT), "{knobs:?}");
+        }
+
+        let refused: [(Knobs, &str); 7] = [
+            ((true, TEST, None, None, None), "ROOST_TEST_MODE=1"),
+            ((false, TEST, None, None, None), "ROOST_TEST_MODE=1"),
+            ((false, TEST, None, None, HOME), "ROOST_TEST_MODE=1"),
+            ((true, TEST, None, None, BAD_HOME), "ROOST_TEST_MODE=1"),
+            ((true, TEST, SHIPPED, None, None), "ROOST_TEST_MODE=1"),
+            ((true, None, SHIPPED, None, None), SESSION_DIR_NAMES_ENV),
+            ((true, None, SHIPPED, None, BAD_HOME), SESSION_DIR_NAMES_ENV),
+        ];
+        for (knobs, reason) in refused {
+            let Err(error) = resolve(knobs) else {
+                panic!("{knobs:?} must be refused");
+            };
+            let text = format!("{error:#}");
+            assert!(text.contains(reason), "{knobs:?}: {text}");
+            assert!(text.contains(SESSION_SOCKET_DIR_ENV), "{knobs:?}: {text}");
+        }
+    }
+
+    /// A lookup over `pairs` alone, keyed by the literal variable names, so
+    /// a reader that asked for any other name would see nothing.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let map: std::collections::HashMap<String, std::ffi::OsString> = pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.into()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    /// The production readers, not a hand-built shape: each knob comes
+    /// from its own variable, and the debug-only ones only in a debug
+    /// build — this build's own flag.
+    #[test]
+    fn the_session_readers_take_each_knob_from_its_own_variable() {
+        let shaped = SessionTestShape::from_env(&env_of(&[
+            ("ROOST_TEST_MODE", "1"),
+            ("ROOST_TEST_SESSION_DIR_NAMES", "release"),
+        ]));
+        assert_eq!(
+            shaped,
+            SessionTestShape {
+                test_mode: true,
+                shipped_names_in_debug: cfg!(debug_assertions),
+            }
+        );
+        assert_eq!(
+            SessionTestShape::from_env(&env_of(&[])),
+            SessionTestShape::default()
+        );
+
+        let old = env_of(&[("ROOST_TEST_OLD_SESSION_DIR", "/tmp/old-session")]);
+        assert_eq!(
+            test_old_session_dir_from(&old),
+            cfg!(debug_assertions).then(|| PathBuf::from("/tmp/old-session"))
+        );
+
+        let default = PathBuf::from(SAFE_DEFAULT);
+        let refused = mac_session_socket(default.clone(), &env_of(&[("ROOST_TEST_MODE", "1")]))
+            .expect_err("a test-mode resolve with no override is refused");
+        assert!(
+            format!("{refused:#}").contains(SESSION_SOCKET_DIR_ENV),
+            "{refused:#}"
+        );
+        let overridden = env_of(&[
+            ("ROOST_TEST_MODE", "1"),
+            ("ROOST_SESSION_SOCKET_DIR", "/tmp/roost-ss"),
+        ]);
+        assert_eq!(
+            mac_session_socket(default, &overridden).expect("resolve"),
+            PathBuf::from("/tmp/roost-ss/roost.sock")
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_linux_reader_takes_each_path_from_its_own_variable() {
+        let env = LinuxPathEnv::from_env(&env_of(&[
+            ("HOME", "/home/tester"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("XDG_DATA_HOME", "/data"),
+            ("XDG_STATE_HOME", "/state"),
+            ("XDG_CACHE_HOME", "/cache"),
+            ("ROOST_SESSION_SOCKET_DIR", "/tmp/roost-ss"),
+            ("ROOST_TEST_PASSWD_HOME", "/tmp/scratch-home"),
+            ("ROOST_TEST_MODE", "1"),
+        ]));
+        assert_eq!(env.home.as_deref(), Some(OsStr::new("/home/tester")));
+        assert_eq!(
+            env.runtime_dir.as_deref(),
+            Some(OsStr::new("/run/user/1000"))
+        );
+        assert_eq!(env.data_home.as_deref(), Some(OsStr::new("/data")));
+        assert_eq!(env.state_home.as_deref(), Some(OsStr::new("/state")));
+        assert_eq!(env.cache_home.as_deref(), Some(OsStr::new("/cache")));
+        assert_eq!(
+            env.session_socket_dir.as_deref(),
+            Some(OsStr::new("/tmp/roost-ss"))
+        );
+        assert_eq!(
+            env.passwd_home,
+            cfg!(debug_assertions).then(|| PathBuf::from("/tmp/scratch-home"))
+        );
+        assert!(env.session_test_shape.test_mode);
+
+        // End to end through the same reader: test mode alone is refused.
+        let bare = LinuxPathEnv::from_env(&env_of(&[
+            ("HOME", "/home/tester"),
+            ("ROOST_TEST_MODE", "1"),
+        ]));
+        let error = resolve_paths_linux(BundleProfileKind::Session, &bare, 1000)
+            .expect_err("a test-mode session resolve with no override is refused");
+        assert!(
+            format!("{error:#}").contains(SESSION_SOCKET_DIR_ENV),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn the_test_path_knobs_are_absolute_and_debug_only() {
+        let knob =
+            |debug_build, raw: Option<&str>| debug_test_path(debug_build, raw.map(OsStr::new));
+        assert_eq!(
+            knob(true, Some("/tmp/scratch")),
+            Some(PathBuf::from("/tmp/scratch"))
+        );
+        for raw in [None, Some(""), Some("relative/scratch")] {
+            assert_eq!(knob(true, raw), None, "{raw:?}");
+        }
+        assert_eq!(
+            knob(false, Some("/tmp/scratch")),
+            None,
+            "a packaged build ignores it"
+        );
+    }
+
     #[test]
     fn session_profile_slug_round_trips_but_is_not_a_profile_env_value() {
         assert_eq!(BundleProfileKind::Session.as_str(), "session");
@@ -823,32 +1294,55 @@ mod tests {
         }
     }
 
-    /// The macOS half of the session path contract. Mirrored by
-    /// `RoostTests.swift`'s `bundleProfileSession*` tests.
+    /// The macOS half of the session path contract, pinned literally over
+    /// an injected environment — an override or `HOME` the test process
+    /// happens to carry must not move it. Mirrored by `RoostTests.swift`'s
+    /// `bundleProfileSession*` tests.
     #[cfg(target_os = "macos")]
     #[test]
     fn session_paths_live_under_their_own_mac_library_dirs() {
         let label = build_session_dir_names().0;
-        let session = BundleProfile::session().expect("session profile");
-        let Some(home) = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|h| !h.as_os_str().is_empty() && h.is_absolute())
-        else {
+        let home = env_of(&[("HOME", "/Users/tester")]);
+        let (socket, state, log) =
+            resolve_paths_mac(BundleProfileKind::Session, label, &home).expect("resolve");
+        assert_eq!(
+            socket,
+            PathBuf::from(format!("/Users/tester/Library/Caches/{label}/roost.sock"))
+        );
+        assert_eq!(
+            state,
+            PathBuf::from(format!("/Users/tester/Library/Application Support/{label}"))
+        );
+        assert_eq!(
+            log,
+            PathBuf::from(format!("/Users/tester/Library/Logs/{label}"))
+        );
+
+        for homeless in [env_of(&[]), env_of(&[("HOME", "")])] {
+            let (socket, state, log) =
+                resolve_paths_mac(BundleProfileKind::Session, label, &homeless).expect("resolve");
             let tmp = PathBuf::from("/tmp").join(label);
-            assert_eq!(session.socket_path, tmp.join("roost.sock"));
-            assert_eq!(session.state_dir, tmp);
-            assert_eq!(session.log_dir, tmp);
-            return;
-        };
+            assert_eq!(socket, tmp.join("roost.sock"));
+            assert_eq!(state, tmp);
+            assert_eq!(log, tmp);
+        }
+
+        // The override moves the session socket and nothing else, and the
+        // UI profiles never read it.
+        let overridden = env_of(&[
+            ("HOME", "/Users/tester"),
+            ("ROOST_SESSION_SOCKET_DIR", "/tmp/roost-ss"),
+        ]);
+        let (socket, moved_state, _) =
+            resolve_paths_mac(BundleProfileKind::Session, label, &overridden).expect("resolve");
+        assert_eq!(socket, PathBuf::from("/tmp/roost-ss/roost.sock"));
+        assert_eq!(moved_state, state);
+        let (iced, _, _) =
+            resolve_paths_mac(BundleProfileKind::Iced, "Roost-iced", &overridden).expect("resolve");
         assert_eq!(
-            session.socket_path,
-            home.join("Library/Caches").join(label).join("roost.sock")
+            iced,
+            PathBuf::from("/Users/tester/Library/Caches/Roost-iced/roost.sock")
         );
-        assert_eq!(
-            session.state_dir,
-            home.join("Library/Application Support").join(label)
-        );
-        assert_eq!(session.log_dir, home.join("Library/Logs").join(label));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -887,6 +1381,7 @@ mod tests {
             data_home: Some("/home/tester/.local/share".into()),
             state_home: Some("/home/tester/.local/state".into()),
             cache_home: Some("/home/tester/.cache".into()),
+            ..LinuxPathEnv::default()
         }
     }
 
@@ -958,6 +1453,7 @@ mod tests {
             data_home: Some("relative/share".into()),
             state_home: Some("".into()),
             cache_home: Some("relative/cache".into()),
+            ..LinuxPathEnv::default()
         };
         let (socket, state, log) =
             resolve_paths_linux(BundleProfileKind::Linux, &env, 1000).expect("resolve");
@@ -1072,6 +1568,92 @@ mod tests {
         assert_eq!(
             log,
             PathBuf::from(format!("/home/tester/.local/state/{ns}"))
+        );
+    }
+
+    /// `ROOST_SESSION_SOCKET_DIR` moves the session's socket and its lock
+    /// and nothing else; the UI profiles never read it, not even to
+    /// refuse a bad value.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn golden_session_socket_under_the_override() {
+        let ns = build_session_dir_names().1;
+        let env = LinuxPathEnv {
+            session_socket_dir: Some("/tmp/roost-ss".into()),
+            ..golden_env()
+        };
+        let (socket, state, log) =
+            resolve_paths_linux(BundleProfileKind::Session, &env, 1000).expect("resolve");
+        assert_eq!(socket, PathBuf::from("/tmp/roost-ss/roost.sock"));
+        assert_eq!(
+            state,
+            PathBuf::from(format!("/home/tester/.local/share/{ns}"))
+        );
+        assert_eq!(
+            log,
+            PathBuf::from(format!("/home/tester/.local/state/{ns}"))
+        );
+        let profile = BundleProfile {
+            kind: BundleProfileKind::Session,
+            app_label: build_session_dir_names().0,
+            app_id: "ai.stridelabs.Roost.session",
+            socket_path: socket,
+            state_dir: state,
+            log_dir: log,
+        };
+        assert_eq!(
+            profile.socket_lock_path(),
+            PathBuf::from("/tmp/roost-ss/roost.lock")
+        );
+
+        for kind in [BundleProfileKind::Linux, BundleProfileKind::Iced] {
+            let namespace = linux_namespace(kind);
+            for raw in ["/tmp/roost-ss", "relative/dir"] {
+                let env = LinuxPathEnv {
+                    session_socket_dir: Some(raw.into()),
+                    ..golden_env()
+                };
+                let (socket, _, _) = resolve_paths_linux(kind, &env, 1000).expect("resolve");
+                assert_eq!(
+                    socket,
+                    PathBuf::from(format!("/run/user/1000/{namespace}/roost.sock")),
+                    "{kind:?} {raw:?}"
+                );
+            }
+        }
+    }
+
+    /// The guards sit on the session socket alone: a test-mode UI still
+    /// resolves its own profile.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_test_mode_resolve_without_the_override_fails_the_session_profile_only() {
+        let env = LinuxPathEnv {
+            session_test_shape: SessionTestShape {
+                test_mode: true,
+                shipped_names_in_debug: false,
+            },
+            ..golden_env()
+        };
+        let error = resolve_paths_linux(BundleProfileKind::Session, &env, 1000)
+            .expect_err("a test-mode session resolve with no override is refused");
+        assert!(
+            format!("{error:#}").contains(SESSION_SOCKET_DIR_ENV),
+            "{error:#}"
+        );
+        assert!(resolve_paths_linux(BundleProfileKind::Iced, &env, 1000).is_ok());
+
+        let scratch = LinuxPathEnv {
+            passwd_home: Some("/tmp/scratch-home".into()),
+            ..env
+        };
+        let (socket, _, _) =
+            resolve_paths_linux(BundleProfileKind::Session, &scratch, 1000).expect("resolve");
+        let ns = build_session_dir_names().1;
+        assert_eq!(
+            socket,
+            PathBuf::from(format!("/run/user/1000/{ns}/roost.sock")),
+            "the scratch home moves no path"
         );
     }
 

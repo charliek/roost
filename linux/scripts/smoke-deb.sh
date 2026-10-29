@@ -82,6 +82,9 @@ else
 fi
 
 APP=""
+# Set only once this script has made it; cleanup never acts on a value it
+# merely inherited.
+session_dir=""
 cleanup() {
   if [ -n "${APP}" ]; then
     # TERM the whole process group, not just $APP: $APP is the xvfb-run
@@ -99,6 +102,12 @@ cleanup() {
     done
     kill -KILL -- "-${APP}" 2>/dev/null || true
     wait "${APP}" 2>/dev/null || true
+  fi
+  # A session the UI spawned daemonized out of its process group, so the
+  # kill above never reached it. Stopped over its own socket by the
+  # packaged roostctl, which is the same build and honours the override.
+  if [ -n "${session_dir}" ] && [ -S "${session_dir}/roost.sock" ] && [ -x "${ROOSTCTL:-}" ]; then
+    ROOST_SESSION_SOCKET_DIR="${session_dir}" "${ROOSTCTL}" session stop >/dev/null 2>&1 || true
   fi
   # Only ever delete a directory this script created. A caller-supplied
   # --work-dir keeps its contents — after a failure the app log in there is
@@ -196,13 +205,20 @@ ROOSTCTL="${payload}/usr/bin/roostctl"
 # proving the *compiled-in default* lands on the production `roost` namespace
 # (what existing GTK users already have on disk), not an env override
 # papering over a build that defaults to the dev `roost-iced` namespace.
-unset ROOST_BUNDLE_PROFILE
+#
+# A fresh install starts its tabs on a `roost-session`, and a session socket
+# is isolated by ROOST_SESSION_SOCKET_DIR, not by XDG_RUNTIME_DIR: without
+# one the packaged UI would dial (and spawn) this user's real session. The
+# two debug-only test knobs never reach it.
+unset ROOST_BUNDLE_PROFILE ROOST_TEST_PASSWD_HOME ROOST_TEST_OLD_SESSION_DIR
 export XDG_RUNTIME_DIR="${work}/runtime"
 export XDG_DATA_HOME="${work}/data"
 export XDG_STATE_HOME="${work}/state"
-rm -rf "${XDG_RUNTIME_DIR}" "${XDG_DATA_HOME}" "${XDG_STATE_HOME}"
-mkdir -p "${XDG_RUNTIME_DIR}" "${XDG_DATA_HOME}" "${XDG_STATE_HOME}"
-chmod 700 "${XDG_RUNTIME_DIR}"
+session_dir="${work}/session"
+export ROOST_SESSION_SOCKET_DIR="${session_dir}"
+rm -rf "${XDG_RUNTIME_DIR}" "${XDG_DATA_HOME}" "${XDG_STATE_HOME}" "${session_dir}"
+mkdir -p "${XDG_RUNTIME_DIR}" "${XDG_DATA_HOME}" "${XDG_STATE_HOME}" "${session_dir}"
+chmod 700 "${XDG_RUNTIME_DIR}" "${session_dir}"
 
 log="${work}/app.log"
 # `set -m` puts the background job in its own process group (pgid == $!), which
