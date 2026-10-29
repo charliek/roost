@@ -169,14 +169,62 @@ pub enum ClipboardTarget {
     Selection,
 }
 
-/// State the byte-by-byte parser cycles through.
+/// State the byte-by-byte parser cycles through: libghostty's parser
+/// states (`parse_table.zig`, the DEC parser), merged where they treat
+/// every byte alike as far as where an OSC starts and ends.
+///
+/// Roost judges each notification this scanner raises at the place
+/// libghostty reported for the same bytes, so the two must agree on
+/// where every OSC starts and ends, however a read splits the bytes.
+/// libghostty starts one at `ESC ]`, or at an 8-bit OSC (0x9D) anywhere
+/// but in ground, an OSC or a DCS's payload; it ends one at a BEL, or at
+/// an `ESC` whatever follows it, and CAN or SUB cancel it. Every state
+/// here moves on the bytes libghostty's does, so that holds — and a BEL
+/// is a bell exactly where libghostty executes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
+    /// Ground. Bytes from 0x80 go through UTF-8 decoding there, so no C1
+    /// control acts, and only an `ESC` starts a sequence.
     Outside,
-    Esc,     // saw ESC, waiting for ']'
-    Prefix,  // collecting <number> before ';'
-    Body,    // collecting body before BEL or ESC \
-    BodyEsc, // saw ESC inside body, expecting '\\'
+    Esc,
+    EscIntermediate,
+    /// Any CSI state: each ends at a final byte, 0x40-0x7E.
+    Csi,
+    DcsEntry,
+    DcsParam,
+    DcsIntermediate,
+    /// A DCS's payload, or one being ignored: only an `ESC`, CAN or SUB
+    /// ends it, and a C1 byte is payload.
+    DcsBody,
+    /// An SOS, PM or APC string.
+    Apc,
+    /// Collecting an OSC's number before its `;`.
+    Prefix,
+    /// Collecting an OSC's body.
+    Body,
+    /// An OSC whose number isn't one: open until its terminator, raising
+    /// nothing.
+    OscIgnore,
+}
+
+impl State {
+    fn is_osc(self) -> bool {
+        matches!(self, Self::Prefix | Self::Body | Self::OscIgnore)
+    }
+
+    /// Whether a C1 byte here is data rather than a control. In ground
+    /// it is UTF-8; in an OSC or a DCS's payload, the string's own.
+    fn takes_c1_as_data(self) -> bool {
+        self.is_osc() || matches!(self, Self::Outside | Self::DcsBody)
+    }
+
+    /// Whether a C0 control here is executed, which for a BEL is a bell.
+    fn executes_c0(self) -> bool {
+        matches!(
+            self,
+            Self::Outside | Self::Esc | Self::EscIntermediate | Self::Csi
+        )
+    }
 }
 
 /// Stateful OSC byte-stream scanner. Not safe for concurrent use;
@@ -200,9 +248,12 @@ pub struct OscScanner {
     /// would otherwise silently write the wrong (or partial) text to
     /// the user's clipboard. Reset on each new OSC.
     body_truncated: bool,
+    /// The current OSC had its `;`.
+    separated: bool,
     pending: Vec<OscEvent>,
-    /// BEL bytes seen **outside** any OSC since the last
-    /// [`OscScanner::take_bells`] — the terminal bell.
+    /// BEL bytes libghostty executes as the terminal bell — outside any
+    /// OSC, DCS, SOS, PM or APC string — since the last
+    /// [`OscScanner::take_bells`].
     ///
     /// Not an [`OscEvent`]: a bell is not an OSC, and the scanner is
     /// the only thing in the stack that already knows whether a `0x07`
@@ -227,6 +278,7 @@ impl OscScanner {
             num: String::new(),
             body: Vec::new(),
             body_truncated: false,
+            separated: false,
             pending: Vec::new(),
             bells: 0,
         }
@@ -253,79 +305,117 @@ impl OscScanner {
     }
 
     fn step(&mut self, b: u8) {
-        match self.state {
-            State::Outside => {
-                if b == 0x1B {
-                    self.state = State::Esc;
-                } else if b == 0x07 {
-                    // A BEL that terminates an OSC is consumed by the
-                    // `Prefix`/`Body` arms below, so one reaching here
-                    // is the control character: the bell.
-                    //
-                    // Limitation: this state machine models OSC only, so
-                    // a BEL carried inside a DCS/APC/PM/SOS string
-                    // (sixel, tmux passthrough) also lands here and is
-                    // counted. libghostty's own bell callback would not;
-                    // `roost-vt`'s `CallbackCtx` now multiplexes
-                    // `OPT_USERDATA`, so wiring it is one more sink there.
-                    self.bells = self.bells.saturating_add(1);
+        match b {
+            0x1B => {
+                if matches!(self.state, State::Prefix | State::Body) {
+                    self.dispatch();
                 }
+                self.state = State::Esc;
+                return;
             }
+            0x18 | 0x1A => {
+                self.state = State::Outside;
+                return;
+            }
+            0x07 if self.state.executes_c0() => {
+                self.bells = self.bells.saturating_add(1);
+                return;
+            }
+            0x80..=0x9F if !self.state.takes_c1_as_data() => {
+                self.state = match b {
+                    0x9D => self.start_osc(),
+                    0x9B => State::Csi,
+                    0x90 => State::DcsEntry,
+                    0x98 | 0x9E | 0x9F => State::Apc,
+                    _ => State::Outside,
+                };
+                return;
+            }
+            _ => {}
+        }
+        self.state = match self.state {
+            State::Outside => State::Outside,
             State::Esc => match b {
-                b']' => {
-                    self.state = State::Prefix;
-                    self.num.clear();
-                    self.body.clear();
-                    self.body_truncated = false;
-                }
-                0x1B => {
-                    // ESC ESC: stay in Esc.
-                }
-                _ => self.state = State::Outside,
+                b']' => self.start_osc(),
+                b'[' => State::Csi,
+                b'P' => State::DcsEntry,
+                b'X' | b'^' | b'_' => State::Apc,
+                0x20..=0x2F => State::EscIntermediate,
+                0x30..=0x7E => State::Outside,
+                _ => State::Esc,
             },
+            State::EscIntermediate => match b {
+                0x30..=0x7E => State::Outside,
+                _ => State::EscIntermediate,
+            },
+            State::Csi => match b {
+                0x40..=0x7E => State::Outside,
+                _ => State::Csi,
+            },
+            State::DcsEntry => match b {
+                0x20..=0x2F => State::DcsIntermediate,
+                b'0'..=b'9' | b';' | 0x3C..=0x3F => State::DcsParam,
+                b':' | 0x40..=0x7E => State::DcsBody,
+                _ => State::DcsEntry,
+            },
+            State::DcsParam => match b {
+                0x20..=0x2F => State::DcsIntermediate,
+                b':' | 0x3C..=0x7E => State::DcsBody,
+                _ => State::DcsParam,
+            },
+            State::DcsIntermediate => match b {
+                0x30..=0x7E => State::DcsBody,
+                _ => State::DcsIntermediate,
+            },
+            State::DcsBody => State::DcsBody,
+            State::Apc => State::Apc,
             State::Prefix => match b {
-                b';' => self.state = State::Body,
+                b';' => {
+                    self.separated = true;
+                    State::Body
+                }
                 0x07 => {
                     // BEL terminator with no body
                     self.dispatch();
-                    self.state = State::Outside;
+                    State::Outside
                 }
-                0x1B => self.state = State::BodyEsc,
                 b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' => {
                     if self.num.len() < 8 {
                         self.num.push(b as char);
                     }
+                    State::Prefix
                 }
-                _ => self.state = State::Outside,
+                // libghostty skips the other C0 controls inside an OSC.
+                0x00..=0x1F => State::Prefix,
+                _ => State::OscIgnore,
             },
             State::Body => match b {
                 0x07 => {
                     self.dispatch();
-                    self.state = State::Outside;
+                    State::Outside
                 }
-                0x1B => self.state = State::BodyEsc,
                 _ => {
                     if self.body.len() < MAX_BODY {
                         self.body.push(b);
                     } else {
                         self.body_truncated = true;
                     }
+                    State::Body
                 }
             },
-            State::BodyEsc => {
-                if b == b'\\' {
-                    self.dispatch();
-                    self.state = State::Outside;
-                    return;
-                }
-                // Any byte other than `\` aborts the sequence
-                // (malformed). Re-feed the byte through the outer
-                // state machine so an ESC that starts a NEW OSC
-                // isn't lost.
-                self.state = State::Outside;
-                self.step(b);
-            }
-        }
+            State::OscIgnore => match b {
+                0x07 => State::Outside,
+                _ => State::OscIgnore,
+            },
+        };
+    }
+
+    fn start_osc(&mut self) -> State {
+        self.num.clear();
+        self.body.clear();
+        self.body_truncated = false;
+        self.separated = false;
+        State::Prefix
     }
 
     fn dispatch(&mut self) {
@@ -352,7 +442,8 @@ impl OscScanner {
             }
             "9" => {
                 let body = notification_text(&self.body);
-                if !is_osc9_notification(&body) {
+                // An `OSC 9` with no `;` is no notification to libghostty.
+                if !self.separated || !is_osc9_notification(&body) {
                     return;
                 }
                 self.pending.push(OscEvent::Notification {
@@ -1231,18 +1322,133 @@ mod tests {
         );
     }
 
+    /// An `ESC` ends the sequence whatever follows it, as in libghostty:
+    /// a bogus byte after it, another OSC straight after it, or the `\` of
+    /// an ST in the next read.
     #[test]
-    fn malformed_st_recovers_following_osc() {
-        // ESC followed by non-\ aborts the sequence in flight,
-        // but should re-feed the byte so a subsequent OSC ESC
-        // starts a NEW sequence cleanly — preserves the back-to-back
-        // OSC case.
+    fn an_esc_ends_the_sequence_whatever_follows() {
+        let notification = |text: &str| OscEvent::Notification {
+            title: text.into(),
+            body: String::new(),
+        };
         let mut s = OscScanner::new();
-        // Start an OSC, abort it with ESC + bogus byte, then
-        // start a fresh OSC.
         let events = s.feed(b"\x1b]9;abc\x1bX\x1b]7;file:///b\x07");
-        // Aborted sequence drops; the second OSC parses cleanly.
-        assert_eq!(events, vec![OscEvent::Pwd("/b".into())]);
+        assert_eq!(
+            events,
+            vec![notification("abc"), OscEvent::Pwd("/b".into())]
+        );
+
+        let events = s.feed(b"\x1b]0;one\x1b]0;two\x07");
+        assert_eq!(
+            events,
+            vec![OscEvent::Title("one".into()), OscEvent::Title("two".into())]
+        );
+
+        assert_eq!(s.feed(b"\x1b]9;split\x1b"), vec![notification("split")]);
+        assert!(s.feed(b"\\").is_empty(), "the ST's backslash is its own");
+        assert_eq!(s.feed(b"\x1b]9;after\x07"), vec![notification("after")]);
+        assert_eq!(s.take_bells(), 0);
+
+        assert_eq!(
+            s.feed(b"\x1b]0;rung\x1b\x07\\"),
+            vec![OscEvent::Title("rung".into())]
+        );
+        assert_eq!(s.take_bells(), 1, "a BEL after the ESC is a bell");
+    }
+
+    fn notified(text: &str) -> OscEvent {
+        OscEvent::Notification {
+            title: text.into(),
+            body: String::new(),
+        }
+    }
+
+    /// libghostty's escape state executes a C0 control and ignores DEL
+    /// without leaving it, so a `]` after them still opens an OSC (the
+    /// astra review's round-3 case).
+    #[test]
+    fn an_escape_survives_a_c0_control_or_del() {
+        for between in [0x00u8, b'\t', b'\n', 0x7f] {
+            let bytes = [&b"\x1b]0;t\x1b"[..], &[between], b"]9;x\x07"].concat();
+            assert_eq!(
+                feed_all(&bytes),
+                vec![OscEvent::Title("t".into()), notified("x")],
+                "{between:#x}"
+            );
+        }
+    }
+
+    /// An 8-bit OSC opens one wherever libghostty honours C1 controls —
+    /// inside an escape (and its intermediates), a CSI, a DCS's head or an
+    /// SOS/PM/APC string — and
+    /// nowhere else: ground decodes it as UTF-8, and inside an OSC or a
+    /// DCS's payload it is data.
+    #[test]
+    fn an_8_bit_osc_opens_one_only_where_libghostty_honours_it() {
+        for lead in [
+            &b"\x1b"[..],
+            b"\x1b ",
+            b"\x1b[0",
+            b"\x1bP",
+            b"\x1bP0",
+            b"\x1bX",
+        ] {
+            let bytes = [lead, b"\x9d9;x\x07"].concat();
+            assert_eq!(feed_all(&bytes), vec![notified("x")], "{lead:02x?}");
+        }
+        for lead in [&b""[..], b"\x1bPq", b"\x1b]9;"] {
+            let bytes = [lead, b"\x9d9;x\x07"].concat();
+            let events = feed_all(&bytes);
+            assert!(!events.contains(&notified("x")), "{lead:02x?}: {events:?}");
+        }
+    }
+
+    /// Inside an OSC, libghostty skips the other C0 controls, so one in the
+    /// number doesn't end it; anything else that isn't a digit makes it
+    /// no OSC, open until its terminator. An `OSC 9` with no `;` is no
+    /// notification.
+    #[test]
+    fn an_osc_number_skips_c0_and_a_bad_one_raises_nothing() {
+        assert_eq!(feed_all(b"\x1b]9\n;x\x07"), vec![notified("x")]);
+        let mut s = OscScanner::new();
+        assert!(s
+            .feed(b"\x1b]9 ;x\x07\x1b]9.;y\x1b]9;z\x07")
+            .contains(&notified("z")));
+        assert_eq!(s.take_bells(), 0, "the BEL ended an OSC");
+        assert!(feed_all(b"\x1b]9\x07\x1b]9\x1b\\").is_empty());
+    }
+
+    /// A BEL is a bell where libghostty executes it — ground, an escape, a
+    /// CSI — and not inside a DCS, SOS, PM or APC string.
+    #[test]
+    fn a_bel_rings_only_where_libghostty_executes_it() {
+        for (bytes, bells) in [
+            (&b"\x07\x1b\x07\x1b[0\x07m"[..], 3),
+            (b"\x1bPq\x07\x1b\\", 0),
+            (b"\x1bP0\x07q\x1b\\", 0),
+            (b"\x1b_G\x07\x1b\\\x1bX\x07\x9c", 0),
+        ] {
+            let mut s = OscScanner::new();
+            s.feed(bytes);
+            assert_eq!(s.take_bells(), bells, "{bytes:02x?}");
+        }
+    }
+
+    /// CAN and SUB cancel a sequence, as in libghostty: nothing is raised,
+    /// and the terminator that would have ended it is plain output after.
+    #[test]
+    fn can_and_sub_cancel_the_sequence() {
+        for cancel in [0x18u8, 0x1a] {
+            let mut s = OscScanner::new();
+            let mut bytes = b"\x1b]9;a".to_vec();
+            bytes.push(cancel);
+            bytes.extend_from_slice(b"b\x1b\\\x1b]0;next\x07");
+            assert_eq!(
+                s.feed(&bytes),
+                vec![OscEvent::Title("next".into())],
+                "{cancel:#x}"
+            );
+        }
     }
 
     #[test]

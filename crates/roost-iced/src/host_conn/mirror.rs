@@ -633,6 +633,152 @@ mod tests {
         assert!(tab.hook_active);
     }
 
+    /// Plan 083 B-2/B-3: a host mirror runs no hook path of its own; it
+    /// shows the session's reading of a tab's OSC 133 marks as the wire
+    /// carries it. A real workspace behind a terminal with a status sink —
+    /// a session tab's pipeline, minus the PTY — produces the batches: each
+    /// prompt-only change reaches the mirror, `P;k=i` ends a Waiting owner's
+    /// lifecycle (libghostty's reading; roost-osc's ignored it), `A;k=s`
+    /// does nothing (libghostty filters it; roost-osc took it as `A`), and
+    /// a repeated mark sends nothing.
+    #[test]
+    fn a_mirror_shows_the_sessions_reading_of_its_prompt_marks() {
+        use roost_engine::{event_push, program_status, Workspace};
+        use roost_ipc::agent::{OwnershipAction, TabAgentReportParams};
+
+        struct Session {
+            workspace: Workspace,
+            tab: i64,
+            terminal: roost_vt::Terminal,
+            sink: Arc<Mutex<Vec<roost_vt::TerminalEvent>>>,
+            stream:
+                tokio::sync::broadcast::Receiver<roost_engine::workspace::VersionedWorkspaceEvent>,
+        }
+
+        impl Session {
+            /// Write `bytes`, apply what the sink saw, and fold every
+            /// batch the workspace committed into `mirror`, returning the
+            /// event names.
+            fn feed(&mut self, mirror: &mut HostMirror, bytes: &[u8]) -> Vec<String> {
+                self.terminal.vt_write(bytes);
+                self.workspace
+                    .apply_program_status(self.tab, program_status::drain(&self.sink), 0)
+                    .unwrap();
+                self.fold(mirror)
+            }
+
+            fn fold(&mut self, mirror: &mut HostMirror) -> Vec<String> {
+                let mut names = Vec::new();
+                while let Ok(versioned) = self.stream.try_recv() {
+                    let batch = EventBatch {
+                        revision: versioned.revision,
+                        events: versioned
+                            .events
+                            .iter()
+                            .filter_map(event_push::envelope)
+                            .collect(),
+                    };
+                    names.extend(batch.events.iter().map(|event| event.event.clone()));
+                    assert!(mirror.apply_batch(&batch));
+                }
+                names
+            }
+
+            fn agrees(&self, mirror: &HostMirror) -> (ShellState, AgentLifecycle, TabState) {
+                let served = self.workspace.tab(self.tab).unwrap();
+                let shown = mirror.tab(self.tab).unwrap();
+                let axes = |tab: &Tab| (tab.shell_state, tab.agent_lifecycle, tab.state);
+                assert_eq!(axes(shown), axes(&served), "the mirror follows the session");
+                assert_eq!(shown.hook_active, served.hook_active);
+                axes(shown)
+            }
+        }
+
+        let workspace = Workspace::new();
+        let project = workspace.create_project("p", "/tmp").unwrap().id;
+        let tab = workspace.open_tab(project, "/tmp", "t", false).unwrap().id;
+        let mut terminal = roost_vt::Terminal::new(roost_vt::TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        terminal.set_status_sink(Arc::clone(&sink)).unwrap();
+        let stream = workspace.subscribe_versioned();
+        let mut mirror = HostMirror::from_list(
+            TabListResult {
+                projects: workspace.snapshot(),
+                revision: Some(workspace.revision()),
+            },
+            workspace.revision(),
+        );
+        let mut session = Session {
+            workspace,
+            tab,
+            terminal,
+            sink,
+            stream,
+        };
+        let moved = vec![
+            ops::EVENT_TAB_STATE_CHANGED.to_string(),
+            ops::EVENT_AGENT_REPORT_CHANGED.to_string(),
+        ];
+
+        assert_eq!(session.feed(&mut mirror, b"\x1b]133;C\x07"), moved);
+        assert_eq!(
+            session.agrees(&mirror),
+            (
+                ShellState::ForegroundProcess,
+                AgentLifecycle::Inactive,
+                TabState::Running
+            )
+        );
+        assert!(session.feed(&mut mirror, b"\x1b]133;C\x07").is_empty());
+        assert_eq!(session.feed(&mut mirror, b"\x1b]133;D;0\x07"), moved);
+        assert_eq!(
+            session.agrees(&mirror),
+            (
+                ShellState::AtPrompt,
+                AgentLifecycle::Inactive,
+                TabState::None
+            )
+        );
+        assert!(session.feed(&mut mirror, b"\x1b]133;D\x07").is_empty());
+
+        let claim = TabAgentReportParams {
+            session_id: "s1".into(),
+            ..TabAgentReportParams::sessionless(
+                tab,
+                "claude",
+                OwnershipAction::Claim,
+                Some(AgentLifecycle::Waiting),
+            )
+        };
+        assert!(session.workspace.agent_report(&claim).unwrap().0);
+        session.fold(&mut mirror);
+        assert_eq!(
+            session.agrees(&mirror),
+            (
+                ShellState::AtPrompt,
+                AgentLifecycle::Waiting,
+                TabState::NeedsInput
+            )
+        );
+        assert!(session.feed(&mut mirror, b"\x1b]133;A;k=s\x07").is_empty());
+        assert_eq!(session.feed(&mut mirror, b"\x1b]133;P;k=i\x07"), moved);
+        assert_eq!(
+            session.agrees(&mirror),
+            (
+                ShellState::AtPrompt,
+                AgentLifecycle::Inactive,
+                TabState::None
+            )
+        );
+        assert!(mirror.tab(tab).unwrap().hook_active, "ownership is kept");
+    }
+
     #[test]
     fn projects_are_created_renamed_and_deleted() {
         let mut mirror = mirror();

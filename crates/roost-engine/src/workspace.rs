@@ -1918,12 +1918,12 @@ impl Workspace {
         // this way (plan §3.4) — the agent's own adapter is what emits
         // those, so gating them would mute the very source it protects.
         if let AttentionSource::RawOsc {
-            records_authoritative,
+            suppressed_at_place,
         } = source
         {
-            let records =
-                records_authoritative.unwrap_or_else(|| row.program_status.is_authoritative());
-            if agent::suppress_raw_osc(&row.agent) || records {
+            let placed =
+                suppressed_at_place.unwrap_or_else(|| row.program_status.is_authoritative());
+            if placed || agent::suppress_raw_osc(&row.agent) {
                 tracing::debug!(tab_id, "raw OSC notification suppressed (agent owns tab)");
                 return Ok(false);
             }
@@ -2034,43 +2034,21 @@ impl Workspace {
         self.apply_agent_reports(&report, None).map(|_| ())
     }
 
-    /// OSC 133 prompt/command mark → the **shell** axis, ungated.
-    ///
-    /// The old `hook_active` gate is gone: the axes are independent, so
-    /// there is nothing to suppress — derivation decides which one
-    /// shows. `A`/`B`/`D` additionally drop the lifecycle to `inactive`
-    /// (keeping ownership as a label), which is the failsafe against a
-    /// killed agent muting the tab forever. See [`agent::apply_shell_mark`].
-    pub fn apply_shell_mark(&self, tab_id: i64, body: &str) -> Result<(), WorkspaceError> {
-        let mut inner = self.inner.lock().unwrap();
-        let row = inner
-            .tabs
-            .get_mut(&tab_id)
-            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        let Some(next) = agent::apply_shell_mark(&row.agent, body) else {
-            return Ok(()); // undefined mark body — no change
-        };
-        let records = row.program_status.clone();
-        let events = replace_axes(row, next, records);
-        // Run state isn't in the persisted snapshot — emit only.
-        self.commit(inner, events, Persist::Skip);
-        Ok(())
-    }
-
     /// Apply one ordered batch of OSC 7501 reports and OSC 133 prompt
     /// marks from the tab's authoritative terminal to its program-status
-    /// records, under one lock, emitting the derived-state deltas once for
-    /// the net result. The hook layer is not touched: the caller still
-    /// hands the batch's OSC 133 marks to [`Self::apply_shell_mark`]
-    /// afterwards, as roost-osc reads them.
+    /// records and to the hook layer's shell axis, under one lock,
+    /// emitting the derived-state deltas once for the net result. This is
+    /// the only way an OSC 133 mark reaches a tab (plan 083 D-B2); the
+    /// marks are ungated, and `A`/`B`/`D` are the dead-agent failsafe
+    /// [`agent::apply_shell_mark`] describes.
     ///
     /// A record banner for a tab the user is watching is dropped, like any
     /// other raise. `now_ms` is the caller's: [`unix_now_ms`] in
     /// production.
     ///
-    /// Returns the records' authority at each notification the batch
-    /// placed, for the caller to hand the same chunk's raw OSC 9 / 777
-    /// through [`crate::application::apply_osc`].
+    /// Returns whether a raw notification is suppressed at each place the
+    /// batch put one, for the caller to hand the same chunk's raw OSC 9 /
+    /// 777 through [`crate::application::apply_osc`].
     pub fn apply_program_status(
         &self,
         tab_id: i64,
@@ -2083,10 +2061,12 @@ impl Workspace {
             .tabs
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
+        // Clones, not the row's own: `replace_axes` finds what changed by
+        // comparing the row with what it is handed.
+        let mut next_agent = row.agent.clone();
         let mut records = row.program_status.clone();
-        let mut applied = records.apply(&row.agent, events, now_ms);
-        let agent = row.agent.clone();
-        let mut events = replace_axes(row, agent, records);
+        let mut applied = records.apply(&mut next_agent, events, now_ms);
+        let mut events = replace_axes(row, next_agent, records);
         if !watched {
             for banner in &applied.banners {
                 let title = if banner.title.is_empty() {
@@ -2662,10 +2642,11 @@ impl Workspace {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttentionSource {
     RawOsc {
-        /// Whether the records were authoritative at the notification's
-        /// own bytes ([`crate::program_status::RawOscAuthority`]); `None`
-        /// reads them as they stand.
-        records_authoritative: Option<bool>,
+        /// Whether the notification is suppressed at its own bytes
+        /// ([`crate::program_status::RawOscAuthority`]); `None` reads the
+        /// records as they stand. The hook layer as it stands suppresses
+        /// either way, so a hook report applied since still counts.
+        suppressed_at_place: Option<bool>,
     },
     Structured,
 }
@@ -3450,6 +3431,7 @@ fn derive_title(cwd: &str) -> String {
 mod tests {
     use super::*;
     use roost_ipc::agent::{AttentionOp, ShellState};
+    use roost_ipc::program_status::PromptMark;
 
     fn a_host(id: &str, label: &str, target: &str) -> HostSnapshot {
         HostSnapshot {
@@ -4539,6 +4521,13 @@ mod tests {
         (ws, tid)
     }
 
+    /// One OSC 133 mark the way a sink terminal hands it over: alone, in
+    /// one program-status batch.
+    fn shell_mark(ws: &Workspace, tid: i64, mark: PromptMark) {
+        ws.apply_program_status(tid, vec![StatusEvent::Prompt(mark)], 0)
+            .unwrap();
+    }
+
     /// Replaces `set_tab_state_from_osc_respects_hook_active`: the gate
     /// it pinned is gone. OSC 133 now writes the shell axis
     /// unconditionally, and derivation — not a suppression rule —
@@ -4549,7 +4538,7 @@ mod tests {
 
         // The mark lands on the shell axis even while an agent owns the
         // tab; the agent's lifecycle still wins the derived state.
-        ws.apply_shell_mark(tid, "C").unwrap();
+        shell_mark(&ws, tid, PromptMark::OutputStart);
         let tab = ws.tab(tid).unwrap();
         assert_eq!(tab.shell_state, ShellState::ForegroundProcess);
         assert_eq!(tab.agent_lifecycle, AgentLifecycle::Waiting);
@@ -4559,9 +4548,9 @@ mod tests {
     #[test]
     fn shell_marks_drive_the_state_without_an_owner() {
         let (ws, tid) = agent_ws();
-        ws.apply_shell_mark(tid, "C").unwrap();
+        shell_mark(&ws, tid, PromptMark::OutputStart);
         assert_eq!(ws.tab(tid).unwrap().state, TabState::Running);
-        ws.apply_shell_mark(tid, "D;0").unwrap();
+        shell_mark(&ws, tid, PromptMark::CommandEnd);
         assert_eq!(ws.tab(tid).unwrap().state, TabState::None);
     }
 
@@ -4577,13 +4566,13 @@ mod tests {
                 "Wrapper",
                 "noise",
                 AttentionSource::RawOsc {
-                    records_authoritative: None,
+                    suppressed_at_place: None,
                 }
             )
             .unwrap());
         assert!(!ws.tab(tid).unwrap().has_notification);
 
-        ws.apply_shell_mark(tid, "D;0").unwrap();
+        shell_mark(&ws, tid, PromptMark::CommandEnd);
         let tab = ws.tab(tid).unwrap();
         assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
         assert!(tab.hook_active, "ownership survives as a label");
@@ -4594,7 +4583,7 @@ mod tests {
                 "Build",
                 "done",
                 AttentionSource::RawOsc {
-                    records_authoritative: None,
+                    suppressed_at_place: None,
                 }
             )
             .unwrap());
@@ -4672,7 +4661,7 @@ mod tests {
             "accepted reports are not counted"
         );
 
-        ws.apply_shell_mark(tid, "C").unwrap();
+        shell_mark(&ws, tid, PromptMark::OutputStart);
         let nested = report(tid, "codex", "inner", OwnershipAction::Claim, None);
         let (accepted, tab) = ws.agent_report(&nested).unwrap();
         assert!(!accepted);
@@ -5121,20 +5110,20 @@ mod tests {
                 "Wrapper",
                 "noise",
                 AttentionSource::RawOsc {
-                    records_authoritative: None,
+                    suppressed_at_place: None,
                 }
             )
             .unwrap());
         assert!(!ws.tab(tid).unwrap().has_notification);
 
-        ws.apply_shell_mark(tid, "D;0").unwrap();
+        shell_mark(&ws, tid, PromptMark::CommandEnd);
         assert!(ws
             .raise_attention(
                 tid,
                 "Build",
                 "done",
                 AttentionSource::RawOsc {
-                    records_authoritative: None,
+                    suppressed_at_place: None,
                 }
             )
             .unwrap());
@@ -5188,7 +5177,7 @@ mod tests {
 
         // `none` releases; with a live foreground process the shell axis
         // now shows `running` rather than `none`.
-        ws.apply_shell_mark(tid, "C").unwrap();
+        shell_mark(&ws, tid, PromptMark::OutputStart);
         ws.set_tab_state(tid, TabState::None).unwrap();
         let tab = ws.tab(tid).unwrap();
         assert!(!tab.hook_active, "set-state none releases ownership");
@@ -5275,9 +5264,14 @@ mod tests {
             Ok(WorkspaceEvent::AgentChanged { .. })
         ));
 
-        // A report that changes nothing emits nothing — repeated prompt
+        // A mark that changes nothing emits nothing — repeated prompt
         // marks are the common case and must not churn the UI.
-        ws.apply_shell_mark(tid, "Z").unwrap();
+        shell_mark(&ws, tid, PromptMark::OutputStart);
+        assert!(
+            !drain(&mut rx).is_empty(),
+            "the first C moves the shell axis"
+        );
+        shell_mark(&ws, tid, PromptMark::OutputStart);
         assert!(rx.try_recv().is_err());
     }
 
@@ -6708,7 +6702,7 @@ mod tests {
                 "title",
                 "body",
                 AttentionSource::RawOsc {
-                    records_authoritative: None,
+                    suppressed_at_place: None,
                 }
             )
             .unwrap());
@@ -7535,7 +7529,7 @@ mod tests {
                     "codex",
                     "turn done",
                     AttentionSource::RawOsc {
-                        records_authoritative: None,
+                        suppressed_at_place: None,
                     }
                 )
                 .unwrap());
@@ -7555,7 +7549,7 @@ mod tests {
                     "Build",
                     "done",
                     AttentionSource::RawOsc {
-                        records_authoritative: None,
+                        suppressed_at_place: None,
                     }
                 )
                 .unwrap());
@@ -7611,6 +7605,157 @@ mod tests {
                 banners(&drain(&mut rx)),
                 vec![("before".to_string(), String::new())]
             );
+        }
+
+        fn hook_changes(events: &[WorkspaceEvent]) -> Vec<(ShellState, AgentLifecycle)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    WorkspaceEvent::AgentChanged { agent, .. } => {
+                        Some((agent.shell, agent.lifecycle))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Plan 083 B-3: a batch of prompt marks alone moves the hook layer
+        /// and says so in one commit — `AgentChanged` with the new axes,
+        /// `TabStateChanged` when the composed state moved — and a repeat
+        /// of the same mark changes nothing, so it emits nothing and spends
+        /// no revision.
+        #[test]
+        fn a_lone_prompt_mark_emits_the_hook_layers_change_and_a_repeat_nothing() {
+            let (ws, tid) = agent_ws();
+            let mut rx = ws.subscribe();
+            shell_mark(&ws, tid, PromptMark::OutputStart);
+            let events = drain(&mut rx);
+            assert_eq!(
+                state_changes(&events),
+                vec![TabState::Running],
+                "{events:?}"
+            );
+            assert_eq!(
+                hook_changes(&events),
+                vec![(ShellState::ForegroundProcess, AgentLifecycle::Inactive)]
+            );
+            let tab = ws.tab(tid).unwrap();
+            assert_eq!(
+                (tab.shell_state, tab.state),
+                (ShellState::ForegroundProcess, TabState::Running)
+            );
+
+            let mut versioned = ws.subscribe_versioned();
+            shell_mark(&ws, tid, PromptMark::OutputStart);
+            assert!(drain(&mut rx).is_empty(), "a repeated C");
+            assert!(versioned.try_recv().is_err(), "and no revision for it");
+
+            // An agent owns the tab, mid-turn under the command: a `D`
+            // ends its lifecycle, keeps it as a label, and the tab falls
+            // through to the shell.
+            let (ws, tid) = owned_ws(AgentLifecycle::Working);
+            shell_mark(&ws, tid, PromptMark::OutputStart);
+            let mut rx = ws.subscribe();
+            shell_mark(&ws, tid, PromptMark::CommandEnd);
+            let events = drain(&mut rx);
+            assert_eq!(state_changes(&events), vec![TabState::None], "{events:?}");
+            assert_eq!(
+                hook_changes(&events),
+                vec![(ShellState::AtPrompt, AgentLifecycle::Inactive)]
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, WorkspaceEvent::HookActiveChanged { .. })),
+                "ownership is kept: {events:?}"
+            );
+            let tab = ws.tab(tid).unwrap();
+            assert!(tab.hook_active);
+            assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
+
+            let mut versioned = ws.subscribe_versioned();
+            for mark in [PromptMark::CommandEnd, PromptMark::PromptStart] {
+                shell_mark(&ws, tid, mark);
+            }
+            assert!(
+                drain(&mut rx).is_empty(),
+                "D again, then an A, change nothing"
+            );
+            assert!(versioned.try_recv().is_err());
+        }
+
+        /// The other half of B-3: a mark that moves the hook layer without
+        /// moving the composed state still sends `AgentChanged`, and only
+        /// that. Here an agent waiting under a prompt sees its shell start a
+        /// command: the agent's lifecycle still decides.
+        #[test]
+        fn a_mark_under_a_driving_agent_emits_agent_changed_alone() {
+            let (ws, tid) = owned_ws(AgentLifecycle::Waiting);
+            let mut rx = ws.subscribe();
+            shell_mark(&ws, tid, PromptMark::OutputStart);
+            let events = drain(&mut rx);
+            assert!(state_changes(&events).is_empty(), "{events:?}");
+            assert_eq!(
+                hook_changes(&events),
+                vec![(ShellState::ForegroundProcess, AgentLifecycle::Waiting)]
+            );
+            assert_eq!(ws.tab(tid).unwrap().state, TabState::NeedsInput);
+        }
+
+        /// Plan 083 D-B4 on a tab a hook owns and no record decides: a raw
+        /// OSC 9 placed before the mark that ends the agent's turn is
+        /// judged against the agent still driving, and one placed after it
+        /// against the shell, whatever the chunk ends on. One libghostty
+        /// placed nowhere is judged at the chunk's end, after its marks.
+        #[test]
+        fn raw_osc_under_a_hook_owner_is_judged_at_its_place_in_the_chunk() {
+            for mark in [
+                PromptMark::PromptStart,
+                PromptMark::InputStart,
+                PromptMark::CommandEnd,
+            ] {
+                let (ws, tid) = owned_ws(AgentLifecycle::Working);
+                let mut rx = ws.subscribe();
+                let mut authority = ws
+                    .apply_program_status(
+                        tid,
+                        vec![osc9("before"), StatusEvent::Prompt(mark), osc9("after")],
+                        LATE,
+                    )
+                    .unwrap();
+                for text in ["before", "after", "unplaced"] {
+                    crate::application::apply_osc(&ws, tid, 9, text, &mut authority);
+                }
+                assert_eq!(
+                    banners(&drain(&mut rx)),
+                    vec![
+                        ("after".to_string(), String::new()),
+                        ("unplaced".to_string(), String::new())
+                    ],
+                    "{mark:?}"
+                );
+            }
+
+            // A hook report since the chunk's batch still counts.
+            let (ws, tid) = owned_ws(AgentLifecycle::Working);
+            let mut authority = ws
+                .apply_program_status(
+                    tid,
+                    vec![StatusEvent::Prompt(PromptMark::PromptStart), osc9("after")],
+                    LATE,
+                )
+                .unwrap();
+            ws.agent_report(&report(
+                tid,
+                "claude",
+                "s1",
+                OwnershipAction::Preserve,
+                Some(AgentLifecycle::Working),
+            ))
+            .unwrap();
+            let mut rx = ws.subscribe();
+            crate::application::apply_osc(&ws, tid, 9, "after", &mut authority);
+            assert!(banners(&drain(&mut rx)).is_empty());
         }
 
         /// Plan 082 B-4: the child-record cap's warning reaches the log

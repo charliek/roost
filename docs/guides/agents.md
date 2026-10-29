@@ -193,7 +193,9 @@ The rules you see:
   `blocked` record, the way a crashed agent's state should end. A
   finished `done` or `error` stays on the tab after the prompt until
   you start the next command. Claude Code sends prompt marks of its own
-  only in Screen Reader Mode, and they count the same way.
+  only in Screen Reader Mode, and they count the same way. The record
+  layer and the hook layer read the same marks, in the same order, so
+  [which forms count](#which-marks-count) is one rule for both.
 - **One banner per change.** A record moving the tab into Waiting,
   Failed or Finished raises one desktop banner, titled with the
   record's title (else the agent's name) and carrying its message (else
@@ -417,7 +419,8 @@ the tab keeps showing the state that projects from it (`running`,
 **What clears it.** Ownership is deliberately not TTL'd — Claude fires
 no periodic hook, so a long tool call would look stale and get released
 mid-turn — so the only thing that clears a stuck lifecycle is the
-shell's own OSC 133 prompt marks. Reaching a fresh prompt (`A`/`B`) or a
+shell's own OSC 133 prompt marks ([which forms
+count](#which-marks-count)). Reaching a fresh prompt (`A`/`B`) or a
 command ending (`D`) drops the lifecycle to `inactive` while *keeping*
 ownership as a label, so the tab falls through to shell-derived state
 instead of staying stuck. The marks clear the lifecycle because the
@@ -457,6 +460,27 @@ process group is read only for a new tab's directory
 ([cwd tracking](cwd-tracking.md)), never for a tab's state. A
 `tcgetpgrp`-based one, which would cover dash/`sh` too, is tracked as
 future work in [#519](https://github.com/charliek/roost/issues/519).
+
+### Which marks count
+
+On Roost-Iced, a session tab and an in-process tab take their OSC 133
+marks from libghostty, the same stream the
+[program-status](#program-status-osc-7501) records read, so a mark
+moves the hook layer and the records at the same byte. libghostty's
+reading is the spec's:
+
+| The mark | What it does |
+|---|---|
+| `A`, `P`, `N` — a prompt starting (with `k=i` or no `k`); `B`, `I` — input starting; `D`, `D;<exit code>` — a command ending | the shell is at a prompt, and an agent's lifecycle drops to `inactive` (ownership stays as a label) |
+| `C`, `C;<options>` — a command starting | the shell has a foreground process; the agent's lifecycle stays |
+| `A;k=s`, `A;k=r`, `A;k=c`, and `P`/`N` with those — a secondary, right or continuation prompt | nothing |
+| a letter not followed by `;` or the end (`Axyz`, `D0`), `L`, an empty or unknown body | nothing |
+| a mark over 2048 bytes after `133;` (a long `C;cmdline_url=…`) | nothing: libghostty drops an OSC sequence that overflows its buffer, a known limit |
+
+A host tab's client shows what the session made of the marks; it reads
+none itself. Roost.app (the Swift Mac app) keeps its own scanner and the
+older rule: the first letter decides, `C` or one of `A`, `B`, `D`, so
+`A;k=s` and `Axyz` count as prompts there and `P`, `N` and `I` don't.
 
 ## Codex trust
 

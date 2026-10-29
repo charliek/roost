@@ -1164,9 +1164,11 @@ listens — a session tab's server terminal, an in-process iced tab's own;
 a host tab's client mirror and the Swift app keep no records — and it
 hands records and OSC 133 prompt marks to that layer as one stream in
 byte order, so the result never depends on where a PTY read split the
-bytes. While a record is mid-turn the program decides; hooks keep
-ownership and identity, their state changes are vetoed (counted, not
-dropped), and a claim from a different agent is refused (`foreign_app`).
+bytes. (Since [DL-30](#dl-30-one-osc-133-parser-per-sink-terminal-2026-10-28)
+the hook layer reads its marks from that stream too.) While a record is
+mid-turn the program decides; hooks keep ownership and identity, their
+state changes are vetoed (counted, not dropped), and a claim from a
+different agent is refused (`foreign_app`).
 
 Two of the rules are Charlie's calls on departures from the release
 doc ([`protocol-7-release.md`](https://github.com/charliek/roost/blob/main/discovery/protocol-7-release.md)):
@@ -1186,6 +1188,55 @@ Prompt marks are A, B and D, not only A, because Roost's bash and zsh
 integration never sends A. The user-facing rules are in
 [`guides/agents.md`](../guides/agents.md#program-status-osc-7501); the
 wire shape is [`Tab.program_status`](../reference/ipc.md#tabprogram_status-osc-7501).
+
+### DL-30: one OSC 133 parser per sink terminal (2026-10-28)
+
+Plan 083 (#650) reverses plan 082's D4.3, which left the hook layer
+reading OSC 133 through `roost-osc` while the records of
+[DL-29](#dl-29-program-status-is-a-fourth-per-tab-axis-composed-above-the-hook-layer-2026-10-28)
+read libghostty's ordered semantic-prompt stream. The two parsers
+disagree on real forms — libghostty reads `133;P;k=i` and `133;N` as a
+primary prompt start and filters `133;A;k=s`, `roost-osc` took the first
+letter — so a banner could depend on where a PTY read split the bytes,
+and 082 needed a pairing layer to line the hook layer's raw-OSC
+suppression up with the record layer's. Two sources of truth for the
+same bytes cost a bug and a layer, and every later feature built on
+marks would have inherited both views.
+
+On a **sink terminal** — a session tab's server terminal and an
+in-process iced tab's, the ones with a status sink, which are exactly
+the ones whose bytes `roost-osc` scans — the hook layer now takes its
+marks from that same stream: `Workspace::apply_program_status` advances
+the hook state through each prompt mark in byte order, inside the one
+lock that applies the records, and `roost-engine`'s `OscRouter` maps
+`roost-osc`'s 133 to nothing. `agent::apply_shell_mark`, the shared
+agent fixtures and the failsafe are unchanged; what changes is which
+forms reach them (spec-correct, the table in
+[`guides/agents.md`](../guides/agents.md#which-marks-count)), and a
+mark libghostty drops — one over its 2048-byte OSC buffer — moves
+nothing. A raw OSC 9 / 777 libghostty places is judged where it falls
+against both the records and the hook layer as the chunk had moved
+them. For that, `roost-osc` now frames an OSC as libghostty's parser
+does: it follows libghostty through escapes, CSIs, DCSs and SOS/PM/APC
+strings (8-bit controls included, where libghostty honours them), so
+an OSC starts where libghostty starts one, and it ends one at a BEL or
+at an `ESC` whatever follows it, with CAN or SUB cancelling it, instead
+of waiting for the `\` of an ST. A notification and its place then land
+in the same read however the bytes split, and no sequence is a
+notification to one parser and nothing to the other; a differential
+test feeds both parsers hundreds of thousands of byte strings to hold
+them to it. A form only one parser accepts is
+still judged at its chunk's end (the residuals listed on
+`RawOscAuthority`). Host mirrors keep taking `shell_state` from the
+wire. Roost.app keeps its own scanner, its framing and the first-letter
+rule: the Swift app is frozen for this release, and these forms are not
+worth a change there.
+
+*Rejected:* applying both parsers (idempotent for the plain letters, but
+the divergent forms stay divergent); skipping the second reading at its
+consumers (the iced batch tail would need a sink lookup for a tab that
+may be gone); teaching `roost-osc` libghostty's grammar (a second
+grammar to keep in step).
 
 ## Direction (under evaluation)
 

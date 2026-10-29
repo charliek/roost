@@ -601,6 +601,78 @@ async fn a_notification_reaches_a_subscriber() {
     );
 }
 
+/// Plan 083 B-3: a prompt mark alone is a commit a subscriber sees — the
+/// shell axis on `agent_report.changed`, and `tab.state_changed` when the
+/// composed state moved — and a repeat of it is no commit at all. A title
+/// change after each mark is the fence: the mark's batch comes before it,
+/// and a repeat's would too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lone_prompt_mark_reaches_a_subscriber_and_a_repeat_does_not() {
+    use roost_ipc::program_status::{PromptMark, StatusEvent};
+    let h = harness(true, None).await;
+    let project = h.workspace.create_project("p", "/tmp").unwrap();
+    let tab = h.workspace.open_tab(project.id, "/tmp", "t", true).unwrap();
+    let (mut watcher, _ww, fence) = h.subscribe().await;
+    let mark = |mark| {
+        h.workspace
+            .apply_program_status(tab.id, vec![StatusEvent::Prompt(mark)], 0)
+            .expect("the tab exists");
+    };
+    let shell_of = |batch: &EventBatch| {
+        batch
+            .events
+            .iter()
+            .find(|event| event.event == ops::EVENT_AGENT_REPORT_CHANGED)
+            .map(|event| {
+                (
+                    event.data["shell_state"].clone(),
+                    event.data["state"].clone(),
+                )
+            })
+    };
+
+    let title = |text: String| {
+        h.workspace.set_tab_title(tab.id, &text).unwrap();
+    };
+
+    for (step, prompt_mark, shell, state) in [
+        (0, PromptMark::OutputStart, "foreground_process", "running"),
+        (1, PromptMark::CommandEnd, "at_prompt", "none"),
+    ] {
+        mark(prompt_mark);
+        title(format!("after {step}"));
+        let batch = read_batch(&mut watcher).await;
+        assert_eq!(
+            names(&batch),
+            vec![
+                ops::EVENT_TAB_STATE_CHANGED,
+                ops::EVENT_AGENT_REPORT_CHANGED
+            ],
+            "{prompt_mark:?}"
+        );
+        assert_eq!(batch.revision, fence + 1 + 3 * step, "{step}");
+        assert_eq!(
+            shell_of(&batch),
+            Some((serde_json::json!(shell), serde_json::json!(state))),
+            "{prompt_mark:?}"
+        );
+        assert_eq!(
+            names(&read_batch(&mut watcher).await),
+            vec![ops::EVENT_TAB_TITLE_CHANGED]
+        );
+
+        mark(prompt_mark);
+        title(format!("after a second {step}"));
+        let next = read_batch(&mut watcher).await;
+        assert_eq!(
+            names(&next),
+            vec![ops::EVENT_TAB_TITLE_CHANGED],
+            "the repeated {prompt_mark:?} sent nothing"
+        );
+        assert_eq!(next.revision, batch.revision + 2);
+    }
+}
+
 /// Read to EOF and report the last frame seen plus whether the close
 /// actually followed it. Batches committed before the cut are
 /// legitimately still in flight, so the label is asserted on the *last*

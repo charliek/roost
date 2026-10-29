@@ -130,34 +130,44 @@ impl StatusApplied {
     }
 }
 
-/// A notification libghostty placed in the status stream, with whether
-/// the records were authoritative at that point.
+/// A notification libghostty placed in the status stream, with whether a
+/// raw OSC notification there is suppressed ([`RawOscAuthority`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacedNotification {
     pub title: String,
     pub body: String,
-    pub authoritative: bool,
+    pub suppressed: bool,
 }
 
-/// Whether the records were authoritative at each of one chunk's raw OSC
-/// 9 / 777 notifications (plan 082 D5.8 and its amendment), so each is
-/// judged against the records as they stood at its own bytes rather than
-/// at the end of whatever read it arrived in.
+/// Whether each of one chunk's raw OSC 9 / 777 notifications is suppressed
+/// where it falls (plan 082 D5.8 and its amendment, plan 083 D-B4): by
+/// the records, or by the hook layer, as each stood at the notification's
+/// own bytes rather than at the end of whatever read it arrived in. The
+/// hook layer moves with the chunk's OSC 133 marks, so `OSC 9, 133;A` on
+/// a tab an agent drives is suppressed however the read splits.
 ///
-/// libghostty places the notifications and roost-osc raises them, and the
-/// two parsers don't accept quite the same forms (the matrix in this
-/// module's tests). So each of roost-osc's notifications takes the first
-/// unclaimed place with the same text, not the next place, and a place
+/// libghostty places the notifications and roost-osc raises them. Both
+/// start and end every OSC at the same bytes (roost-osc follows
+/// libghostty's parser; a differential test in this module checks it), so
+/// a notification and its place always land in the same chunk, however a
+/// read splits the bytes. They don't accept quite the same forms, though
+/// (the matrix in this module's tests). So each of roost-osc's
+/// notifications takes the first unclaimed place with the same text, not
+/// the next place, and a place
 /// roost-osc would never raise (an `OSC 9` body its own classifier calls
 /// ConEmu) isn't claimable at all, so it can't stand in for a later
 /// notification with the same text. One only roost-osc accepts finds no
-/// place and is judged at the chunk's end.
+/// place and is judged at the chunk's end: against the records and the
+/// hook layer after all of the chunk's marks, so an `OSC 133;A` later in
+/// the same read has already ended an agent's turn under it.
 ///
 /// Known residuals, each judged at the chunk's end rather than at its
 /// place: a body over libghostty's 2047-byte OSC cap (libghostty places
 /// nothing), an `OSC 777;notify;;<text>` whose text reads as a ConEmu
 /// command (libghostty reports it like an `OSC 9`), and any other form the
-/// two parsers disagree on.
+/// two parsers disagree on. Such a form takes a later place in its chunk
+/// instead, if a notification both parsers accept follows it with the
+/// same text.
 #[derive(Debug, Default)]
 pub struct RawOscAuthority {
     places: Vec<Option<((String, String), bool)>>,
@@ -175,7 +185,7 @@ impl RawOscAuthority {
                 .map(|place| {
                     Some((
                         notification_key(&place.title, &place.body),
-                        place.authoritative,
+                        place.suppressed,
                     ))
                 })
                 .collect(),
@@ -184,9 +194,9 @@ impl RawOscAuthority {
     }
 
     /// Claim the place of roost-osc's notification `title` / `body` and
-    /// say whether the records were authoritative there. `None` when
-    /// libghostty placed no such notification in the chunk: the caller
-    /// then reads the records as they stand, at the chunk's end.
+    /// say whether it is suppressed there. `None` when libghostty placed
+    /// no such notification in the chunk: the caller then reads the tab as
+    /// it stands, at the chunk's end.
     pub fn claim(&mut self, tab_id: i64, title: &str, body: &str) -> Option<bool> {
         let key = notification_key(title, body);
         let claimed = self
@@ -194,7 +204,7 @@ impl RawOscAuthority {
             .iter_mut()
             .find(|place| place.as_ref().is_some_and(|(placed, _)| *placed == key))
             .and_then(Option::take)
-            .map(|(_, authoritative)| authoritative);
+            .map(|(_, suppressed)| suppressed);
         if claimed.is_none() && !std::mem::replace(&mut self.unplaced_logged, true) {
             tracing::debug!(
                 tab_id,
@@ -264,38 +274,37 @@ impl ProgramStatusRecords {
         self.deciding().is_some()
     }
 
-    /// Apply one ordered batch from the tab's authoritative terminal.
+    /// Apply one ordered batch from the tab's authoritative terminal to the
+    /// records and to the hook layer `agent`, whose shell marks come from
+    /// the same stream (plan 083 D-B1).
     ///
-    /// Banners are decided after each event, against the composed
-    /// lifecycle before it. The caller hands each of the batch's OSC 133
-    /// marks to the hook layer only after this returns, so composition
-    /// reads a projection of `agent` that each prompt mark moves exactly as
-    /// that later [`agent::apply_shell_mark`] will. Every event then sees
-    /// the hook state it follows in the byte stream, and the result is the
-    /// same however the stream was batched. `agent` itself is untouched.
+    /// Each prompt mark moves `agent` through [`agent::apply_shell_mark`]
+    /// where it falls, and banners are decided after each event, against
+    /// the composed lifecycle before it. Every event then sees the hook
+    /// state it follows in the byte stream, and the result is the same
+    /// however the stream was batched.
     pub fn apply(
         &mut self,
-        agent: &AgentTabState,
+        agent: &mut AgentTabState,
         events: impl IntoIterator<Item = StatusEvent>,
         now_ms: i64,
     ) -> StatusApplied {
         let mut applied = StatusApplied::default();
-        let mut hooks = agent.clone();
-        let mut before = compose(&hooks, self).lifecycle;
+        let mut before = compose(agent, self).lifecycle;
         for event in events {
             match event {
                 StatusEvent::Report(report) => self.report(&report, now_ms, &mut applied),
                 StatusEvent::Prompt(mark) => {
                     self.prompt(mark);
-                    if let Some(next) = agent::apply_shell_mark(&hooks, osc133_body(mark)) {
-                        hooks = next;
+                    if let Some(next) = agent::apply_shell_mark(agent, osc133_body(mark)) {
+                        *agent = next;
                     }
                 }
                 StatusEvent::Notification { title, body } => {
                     applied.notifications.push(PlacedNotification {
                         title,
                         body,
-                        authoritative: self.is_authoritative(),
+                        suppressed: self.is_authoritative() || agent::suppress_raw_osc(agent),
                     });
                     continue;
                 }
@@ -303,7 +312,7 @@ impl ProgramStatusRecords {
             if self.children() < MAX_CHILDREN {
                 self.cap_warned = false;
             }
-            before = self.announce(&hooks, before, now_ms, &mut applied);
+            before = self.announce(agent, before, now_ms, &mut applied);
         }
         applied
     }
@@ -657,14 +666,8 @@ fn from_vt(events: Vec<roost_vt::TerminalEvent>) -> Vec<StatusEvent> {
         .collect()
 }
 
-/// The OSC 133 body roost-osc hands the hook layer for the byte libghostty
-/// reported as `mark`.
-///
-/// Not exact, a known residual (plan 082, the amendment after D5.8):
-/// libghostty reports `133;P;k=i` and `133;N` as a primary prompt start,
-/// which the hook layer ignores, and filters `133;A;k=s`, which the hook
-/// layer takes as `A`. A banner can then depend on the read boundary when
-/// a shell emits those marks in the same read as a record change.
+/// The OSC 133 body [`agent::apply_shell_mark`] reads for the mark
+/// libghostty reported.
 fn osc133_body(mark: PromptMark) -> &'static str {
     match mark {
         PromptMark::PromptStart => "A",
@@ -763,7 +766,7 @@ mod tests {
         report(S::Clear, id, "", "")
     }
 
-    /// Each OSC 133 mark with the body roost-osc hands the hook layer.
+    /// Each OSC 133 mark by the letter a shell sends for it.
     const MARKS: [(&str, PromptMark); 4] = [
         ("A", PromptMark::PromptStart),
         ("B", PromptMark::InputStart),
@@ -777,10 +780,6 @@ mod tests {
             .find(|(b, _)| *b == body)
             .unwrap_or_else(|| panic!("not a mark this test speaks: {body}"))
             .1
-    }
-
-    fn body(mark: PromptMark) -> &'static str {
-        MARKS.iter().find(|(_, m)| *m == mark).unwrap().0
     }
 
     /// `events` split at `cuts`.
@@ -860,22 +859,10 @@ mod tests {
     }
 
     impl Tab {
-        /// One batch as both axes see it: the records from libghostty's
-        /// ordered stream, then the batch's prompt marks to the hook layer
-        /// from roost-osc, the order a session tab's ingest runs them in.
+        /// One batch from libghostty's ordered stream, to both axes.
         fn feed(&mut self, events: impl IntoIterator<Item = StatusEvent>, now_ms: i64) {
-            let events: Vec<StatusEvent> = events.into_iter().collect();
-            let applied = self
-                .records
-                .apply(&self.agent, events.iter().cloned(), now_ms);
+            let applied = self.records.apply(&mut self.agent, events, now_ms);
             self.banners.extend(applied.banners);
-            for event in &events {
-                if let StatusEvent::Prompt(mark) = event {
-                    if let Some(next) = agent::apply_shell_mark(&self.agent, body(*mark)) {
-                        self.agent = next;
-                    }
-                }
-            }
         }
 
         fn mark(&mut self, body: &str, now_ms: i64) {
@@ -1321,35 +1308,35 @@ mod tests {
 
     #[test]
     fn the_cap_refuses_the_256th_child_accepts_the_root_and_warns_once_per_burst() {
-        let agent = AgentTabState::default();
+        let mut agent = AgentTabState::default();
         let mut records = ProgramStatusRecords::default();
         let child = |i: usize| report(S::Working, &format!("c{i}"), "", "");
 
-        let applied = records.apply(&agent, (0..MAX_CHILDREN).map(child), T0);
+        let applied = records.apply(&mut agent, (0..MAX_CHILDREN).map(child), T0);
         assert!(applied.refused.is_empty());
         assert_eq!(records.children(), 255);
 
-        let applied = records.apply(&agent, [child(255)], T0);
+        let applied = records.apply(&mut agent, [child(255)], T0);
         assert_eq!(applied.refused, ["c255"]);
         assert!(!records.records.contains_key("c255"));
-        let applied = records.apply(&agent, [child(256)], T0);
+        let applied = records.apply(&mut agent, [child(256)], T0);
         assert!(applied.refused.is_empty(), "warned once");
         assert_eq!(records.children(), 255);
 
-        records.apply(&agent, [report(S::Done, "c0", "", "")], T0);
+        records.apply(&mut agent, [report(S::Done, "c0", "", "")], T0);
         assert_eq!(
             records.records["c0"].state,
             S::Done,
             "a known child updates"
         );
-        records.apply(&agent, [claude(S::Working)], T0);
+        records.apply(&mut agent, [claude(S::Working)], T0);
         assert!(
             records.records.contains_key(ROOT),
             "the root is always accepted"
         );
         assert_eq!(records.records.len(), 256);
 
-        let applied = records.apply(&agent, [clear("c1"), child(257), child(258)], T0);
+        let applied = records.apply(&mut agent, [clear("c1"), child(257), child(258)], T0);
         assert!(records.records.contains_key("c257"));
         assert_eq!(applied.refused, ["c258"], "warned again after dropping");
     }
@@ -1616,7 +1603,7 @@ mod tests {
     #[test]
     fn a_veto_is_flagged_only_when_it_suppressed_something() {
         let mut records = ProgramStatusRecords::default();
-        records.apply(&AgentTabState::default(), [claude(S::Working)], T0);
+        records.apply(&mut AgentTabState::default(), [claude(S::Working)], T0);
         let agent = owner("claude", L::Working, ShellState::ForegroundProcess);
         let apply =
             |report: TabAgentReportParams| apply_hook_report(&agent, &records, &report, NOW_S);
@@ -1687,7 +1674,7 @@ mod tests {
         ];
         for state in [S::Idle, S::Working, S::Blocked, S::Done, S::Error] {
             let mut records = ProgramStatusRecords::default();
-            records.apply(&AgentTabState::default(), [claude(state)], T0);
+            records.apply(&mut AgentTabState::default(), [claude(state)], T0);
             let shown = compose(&AgentTabState::default(), &records);
             assert_eq!(shown.decided_by, By::Records);
             for shell in [
@@ -1836,7 +1823,7 @@ mod tests {
             (S::Idle, L::Inactive, TabState::None),
         ] {
             let mut records = ProgramStatusRecords::default();
-            records.apply(&AgentTabState::default(), [claude(state)], T0);
+            records.apply(&mut AgentTabState::default(), [claude(state)], T0);
             let composed = compose(&AgentTabState::default(), &records);
             assert_eq!(composed.lifecycle, lifecycle, "{state:?}");
             assert_eq!(composed.tab_state(), tab_state, "{state:?}");
@@ -1925,7 +1912,7 @@ mod tests {
         let seeded = || {
             let mut records = ProgramStatusRecords::default();
             records.apply(
-                &AgentTabState::default(),
+                &mut AgentTabState::default(),
                 [
                     claude(S::Working),
                     report(S::Blocked, "a", "", ""),
@@ -1940,7 +1927,7 @@ mod tests {
         for body in ["A", "B", "D"] {
             let mut records = seeded();
             records.apply(
-                &AgentTabState::default(),
+                &mut AgentTabState::default(),
                 [StatusEvent::Prompt(mark(body))],
                 T0,
             );
@@ -1950,7 +1937,7 @@ mod tests {
         }
         let mut records = seeded();
         records.apply(
-            &AgentTabState::default(),
+            &mut AgentTabState::default(),
             [StatusEvent::Prompt(mark("C"))],
             T0,
         );
@@ -2089,9 +2076,16 @@ mod tests {
         use crate::osc::{OscAction, OscRouter};
 
         // (bytes, libghostty's places, roost-osc's notifications)
-        let matrix: [(&[u8], usize, usize); 22] = [
+        let matrix: [(&[u8], usize, usize); 27] = [
             (b"\x1b]9;Build done\x07", 1, 1),
             (b"\x1b]9;Build done\x1b\\", 1, 1),
+            // Both end a sequence at its `ESC` whatever follows, and CAN
+            // or SUB cancel it.
+            (b"\x1b]9;Build done\x1b[m", 1, 1),
+            (b"\x1b]777;notify;Build;done\x1bX", 1, 1),
+            (b"\x1b]9;one\x1b]9;two\x07", 2, 2),
+            (b"\x1b]9;Build\x18done\x1b\\", 0, 0),
+            (b"\x1b]777;notify;Build;\x1adone\x07", 0, 0),
             (b"\x1b]9;\x07", 1, 1),
             (b"\x1b]9;13 tests passed\x07", 1, 1),
             (b"\x1b]777;notify;Build;done\x07", 1, 1),
@@ -2104,13 +2098,14 @@ mod tests {
             (b"\x1b]9;2;message box\x07", 0, 0),
             (b"\x1b]9;9;/tmp\x07", 0, 0),
             (b"\x1b]777;set-color;1\x07", 0, 0),
-            // Disagreements: roost-osc's OSC 777 accepts a title alone and
-            // OSC 9 with no `;`; libghostty takes an OSC 9 body that starts
-            // `5` or `12` as ConEmu's wait-for-input and prompt mark, and
-            // reads a bare ConEmu number, or a progress or `10` sub-command
-            // with a value it doesn't know, as a notification.
+            // Neither raises an OSC 9 with no `;`.
+            (b"\x1b]9\x07", 0, 0),
+            // Disagreements: roost-osc's OSC 777 accepts a title alone;
+            // libghostty takes an OSC 9 body that starts `5` or `12` as
+            // ConEmu's wait-for-input and prompt mark, and reads a bare
+            // ConEmu number, or a progress or `10` sub-command with a
+            // value it doesn't know, as a notification.
             (b"\x1b]777;notify;Build done\x07", 0, 1),
-            (b"\x1b]9\x07", 0, 1),
             (b"\x1b]9;5 tests failed\x07", 0, 1),
             (b"\x1b]9;12 done\x07", 0, 1),
             (b"\x1b]9;1\x07", 1, 0),
@@ -2166,6 +2161,155 @@ mod tests {
         }
     }
 
+    /// Plan 083 B1, round 3: libghostty and roost-osc agree on where every
+    /// OSC starts and ends, so on every byte string the notifications
+    /// libghostty places and the ones roost-osc raises are the same, in the
+    /// same order, with the same text. Checked exhaustively over every
+    /// `A + "]9;x" + B + T` — `A` and `B` any strings of up to two bytes of
+    /// [`FRAMING_ALPHABET`], or `A` three and `B` up to one, `T` a BEL or
+    /// an `ESC` — and every `A + "9;x" + T` with `A` up to four bytes, so
+    /// the bytes before and inside a notification (an `ESC ]` or an 8-bit
+    /// OSC among them) decide whether it is one; and over 300,000 seeded
+    /// random strings of those bytes and a few OSC fragments, 4 to 37
+    /// bytes long.
+    ///
+    /// The alphabet holds no byte of a title-only `OSC 777` (no `7`) and
+    /// can't build a body over libghostty's buffer, two of the content
+    /// residuals [`RawOscAuthority`] lists. The third, an `OSC 9` body a
+    /// parser reads as ConEmu's, is the only thing excluded after the
+    /// fact: a case where either side reports a text starting with a digit
+    /// isn't compared, and those stay a small share of the cases.
+    #[cfg(feature = "vt")]
+    #[test]
+    fn libghostty_and_roost_osc_frame_every_osc_alike() {
+        let mut term = roost_vt::Terminal::new(roost_vt::TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+            ..Default::default()
+        })
+        .expect("terminal");
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        term.set_status_sink(std::sync::Arc::clone(&sink))
+            .expect("status sink");
+        let (mut compared, mut skipped) = (0usize, 0usize);
+        let mut check = |bytes: &[u8]| {
+            term.vt_write(bytes);
+            // CAN puts libghostty back at ground from any state, and
+            // cancels an OSC left open, so the next case starts clean.
+            term.vt_write(b"\x18");
+            let placed: Vec<(String, String)> = drain(&sink)
+                .into_iter()
+                .filter_map(|event| match event {
+                    StatusEvent::Notification { title, body } => {
+                        Some(notification_key(&title, &body))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let raised: Vec<(String, String)> = roost_osc::OscScanner::new()
+                .feed(bytes)
+                .into_iter()
+                .filter_map(|event| match event {
+                    roost_osc::OscEvent::Notification { title, body } => {
+                        Some(notification_key(&title, &body))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let conemu_shaped = placed
+                .iter()
+                .chain(&raised)
+                .any(|(text, _)| text.starts_with(|c: char| c.is_ascii_digit()));
+            if conemu_shaped {
+                skipped += 1;
+                return;
+            }
+            compared += 1;
+            assert_eq!(placed, raised, "{bytes:02x?}");
+        };
+
+        let short: Vec<Vec<u8>> = std::iter::once(Vec::new())
+            .chain(FRAMING_ALPHABET.iter().map(|b| vec![*b]))
+            .chain(
+                FRAMING_ALPHABET
+                    .iter()
+                    .flat_map(|a| FRAMING_ALPHABET.iter().map(move |b| vec![*a, *b])),
+            )
+            .collect();
+        let longer: Vec<Vec<u8>> = short
+            .iter()
+            .filter(|s| s.len() == 2)
+            .flat_map(|s| {
+                FRAMING_ALPHABET
+                    .iter()
+                    .map(move |b| [s.as_slice(), &[*b]].concat())
+            })
+            .collect();
+        let longest: Vec<Vec<u8>> = longer
+            .iter()
+            .flat_map(|s| {
+                FRAMING_ALPHABET
+                    .iter()
+                    .map(move |b| [s.as_slice(), &[*b]].concat())
+            })
+            .collect();
+        let at_most_one = &short[..=FRAMING_ALPHABET.len()];
+        let nothing = &short[..1];
+        for (befores, osc, afters) in [
+            (&short[..], &b"]9;x"[..], &short[..]),
+            (&longer[..], b"]9;x", at_most_one),
+            (&short[..], b"9;x", nothing),
+            (&longer[..], b"9;x", nothing),
+            (&longest[..], b"9;x", nothing),
+        ] {
+            for a in befores {
+                for b in afters {
+                    for terminator in [&b"\x07"[..], b"\x1b"] {
+                        check(&[a.as_slice(), osc, b.as_slice(), terminator].concat());
+                    }
+                }
+            }
+        }
+
+        let fragments: [&[u8]; 4] = [b"]9;x", b"]9;y", b"]0;t", b"\x1b]9;z"];
+        let mut seed: u64 = 0x0083_b1f3_a1e5_0001;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..300_000 {
+            let len = 4 + (next() % 29) as usize;
+            let mut bytes = Vec::with_capacity(len + 8);
+            while bytes.len() < len {
+                let pick = (next() % (FRAMING_ALPHABET.len() as u64 + 4)) as usize;
+                match FRAMING_ALPHABET.get(pick) {
+                    Some(b) => bytes.push(*b),
+                    None => bytes.extend_from_slice(fragments[pick - FRAMING_ALPHABET.len()]),
+                }
+            }
+            check(&bytes);
+        }
+        assert!(
+            skipped * 10 < compared,
+            "{skipped} ConEmu-shaped cases skipped of {}",
+            compared + skipped
+        );
+    }
+
+    /// The bytes [`libghostty_and_roost_osc_frame_every_osc_alike`] builds
+    /// its cases from: the OSC introducer and terminators, the controls
+    /// that cancel or don't, the escapes that open other sequences
+    /// (`[` CSI, `P` DCS, `X` SOS), their 8-bit forms and an 8-bit ST, and
+    /// the text of an `OSC 9` and an `OSC 0`.
+    #[cfg(feature = "vt")]
+    const FRAMING_ALPHABET: [u8; 21] = [
+        0x1b, b']', b'9', b';', b'x', 0x07, b'\\', 0x18, 0x1a, b'\n', 0x00, 0x7f, b'[', b'P', b'X',
+        0x9c, b'0', b' ', 0x9d, 0x9b, 0x90,
+    ];
+
     fn placed(body: &str) -> StatusEvent {
         StatusEvent::Notification {
             title: String::new(),
@@ -2173,20 +2317,19 @@ mod tests {
         }
     }
 
-    fn place(body: &str, authoritative: bool) -> PlacedNotification {
+    fn place(body: &str, suppressed: bool) -> PlacedNotification {
         PlacedNotification {
             title: String::new(),
             body: body.into(),
-            authoritative,
+            suppressed,
         }
     }
 
-    /// The D5.8 records half at each notification's place: the flag is the
-    /// records' authority after everything before it in the batch, and a
-    /// place changes nothing else.
+    /// The D5.8 records half at each notification's place: with no hook
+    /// owner, the flag is the records' authority after everything before
+    /// it in the batch, and a place changes nothing else.
     #[test]
     fn a_notification_place_records_the_authority_there_and_changes_nothing() {
-        let agent = AgentTabState::default();
         let stream = [
             placed("one"),
             report(S::Blocked, "", "pi", ""),
@@ -2195,8 +2338,9 @@ mod tests {
             placed("three"),
         ];
 
+        let mut agent = AgentTabState::default();
         let mut records = ProgramStatusRecords::default();
-        let applied = records.apply(&agent, stream.iter().cloned(), LATE);
+        let applied = records.apply(&mut agent, stream.iter().cloned(), LATE);
         assert_eq!(
             applied.notifications,
             [
@@ -2211,11 +2355,76 @@ mod tests {
             .filter(|event| !matches!(event, StatusEvent::Notification { .. }))
             .cloned()
             .collect();
+        let mut plain_agent = AgentTabState::default();
         let mut plain = ProgramStatusRecords::default();
-        let plain_applied = plain.apply(&agent, without, LATE);
+        let plain_applied = plain.apply(&mut plain_agent, without, LATE);
         assert_eq!(records, plain, "the records");
+        assert_eq!(agent, plain_agent, "the hook layer");
         assert_eq!(applied.banners, plain_applied.banners, "the banners");
         assert_eq!(applied.banners, [banner("Pi", "Needs your input")]);
+    }
+
+    /// Plan 083 D-B4, the hook half: with no record anywhere, a place
+    /// before the mark that ends a driving agent's turn is suppressed, and
+    /// one after it isn't, because the mark has moved the hook layer by
+    /// then. A `C` keeps the agent driving.
+    #[test]
+    fn a_notification_place_records_whether_the_hooks_suppressed_it_there() {
+        for (body, after) in [("A", false), ("B", false), ("D", false), ("C", true)] {
+            let mut agent = owner("claude", L::Working, ShellState::Unknown);
+            let mut records = ProgramStatusRecords::default();
+            let applied = records.apply(
+                &mut agent,
+                [
+                    placed("before"),
+                    StatusEvent::Prompt(mark(body)),
+                    placed("after"),
+                ],
+                LATE,
+            );
+            assert_eq!(
+                applied.notifications,
+                [place("before", true), place("after", after)],
+                "{body}"
+            );
+            assert!(records.is_empty(), "{body}: no record was made up");
+        }
+    }
+
+    /// Plan 083 D-B1: the batch's prompt marks move the hook layer it is
+    /// handed, in byte order, with ownership kept as a label.
+    #[test]
+    fn a_batchs_prompt_marks_move_the_hook_layer_in_order() {
+        let at = |marks: &[&str]| {
+            let mut agent = owner("claude", L::Waiting, ShellState::Unknown);
+            ProgramStatusRecords::default().apply(
+                &mut agent,
+                marks.iter().map(|body| StatusEvent::Prompt(mark(body))),
+                LATE,
+            );
+            agent
+        };
+        assert_eq!(at(&[]), owner("claude", L::Waiting, ShellState::Unknown));
+        assert_eq!(
+            at(&["C"]),
+            owner("claude", L::Waiting, ShellState::ForegroundProcess),
+            "C writes only the shell axis"
+        );
+        for body in ["A", "B", "D"] {
+            assert_eq!(
+                at(&[body]),
+                owner("claude", L::Inactive, ShellState::AtPrompt),
+                "{body} is the failsafe"
+            );
+        }
+        assert_eq!(
+            at(&["D", "C"]),
+            owner("claude", L::Inactive, ShellState::ForegroundProcess)
+        );
+        assert_eq!(
+            at(&["C", "D"]),
+            owner("claude", L::Inactive, ShellState::AtPrompt)
+        );
     }
 
     /// A notification claims the first unclaimed place with its text; a

@@ -357,6 +357,61 @@ def test_osc133_records_shell_axis_under_an_agent_owner(roost, project):
     assert roost.hook_active(tab) is False
 
 
+# Plan 083 D-B3: OSC 133 forms the two implementations read differently.
+# Roost-Iced's hook layer takes its marks from libghostty's stream (a
+# prompt start for `P;k=i` and `N`, an input start for `I`, nothing for a
+# secondary prompt or a letter with no `;` after it); Roost.app keeps its
+# own scanner and the first-letter rule. Each value is what the form does
+# to a tab a hook owner holds, Waiting, at a prompt.
+_FORMS_BY_TARGET = {
+    b"P;k=i": {"iced": "prompt", "mac": "ignored"},
+    b"N": {"iced": "prompt", "mac": "ignored"},
+    b"I": {"iced": "prompt", "mac": "ignored"},
+    b"A;k=s": {"iced": "ignored", "mac": "prompt"},
+    b"Axyz": {"iced": "ignored", "mac": "prompt"},
+    b"Cxyz": {"iced": "ignored", "mac": "command"},
+    b"D0": {"iced": "ignored", "mac": "prompt"},
+    b"A": {"iced": "prompt", "mac": "prompt"},
+    b"C": {"iced": "command", "mac": "command"},
+}
+_FORM_EFFECT = {
+    "prompt": ("at_prompt", "inactive"),
+    "command": ("foreground_process", "waiting"),
+    "ignored": ("at_prompt", "waiting"),
+}
+
+
+@pytest.mark.skipif(
+    not _TEST_MODE,
+    reason="feeding OSC 133 needs ROOST_TEST_MODE=1 in the UI's launch env",
+)
+def test_osc133_forms_follow_each_targets_rule(roost, project, target):
+    """Each target's rule for the forms where they part (plan 083 D-B3):
+    Roost-Iced reads OSC 133 the way libghostty does, Roost.app keeps the
+    first-letter rule. A `D` and a fresh claim put the tab back at a
+    prompt under a Waiting owner before each form; the OSC 0 title after
+    it is the ordering barrier."""
+    tab = roost.open_tab(project, cwd="/tmp", argv=["/bin/sh", "-c", "exec sleep 300"])
+    roost.open_tab(project, cwd="/tmp")  # steals active
+    wait_tab_attached(roost, tab)
+
+    def fed_then_titled(data: bytes, title: str) -> None:
+        roost.tab_feed_pty_bytes(tab, data + f"\x1b]0;{title}\x07".encode())
+        roost._wait(
+            lambda: (roost.tab(tab) or {}).get("title") == title,
+            timeout=5,
+            what=f"OSC 0 barrier {title}",
+        )
+
+    for i, (body, by_target) in enumerate(_FORMS_BY_TARGET.items()):
+        fed_then_titled(b"\x1b]133;D\x07", f"osc133-reset-{i}")
+        roost.agent_report(tab, "claude", "claim", session_id="s1", lifecycle="waiting")
+        fed_then_titled(b"\x1b]133;" + body + b"\x07", f"osc133-form-{i}")
+        listed = roost.tab(tab)
+        want = _FORM_EFFECT[by_target[target]]
+        assert (listed["shell_state"], listed["agent_lifecycle"]) == want, (body, listed)
+
+
 def test_bash_marks_emit_wired(roost, project):
     """The shipped bash integration wires the OSC 133 C mark into PS0 on
     bash >= 4.4. Older bash (e.g. macOS /bin/bash 3.2) ignores PS0, so the
