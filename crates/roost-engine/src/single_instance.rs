@@ -19,7 +19,9 @@
 //!
 //! * the **socket/bind lock** (`BundleProfile::socket_lock_path`,
 //!   `<socket dir>/roost.lock`) guards the probe→unlink→bind sequence
-//!   and the socket's lifetime, and follows `XDG_RUNTIME_DIR`;
+//!   and the socket's lifetime, and follows the socket (a UI's
+//!   `XDG_RUNTIME_DIR`; a session's directory under the passwd home, or
+//!   `ROOST_SESSION_SOCKET_DIR`);
 //! * the **state lock** (`BundleProfile::state_lock_path`,
 //!   `<state dir>/state.lock`) guards `state.json`, and follows
 //!   `ROOST_STATE_DIR`.

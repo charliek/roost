@@ -637,7 +637,9 @@ mod tests {
     #[test]
     fn nothing_is_said_about_the_local_session_while_a_retry_is_armed() {
         let between_retries = SlotFacts {
-            reason: Some("no session is running at /run/user/1000/roost-session/roost.sock"),
+            reason: Some(
+                "no session is running at /home/u/.local/state/roost-session/run/roost.sock",
+            ),
             detail: None,
             retry_armed: true,
             ..settled_slot(SectionState::Disconnected)

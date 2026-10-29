@@ -23,11 +23,16 @@ The env differs per OS because the resolver does
   `~/Library/Caches/<label>/roost.sock`,
   `~/Library/Application Support/<label>`, `~/Library/Logs/<label>`.
   So `HOME` alone is the whole isolation knob.
-* **Linux** — XDG: `XDG_RUNTIME_DIR/<ns>/roost.sock`,
-  `XDG_DATA_HOME/<ns>`, `XDG_STATE_HOME/<ns>`. `HOME` is set too, as the
-  fallback the resolver uses when an XDG dir is missing, and
-  `XDG_CACHE_HOME` because `roost-engine`'s shell-integration cache
-  writes there.
+* **Linux** — the socket is not XDG: its default is under the uid's
+  passwd home, which no env var in this process can isolate, so every
+  env carries `ROOST_SESSION_SOCKET_DIR` (`<root>/sock`, see
+  `socket_dir`) and the socket is `<root>/sock/roost.sock`. State and
+  logs stay XDG: `XDG_DATA_HOME/<ns>`, `XDG_STATE_HOME/<ns>`. `HOME` is
+  set too, as the fallback the resolver uses when an XDG dir is missing,
+  and `XDG_CACHE_HOME` because `roost-engine`'s shell-integration cache
+  writes there. `XDG_RUNTIME_DIR` is still pointed at `<root>/run`, so
+  nothing a process launched here reads reaches the developer's, but it
+  no longer moves the session.
 
 The root is **canonicalized** (`Path.resolve()`) before anything is
 derived from it. `validate_runtime_dir` rejects a socket directory with
@@ -42,16 +47,15 @@ inside the profile's root. A test that wants a session to write hook
 entries calls it, and from then on every launch asserts the jail before
 spawning (plan 046 §3.9).
 
-The runtime directory's *parent* is pre-created here rather than left to
+The socket directory's *parent* is pre-created here rather than left to
 the daemon: `validate_runtime_dir` creates only the leaf (non-recursive,
-`0700`), which is right for a real machine where `$XDG_RUNTIME_DIR` and
-`~/Library/Caches` are provided by the OS. The fixture plays the OS.
-On Linux that means `make_env` also chmods `$XDG_RUNTIME_DIR` itself to
-`0700` after creating it, since `Path.mkdir` inherits the process umask
-and a permissive one (e.g. 0002) would otherwise leave it group-writable
-and fail the same validation a real runtime dir would; `data`/`state`/
-`cache` are left as `mkdir` makes them since the daemon never validates
-those.
+`0700`), which is right for a real machine where `~/Library/Caches` is
+provided by the OS, and the override's leaf sits directly under the
+root. The fixture plays the OS. On Linux `make_env` also chmods
+`$XDG_RUNTIME_DIR` to `0700` after creating it, since `Path.mkdir`
+inherits the process umask and a permissive one (e.g. 0002) would
+otherwise leave it group-writable; `data`/`state`/`cache` are left as
+`mkdir` makes them since the daemon never validates those.
 
 # Why `SHELL=/bin/sh`
 

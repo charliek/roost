@@ -75,7 +75,11 @@ See `docs/development/vision.md` for the design rationale and
 - External tools dial the running UI process at the bundle profile's
   socket path (`~/Library/Caches/Roost/roost.sock` for Mac,
   `$XDG_RUNTIME_DIR/roost/roost.sock` for Linux — fallback
-  `/tmp/roost-<uid>/roost.sock`). The wire format is newline-delimited
+  `/tmp/roost-<uid>/roost.sock`). The headless `roost-session`'s socket is
+  `~/Library/Caches/RoostSession/roost.sock` on Mac and, on Linux, under
+  the uid's passwd home — `<pw_dir>/.local/state/roost-session/run/roost.sock`,
+  not `XDG_RUNTIME_DIR` — with `ROOST_SESSION_SOCKET_DIR` replacing the
+  directory (`docs/reference/paths.md`). The wire format is newline-delimited
   JSON; see `docs/reference/ipc.md`.
 
 ## Threading (critical)

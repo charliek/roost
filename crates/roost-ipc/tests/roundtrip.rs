@@ -488,7 +488,7 @@ fn both_identify_vectors_decode_as_the_current_typed_result() {
     assert_eq!(result.local_backend, LocalBackendMode::Session);
     assert_eq!(
         result.local_session_socket.as_deref(),
-        Some("/run/user/1000/roost-session/roost.sock")
+        Some("/home/u/.local/state/roost-session/run/roost.sock")
     );
     // Under `session` the ids on the wire are the slot's selection, not
     // this socket's own workspace — the reason the field pair exists.

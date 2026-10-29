@@ -890,6 +890,7 @@ ops these verbs drive.
 roostctl session start
 roostctl session status
 roostctl session stop
+roostctl session stop --old-path <socket>
 ```
 
 These three verbs are a deliberate carve-out: a session is not a UI, so
@@ -929,10 +930,25 @@ convention so a script can branch on the code alone without parsing
 output; a socket that exists but will not answer is a real fault and
 exits 1 (`connection`), not 3.
 
+A session left running by an older build at a socket path this build no
+longer uses is not counted as running, but it is named: one
+`running at an old path: <socket> (session <id>, protocol <n>)` line per
+session, printed whether or not a session also answers at the new path
+(a socket that answers but will not identify prints `(not identified:
+<why>)`). `--json` carries the same in an `old_paths` array, and exit 3
+stays exit 3. `session start` refuses to run beside such a session and
+names the fix. `session stop` only ever stops the new path's session;
+`session stop --old-path <socket>` stops the one at an old path. It
+takes only a socket `session status` would have listed (anything else,
+and this build's own socket, are refused), requires the session to
+report a session id, prints `stopping session <id> at <socket>` and then
+stops it only if that id still answers when the stop is sent. See
+[Paths → Upgrading from an older build](paths.md#upgrading-from-an-older-build).
+
 | Verb | Exit 0 | Exit 1 | Exit 3 |
 |---|---|---|---|
 | `session start` | a session confirmed serving (fresh or already-running) | spawn failed, or no session answered `session.identify` within the confirm window | — |
-| `session stop` | stopped, or already not running | a socket exists but never answered, or the reap timed out | — |
+| `session stop` | stopped, or already not running | a socket exists but never answered, or the reap timed out; with `--old-path`, a socket that is not an old-path candidate, this build's own socket, or a session that reports no id | — |
 | `session status` | a session answered; identity printed | a socket exists but would not answer | no session is running |
 
 ## `host` subcommands
@@ -1059,14 +1075,14 @@ roostctl doctor --color=always
 |---|---|---|---|
 | `--tab` | int | `$ROOST_TAB_ID` / the UI's active tab | Inspect this tab instead. Doctor reads the env var itself rather than through the parse every other `--tab` command shares, so an unparsable `$ROOST_TAB_ID` becomes a diagnostic (`env.tab_id: fail`) instead of exit 2 `usage` |
 | `--json` | flag | `false` | Machine-readable report (the global flag; see [JSON output](#json-output)) |
-| `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 40 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
+| `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 41 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
 | `--color` | `auto` \| `always` \| `never` | `auto` | Colorize the text output. `auto` enables color only when stdout is a TTY, `NO_COLOR` is unset **or empty**, and `TERM` is not `dumb`; `always` bypasses all three checks; `never` always disables. Per <https://no-color.org/>, `NO_COLOR=` (present but empty) does **not** disable — only a non-empty value does. Ignored by `--json` |
 
 Doctor diagnoses the Roost any other verb would dial: from inside a local
 session tab, that is the window that owns the session, and `ui.target` names
 both ([Inside a session tab](#inside-a-session-tab)).
 
-The report is six sections. Each declares one of three scopes: **process**
+The report is seven sections. Each declares one of three scopes: **process**
 (the shell/process that invoked doctor), **ui** (the Roost instance doctor
 reached), **tab** (the selected tab) — a *process* fact is never used to
 judge a *tab* fact unless the selected tab is doctor's own tab.
@@ -1077,6 +1093,7 @@ judge a *tab* fact unless the selected tab is doctor's own tab.
 | `ui` | ui | Which UI did target resolution pick, is its socket reachable, does `identify` succeed, does its version match `roostctl`'s, and does it speak the current agent-state wire format? |
 | `shell` | process (`shell.marks_observed` is tab-scoped) | Is the shell-integration contract offered, can this shell/version emit the OSC 133 marks that drive the running dot, and has a mark actually been observed on doctor's own tab? |
 | `tab` | tab | Which tab is selected — the one check in the section, and it can fail if a `--tab`/`$ROOST_TAB_ID` no longer exists — then, for that tab, its four agent axes (shell state, agent lifecycle, attention, ownership), the state derived from them, whether raw OSC 9/99/777 is currently suppressed, and the agent reports the tab's server has dropped (how many, the latest, and a note when the latest was dropped while no agent owned the tab and that agent doesn't own it now: if it is still running, it has lost the tab). Those seven are observations, not verdicts. |
+| `session` | process | Is a session running at a socket path this build no longer uses (`session.old_path`)? A warn names each one and the `session stop --old-path` fix; skipped, saying why, where the probe may not run (an override or test mode is in effect) |
 | `claude` | process (`claude.observed` is tab-scoped) | Is `claude` on `PATH`, does `~/.claude/settings.json` parse and register every lifecycle event Roost maps, does each hook command resolve to a runnable `roostctl`, has this tab actually seen a Claude hook fire? Pre-046 checks, kept for the settings-file shape they've always covered — see the `agents` section below for the other four agents and for Claude's newer, agent-hooks-specific facts |
 | `agents` | process (the `owning` checks are tab-scoped) | Is `$ROOST_AGENT_HOOK` set and executable from this tab; per agent (claude, codex, grok, cursor, opencode), is Roost's hook entry present and at the current integration version, and does that source currently own a tab on this UI; for codex, does its `trusted_hash` on disk match what codex would compute; is a legacy `~/.config/roost/claude-settings.json` or shell alias still lying around? See the [Agent Hooks](../guides/agents.md) guide |
 
@@ -1136,7 +1153,7 @@ something to say with nothing running — only the tab-scoped `owning`
 checks and `agent.hook_binary` (which needs to be inside a tab at all)
 come back `skipped` here.
 
-`-v` prints all 40 entries grouped by section, with the status column
+`-v` prints all 41 entries grouped by section, with the status column
 blank for `null`-status observations (not for `skipped` — that word
 still prints, because it *is* a status) and a doc link under every
 `fail`/`warn`. Same capture, `-v`, trimmed with `[…]` to the sections
@@ -1212,7 +1229,7 @@ anything fail" from the check list), and every entry's stable `id`,
 observations, one of `ok`/`warn`/`fail`/`skipped` for checks. That's the
 shape to script against; the text output's column widths are not.
 `--json` is also unaffected by `-v` and `--color`: it always carries all
-40 entries and never contains a color escape, regardless of either
+41 entries and never contains a color escape, regardless of either
 flag.
 
 ## Environment
@@ -1226,6 +1243,7 @@ flag.
 | `ROOST_DEBUG` | If set, `claude-hook` and `agent-hook` write failure messages to stderr |
 | `ROOST_AGENT_HOOKS_FORCE` | Set to `1` to let `agent ensure`/`install`/`uninstall` write real dotfiles while `ROOST_TEST_MODE=1` is also set — without it, the agent-hooks install engine refuses to run at all under `ROOST_TEST_MODE=1`, belt and braces against a test writing into a real machine's dotfiles |
 | `ROOST_SESSION_BIN` | Overrides where `session start` looks for the `roost-session` binary (default: next to `roostctl`, then `PATH`) |
+| `ROOST_SESSION_SOCKET_DIR` | Absolute directory holding the session's socket (`<dir>/roost.sock`), replacing the default under the passwd home, for `session start|stop|status` and `--target session`. See [`paths.md`](paths.md#session-socket-override) |
 | `ROOST_SSH_BIN` | Overrides the `ssh` binary a host's SSH transport execs (default: `ssh` on `PATH`) — read by `host add --verify` against an SSH target and by the UI's own tunnel. See [`paths.md`](paths.md#ssh-scratch-directories). |
 
 `ROOST_SOCKET` / `ROOST_TAB_ID` / `ROOST_AGENT_HOOK` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac` / `linux` / `iced`) — see [Paths & Environment](paths.md). `roostctl` reads `ROOST_BUNDLE_PROFILE` too, as the env-var form of `--target`; an unrecognized value is a hard error there ("unknown ROOST_BUNDLE_PROFILE value … expected `mac`, `linux`, or `iced`") rather than the UI's warn-and-fall-back. `--target` alone additionally accepts `session` (#475) — `ROOST_BUNDLE_PROFILE=session` is one of the values that hard error names as unrecognized, by design: a session is reachable only explicitly.
