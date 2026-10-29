@@ -53,6 +53,7 @@ jobs:
       linux: ${{ steps.filter.outputs.linux }}
       fixtures: ${{ steps.filter.outputs.fixtures }}
       tests: ${{ steps.filter.outputs.tests }}
+      harness: ${{ steps.filter.outputs.harness }}
       ci: ${{ steps.filter.outputs.ci }}
       deb: ${{ steps.filter.outputs.deb }}
       macbundle: ${{ steps.filter.outputs.macbundle }}
@@ -131,6 +132,12 @@ jobs:
               # test_osc7_emitters.py sources all four in real bash and zsh.
               - 'crates/roost-engine/resources/shell-integration/**'
               - 'mac/Sources/Roost/Resources/shell-integration/**'
+            # Inputs of harness-unit's own tests only (test_release_dry_run.py reads
+            # release.yml through tools/release/dry_run.py), kept out of `tests` so
+            # they don't start the E2E lanes that `tests` also gates.
+            harness:
+              - 'tools/release/**'
+              - '.github/workflows/release.yml'
             # roost-cli's `doc_anchors_resolve` test reads the site nav and
             # every page it links, so those files are inputs to a RUST test
             # even though no Rust file changes when they move. Without this,
@@ -270,7 +277,8 @@ jobs:
 
   harness-unit:
     needs: changes
-    if: needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
+    # `rust` too: test_release_dry_run.py reads the workspace version from Cargo.toml.
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.harness == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -1886,7 +1894,7 @@ jobs:
   # ships a release build (`lto = "thin"`, `codegen-units = 1` in
   # `[profile.release]`), and this stack has already produced a release-only
   # bug: #299's swash shaping hang didn't reproduce in debug. Single
-  # ubuntu-latest/wgpu lane, not a matrix — the renderer split is already
+  # ubuntu-24.04/wgpu lane, not a matrix — the renderer split is already
   # covered in debug above; what's untested here is the release profile
   # itself, not the backend.
   iced-release:
@@ -1899,7 +1907,10 @@ jobs:
     # steps further down (build the real .deb, then smoke it and verify its
     # dependency closure).
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.linux == 'true' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.deb == 'true'
-    runs-on: ubuntu-latest
+    # Pinned to release.yml's Linux build host: a binary built on a newer
+    # runner links newer glibc symbols (ubuntu-latest became 26.04, glibc
+    # 2.43) and fails the clean ubuntu:24.04 dependency-closure check.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
@@ -1940,7 +1951,7 @@ jobs:
       # Must precede the build, because on the `deb` path the build is done by
       # build-deb.sh, which ends in `nfpm pkg`. Mirrors release.yml's install
       # exactly (same pinned version, same source) rather than inventing a
-      # second mechanism — this lane is ubuntu-latest, i.e. amd64, so the arch
+      # second mechanism — this lane is ubuntu-24.04, i.e. amd64, so the arch
       # is unconditionally x86_64.
       - name: Install nfpm
         if: needs.changes.outputs.deb == 'true'

@@ -48,7 +48,7 @@
 //!     the queries as `ColorQuery` / `PaletteQuery` events, but Roost
 //!     no longer answers them: libghostty replies to OSC 4, OSC
 //!     10/11/12 and Kitty OSC 21 itself through the `write_pty`
-//!     effect as of the pinned ghostty `f2d5758f6` (upstream
+//!     effect at the pinned ghostty `6ba14415` (since upstream
 //!     `14c829883`), and both UIs install that callback. A second
 //!     synthesised reply would put two answers on the wire. The
 //!     matching SET and RESET forms (10/11/12, 4, 110/111/112, 104)

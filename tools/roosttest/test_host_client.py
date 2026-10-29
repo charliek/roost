@@ -714,6 +714,83 @@ def test_the_clients_terminal_matches_the_sessions_for_a_scripted_workload(host,
         assert resolved_grid(client_side) == resolved_grid(served)
 
 
+def seed_history(session: Roost, tab: int, tag: str, image: bool) -> str:
+    """1500 lines, optionally a 1x1 Kitty image, then 80 more: history
+    deep enough for several snapshot pages. Returns the last line."""
+    older = [f"{tag}-older-{i:04d}" for i in range(1500)]
+    newer = [f"{tag}-newer-{i:04d}" for i in range(80)]
+    for start in range(0, len(older), 250):
+        chunk = older[start : start + 250]
+        session.tab_feed_pty_bytes(tab, "".join(f"{line}\r\n" for line in chunk).encode())
+    if image:
+        # Transmitted directly and placed at the cursor.
+        session.tab_feed_pty_bytes(tab, b"\x1b_Ga=T,f=24,s=1,v=1,i=31,q=2;/wAA\x1b\\\r\n")
+    session.tab_feed_pty_bytes(tab, "".join(f"{line}\r\n" for line in newer).encode())
+    wait_session_dump_contains(session, tab, newer[-1])
+    assert session.dump(tab)["scrollback_rows"] > 1000
+    return newer[-1]
+
+
+def assert_hydrated_like_the_session(roost: Roost, session: Roost, tab: int, last: str) -> None:
+    key = host_key(roost, tab)
+    # The hydrated terminal is swapped in at FINISH, so a decode that
+    # never reaches it never shows the session's content at all.
+    wait_dump_contains(roost, key, last, timeout=60.0)
+
+    # The focused attach re-grids both terminals to the client's window
+    # once hydration lands, so the two are compared once they agree on a
+    # geometry rather than at the snapshot's.
+    def views() -> tuple[dict, dict]:
+        served = session.dump(tab, scrollback=2000)
+        mirrored = roost.call("tab.dump", {"tab_id": key, "scrollback": 2000})
+        return served, mirrored
+
+    def same_geometry() -> bool:
+        served, mirrored = views()
+        return (served["cols"], served["rows"]) == (mirrored["cols"], mirrored["rows"])
+
+    wait_until(same_geometry, 30.0, "the session and the client to share a geometry")
+    served, mirrored = views()
+    assert mirrored["rows_text"] == served["rows_text"]
+    assert mirrored["scrollback_rows"] == served["scrollback_rows"], (
+        mirrored["scrollback_rows"],
+        served["scrollback_rows"],
+    )
+    assert mirrored["scrollback_text"] == served["scrollback_text"]
+
+
+def test_snapshot_attaches_with_deep_history_and_a_kitty_image_hydrate(host, roost):
+    """Plan 082 D1.6: a snapshot attach decodes to FINISH, with and
+    without a Kitty image.
+
+    libghostty's decoder reads ahead past each history PAGE, and the
+    pixels of an image are a decode step of their own. A client that
+    misjudges where a step ends either stalls short of FINISH — which
+    the history-only tab catches, since there FINISH follows the last
+    PAGE directly — or poisons on the image step, which the image tab
+    catches (its pixels are encoded after the history, just before
+    FINISH). Everything is fed before the first connect, so each attach
+    is a snapshot rather than a live stream.
+    """
+    with host.client() as session:
+        project = first_project(session)
+        plain = quiet_tab(session, project, host.env.launch_cwd)
+        imaged = quiet_tab(session, project, host.env.launch_cwd)
+        plain_last = seed_history(session, plain, marker("PLAIN"), image=False)
+        imaged_last = seed_history(session, imaged, marker("KITTY"), image=True)
+
+        host.connect_and_wait()
+        assert_hydrated_like_the_session(roost, session, plain, plain_last)
+        assert_hydrated_like_the_session(roost, session, imaged, imaged_last)
+
+    # Matching builds, so both attaches were decoded as snapshots: a `vt`
+    # fallback would match the text above without ever running the
+    # snapshot decoder. No op exposes Kitty image state, so this is what
+    # establishes the image tab went through the decoder's image step.
+    status = roost.host_status(id=host.saved_id)["hosts"][0]
+    assert status.get("payload_kind") == "ghostty-snapshot", status
+
+
 def test_a_refocus_resumes_without_blanking_or_duplicating(host, roost):
     """The two ways a re-attach can be wrong, watched for while it runs.
 

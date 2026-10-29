@@ -91,7 +91,7 @@ final class TerminalView: NSView {
     /// future render-state walks, and freed on the main thread when
     /// the NSView is torn down. Revisit if any background-thread
     /// rendering path lands.
-    nonisolated(unsafe) private var terminal: GhosttyTerminal?
+    nonisolated(unsafe) private(set) var terminal: GhosttyTerminal?
 
     /// libghostty-vt key encoder bridge (goal-mac-polish-cursor-keys
     /// M1). Allocated alongside the terminal handle in `init`, freed
@@ -613,7 +613,7 @@ final class TerminalView: NSView {
             // untouched. libghostty answers them itself from the same
             // bytes, through the `write_pty` effect that
             // `flushPendingPtyReplies` drains at the end of this
-            // method — as of the pinned ghostty `f2d5758f6` (upstream
+            // method — at the pinned ghostty `6ba14415` (since upstream
             // `14c829883`). Answering here too put a SECOND reply on
             // the wire for every query.
             if case .colorQuery = event { continue }

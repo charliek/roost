@@ -74,7 +74,7 @@ For Claude Code, a native plugin is also available (it namespaces the skill as
 ```bash
 git clone https://github.com/charliek/roost
 cd roost
-mise install                          # Rust (rust-toolchain.toml) + Zig 0.16.x
+mise install                          # Rust (rust-toolchain.toml) + Zig 0.17.x
 ./third_party/ghostty/build.sh        # clones Ghostty at the pinned SHA, builds libghostty-vt
 
 # Linux UI — iced, what the packaged .deb ships (needs: sudo apt install libclang-dev pkg-config):

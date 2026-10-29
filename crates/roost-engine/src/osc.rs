@@ -7,7 +7,7 @@
 //!
 //! **Color queries are not answered here.** libghostty answers OSC 4,
 //! OSC 10/11/12 and Kitty OSC 21 queries itself through the `write_pty`
-//! effect as of the pinned ghostty `f2d5758f6` (upstream `14c829883`,
+//! effect at the pinned ghostty `6ba14415` (since upstream `14c829883`,
 //! "terminal: report OSC color queries in lib-vt"), and Roost installs
 //! that callback for the device-query replies. Synthesizing a second
 //! reply here put two answers on the wire for every query, so the
@@ -373,8 +373,8 @@ mod tests {
         );
     }
 
-    /// The contract this router adopted at the `f2d5758f6` pin: a color
-    /// query is scanned and dropped. libghostty answers it from the
+    /// The contract since upstream `14c829883`: a color query is
+    /// scanned and dropped. libghostty answers it from the
     /// same bytes through `write_pty`; a second reply from here would
     /// put two answers on the wire.
     #[test]
@@ -420,7 +420,7 @@ mod tests {
     /// Sequential semantics, matching xterm and the terminal that now
     /// answers the query: the SET has already moved the state by the
     /// time the QUERY beside it in the same chunk is scanned. (Before
-    /// the `f2d5758f6` pin this router answered such a query itself,
+    /// upstream `14c829883` this router answered such a query itself,
     /// from a chunk-start snapshot — the pre-chunk color. libghostty
     /// answers with the just-set one, so that snapshot is gone.)
     #[test]

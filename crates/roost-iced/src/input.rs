@@ -360,8 +360,8 @@ pub(crate) struct OptionKey {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct OptionPress {
     /// The unmodified key, one ASCII byte, in place of the glyph Option
-    /// typed: libghostty's legacy ESC prefix needs a single-byte `utf8`,
-    /// so ALT is no longer consumed. `None` keeps the press's own text.
+    /// typed, so the ESC prefix carries the key rather than the glyph and
+    /// ALT is no longer consumed. `None` keeps the press's own text.
     text: Option<String>,
     /// [`mods::ALT_SIDE`] when the right Option is the held one, which
     /// libghostty checks for `left` and `right` itself.
@@ -396,9 +396,9 @@ fn option_press(option: OptionKey, key: &Key<&str>, modifiers: keyboard::Modifie
         _ => None,
     };
     // Control owns its own chord recovery and a Command chord types no
-    // text. The ESC prefix carries one byte, so a non-ASCII key (`é`)
-    // keeps the glyph Option typed: libghostty would otherwise truncate
-    // its codepoint into a byte that is not UTF-8. So does a shifted
+    // text. A non-ASCII key (`é`) keeps the glyph Option typed and leaves
+    // the prefix to libghostty, which under Option-as-Alt prefixes the
+    // physical key's unshifted codepoint as UTF-8. So does a shifted
     // non-letter, whose shifted glyph is the layout's to know.
     let text = unmodified
         .filter(|value| as_alt && value.is_ascii() && !modifiers.control() && !modifiers.logo())
@@ -1430,11 +1430,11 @@ mod tests {
             // Option-transformed text: no ctrl, so nothing is recovered.
             // What libghostty then EMITS is platform-compiled: macOS
             // writes the transformed text; elsewhere alt is an ESC prefix
-            // on the base key.
+            // on the text, all of its UTF-8.
             #[cfg(target_os = "macos")]
             ("b", "∫", Code::KeyB, alt, "∫", "∫".as_bytes()),
             #[cfg(not(target_os = "macos"))]
-            ("b", "∫", Code::KeyB, alt, "∫", b"\x1bb".as_slice()),
+            ("b", "∫", Code::KeyB, alt, "∫", "\x1b∫".as_bytes()),
             // NUL (ctrl+shift+2) and RS (ctrl+shift+6) stay where they were.
             ("2", "@", Code::Digit2, ctrl_shift, "\u{0}", b"\x1b[0;5u"),
             ("6", "^", Code::Digit6, ctrl_shift, "\u{1e}", b"\x1b[30;5u"),
@@ -2075,7 +2075,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         let today = "∫".as_bytes();
         #[cfg(not(target_os = "macos"))]
-        let today = b"\x1bb".as_slice();
+        let today = "\x1b∫".as_bytes();
         for (left, right) in [(false, false), (true, false), (false, true), (true, true)] {
             let option = OptionKey {
                 as_alt: OptionAsAlt::False,
@@ -2120,7 +2120,7 @@ mod tests {
             let mac_shaped = || chord("b", "∫", Code::KeyB, alt, "∫");
             assert_eq!(
                 encode_press(&mut encoder, &terminal, mac_shaped(), false, option),
-                b"\x1bb".to_vec(),
+                "\x1b∫".as_bytes().to_vec(),
                 "legacy {option:?}"
             );
             for event in [mac_shaped(), chord("b", "b", Code::KeyB, alt, "b")] {

@@ -338,7 +338,7 @@ mod tests {
     fn libghostty_build_matches_current_pin() {
         assert_eq!(
             libghostty_build(),
-            "ghostty-f2d5758f6305867d+snapshot.v1",
+            "ghostty-6ba144158577d033+snapshot.v1",
             "GHOSTTY_SHA in third_party/ghostty/build.sh changed without \
              updating this pin (or vice versa)"
         );

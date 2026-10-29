@@ -19,7 +19,7 @@ set -euo pipefail
 # --- Pinned versions ---------------------------------------------------------
 # Ghostty SHA — bump deliberately, in its own PR, with a rebuild test on
 # Linux + Mac CI.
-GHOSTTY_SHA="f2d5758f6305867dc36b36293c6165d8152b853e"  # 2026-08-26 main tip, builds lib-vt cleanly with zig 0.16.0
+GHOSTTY_SHA="6ba144158577d033ccb6ed4b574e4013957c9161"  # 2026-10-27 audited main tip; needs zig 0.17.0
 GHOSTTY_REPO="https://github.com/ghostty-org/ghostty.git"
 
 # --- Paths -------------------------------------------------------------------
@@ -44,12 +44,12 @@ command -v zig >/dev/null 2>&1 || {
   exit 1
 }
 
-# Ghostty pins to Zig 0.16.x (its own `minimum_zig_version` at the pinned
+# Ghostty pins to Zig 0.17.x (its own `minimum_zig_version` at the pinned
 # SHA); neighbouring versions produce surprising errors downstream.
 # Validate up front so a wrong toolchain is obvious.
 zig_version="$(zig version 2>/dev/null || true)"
-if ! printf '%s\n' "${zig_version}" | grep -E '^0\.16(\.|$)' >/dev/null; then
-  echo "error: zig version ${zig_version:-<unknown>} is not 0.16.x." >&2
+if ! printf '%s\n' "${zig_version}" | grep -E '^0\.17(\.|$)' >/dev/null; then
+  echo "error: zig version ${zig_version:-<unknown>} is not 0.17.x." >&2
   echo "       Install the right toolchain via \`mise install\` from the repo root." >&2
   exit 1
 fi

@@ -17,6 +17,7 @@ tools/
   perf/           Render-path cost — a sibling axis, not a layer (see intro above).
   repro/          (non-tier — on-demand drivers for intermittent bugs; see repro/README.md)
   roosttest_unit/ (non-tier — fast unit tests for the harness wiring itself)
+  release/        (non-tier — release.yml dry-run generator; see release/README.md)
   shed/           (non-tier — Apple VZ Linux microVM driver for Linux testing from a Mac)
   wayland/        (non-tier — Wayland-specific test support)
 ```

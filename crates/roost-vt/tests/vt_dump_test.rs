@@ -12,12 +12,9 @@
 //!
 //! The payload's failure mode is a screen that is subtly wrong rather
 //! than an exception, so the corpus is the specification: composition
-//! order, the pad, the background refill and the origin-mode
-//! re-position are each pinned by a case that fails loudly without them.
-//!
-//! Two divergences are asserted **as** divergences — per-cell hyperlinks
-//! and background-only rows in history — so a libghostty pin bump that
-//! fixes either one fails here instead of passing silently.
+//! order, trailing blank rows, background-only rows (viewport and
+//! history), per-cell hyperlinks and the origin-mode re-position are each
+//! pinned by a case that fails loudly without them.
 //!
 //! Gated on `ffi`; run with: `cargo test -p roost-vt --features ffi`.
 #![cfg(feature = "ffi")]
@@ -267,11 +264,10 @@ fn an_empty_terminal() {
     replays(&mut server, b"first input", "empty");
 }
 
-/// The pad's reason for existing: the formatter trims trailing blank
-/// rows, so a screen with history and eleven blank rows at its bottom
-/// replays eleven rows short — the client scrolls eleven times too few,
-/// its viewport shows history at the top, and every absolute address
-/// after the content lands on the wrong row.
+/// A screen with history and eleven blank rows at its bottom has to
+/// replay those rows: eleven short, the client scrolls eleven times too
+/// few, its viewport shows history at the top, and every absolute
+/// address after the content lands on the wrong row.
 #[test]
 fn a_screen_with_history_whose_bottom_rows_are_blank() {
     let mut server = fresh();
@@ -292,9 +288,9 @@ fn a_history_past_eviction_with_a_blank_run_at_a_page_boundary() {
     for line in 1..=1050 {
         server.write(format!("line {line}\r\n").as_bytes());
     }
-    // A run of blank rows well inside the retained history: the
-    // formatter defers a blank row's newline, so a mis-counted pad shows
-    // up here as history that has slid by five rows.
+    // A run of blank rows well inside the retained history: a dropped
+    // blank row's newline shows up here as history that has slid by five
+    // rows.
     server.write(b"\r\n\r\n\r\n\r\n\r\n");
     for line in 1051..=2100 {
         server.write(format!("line {line}\r\n").as_bytes());
@@ -664,11 +660,10 @@ fn sgr_colors_and_attributes() {
     replays(&mut server, b"\r\nplain", "SGR colours and attributes");
 }
 
-/// A row erased under a background colour has no text at all, so the
-/// formatter's blank-row predicate drops it. Viewport rows are refilled
-/// with ECH runs.
+/// A row erased under a background colour has no text at all, and still
+/// has to replay with its fill rather than as a blank row.
 #[test]
-fn a_background_only_row_in_the_viewport_is_refilled() {
+fn a_background_only_row_in_the_viewport_keeps_its_fill() {
     let mut server = fresh();
     server.write(b"header\r\n\x1b[44m\x1b[2K\x1b[0m\x1b[3;1Hbody");
     let mut client = replays(&mut server, b"!", "background-only viewport row");
@@ -679,12 +674,11 @@ fn a_background_only_row_in_the_viewport_is_refilled() {
     assert!(row.cells.iter().all(|cell| cell.explicit_background));
 }
 
-/// The refill fires only where the formatter really dropped the row. A
-/// row of *spaces* under a pen trims to empty `text` too, but a space is
-/// text: the formatter emits those cells itself, and an ECH over them
-/// would erase everything but their background.
+/// A row of *spaces* under a pen trims to empty `text` too, but a space
+/// is text: it has to replay as spaces in that pen, not as a
+/// background-only erase, which would keep nothing but the background.
 #[test]
-fn a_row_of_styled_spaces_is_left_to_the_formatter() {
+fn a_row_of_styled_spaces_keeps_its_pen() {
     let mut server = fresh();
     server.write(b"header\r\n\x1b[31;44m");
     server.write(" ".repeat(40).as_bytes());
@@ -705,7 +699,7 @@ fn a_row_of_styled_spaces_is_left_to_the_formatter() {
     );
 }
 
-/// Step 0's reason, applied to the refill: a row erased under `SGR 44`
+/// Step 0's reason, applied to a background-only row: a row erased under `SGR 44`
 /// has to replay as slot 4 and pick up the *client's* blue, exactly as
 /// the ordinary text rows around it (which pass A emits as `CSI 44 m`)
 /// do. Emitting the server's resolved RGB would leave one row wearing
@@ -739,15 +733,14 @@ fn a_background_only_row_replays_as_a_palette_slot_not_a_resolved_rgb() {
         row.cells
             .iter()
             .all(|cell| cell.background == client_theme[4]),
-        "the refill wears the client's own slot 4"
+        "the fill wears the client's own slot 4"
     );
 }
 
-/// The same row in history is a **known limitation**: there is no cursor
-/// addressing into scrollback, so nothing can refill it. Pinned so a
-/// libghostty bump that starts emitting the fill fails here.
+/// The same row in history keeps its fill too: there is no cursor
+/// addressing into scrollback, so it has to be in the content itself.
 #[test]
-fn a_background_only_row_in_history_is_a_known_divergence() {
+fn a_background_only_row_in_history_keeps_its_fill() {
     let mut server = fresh();
     server.write(b"\x1b[44m\x1b[2K\x1b[0m\r\n");
     for line in 1..=40 {
@@ -766,12 +759,7 @@ fn a_background_only_row_in_history_is_a_known_divergence() {
         usize::from(COLS),
         "server keeps the fill"
     );
-    assert!(
-        actual.cells.is_empty(),
-        "the fill is lost in history — if this now matches, the limitation \
-         is gone and `vt_dump.rs` should say so"
-    );
-    assert_eq!(actual.text, expected.text, "the text still matches");
+    assert_eq!(actual, expected, "the history row replays with its fill");
 }
 
 #[test]
@@ -856,11 +844,10 @@ fn solid_palette(seed: u8) -> [ColorRgb; 256] {
 // Hyperlinks
 // ============================================================================
 
-/// The pen's hyperlink is carried by pass B's `OSC 8` extra; the cells'
-/// own links are not, because VT content emits `OSC 8` only for HTML.
-/// Pinned as a divergence so a pin bump that emits them is noticed.
+/// The cells' own links ride pass A's content as `OSC 8`; the pen's
+/// hyperlink rides pass B's `OSC 8` extra.
 #[test]
-fn a_hyperlink_pen_carries_but_hyperlinked_cells_are_a_known_divergence() {
+fn hyperlinked_cells_and_the_hyperlink_pen_both_carry() {
     let mut server = fresh();
     server.write(b"\x1b]8;;https://example.com\x1b\\link");
 
@@ -872,12 +859,13 @@ fn a_hyperlink_pen_carries_but_hyperlinked_cells_are_a_known_divergence() {
         server.terminal.hyperlink_at(0, 0).as_deref(),
         Some("https://example.com")
     );
-    assert_eq!(
-        client.terminal.hyperlink_at(0, 0),
-        None,
-        "per-cell links are lost — if this now matches, the limitation is \
-         gone and `vt_dump.rs` should say so"
-    );
+    for col in 0..4 {
+        assert_eq!(
+            client.terminal.hyperlink_at(col, 0),
+            server.terminal.hyperlink_at(col, 0),
+            "cell {col} keeps its link"
+        );
+    }
 
     // The pen, though, is live on both: what either side prints next is
     // still inside the span.

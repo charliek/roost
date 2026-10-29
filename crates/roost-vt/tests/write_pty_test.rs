@@ -8,7 +8,7 @@
 //! (`third_party/ghostty/src/src/terminal/c/terminal.zig`, "set write_pty
 //! callback") plus roost's replacement/clear/drop semantics.
 //!
-//! Since the pin moved to ghostty `f2d5758f6` (upstream `14c829883`,
+//! At the pinned ghostty `6ba14415` (since upstream `14c829883`,
 //! "terminal: report OSC color queries in lib-vt") the same callback
 //! also carries the OSC 4 / 10 / 11 / 12 color-query replies Roost used
 //! to synthesize itself. The `osc_*` cases below pin that: the exact
@@ -24,7 +24,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use roost_vt::{ColorRgb, Terminal, TerminalOptions};
+use roost_vt::{ffi, ColorRgb, Terminal, TerminalOptions};
 
 fn new_terminal() -> Terminal {
     Terminal::new(TerminalOptions {
@@ -306,6 +306,57 @@ fn drop_with_buffer_installed_is_clean() {
     // (callback cleared before free). The caller's Arc survives.
     drop(term);
     assert_eq!(Arc::strong_count(&buf), 1);
+}
+
+/// Asking is how a program learns the terminal speaks OSC 7501, so a
+/// terminal without a program-status callback must stay silent: an
+/// answer would advertise support for reports it then drops.
+#[test]
+fn a_program_status_probe_without_the_callback_gets_no_reply() {
+    let mut term = new_terminal();
+    let buf = install_buffer(&mut term);
+
+    assert!(query(&mut term, &buf, b"\x1b]7501;?\x1b\\").is_empty());
+    assert!(query(&mut term, &buf, b"\x1b]7501;?\x07").is_empty());
+}
+
+extern "C" fn ignore_program_status(
+    _terminal: ffi::GhosttyTerminal,
+    _userdata: *mut std::ffi::c_void,
+    _report: *const ffi::GhosttyTerminalProgramStatus,
+) {
+}
+
+fn set_program_status_callback(term: &Terminal) {
+    let callback: ffi::GhosttyTerminalProgramStatusFn = Some(ignore_program_status);
+    let rc = unsafe {
+        ffi::ghostty_terminal_set(
+            term.as_ffi(),
+            ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS,
+            callback.map_or(std::ptr::null(), |f| f as *const std::ffi::c_void),
+        )
+    };
+    assert_eq!(rc, ffi::GhosttyResult_GHOSTTY_SUCCESS);
+}
+
+/// The other side of the pair above, and its negative control: setting the
+/// callback through the raw C API is what makes the same probe answered.
+#[test]
+fn a_program_status_probe_with_the_callback_is_answered() {
+    let mut term = new_terminal();
+    let buf = install_buffer(&mut term);
+    set_program_status_callback(&term);
+
+    let reply = query(&mut term, &buf, b"\x1b]7501;?\x1b\\");
+    assert!(
+        reply.starts_with(b"\x1b]7501;?:states="),
+        "probe not answered: {reply:?}"
+    );
+    let reply = query(&mut term, &buf, b"\x1b]7501;?\x07");
+    assert!(
+        reply.starts_with(b"\x1b]7501;?:states=") && reply.ends_with(b"\x07"),
+        "BEL probe not answered with BEL: {reply:?}"
+    );
 }
 
 #[test]

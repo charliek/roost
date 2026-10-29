@@ -39,9 +39,10 @@ use crate::engine_feed::{EngineFeed, EngineFeedSender};
 use crate::host_conn::queue::{AttachPermit, HostOpError, HostOps};
 use crate::host_conn::state::CLIENT_PAYLOAD_KINDS;
 
-/// History pages stepped per feed-drain pass. Bounds main-thread work so
-/// a large-scrollback attach never stalls a frame; the drain re-arms
-/// itself with [`HostTabFrame::StepDecoder`] while pages remain.
+/// History records (pages or image payloads) stepped per feed-drain
+/// pass. Bounds main-thread work so a large-scrollback attach never
+/// stalls a frame; the drain re-arms itself with
+/// [`HostTabFrame::StepDecoder`] while records remain.
 const PAGES_PER_PASS: usize = 8;
 
 /// The pre-swap resize withhold (architecture §5: a resize mid-snapshot
@@ -1075,7 +1076,7 @@ impl HostAttach {
         for _ in 0..PAGES_PER_PASS {
             match decoder.try_next() {
                 Ok(HistoryStep::NeedMoreBytes) => return AttachStep::None,
-                Ok(HistoryStep::Page { .. }) => {}
+                Ok(HistoryStep::Page { .. } | HistoryStep::Image { .. }) => {}
                 Ok(HistoryStep::Finished) => return self.finish_hydration(tab),
                 Err(error) => {
                     tracing::debug!(key = %self.key, %error, "history decode failed; re-attaching");

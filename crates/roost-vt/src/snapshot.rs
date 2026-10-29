@@ -16,11 +16,12 @@
 //! envelope and each record's `tag | payload_len | crc` header
 //! (`snapshot.h:53-118`) — to find record boundaries. It calls
 //! `decoder_ready` only once the complete prefix through the READY
-//! record is buffered and `decoder_next` only once the next PAGE (or
-//! FINISH) record is, so every read the C decoder issues completes from
-//! memory. Every *semantic* judgment — CRC checks, record order, version
-//! acceptance, continuation validation — stays inside libghostty; the
-//! scanner never validates, it only measures.
+//! record is buffered and `decoder_next` only once everything that call
+//! will read is — see [`Framing`] for where a call stops — so every read
+//! the C decoder issues completes from memory. Every *semantic*
+//! judgment — CRC checks, record order, version acceptance,
+//! continuation validation — stays inside libghostty; the scanner never
+//! validates, it only measures.
 //!
 //! # No Swift twin
 //!
@@ -146,13 +147,23 @@ const RECORD_HEADER_LEN: usize = 10;
 
 /// Record tags, from the format's own framing table
 /// (`snapshot/record.zig`'s `Tag`). The scanner reads them for boundary
-/// purposes only: PAGE and FINISH are where `decoder_next` stops, READY
-/// is where `decoder_ready` stops, and CONTINUATION is the one record
-/// whose declared length the wrapper caps before any FFI call.
+/// purposes only — [`Framing`] says where each one leaves a
+/// `decoder_next` call — and CONTINUATION is the one record whose
+/// declared length the wrapper caps before any FFI call.
 const TAG_PAGE: u16 = 3;
 const TAG_READY: u16 = 5;
 const TAG_FINISH: u16 = 6;
 const TAG_CONTINUATION: u16 = 7;
+const TAG_KITTY_IMAGE_PAYLOAD: u16 = 9;
+const TAG_KITTY_IMAGE_PAGE_PLACEMENTS: u16 = 10;
+
+/// The tags libghostty decodes rather than skips (`Tag.known`). The
+/// three Kitty tags count because `third_party/ghostty/build.sh` keeps
+/// Kitty graphics on; a build without them would skip those records
+/// whole, and `kitty_graphics_is_built` pins that it doesn't.
+fn known_tag(tag: u16) -> bool {
+    (1..=TAG_KITTY_IMAGE_PAGE_PLACEMENTS).contains(&tag)
+}
 
 /// Offset of the first byte after the READY record in an encoded
 /// snapshot.
@@ -271,6 +282,10 @@ pub enum HistoryStep {
         rows_prepended: usize,
         pages_remaining_in_screen: u32,
     },
+    /// The pixels of one Kitty graphics image or animation frame were
+    /// consumed. `bytes` is zero when they were validated but dropped —
+    /// live input deleted or replaced the image, or it no longer fit.
+    Image { screen: ActiveScreen, bytes: usize },
     /// FINISH validated. Idempotent: further calls also report
     /// `Finished`.
     Finished,
@@ -372,6 +387,21 @@ unsafe extern "C" fn snapshot_reader_trampoline(
 }
 
 /// Framing scanner state — record boundaries only.
+///
+/// A `decoder_next` call reads ahead (`Decoder.next` in
+/// `snapshot/snapshot.zig`): after a PAGE it also reads the header of the
+/// next known record, skipping unknown-tag records whole, and when that
+/// header is KITTY_IMAGE_PAGE_PLACEMENTS the whole placements record. So
+/// the decoder's source offset is not record-aligned, and a call's
+/// **stop** — the offset its last read ends at — is:
+///
+/// * after a PAGE, the end of the next known header, or of the
+///   placements record when that is what follows;
+/// * after a KITTY_IMAGE_PAYLOAD or FINISH, the record's own end.
+///
+/// A HISTORY manifest is never a stop: the call that reads it goes on
+/// to whatever step comes next — the sequence's first page, a payload,
+/// or, for a sequence with no pages, the next HISTORY or FINISH.
 struct Framing {
     /// Offset of the next record header to parse. Starts past the
     /// envelope, which is a fixed-size skip.
@@ -379,13 +409,19 @@ struct Framing {
     /// The READY record is fully buffered, so `decoder_ready` can run
     /// entirely from memory.
     ready_seen: bool,
-    /// End offset of the last fully buffered PAGE or FINISH record —
-    /// the records `decoder_next` stops on. Because scanning is a strict
-    /// left-to-right prefix walk, `last_stop > consumed` is exactly
-    /// "everything the next `decoder_next` will read is in memory".
+    /// A PAGE is fully buffered but its stop isn't known yet: that needs
+    /// the next known header.
+    page_open: bool,
+    /// The furthest stop the buffered prefix determines. Because
+    /// scanning is a strict left-to-right prefix walk, `last_stop >
+    /// consumed` means everything the next `decoder_next` will read is
+    /// in memory. It is not the whole condition: when a PAGE's
+    /// read-ahead already took FINISH's header, the two are equal and
+    /// only `finish_seen` lets the final call through.
     last_stop: usize,
     /// FINISH has been scanned; everything after it is trailing
-    /// transport, not records (`snapshot.h:100-105`).
+    /// transport, not records (`snapshot.h:100-105`), so no call can
+    /// read past what is buffered.
     finish_seen: bool,
 }
 
@@ -418,8 +454,12 @@ pub struct SnapshotDecoder {
     opts: SnapshotDecodeOptions,
     framing: Framing,
     state: State,
-    /// Source bytes the C decoder reports as consumed. Record-aligned,
-    /// so it is the left edge of the next `decoder_next`'s reads.
+    /// Source bytes the C decoder reports as consumed: after a
+    /// successful call, that call's stop, so not record-aligned after a
+    /// PAGE (see [`Framing`]); after FINISH, where trailing transport
+    /// begins. A read-ahead that failed mid-record (a corrupt record
+    /// after a page) leaves it between stops, but the decoder then
+    /// returns that error on the next call without reading.
     consumed: usize,
     extents: Option<(u64, Option<u64>)>,
     _not_sync: PhantomData<std::cell::Cell<()>>,
@@ -445,6 +485,7 @@ impl SnapshotDecoder {
             framing: Framing {
                 at: ENVELOPE_LEN,
                 ready_seen: false,
+                page_open: false,
                 last_stop: 0,
                 finish_seen: false,
             },
@@ -474,7 +515,7 @@ impl SnapshotDecoder {
             match decoder.try_next()? {
                 HistoryStep::Finished => break,
                 HistoryStep::NeedMoreBytes => return Err(Error::InvalidValue),
-                HistoryStep::Page { .. } => {}
+                HistoryStep::Page { .. } | HistoryStep::Image { .. } => {}
             }
         }
         decoder.finish()
@@ -584,7 +625,8 @@ impl SnapshotDecoder {
         }
     }
 
-    /// Consume one history page, if the next one is buffered.
+    /// Consume one history page or image payload, if everything that
+    /// takes is buffered.
     ///
     /// Progress data is read immediately after each success — a later
     /// `next` replaces or clears it (`snapshot.h:217-245`).
@@ -598,7 +640,7 @@ impl SnapshotDecoder {
             State::Poisoned => return Err(Error::Lifecycle("try_next on a poisoned decoder")),
         }
         self.advance()?;
-        if self.framing.last_stop <= self.consumed {
+        if !self.framing.finish_seen && self.framing.last_stop <= self.consumed {
             return Ok(HistoryStep::NeedMoreBytes);
         }
         let Some(decoder) = self.decoder else {
@@ -741,9 +783,9 @@ impl SnapshotDecoder {
     }
 
     /// Walk record headers from wherever the last scan stopped,
-    /// recording boundaries and enforcing the wrapper's per-record caps.
-    /// Boundary-finding only: unknown tags are skipped by their declared
-    /// length and left for libghostty to reject.
+    /// recording [`Framing`]'s stops and enforcing the wrapper's
+    /// per-record caps. Boundary-finding only: unknown tags are skipped
+    /// by their declared length, as libghostty skips them.
     fn advance(&mut self) -> Result<()> {
         // SAFETY: same borrow discipline as `reader_mut`; this one is
         // read-only and ends before the function returns. It is legal to
@@ -779,12 +821,21 @@ impl SnapshotDecoder {
             let Some(record_end) = header_end.checked_add(payload_len) else {
                 return Err(Error::InvalidValue);
             };
+            if self.framing.page_open && known_tag(tag) && tag != TAG_KITTY_IMAGE_PAGE_PLACEMENTS {
+                self.framing.last_stop = header_end;
+                self.framing.page_open = false;
+            }
             if buf.len() < record_end {
                 break;
             }
             match tag {
                 TAG_READY => self.framing.ready_seen = true,
-                TAG_PAGE => self.framing.last_stop = record_end,
+                TAG_PAGE => self.framing.page_open = true,
+                TAG_KITTY_IMAGE_PAGE_PLACEMENTS if self.framing.page_open => {
+                    self.framing.last_stop = record_end;
+                    self.framing.page_open = false;
+                }
+                TAG_KITTY_IMAGE_PAYLOAD => self.framing.last_stop = record_end,
                 TAG_FINISH => {
                     self.framing.last_stop = record_end;
                     self.framing.finish_seen = true;
@@ -880,6 +931,18 @@ impl SnapshotDecoder {
     }
 
     fn read_progress(&mut self, decoder: sys::GhosttySnapshotDecoder) -> Result<HistoryStep> {
+        let mut kind: sys::GhosttySnapshotDecoderProgressKind =
+            sys::GhosttySnapshotDecoderProgressKind_GHOSTTY_SNAPSHOT_DECODER_PROGRESS_KIND_PAGE;
+        // SAFETY: decoder live and just past a successful `next`; `kind`
+        // is a real local of the documented out type.
+        let rc = unsafe {
+            sys::ghostty_snapshot_decoder_get(
+                decoder,
+                sys::GhosttySnapshotDecoderData_GHOSTTY_SNAPSHOT_DECODER_DATA_PROGRESS_KIND,
+                (&mut kind) as *mut sys::GhosttySnapshotDecoderProgressKind as *mut _,
+            )
+        };
+        Error::from_result(rc)?;
         let mut screen: sys::GhosttyTerminalScreen =
             sys::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_PRIMARY;
         // SAFETY: decoder live and just past a successful `next`;
@@ -892,23 +955,37 @@ impl SnapshotDecoder {
             )
         };
         Error::from_result(rc)?;
-        let rows_prepended = get_usize(
-            decoder,
-            sys::GhosttySnapshotDecoderData_GHOSTTY_SNAPSHOT_DECODER_DATA_PROGRESS_ROWS,
-        )?;
-        let pages_remaining_in_screen = get_u32(
-            decoder,
-            sys::GhosttySnapshotDecoderData_GHOSTTY_SNAPSHOT_DECODER_DATA_PROGRESS_REMAINING,
-        )?;
+        let screen = ActiveScreen::from_sys(screen);
+        let step = match kind {
+            sys::GhosttySnapshotDecoderProgressKind_GHOSTTY_SNAPSHOT_DECODER_PROGRESS_KIND_PAGE => {
+                HistoryStep::Page {
+                    screen,
+                    rows_prepended: get_usize(
+                        decoder,
+                        sys::GhosttySnapshotDecoderData_GHOSTTY_SNAPSHOT_DECODER_DATA_PROGRESS_ROWS,
+                    )?,
+                    pages_remaining_in_screen: get_u32(
+                        decoder,
+                        sys::GhosttySnapshotDecoderData_GHOSTTY_SNAPSHOT_DECODER_DATA_PROGRESS_REMAINING,
+                    )?,
+                }
+            }
+            sys::GhosttySnapshotDecoderProgressKind_GHOSTTY_SNAPSHOT_DECODER_PROGRESS_KIND_IMAGE => {
+                HistoryStep::Image {
+                    screen,
+                    bytes: get_usize(
+                        decoder,
+                        sys::GhosttySnapshotDecoderData_GHOSTTY_SNAPSHOT_DECODER_DATA_PROGRESS_IMAGE_BYTES,
+                    )?,
+                }
+            }
+            _ => return Err(Error::InvalidValue),
+        };
         self.consumed = get_usize(
             decoder,
             sys::GhosttySnapshotDecoderData_GHOSTTY_SNAPSHOT_DECODER_DATA_SOURCE_OFFSET,
         )?;
-        Ok(HistoryStep::Page {
-            screen: ActiveScreen::from_sys(screen),
-            rows_prepended,
-            pages_remaining_in_screen,
-        })
+        Ok(step)
     }
 
     fn free_decoder(&mut self) {
@@ -996,4 +1073,29 @@ fn get_u32(
     };
     Error::from_result(rc)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kitty_graphics_is_built() {
+        let mut built = false;
+        // SAFETY: `built` is a real local of the `bool` type this key
+        // documents.
+        let rc = unsafe {
+            sys::ghostty_build_info(
+                sys::GhosttyBuildInfo_GHOSTTY_BUILD_INFO_KITTY_GRAPHICS,
+                (&raw mut built).cast(),
+            )
+        };
+        Error::from_result(rc).expect("build info");
+        assert!(
+            built,
+            "libghostty without Kitty graphics skips tags 8-10, so `known_tag` would be wrong"
+        );
+        assert!(known_tag(TAG_KITTY_IMAGE_PAYLOAD));
+        assert!(!known_tag(0) && !known_tag(TAG_KITTY_IMAGE_PAGE_PLACEMENTS + 1));
+    }
 }

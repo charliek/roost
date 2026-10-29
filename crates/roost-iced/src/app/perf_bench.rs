@@ -121,7 +121,7 @@ fn run_workload(
 ///   scrolls the viewport, same as a chatty build log. **This workload is
 ///   expected to show NO improvement, ever**: libghostty full-rebuilds
 ///   the render state whenever the viewport's scroll pin changes
-///   (`third_party/ghostty/src/src/terminal/render.zig:299-302`). It is
+///   (`third_party/ghostty/src/src/terminal/render.zig:1018-1021`). It is
 ///   in this harness precisely so a before/after table has a control
 ///   that stays flat — a future reader seeing W3 unchanged should read
 ///   that as the harness working correctly, not as something to "fix".

@@ -22,7 +22,7 @@ failure mode is loud:
   arm** of its color handler (`src/terminal/stream_terminal.zig`), so
   Roost scanned for those queries itself and wrote its own replies.
   Upstream `14c829883` ("terminal: report OSC color queries in lib-vt",
-  in Roost as of the pinned SHA `f2d5758f6`) makes libghostty answer
+  in Roost since the 2026-08-26 pin; still so at the pinned `6ba14415`) makes libghostty answer
   them from its own color state whenever `write_pty` is installed —
   which Roost does, for the device replies below. Roost's synthesis
   became a **second** answer to every query, so it was removed.
@@ -34,7 +34,7 @@ failure mode is loud:
   enable; see the "provider-gated set" below. Those remain unanswered,
   deferred to #209.)
 
-> **The pin is load-bearing for OSC colors.** Before `f2d5758f6` these
+> **The pin is load-bearing for OSC colors.** Before upstream `14c829883` these
 > queries went unanswered without embedder synthesis; after it, embedder
 > synthesis double-answers. A Ghostty SHA bump that moved backwards past
 > that commit would silence them.

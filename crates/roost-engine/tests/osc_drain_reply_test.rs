@@ -2,8 +2,8 @@
 //!
 //! The drain used to answer OSC color queries itself. It no longer
 //! does: libghostty answers OSC 4 / 10 / 11 / 12 (and Kitty OSC 21)
-//! through the `write_pty` effect as of the pinned ghostty
-//! `f2d5758f6`, and Roost installs that callback for its device-query
+//! through the `write_pty` effect at the pinned ghostty `6ba14415`
+//! (since upstream `14c829883`), and Roost installs that callback for its device-query
 //! replies — so a drain-side answer put a SECOND reply on the wire for
 //! every query. That is what these tests now guard: the drain scans,
 //! tracks colors and forwards actions, and enqueues NOTHING onto the

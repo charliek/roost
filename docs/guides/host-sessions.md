@@ -382,11 +382,9 @@ roostctl host status --id <id> --json
 
 **What the fallback does not carry.** These are real gaps in a screen that otherwise looks right, which is why they are worth knowing about rather than discovering:
 
-- **Link hover and click stop working** on a tab attached this way. Roost turns hyperlinks on in every shell it spawns, so a tab full of `OSC 8` links from `gh`, `cargo` or a test runner still *looks* linked and no longer behaves that way.
 - **The other screen is empty.** If you attach while a full-screen program (vim, `htop`, a TUI agent) is running, the shell underneath comes back blank when that program exits — the alternate screen is what was captured, and only one screen travels.
 - **Wrapped lines replay as separate lines**, so selecting or resizing re-flows them differently than the same tab does on the host.
-- **Some scrolled-off rows lose their background fill** — a coloured status bar that scrolled into history comes back as blank space. On the visible screen it is repainted correctly.
-- **Kitty images do not survive** (nor do they under the binary snapshot), and neither does a saved cursor position or a pushed kitty-keyboard stack.
+- **Kitty images do not survive** (the binary snapshot keeps them, though Roost doesn't draw Kitty images yet), and neither does a saved cursor position or a pushed kitty-keyboard stack.
 
 The [IPC reference](../reference/ipc.md#payload-kinds) has the complete list, including the mode-by-mode reasoning. Everything else — the tab list, titles, agent status, notifications, typing, resizing, scrollback — behaves exactly as it does on a matched build.
 

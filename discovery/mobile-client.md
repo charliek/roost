@@ -63,7 +63,7 @@ These amend the table above and the sections below.
 | Soft keyboard | **Samsung Keyboard** is the default on both devices, so the keyboard spike tests it before Gboard. The Tab S6 Lite is the low-end floor for painter performance. |
 | Quick replies | Keys, not words: 1/2/3, Enter, Esc, arrows. A "Yes" chip would type the word into a numbered menu. |
 | Inbox text after a reconnect | OSC 7501 `blocked` records carry `kind` and `msg`, and protocol 7 exposes them on the agent record. That gives a durable "why" after a reconnect, which the live-only `notification.fired` can't. |
-| Toolchain | Ghostty main needs Zig 0.17. The spike built Android with 0.16. M1 of the protocol-7 release re-checks the `aarch64-linux-android` build with 0.17. |
+| Toolchain | Ghostty main needs Zig 0.17. The spike built Android with 0.16; the 0.17 re-check (2026-10-28, `aarch64-linux-android`, Ghostty `6ba14415`) built OK with Zig 0.17.0 in 94 s cold, `libghostty-vt.a` 22 MB + `.so` 11 MB, 16 KB-aligned LOAD segments. |
 | Prior art | Superlogical's Rex ships a native iOS app with iPad and Duo layouts. Its mobile client originally relied on client-local reflow ("Authoritative server has no idea"). Rex later adopted the owner model this release adapts. See `../superlogical/research/notes/2026-10-27-rex-update.md`. |
 
 **Out of scope for the MVP:**

@@ -7,32 +7,26 @@
 //! # Why the composition is what it is
 //!
 //! libghostty's formatter emits its state extras *after* the content in
-//! the same call (`TerminalFormatter.format`), and it trims trailing
-//! blank rows. Both facts force the shape here:
+//! the same call (`TerminalFormatter.format`). With trimming off, its VT
+//! content keeps the screen's trailing blank rows and recreates
+//! background-only cells with ECH under their own background, so the
+//! content pass replays the whole active screen, scrollback included,
+//! on the right rows and in the right colours.
 //!
-//! * A screen whose bottom `k` rows are blank replays `k` rows short, so
-//!   the client's viewport would show `k` rows of history at its top and
-//!   every subsequent absolute cursor address would land on the wrong
-//!   content. The fix is a pad of `\r\n` between the content and the
-//!   state — which is why there are two formatter passes and not one.
-//!   (Prepending does not work: it shifts the content down by `k`.)
-//! * Nothing in the C API formats state without content, so the second
-//!   pass selects the cursor's own cell: re-printing that glyph where the
-//!   cursor already sits is idempotent, and the formatter's cursor extra
-//!   then restores the position and its pending-wrap.
+//! Nothing in the C API formats state without content, so the second
+//! pass selects the cursor's own cell: re-printing that glyph where the
+//! cursor already sits is idempotent, and the formatter's cursor extra
+//! then restores the position and its pending-wrap.
 //!
 //! Building the extras by hand instead would re-implement libghostty's
 //! state emission and drift from it.
 //!
 //! # What it deliberately does not carry
 //!
-//! The inactive screen; soft-wrap flags; per-cell hyperlinks (VT content
-//! emits `OSC 8` only for HTML); text-free background-only rows *in
-//! history* (there is no cursor addressing into history — viewport ones
-//! are refilled); the saved cursor and the kitty-keyboard stack; Kitty
-//! images; modes outside [`CARRIED_MODES`]; a program colour override
-//! that happens to equal the server's own default; and, under origin
-//! mode, a pending wrap — step 8's `ESC[?6h` homes the cursor and its
+//! The inactive screen; soft-wrap flags; the saved cursor and the
+//! kitty-keyboard stack; Kitty images; modes outside [`CARRIED_MODES`];
+//! a program colour override that happens to equal the server's own
+//! default; and, under origin mode, a pending wrap — step 8's `ESC[?6h` homes the cursor and its
 //! re-position clears the flag, whatever the scrolling region is.
 //!
 //! One ordering hazard, too: `?2027` (grapheme clustering) rides with
@@ -46,7 +40,7 @@ use std::ptr;
 use crate::formatter::FormatterBuf;
 use crate::sys;
 use crate::{
-    ColorRgb, CursorVisualStyle, Error, GridRef, Point, RenderState, RenderedRow, Result, Terminal,
+    ColorRgb, CursorVisualStyle, Error, GridRef, Point, RenderState, Result, Terminal,
     TerminalColor,
 };
 
@@ -106,15 +100,13 @@ const ALT_SCREEN_MODES: &[u16] = &[1049, 47, 1047];
 /// encodable exists yet and the caller must retry after the next input
 /// chunk. `Ok(Some(bytes))` is the payload.
 ///
-/// Refreshes `render` itself — the composition reads the cursor and the
-/// viewport's resolved cells, and a stale snapshot would place the
-/// cursor on the wrong cell.
+/// Refreshes `render` itself — the composition reads the cursor, and a
+/// stale snapshot would place it on the wrong cell.
 pub fn vt_snapshot(terminal: &Terminal, render: &mut RenderState) -> Result<Option<Vec<u8>>> {
     // Asked before any of the work below, not beside the append that
     // consumes it: a caller retrying an `Ok(None)` would otherwise pay a
-    // render update, two formatter passes over the whole history and a
-    // walk of the viewport to be told again that there is nothing to
-    // carry. Only the *test* moves — the bytes are still emitted last,
+    // render update and a formatter pass over the whole history to be
+    // told again that there is nothing to carry. Only the *test* moves — the bytes are still emitted last,
     // which is what makes the client's first live PTY frame complete the
     // cut sequence exactly as it does on the server.
     let Some(continuation) = terminal.continuation()? else {
@@ -128,23 +120,7 @@ pub fn vt_snapshot(terminal: &Terminal, render: &mut RenderState) -> Result<Opti
     write_color_overrides(terminal, &mut out)?;
     write_modes(terminal, &mut out);
 
-    let content = format_terminal(terminal, CONTENT_EXTRA, None)?;
-    let rows_written = count_crlf(&content);
-    out.extend_from_slice(&content);
-
-    // The client's viewport only lines up if the replay ends on the
-    // active screen's last row: `total_rows` rows exist, the content
-    // stopped after `rows_written` newlines, and every row between is a
-    // trailing blank the formatter dropped.
-    let pad = terminal
-        .total_rows()?
-        .saturating_sub(1)
-        .saturating_sub(rows_written as u64);
-    for _ in 0..pad {
-        out.extend_from_slice(b"\r\n");
-    }
-
-    write_background_fills(terminal, render, &mut out)?;
+    out.extend_from_slice(&format_terminal(terminal, CONTENT_EXTRA, None)?);
 
     let cursor = render.cursor();
     let cursor_col = cursor.map_or(0, |cursor| cursor.col);
@@ -247,103 +223,6 @@ fn write_modes(terminal: &Terminal, out: &mut Vec<u8>) {
             let suffix = if enabled { 'h' } else { 'l' };
             push(out, &format!("\x1b[{prefix}{mode}{suffix}"));
         }
-    }
-}
-
-/// Step 4 — refill the viewport rows the formatter drops.
-///
-/// Its row-blank predicate is `Cell.hasTextAny`, so a row erased with a
-/// background colour and no text — a TUI status bar, `EL`/`ED` under SGR
-/// 4x — replays as a bare `\r\n` and loses its fill. A row of *spaces*
-/// under a background is not that row: a space is text, so the formatter
-/// emits those cells itself, and the ECH below would overwrite them with
-/// the fill colour alone. Hence the predicate is "every cell is
-/// genuinely textless", not "the row's text trimmed to nothing".
-///
-/// Consumes the caller's dirty set (`mark_full` + `walk_dirty`): only
-/// the server encodes a payload, and it never renders from the same
-/// [`RenderState`].
-fn write_background_fills(
-    terminal: &Terminal,
-    render: &mut RenderState,
-    out: &mut Vec<u8>,
-) -> Result<()> {
-    let colors = render.colors()?;
-    let defaults = (colors.foreground, colors.background);
-    let cols = terminal.cols().ok_or(Error::InvalidValue)?;
-    let palette = terminal.live_palette()?;
-
-    render.mark_full()?;
-    let mut rows: Vec<(u32, RenderedRow)> = Vec::new();
-    render.walk_dirty(terminal, |row, cells| {
-        if !cells.iter().all(|cell| cell.text.is_empty()) {
-            return;
-        }
-        let built = RenderedRow::build(cells, defaults, None, cols);
-        if !built.cells.is_empty() {
-            rows.push((row, built));
-        }
-    })?;
-
-    for (row, built) in rows {
-        let mut run: Option<(u16, u16, ColorRgb)> = None;
-        for cell in &built.cells {
-            match run {
-                Some((start, len, background))
-                    if background == cell.background && start + len == cell.col =>
-                {
-                    run = Some((start, len + 1, background));
-                }
-                Some((start, len, background)) => {
-                    push(out, &erase_run(row, start, len, background, &palette));
-                    run = Some((cell.col, 1, cell.background));
-                }
-                None => run = Some((cell.col, 1, cell.background)),
-            }
-        }
-        if let Some((start, len, background)) = run {
-            push(out, &erase_run(row, start, len, background, &palette));
-        }
-        push(out, "\x1b[0m");
-    }
-    Ok(())
-}
-
-/// One background run: address it, set the background, erase it.
-fn erase_run(
-    row: u32,
-    col: u16,
-    len: u16,
-    background: ColorRgb,
-    palette: &[ColorRgb; 256],
-) -> String {
-    format!(
-        "\x1b[{};{}H{}\x1b[{}X",
-        row + 1,
-        col + 1,
-        background_sgr(background, palette),
-        len,
-    )
-}
-
-/// The fill colour as SGR, indexed where it can be.
-///
-/// `RenderedRow` carries backgrounds already resolved through the
-/// *server's* palette, and emitting those as truecolour would leave the
-/// refilled rows wearing the server's theme while the text rows around
-/// them — which pass A emits as `CSI 4x m` — wear the client's. Step 0
-/// exists for exactly that, so the resolved colour is looked back up.
-/// The ambiguity it buys: a program that set a truecolour background
-/// numerically equal to a palette slot replays as that slot. Indexed
-/// backgrounds are the common case, and the ones a client theme is meant
-/// to re-map.
-fn background_sgr(background: ColorRgb, palette: &[ColorRgb; 256]) -> String {
-    match palette.iter().position(|slot| *slot == background) {
-        Some(index) => format!("\x1b[48;5;{index}m"),
-        None => format!(
-            "\x1b[48;2;{};{};{}m",
-            background.r, background.g, background.b
-        ),
     }
 }
 
@@ -455,8 +334,8 @@ fn decscusr_code(style: CursorVisualStyle, blinking: bool) -> u8 {
 // ============================================================================
 
 /// Pass A: content plus tabstops. The palette and the modes are step 0's
-/// and step 1's; the region, keyboard, pwd and screen extras all belong
-/// after the pad.
+/// and step 1's; the region, keyboard, pwd and screen extras are pass
+/// B's.
 const CONTENT_EXTRA: Extras = Extras {
     scrolling_region: false,
     tabstops: true,
@@ -602,12 +481,6 @@ fn cell_selection(cell: &GridRef) -> sys::GhosttySelection {
     }
 }
 
-/// Rows the content pass emitted. Cells never hold C0 bytes and VT
-/// content emits no `OSC 8`, so every `\r\n` in it is a row break.
-fn count_crlf(content: &[u8]) -> usize {
-    content.windows(2).filter(|pair| *pair == b"\r\n").count()
-}
-
 fn osc_color(target: &str, rgb: ColorRgb) -> String {
     format!(
         "\x1b]{};rgb:{:02x}/{:02x}/{:02x}\x1b\\",
@@ -635,12 +508,5 @@ mod tests {
         .flat_map(|style| [true, false].map(|blink| decscusr_code(style, blink)))
         .collect();
         assert_eq!(codes, vec![1, 2, 1, 2, 3, 4, 5, 6]);
-    }
-
-    #[test]
-    fn crlf_pairs_are_counted_but_lone_carriage_returns_are_not() {
-        assert_eq!(count_crlf(b"a\r\nb\r\n"), 2);
-        assert_eq!(count_crlf(b"a\rb\nc"), 0);
-        assert_eq!(count_crlf(b""), 0);
     }
 }
