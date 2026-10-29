@@ -354,7 +354,13 @@ async fn stop_old_path_among(
     {
         Stop::Stopped(report) => report,
         Stop::Gone => {
-            if !json {
+            if json {
+                crate::print_json(&serde_json::json!({
+                    "socket": socket.display().to_string(),
+                    "session_id": session_id,
+                    "reap": null,
+                }))?;
+            } else {
                 println!("stopped (it went away first)");
             }
             return Ok(0);

@@ -57,10 +57,10 @@ pytest invocation (`make e2e-old-session`), and
 `pytestmark = pytest.mark.host_client` so whole-directory runs deselect it.
 
 The compatibility checks need a release at this tree's generation, and no
-release that predates M2 is one, so they skip until the lane is revisited.
-Every release the lane runs must predate M2 (`LAST_PRE_M2_RELEASE`): a
-later one would bind where this tree looks, and there would be no old path
-to find.
+release that predates M2 is one, so they skip. Every release the lane runs
+must predate M2 (`LAST_PRE_M2_RELEASE`): a later one would bind where this
+tree looks, and there would be no old path to find, so `fetch()` fails the
+lane on one rather than skipping — the signal to revisit it (#652).
 
 One module-scoped old session + UI per release, condition waits only, and
 every assertion on the op set — `host.status`, `tab.list`, the window's

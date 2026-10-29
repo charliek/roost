@@ -190,8 +190,11 @@ ut_session_dir_new() {
     echo "error: '${dir}' is not a private session socket dir; refusing to launch on it" >&2
     return 1
   fi
-  if record="$(ut_session_dir_record)"; then
-    printf '%s\n' "${dir}" > "${record}"
+  # A launch nobody recorded is a session no later quit can find and stop.
+  if ! record="$(ut_session_dir_record)" || ! printf '%s\n' "${dir}" > "${record}"; then
+    rmdir -- "${dir}"
+    echo "error: no private place to record '${dir}'; not launching" >&2
+    return 1
   fi
   printf '%s\n' "${dir}"
 }

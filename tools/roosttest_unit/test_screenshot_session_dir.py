@@ -216,10 +216,12 @@ class SessionDirTests(unittest.TestCase):
 
         self.env["HOME"] = str(self.scratch / "nowhere")
         (self.scratch / "nowhere").write_text("a file, not a home")
+        before = set(TMP_ROOT.glob("roost-uitest-ss.*"))
         made = _bash("ut_session_dir_new", self.env)
-        self.assertEqual(made.returncode, 0, made.stderr)
-        self.addCleanup(shutil.rmtree, made.stdout.strip(), ignore_errors=True)
-        self.assertIn("not recorded", made.stderr)
+        self.assertNotEqual(made.returncode, 0, made.stdout + made.stderr)
+        self.assertIn("not launching", made.stderr)
+        self.assertEqual(made.stdout.strip(), "", "an unrecorded dir was handed to a launch")
+        self.assertEqual(set(TMP_ROOT.glob("roost-uitest-ss.*")), before, "the unrecorded dir was left behind")
 
 
 if __name__ == "__main__":
