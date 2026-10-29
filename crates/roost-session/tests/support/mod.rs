@@ -446,3 +446,37 @@ pub fn read_state(path: &Path) -> roost_engine::persistence::SnapshotFile {
         .expect("read state.json")
         .expect("state.json must exist after a flush")
 }
+
+/// A scratch session on an old path: it answers every request line at
+/// `socket` as a pre-M2 build's `session.identify` would, and records
+/// each line it is sent — the fake an old-path probe or a fallback
+/// bridge reaches.
+pub fn old_path_sentinel(socket: &Path) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let listener = tokio::net::UnixListener::bind(socket).expect("bind the old-path sentinel");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = std::sync::Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let record = std::sync::Arc::clone(&record);
+            tokio::spawn(async move {
+                let (read, mut write) = stream.into_split();
+                let mut lines = tokio::io::BufReader::new(read).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    record.lock().unwrap().push(line.clone());
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let reply = serde_json::json!({
+                        "id": request["id"], "ok": true,
+                        "result": {"session_protocol": 6, "session_id": "old-1"},
+                    });
+                    let mut bytes = serde_json::to_vec(&reply).unwrap();
+                    bytes.push(b'\n');
+                    if write.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    seen
+}

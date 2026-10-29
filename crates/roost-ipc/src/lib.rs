@@ -30,6 +30,8 @@
 //!   `roost-engine` cannot see `roost-ui-model`.
 //! * [`paths`] — `BundleProfile` path resolution. The Mac UI's Swift
 //!   side has a byte-for-byte equivalent.
+//! * [`old_session`] — finding a session still on a path an older build
+//!   used, for the upgrade across the session socket's move.
 //! * [`socket_state`] — the one shared answer to "is a listener alive
 //!   at this socket path?", used by the bind path and `roostctl
 //!   doctor` and mirrored in Swift.
@@ -44,6 +46,8 @@
 //!   server's opt-in same-UID enforcement.
 //! * [`runtime_dir`] — create-or-validate the directory a socket is
 //!   bound in ([`validate_runtime_dir`]).
+//! * [`session_dir`] — the same for the Linux session socket's default
+//!   directory under the passwd home, one level at a time.
 //! * [`target`] — CLI-side target selection for `roostctl`.
 //! * [`session_launch`] — the launch-cwd hint and the readiness verdict
 //!   line `roostctl session start` and `roost-session` exchange.
@@ -75,9 +79,11 @@ pub mod format_chars;
 pub mod framing;
 pub mod local_route;
 pub mod messages;
+pub mod old_session;
 pub mod paths;
 pub mod program_status;
 pub mod schema;
+pub mod session_dir;
 pub mod session_launch;
 pub mod session_version;
 pub mod socket_state;

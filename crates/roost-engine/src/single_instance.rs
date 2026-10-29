@@ -297,6 +297,45 @@ pub fn acquire(lock_path: impl AsRef<Path>) -> Result<InstanceLock, AcquireError
     Ok(lock)
 }
 
+/// The pid holding a `flock` on `path` right now, from `/proc/locks` —
+/// the kernel's own record of a held lock — matched on the file's device
+/// and inode.
+///
+/// Not the pid [`acquire`] wrote into the file: that one survives the
+/// holder, so a lock file left by a crashed run still names it, and a
+/// refusal built on it would blame a process that is long gone. `None`
+/// when nothing holds the lock, the file is missing, or `/proc/locks`
+/// cannot be read. Linux only; elsewhere the pid in the file is all a
+/// caller has ([`LocksError`]).
+#[cfg(target_os = "linux")]
+pub fn lock_holder(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    let locks = std::fs::read_to_string("/proc/locks").ok()?;
+    flock_holder(
+        &locks,
+        libc::major(meta.dev()),
+        libc::minor(meta.dev()),
+        meta.ino(),
+    )
+}
+
+/// The holder of a granted `FLOCK` on `(major, minor, inode)` in
+/// `/proc/locks`' text. A line reads `1: FLOCK ADVISORY WRITE <pid>
+/// <maj>:<min>:<ino> 0 EOF`, the device in hex; a waiter's line carries
+/// `->` after the index and holds nothing.
+#[cfg(target_os = "linux")]
+fn flock_holder(locks: &str, major: u32, minor: u32, inode: u64) -> Option<u32> {
+    let file = format!("{major:02x}:{minor:02x}:{inode}");
+    locks.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match fields.as_slice() {
+            [_, "FLOCK", _, _, pid, id, ..] if *id == file => pid.parse().ok(),
+            _ => None,
+        }
+    })
+}
+
 fn read_pid(file: &File) -> std::io::Result<i32> {
     let mut buf = String::new();
     let mut clone = file.try_clone()?;
@@ -567,6 +606,47 @@ mod tests {
         drop(locks);
 
         acquire_locks(&socket_lock, &state_lock).expect("both locks must be free after a drop");
+    }
+
+    /// Plan 083 A-3: a held lock names its holder from the kernel's own
+    /// table, and a lock file that merely *contains* a pid is not held.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lock_holder_reads_the_kernels_table_not_the_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.lock");
+        let lock = acquire(&path).unwrap();
+        assert_eq!(lock_holder(&path), Some(std::process::id()));
+        drop(lock);
+        assert_eq!(lock_holder(&path), None, "released: nothing holds it");
+
+        let stale = dir.path().join("stale.lock");
+        std::fs::write(&stale, "999999\n").unwrap();
+        assert_eq!(
+            lock_holder(&stale),
+            None,
+            "a pid in the file is not a holder"
+        );
+        assert_eq!(lock_holder(&dir.path().join("absent.lock")), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn flock_holder_skips_waiters_and_other_files() {
+        let table = "\
+1: POSIX  ADVISORY  WRITE 77 08:02:4242 0 EOF
+2: FLOCK  ADVISORY  WRITE 1234 08:02:999 0 EOF
+2: -> FLOCK  ADVISORY  WRITE 5678 08:02:4242 0 EOF
+3: FLOCK  ADVISORY  WRITE 4321 08:02:4242 0 EOF
+";
+        assert_eq!(flock_holder(table, 8, 2, 4242), Some(4321));
+        assert_eq!(flock_holder(table, 8, 3, 4242), None, "another device");
+        assert_eq!(flock_holder(table, 0xfd, 1, 4242), None);
+        assert_eq!(
+            flock_holder("1: FLOCK ADVISORY WRITE 9 fd:01:7 0 EOF\n", 0xfd, 1, 7),
+            Some(9),
+            "the device is hex"
+        );
     }
 
     #[test]

@@ -44,7 +44,7 @@
 //!   probe→bind sequence is the other half of the answer.
 
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{bail, Context};
@@ -128,41 +128,42 @@ fn check_ancestor(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `lstat` `path`, first making it a `0700` directory if nothing is
+/// there — for the caller to judge, whoever made it.
+///
+/// Someone may create it between the stat and the `mkdir`. Two
+/// simultaneous first starts reach here by design — validation precedes
+/// the lock that would serialize them — and "is this directory
+/// acceptable?" is the same question for one a peer just made as for one
+/// that was already there. So a lost race re-stats rather than failing a
+/// start.
+///
 /// `mkdir` masks the mode with the umask, which can only clear bits —
 /// never widen — so the directory is never more permissive than 0700 for
 /// even an instant. The chmod that follows only restores owner bits a
-/// hostile umask stripped.
-fn create_leaf(path: &Path) -> std::io::Result<()> {
-    fs::DirBuilder::new().mode(0o700).create(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+/// hostile umask stripped, through a no-follow descriptor, so a swap
+/// between the two can never chmod a link's target.
+fn create_or_lstat_dir(path: &Path) -> std::io::Result<fs::Metadata> {
+    match fs::symlink_metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            match fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                    .open(path)?
+                    .set_permissions(fs::Permissions::from_mode(0o700))?,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+            fs::symlink_metadata(path)
+        }
+        stat => stat,
+    }
 }
 
 fn check_leaf(path: &Path) -> anyhow::Result<()> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => match create_leaf(path) {
-            Ok(()) => return Ok(()),
-            // Someone created the leaf between our stat and our mkdir.
-            // Two simultaneous first starts reach here by design —
-            // validation precedes the lock that would serialize them —
-            // and "is this directory acceptable?" is the same question
-            // for a leaf a peer just made as for one that was already
-            // there. So re-stat and answer it, rather than failing a
-            // start over a lost race.
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                fs::symlink_metadata(path).with_context(|| {
-                    format!("stat concurrently created runtime dir {}", path.display())
-                })?
-            }
-            Err(err) => {
-                return Err(err).with_context(|| format!("create runtime dir {}", path.display()))
-            }
-        },
-        Err(err) => {
-            return Err(err).with_context(|| format!("stat runtime dir {}", path.display()))
-        }
-    };
-
+    let meta = create_or_lstat_dir(path)
+        .with_context(|| format!("create or stat runtime dir {}", path.display()))?;
     reject_non_dir(&meta, path, "runtime dir")?;
     let euid = current_euid();
     if meta.uid() != euid {

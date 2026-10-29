@@ -29,18 +29,19 @@
 //! own `stop_completed` next to it in [`session_launch`]) are pure and
 //! table-tested; the I/O around them is thin.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Subcommand;
 
 use crate::error::CliError;
 use roost_ipc::messages::{ops, SessionIdentify, SessionStopResult, TabListResult};
+use roost_ipc::old_session::{self, OldSession};
 use roost_ipc::paths::{derived_session_state_dir, BundleProfile, STATE_DIR_ENV};
 use roost_ipc::session_launch::{
     self, await_stopped, confirm_serving, locate_session_binary, probe_gone,
-    spawn_and_read_verdict, stop_session, timeout_scale, FirstProject, Verdict, BIN_ENV, BIN_NAME,
-    IPC_TIMEOUT,
+    spawn_and_read_verdict, stop_session, stop_session_if, timeout_scale, FirstProject, Stop,
+    Verdict, BIN_ENV, BIN_NAME, IPC_TIMEOUT,
 };
 
 /// How long to wait for the spawned `roost-session start` to print its
@@ -80,7 +81,17 @@ pub enum SessionCmd {
     /// Stop the running session: every tab's shell is hung up and
     /// reaped, then the socket goes away. Prints the reap report.
     /// Stopping something that is not running succeeds.
-    Stop,
+    ///
+    /// Only this build's own socket, unless `--old-path` names another.
+    Stop {
+        /// Stop the session listening at this socket instead: one that
+        /// `session status` reports running at an old path, left by a
+        /// build that kept its socket elsewhere. It must identify itself
+        /// with a session id, and is stopped only if that id still
+        /// answers when the stop is sent.
+        #[arg(long, value_name = "SOCKET")]
+        old_path: Option<PathBuf>,
+    },
     /// Print the running session's identity and workspace size, or
     /// report that none is running (exit 3, `not-running`).
     Status,
@@ -91,7 +102,10 @@ pub enum SessionCmd {
 pub async fn run(cmd: &SessionCmd, json: bool) -> Result<i32, CliError> {
     match cmd {
         SessionCmd::Start => start(json).await,
-        SessionCmd::Stop => stop(json).await,
+        SessionCmd::Stop { old_path: None } => stop(json).await,
+        SessionCmd::Stop {
+            old_path: Some(socket),
+        } => stop_old_path(socket, json).await,
         SessionCmd::Status => status(json).await,
     }
 }
@@ -144,6 +158,13 @@ async fn start(json: bool) -> Result<i32, CliError> {
         ))
     })?;
 
+    let socket = session_socket()?;
+    // Before anything is spawned: a session on an old path would run
+    // beside a new one.
+    old_session::check_start(&socket)
+        .await
+        .map_err(CliError::Failed)?;
+
     // Said before the spawn, and phrased for what is true at that
     // moment: this start may yet fail, or find an `already-running`
     // session that was started elsewhere — possibly directly, which
@@ -176,7 +197,6 @@ async fn start(json: bool) -> Result<i32, CliError> {
         StartStep::Failed(message) => return Err(CliError::Failed(message)),
     };
 
-    let socket = session_socket()?;
     let identity = confirm_serving(&socket, scaled(CONFIRM_TIMEOUT))
         .await
         .map_err(|e| {
@@ -261,6 +281,109 @@ async fn stop(json: bool) -> Result<i32, CliError> {
     Ok(0)
 }
 
+/// `session stop --old-path`: one session on a path this build no
+/// longer uses, re-probed, named, and stopped only if it is still the
+/// session it named.
+///
+/// Through the same gate the discovery runs behind, so a test-shaped
+/// process can name only its own scratch candidate, and never this
+/// build's own socket — that one is plain `session stop`'s.
+async fn stop_old_path(socket: &Path, json: bool) -> Result<i32, CliError> {
+    stop_old_path_among(
+        socket,
+        &old_session::Gate::from_process().candidates(),
+        &session_socket()?,
+        json,
+    )
+    .await
+}
+
+/// [`stop_old_path`] with the gate's answer and this build's own socket
+/// handed in.
+async fn stop_old_path_among(
+    socket: &Path,
+    gate: &old_session::Candidates,
+    own_socket: &Path,
+    json: bool,
+) -> Result<i32, CliError> {
+    if !socket.is_absolute() {
+        return Err(CliError::Failed(format!(
+            "--old-path must be an absolute socket path (got {})",
+            socket.display()
+        )));
+    }
+    gate.permit(socket).map_err(CliError::Failed)?;
+    if old_session::same_socket(own_socket, socket) {
+        return Err(CliError::Failed(format!(
+            "{} is this build's own session socket; stop it with 'roostctl session stop'",
+            socket.display()
+        )));
+    }
+
+    let session_id = match old_session::probe_socket(socket).await {
+        None => {
+            if json {
+                crate::print_json(&serde_json::json!({
+                    "socket": socket.display().to_string(),
+                    "session_id": null,
+                    "reap": null,
+                }))?;
+            } else {
+                println!("not running (no session at {})", socket.display());
+            }
+            return Ok(0);
+        }
+        Some(OldSession::Found {
+            session_id: Some(id),
+            ..
+        }) => id,
+        Some(old) => {
+            return Err(CliError::Failed(format!(
+                "can't identify the session at {}; stop it from its own build",
+                old.describe()
+            )))
+        }
+    };
+
+    if !json {
+        println!("stopping session {session_id} at {}", socket.display());
+    }
+    let report = match stop_session_if(socket, Some(&session_id), scaled(STOP_CALL_TIMEOUT))
+        .await
+        .map_err(CliError::connection)?
+    {
+        Stop::Stopped(report) => report,
+        Stop::Gone => {
+            if !json {
+                println!("stopped (it went away first)");
+            }
+            return Ok(0);
+        }
+        Stop::NotExpected(other) => {
+            return Err(CliError::Failed(format!(
+                "the session at {} is now {other}, not {session_id}; nothing was stopped",
+                socket.display()
+            )))
+        }
+    };
+    if !json {
+        print_reap_report(&report.reap);
+    }
+    await_stopped(socket, &session_id, scaled(STOP_GONE_TIMEOUT))
+        .await
+        .map_err(CliError::failed)?;
+    if json {
+        crate::print_json(&serde_json::json!({
+            "socket": socket.display().to_string(),
+            "session_id": session_id,
+            "reap": report.reap,
+        }))?;
+        return Ok(0);
+    }
+    println!("stopped");
+    Ok(0)
+}
+
 fn print_reap_report(report: &SessionStopResult) {
     println!(
         "reaped={} killed={} abandoned={}",
@@ -292,14 +415,19 @@ fn join_ids(ids: &[i64]) -> String {
 
 async fn status(json: bool) -> Result<i32, CliError> {
     let socket = session_socket()?;
+    let old = old_session::discover(&socket).await;
 
     if probe_gone(&socket).await {
         // The line stays on stdout as the status report it has always
         // been; the error is what carries the exit code.
-        if !json {
+        let (report, error) = not_running_report(&socket, &old);
+        if json {
+            crate::print_json(&report)?;
+        } else {
             println!("not running (no session at {})", socket.display());
+            print_old_paths(&old);
         }
-        return Err(not_running(&socket));
+        return Err(error);
     }
 
     let leg = scaled(IPC_TIMEOUT);
@@ -329,16 +457,64 @@ async fn status(json: bool) -> Result<i32, CliError> {
             "identity": identity,
             "projects": list.projects.len(),
             "tabs": tabs,
+            "old_paths": old_paths_json(&old),
         }))?;
         return Ok(0);
     }
     print_identity(&identity, &socket);
     println!("projects={}\ntabs={tabs}", list.projects.len());
+    print_old_paths(&old);
     Ok(0)
 }
 
-fn not_running(socket: &Path) -> CliError {
-    CliError::NotRunning(format!("no session at {}", socket.display()))
+/// Not running *here*: a session on an old path is not one this build
+/// can reach, so it is named in the message rather than counted.
+fn not_running(socket: &Path, old: &[OldSession]) -> CliError {
+    let mut message = format!("no session at {}", socket.display());
+    for old in old {
+        message.push_str(&format!("; running at an old path: {}", old.describe()));
+    }
+    CliError::NotRunning(message)
+}
+
+/// `session status` with nothing at this build's socket: the `--json`
+/// report — which, in the upgrade case, is where the session on an old
+/// path is listed — and the exit-3 error beside it.
+fn not_running_report(socket: &Path, old: &[OldSession]) -> (serde_json::Value, CliError) {
+    let report = serde_json::json!({
+        "socket": socket.display().to_string(),
+        "identity": null,
+        "old_paths": old_paths_json(old),
+    });
+    (report, not_running(socket, old))
+}
+
+fn print_old_paths(old: &[OldSession]) {
+    for old in old {
+        println!("running at an old path: {}", old.describe());
+    }
+}
+
+fn old_paths_json(old: &[OldSession]) -> serde_json::Value {
+    old.iter()
+        .map(|old| match old {
+            OldSession::Found {
+                socket,
+                protocol_version,
+                pid,
+                session_id,
+            } => serde_json::json!({
+                "socket": socket.display().to_string(),
+                "session_protocol": protocol_version,
+                "pid": pid,
+                "session_id": session_id,
+            }),
+            OldSession::Unidentified { socket, reason } => serde_json::json!({
+                "socket": socket.display().to_string(),
+                "unidentified": reason,
+            }),
+        })
+        .collect()
 }
 
 /// Everything here comes from the session that answered on the socket —
@@ -714,7 +890,7 @@ mod tests {
     /// shared renderer, naming the socket it looked at.
     #[test]
     fn no_session_is_not_running_with_its_own_exit_code() {
-        let error = not_running(Path::new("/run/roost/roost-session.sock"));
+        let error = not_running(Path::new("/run/roost/roost-session.sock"), &[]);
         assert_eq!(error.exit_code(), 3);
         assert_eq!(error.code(), "not-running");
         assert_eq!(
@@ -723,10 +899,237 @@ mod tests {
         );
     }
 
+    /// Plan 083 A-3: a session on an old path is reported, not counted —
+    /// `status` still exits 3, and names every one it found.
+    #[test]
+    fn a_session_on_an_old_path_is_named_by_the_not_running_report() {
+        let old = [
+            OldSession::Found {
+                socket: PathBuf::from("/tmp/old-a/roost.sock"),
+                protocol_version: 6,
+                pid: None,
+                session_id: Some("s-a".into()),
+            },
+            OldSession::Unidentified {
+                socket: PathBuf::from("/tmp/old-b/roost.sock"),
+                reason: "no session.identify answer within 2s".into(),
+            },
+        ];
+        let error = not_running(Path::new("/tmp/new/roost.sock"), &old);
+        assert_eq!(error.exit_code(), 3);
+        let rendered = error.render(false);
+        for want in [
+            "running at an old path: /tmp/old-a/roost.sock (session s-a, protocol 6)",
+            "running at an old path: /tmp/old-b/roost.sock (not identified",
+        ] {
+            assert!(rendered.contains(want), "{rendered}");
+        }
+        let json = old_paths_json(&old);
+        assert_eq!(json[0]["session_id"], "s-a");
+
+        // `--json` lists them too, beside the same exit-3 error.
+        let (report, error) = not_running_report(Path::new("/tmp/new/roost.sock"), &old);
+        assert_eq!(error.exit_code(), 3);
+        assert_eq!(report["socket"], "/tmp/new/roost.sock");
+        assert_eq!(
+            report["old_paths"].as_array().map(Vec::len),
+            Some(2),
+            "{report}"
+        );
+        assert_eq!(report["old_paths"][0]["socket"], "/tmp/old-a/roost.sock");
+        assert_eq!(
+            json[1]["unidentified"],
+            "no session.identify answer within 2s"
+        );
+    }
+
     #[test]
     fn reap_ids_render_as_a_comma_list() {
         assert_eq!(join_ids(&[3, 1, 2]), "3,1,2");
         assert_eq!(join_ids(&[]), "");
+    }
+
+    // ------------------------------------------------------------------
+    // `session stop --old-path`
+    // ------------------------------------------------------------------
+
+    /// A scratch session on an old path. Its first `session.identify`
+    /// answers as `first`, every later one as `then` (`None`: no id at
+    /// all), and a `session.stop` takes its socket away. Returns the ops
+    /// it was sent.
+    fn old_session(
+        socket: &Path,
+        first: Option<&'static str>,
+        then: Option<&'static str>,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let dir = socket.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = std::sync::Arc::clone(&seen);
+        let path = socket.to_path_buf();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let record = std::sync::Arc::clone(&record);
+                let path = path.clone();
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = tokio::io::BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let op = request["op"].as_str().unwrap().to_string();
+                        let identifies = {
+                            let mut seen = record.lock().unwrap();
+                            seen.push(op.clone());
+                            seen.iter()
+                                .filter(|seen| *seen == ops::SESSION_IDENTIFY)
+                                .count()
+                        };
+                        let result = if op == ops::SESSION_STOP {
+                            let _ = std::fs::remove_file(&path);
+                            serde_json::json!({"reaped": [], "killed": [], "abandoned": []})
+                        } else {
+                            let id = if identifies == 1 { first } else { then };
+                            let mut identity =
+                                serde_json::to_value(SessionIdentify::default()).unwrap();
+                            identity["session_protocol"] = 6.into();
+                            identity["session_id"] = id.unwrap_or("").into();
+                            identity
+                        };
+                        let reply = serde_json::json!({
+                            "id": request["id"], "ok": true, "result": result,
+                        });
+                        let mut bytes = serde_json::to_vec(&reply).unwrap();
+                        bytes.push(b'\n');
+                        if write.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        seen
+    }
+
+    /// [`crate::tests::short_socket_dir`], removed however the test ends.
+    struct ShortRoot(PathBuf);
+
+    impl ShortRoot {
+        fn new() -> Self {
+            Self(crate::tests::short_socket_dir("old-path"))
+        }
+
+        fn join(&self, path: &str) -> PathBuf {
+            self.0.join(path)
+        }
+    }
+
+    impl Drop for ShortRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn only(socket: &Path) -> old_session::Candidates {
+        old_session::Candidates::Test(socket.to_path_buf())
+    }
+
+    /// Plan 083 A-3: an old-path session that identifies is named and
+    /// stopped over its own socket.
+    #[tokio::test]
+    async fn an_old_path_session_that_identifies_is_stopped_there() {
+        let root = ShortRoot::new();
+        let socket = root.join("old/roost.sock");
+        let seen = old_session(&socket, Some("old-1"), Some("old-1"));
+        let code = stop_old_path_among(&socket, &only(&socket), &root.join("new.sock"), true)
+            .await
+            .expect("stopped");
+        assert_eq!(code, 0);
+        assert_eq!(
+            seen.lock().unwrap().last().map(String::as_str),
+            Some(ops::SESSION_STOP)
+        );
+        assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn an_old_path_session_with_no_session_id_is_refused() {
+        let root = ShortRoot::new();
+        let socket = root.join("old/roost.sock");
+        let seen = old_session(&socket, None, None);
+        let error = stop_old_path_among(&socket, &only(&socket), &root.join("new.sock"), true)
+            .await
+            .expect_err("refused");
+        let text = error.render(false);
+        assert!(text.contains("can't identify"), "{text}");
+        assert!(!seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| op == ops::SESSION_STOP));
+    }
+
+    /// The id named before the stop is the only one stopped: a session
+    /// that answers as another by the time the stop is sent is left.
+    #[tokio::test]
+    async fn a_session_replaced_between_identify_and_stop_is_left_running() {
+        let root = ShortRoot::new();
+        let socket = root.join("old/roost.sock");
+        let seen = old_session(&socket, Some("old-1"), Some("someone-else"));
+        let error = stop_old_path_among(&socket, &only(&socket), &root.join("new.sock"), true)
+            .await
+            .expect_err("refused");
+        let text = error.render(false);
+        assert!(text.contains("nothing was stopped"), "{text}");
+        assert!(!seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| op == ops::SESSION_STOP));
+        assert!(socket.exists());
+    }
+
+    /// The gate decides which sockets may be named at all, and this
+    /// build's own is never an old path.
+    #[tokio::test]
+    async fn only_a_socket_the_gate_permits_and_never_this_builds_own_is_stopped() {
+        let root = ShortRoot::new();
+        let socket = root.join("old/roost.sock");
+        let seen = old_session(&socket, Some("old-1"), Some("old-1"));
+        for gate in [
+            old_session::Candidates::Closed("ROOST_TEST_MODE is set"),
+            only(&root.join("another/roost.sock")),
+        ] {
+            stop_old_path_among(&socket, &gate, &root.join("new.sock"), true)
+                .await
+                .expect_err("not permitted");
+        }
+        stop_old_path_among(
+            &socket,
+            &old_session::Candidates::Production(Vec::new()),
+            &root.join("new.sock"),
+            true,
+        )
+        .await
+        .expect_err("no candidates, nothing to name");
+        stop_old_path_among(&socket, &only(&socket), &socket, true)
+            .await
+            .expect_err("this build's own socket");
+        // However it is spelled.
+        stop_old_path_among(
+            &root.join("old/../old/roost.sock"),
+            &only(&socket),
+            &socket,
+            true,
+        )
+        .await
+        .expect_err("this build's own socket, spelled another way");
+        stop_old_path_among(Path::new("relative.sock"), &only(&socket), &socket, true)
+            .await
+            .expect_err("relative");
+        assert!(seen.lock().unwrap().is_empty(), "nothing was even probed");
     }
 
     // ------------------------------------------------------------------

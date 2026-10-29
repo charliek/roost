@@ -14,16 +14,20 @@
 //!    calling thread; a runtime, a logger with a writer thread, or a
 //!    signal driver started first would leave the child holding locks
 //!    nobody will ever release.
-//! 4. **Validate the runtime dir before the flock.** Both
+//! 4. **Vouch for the socket dir before the flock.** Both
 //!    `single_instance::acquire` and `IpcServer::bind` `create_dir_all`
-//!    at the default mode, and `validate_runtime_dir` rejects rather
-//!    than repairs — so a leaf either of them materializes first is
-//!    refused from then on, with no recovery short of an `rmdir`.
+//!    at the default mode, and the validators reject rather than repair
+//!    — so a leaf either of them materializes first is refused from then
+//!    on, with no recovery short of an `rmdir`.
 //! 5. **Logger and panic hook before the locks**, so a refusal is
 //!    recorded rather than merely returned.
-//! 6. **Locks before the runtime**, so a losing racer costs one process
+//! 6. **A session on an old path before the locks.** The locks only
+//!    contend with a session on *this* socket and state dir; a pre-M2
+//!    daemon on its old socket, with a state dir of its own, would never
+//!    meet them and would end up running beside this one.
+//! 7. **Locks before the runtime**, so a losing racer costs one process
 //!    start and nothing else.
-//! 7. **The agent-hook path before the fork**, because it is derived
+//! 8. **The agent-hook path before the fork**, because it is derived
 //!    from `current_exe()` and the fork `chdir`s away from the directory
 //!    a relative one would need — see [`crate::agent_hook`] for the
 //!    other half of the reason.
@@ -33,8 +37,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use roost_engine::single_instance::{self, LocksError};
+use roost_ipc::old_session;
 use roost_ipc::paths::BundleProfile;
-use roost_ipc::validate_runtime_dir;
 use tracing::info;
 
 use crate::consts::{
@@ -98,7 +102,7 @@ pub fn set_process_umask() {
     unsafe { libc::umask(PROCESS_UMASK) };
 }
 
-/// Steps 3 through 9. Returns only in the process that will actually
+/// Steps 3 through 8. Returns only in the process that will actually
 /// serve — the forking parent exits inside [`daemonize::daemonize`].
 ///
 /// The profile is resolved by the caller, before the fork, so a
@@ -142,6 +146,8 @@ pub fn start(
         "roost-session starting"
     );
 
+    refuse_beside_an_old_path_session(profile)?;
+
     let locks =
         match single_instance::acquire_locks(profile.socket_lock_path(), profile.state_lock_path())
         {
@@ -157,16 +163,11 @@ pub fn start(
                 return Ok(Outcome::AlreadyRunning((pid > 0).then_some(pid)));
             }
             // We hold the socket lock, so nothing is listening on our
-            // socket: the holder is on a different runtime dir, and
-            // there is no socket to reach it through. Two processes
-            // writing one `state.json` is the thing the lock exists to
-            // stop, so refuse.
+            // socket: the holder is on another socket, and none this
+            // build could find. Two processes writing one `state.json`
+            // is the thing the lock exists to stop, so refuse.
             Err(LocksError::StateHeld { pid, path }) => {
-                anyhow::bail!(
-                    "another session (pid {pid}) is using this state directory; \
-                     refusing to write state.json from two processes (lock: {})",
-                    path.display()
-                );
+                anyhow::bail!("{}", state_held(&path, pid));
             }
             Err(error) => return Err(anyhow::anyhow!("single-instance lock failed: {error}")),
         };
@@ -190,22 +191,50 @@ pub fn start(
 /// Create (or vouch for) the three directories a session writes into.
 ///
 /// The socket's own `0600` is only worth what its directory is worth, so
-/// the runtime dir goes through the full validation — owner-only, ours,
-/// no symlinked component, no writable ancestor without the sticky bit —
-/// and rejects rather than repairs. State and log dirs are ours to
-/// create at `0700`.
+/// that one goes through its profile's validation
+/// ([`BundleProfile::prepare_socket_dir`]: owner-only, ours, never
+/// through a symlink) and is rejected rather than repaired. State and
+/// log dirs are ours to create at `0700`. The socket dir comes first:
+/// on Linux its `<ns>` is also the log dir, and a `create_dir_all` here
+/// first would skip the checks that dir gets.
 fn prepare_directories(profile: &BundleProfile) -> Result<()> {
-    let socket_dir = profile.socket_path.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "session socket path {} has no parent directory",
-            profile.socket_path.display()
-        )
-    })?;
-    validate_runtime_dir(socket_dir)
-        .with_context(|| format!("validate runtime dir {}", socket_dir.display()))?;
+    profile.prepare_socket_dir()?;
     create_owner_only_dir(&profile.state_dir)?;
     create_owner_only_dir(&profile.log_dir)?;
     Ok(())
+}
+
+/// [`old_session::check_start`], on a runtime of its own that is gone
+/// before this returns: `start` is past its fork here, and the serving
+/// runtime is built after the locks.
+fn refuse_beside_an_old_path_session(profile: &BundleProfile) -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build the old-session probe runtime")?
+        .block_on(old_session::check_start(&profile.socket_path))
+        .map_err(anyhow::Error::msg)
+}
+
+/// The state lock is held, and no socket this build can find belongs to
+/// its holder. The holder's pid is the kernel's word where there is one
+/// (`lock_holder`), never just the pid written in the file — that one
+/// outlives a crashed holder.
+fn state_held(lock: &Path, pid_in_file: i32) -> String {
+    #[cfg(target_os = "linux")]
+    let holder = {
+        let _ = pid_in_file;
+        single_instance::lock_holder(lock)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let holder = u32::try_from(pid_in_file).ok().filter(|pid| *pid > 0);
+    let pid = holder.map_or_else(|| "pid unknown".to_string(), |pid| format!("pid {pid}"));
+    format!(
+        "a session holds the state lock; its socket wasn't found ({pid}, lock: {}): another \
+         session is using this state directory, and this one refuses to write state.json \
+         beside it",
+        lock.display()
+    )
 }
 
 fn create_owner_only_dir(path: &Path) -> Result<()> {

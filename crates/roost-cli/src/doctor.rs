@@ -39,6 +39,7 @@ use roost_ipc::agent::{
 };
 use roost_ipc::format_chars::is_format;
 use roost_ipc::messages::{ops, IdentifyParams, IdentifyResult, Tab, TabListResult};
+use roost_ipc::old_session::{self, Candidates, OldSession};
 use roost_ipc::program_status::{suppress_raw_osc, DecidedBy};
 use roost_ipc::session_launch::timeout_scale;
 use roost_ipc::socket_state::{self, describe_file_type, SocketState};
@@ -190,6 +191,10 @@ const DOC_TARGETS: &[(&str, Doc)] = &[
     ("agent.cursor.owning", doc!("guides/agents", "ownership")),
     ("agent.opencode.wired", doc!("guides/agents", "install")),
     ("agent.opencode.owning", doc!("guides/agents", "ownership")),
+    (
+        "session.old_path",
+        doc!("reference/paths", "session-profile"),
+    ),
 ];
 
 fn docs_for(check_id: &str) -> Option<&'static str> {
@@ -733,6 +738,18 @@ pub struct Inputs {
     /// absent rc file is not distinguished from a clean one: there is
     /// nothing actionable to say about either.
     pub legacy_claude_alias_in_rc: bool,
+
+    /// Sessions still on a socket path an older build used (plan 083
+    /// D-A5), behind the same fail-closed gate as everything else that
+    /// looks for them.
+    pub old_sessions: OldSessionProbe,
+}
+
+/// What the old-path probe found, or why it did not run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OldSessionProbe {
+    NotProbed(String),
+    Probed(Vec<OldSession>),
 }
 
 impl Default for Inputs {
@@ -773,6 +790,7 @@ impl Default for Inputs {
             agent_codex_trust_error: None,
             legacy_claude_settings_present: false,
             legacy_claude_alias_in_rc: false,
+            old_sessions: OldSessionProbe::NotProbed("not collected".into()),
         }
     }
 }
@@ -804,11 +822,12 @@ pub async fn collect(
     // ordered internally but depends on none of them. Doctor is reached
     // for precisely when something is hung, so the wall clock must be
     // the slower of the two, not their sum.
-    let (shell_version, parent_comm, claude_version, ui) = tokio::join!(
+    let (shell_version, parent_comm, claude_version, ui, old_sessions) = tokio::join!(
         shell_version(shell_path.as_deref(), shell_usable, subprocess_budget),
         parent_comm(parent_pid, subprocess_budget),
         capture_version("claude", subprocess_budget),
         probe_ui(selector, environment, ipc_budget(scale)),
+        probe_old_sessions(),
     );
 
     let claude_settings_path = crate::claude_settings_path().ok();
@@ -875,6 +894,26 @@ pub async fn collect(
         agent_codex_trust_error,
         legacy_claude_settings_present,
         legacy_claude_alias_in_rc,
+        old_sessions,
+    }
+}
+
+/// Every session on an old path the gate lets this process look for.
+/// Bounded by the probe's own per-leg deadlines.
+async fn probe_old_sessions() -> OldSessionProbe {
+    let socket = match roost_ipc::paths::BundleProfile::session() {
+        Ok(profile) => profile.socket_path,
+        Err(error) => {
+            return OldSessionProbe::NotProbed(format!(
+                "this build's session socket does not resolve: {error:#}"
+            ))
+        }
+    };
+    match old_session::Gate::from_process().candidates() {
+        Candidates::Closed(why) => OldSessionProbe::NotProbed(why.to_string()),
+        candidates => {
+            OldSessionProbe::Probed(old_session::discover_among(&candidates, &socket).await)
+        }
     }
 }
 
@@ -1852,7 +1891,50 @@ pub fn evaluate(inputs: &Inputs) -> Report {
                 "agent.hook_binary",
                 agent_checks(inputs, tabs, model),
             ),
+            section(
+                "session",
+                "Host session",
+                "process",
+                Kind::Check,
+                "session.old_path",
+                vec![old_path_check(inputs)],
+            ),
         ],
+    }
+}
+
+/// A session at a path this build doesn't use: it cannot be reached
+/// from here, and a start would refuse to run beside it.
+fn old_path_check(inputs: &Inputs) -> Check {
+    const ID: &str = "session.old_path";
+    const TITLE: &str = "Session at an old path";
+    match &inputs.old_sessions {
+        OldSessionProbe::NotProbed(why) => {
+            check(ID, TITLE, Status::Skipped, format!("not looked for: {why}"))
+        }
+        OldSessionProbe::Probed(found) if found.is_empty() => check(
+            ID,
+            TITLE,
+            Status::Ok,
+            "no session is running at a path this build doesn't use",
+        ),
+        OldSessionProbe::Probed(found) => {
+            let listed = found
+                .iter()
+                .map(|old| redact(&old.describe()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            check(
+                ID,
+                TITLE,
+                Status::Warn,
+                format!(
+                    "a session is running at a path this build doesn't use: {listed} — stop it \
+                     with 'roostctl session stop --old-path <socket>', then 'roostctl session \
+                     start'"
+                ),
+            )
+        }
     }
 }
 
@@ -3930,10 +4012,58 @@ mod tests {
         })
     }
 
+    fn an_old_session() -> OldSession {
+        OldSession::Found {
+            socket: PathBuf::from("/tmp/roost-session-dev-1000/roost.sock"),
+            protocol_version: 6,
+            pid: None,
+            session_id: Some("s-old".into()),
+        }
+    }
+
+    /// Plan 083 A-3: doctor names every session on an old path, and says
+    /// why it did not look when the gate kept it from looking.
+    #[test]
+    fn a_session_at_an_old_path_is_a_warning_naming_it() {
+        let report = evaluate(&Inputs {
+            old_sessions: OldSessionProbe::Probed(vec![
+                an_old_session(),
+                OldSession::Unidentified {
+                    socket: PathBuf::from("/run/user/1000/roost-session-dev/roost.sock"),
+                    reason: "no session.identify answer within 2s".into(),
+                },
+            ]),
+            ..healthy()
+        });
+        let found = find(&report, "session.old_path");
+        assert_eq!(found.status, Some(Status::Warn));
+        for want in [
+            "a session is running at a path this build doesn't use",
+            "/tmp/roost-session-dev-1000/roost.sock (session s-old, protocol 6)",
+            "/run/user/1000/roost-session-dev/roost.sock (not identified",
+            "--old-path",
+        ] {
+            assert!(found.detail.contains(want), "{}", found.detail);
+        }
+
+        let closed = evaluate(&Inputs {
+            old_sessions: OldSessionProbe::NotProbed("ROOST_TEST_MODE is set".into()),
+            ..healthy()
+        });
+        let check = find(&closed, "session.old_path");
+        assert_eq!(check.status, Some(Status::Skipped));
+        assert!(
+            check.detail.contains("ROOST_TEST_MODE is set"),
+            "{}",
+            check.detail
+        );
+    }
+
     /// A healthy zsh session inside tab 7 of a current UI.
     fn healthy() -> Inputs {
         Inputs {
             now_unix: 1_700_000_100,
+            old_sessions: OldSessionProbe::Probed(Vec::new()),
             env_tab_id: Some("7".into()),
             env_socket: Some("/tmp/roost.sock".into()),
             env_shell_integration: Some("1".into()),
@@ -4005,7 +4135,7 @@ mod tests {
     }
 
     /// The fixed inventory (§3.7): 31 checks + 8 observations.
-    const CHECK_COUNT: usize = 40;
+    const CHECK_COUNT: usize = 41;
 
     // ------------------------------------------------- applicability (AC 7)
 
@@ -6017,6 +6147,7 @@ mod tests {
         ("tab", "tab.derived"),
         ("claude", "claude.hook_events"),
         ("agents", "agent.hook_binary"),
+        ("session", "session.old_path"),
     ];
 
     fn section_of<'a>(report: &'a Report, id: &str) -> &'a Section {
@@ -6271,6 +6402,30 @@ mod tests {
                 "agents",
                 Some(Status::Fail),
                 "agent.claude.wired",
+            ),
+            (
+                "session ok",
+                healthy(),
+                "session",
+                Some(Status::Ok),
+                "session.old_path",
+            ),
+            (
+                "session skipped",
+                Inputs::default(),
+                "session",
+                Some(Status::Skipped),
+                "session.old_path",
+            ),
+            (
+                "session warn",
+                Inputs {
+                    old_sessions: OldSessionProbe::Probed(vec![an_old_session()]),
+                    ..healthy()
+                },
+                "session",
+                Some(Status::Warn),
+                "session.old_path",
             ),
         ];
 
@@ -6771,6 +6926,7 @@ mod tests {
             ("agent.cursor.owning", "Cursor — owning a tab"),
             ("agent.opencode.wired", "OpenCode — wired"),
             ("agent.opencode.owning", "OpenCode — owning a tab"),
+            ("session.old_path", "Session at an old path"),
         ];
         assert_eq!(EXPECTED.len(), CHECK_COUNT);
         // Every fixture the suite has, so a check whose title differs
@@ -6884,6 +7040,10 @@ mod tests {
         vec![
             Inputs::default(),
             healthy(),
+            Inputs {
+                old_sessions: OldSessionProbe::Probed(vec![an_old_session()]),
+                ..healthy()
+            },
             // Inside a tab (a PTY-only variable is set) with nothing
             // else wired: `env.tab_id` and `shell.integration` both fail.
             Inputs {

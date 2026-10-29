@@ -971,8 +971,28 @@ async fn attempt(
 
 /// Probe, and on the first attempt only, spawn.
 async fn ensure_socket(config: &ConnectionConfig, mode: ConnectMode) -> Result<(), AttemptError> {
+    ensure_socket_among(config, mode, || {
+        roost_ipc::old_session::Gate::from_process().candidates()
+    })
+    .await
+}
+
+/// [`ensure_socket`] over the old paths `old_paths` names, read only
+/// when they are needed.
+async fn ensure_socket_among(
+    config: &ConnectionConfig,
+    mode: ConnectMode,
+    old_paths: impl FnOnce() -> roost_ipc::old_session::Candidates,
+) -> Result<(), AttemptError> {
     if mode == ConnectMode::Dial || socket_live(&config.socket).await {
         return Ok(());
+    }
+    // Before anything is spawned: a daemon started now would run beside
+    // the one an older build left on its old path.
+    if config.transport.is_localhost() {
+        if let Some(mismatch) = old_path_session(config, &old_paths()).await {
+            return Err(AttemptError::Incompatible(mismatch));
+        }
     }
     // Nothing is listening, so only a mode that may start one gets to.
     match mode {
@@ -980,6 +1000,37 @@ async fn ensure_socket(config: &ConnectionConfig, mode: ConnectMode) -> Result<(
         ConnectMode::SpawnUnseeded => spawn_session(config, FirstProject::Withheld).await,
         _ => Err(AttemptError::Transport(no_session_at(&config.socket))),
     }
+}
+
+/// This machine's session, still on a path an older build used
+/// ([`roost_ipc::old_session`]): reported as needing a restart, never
+/// attached. Identified in full for the restart that answers it, which
+/// stops it on that socket and starts it again at `config.socket`; one
+/// that will not identify is left to `roost-session start`'s own
+/// refusal.
+async fn old_path_session(
+    config: &ConnectionConfig,
+    old_paths: &roost_ipc::old_session::Candidates,
+) -> Option<Box<super::state::BuildMismatch>> {
+    for old in roost_ipc::old_session::discover_among(old_paths, &config.socket).await {
+        let roost_ipc::old_session::OldSession::Found { socket, .. } = old else {
+            continue;
+        };
+        if let Ok(identity) = session_launch::identify(&socket, leg()).await {
+            tracing::warn!(
+                host = %config.host,
+                old_socket = %socket.display(),
+                socket = %config.socket.display(),
+                "this machine's session is running at an old socket path; it needs a restart"
+            );
+            return Some(Box::new(super::state::BuildMismatch::at_old_socket(
+                &identity,
+                &config.client_build,
+                socket,
+            )));
+        }
+    }
+    None
 }
 
 /// Nothing is listening, and the user asked for a connection: climb the
@@ -2755,7 +2806,112 @@ mod tests {
             HostTransport::LocalSession,
             ConnectMode::Dial,
         );
-        assert!(ensure_socket(&config, ConnectMode::Dial).await.is_ok());
+        assert!(
+            ensure_socket_among(&config, ConnectMode::Dial, never_probed)
+                .await
+                .is_ok()
+        );
+    }
+
+    /// The old-path candidates for a case that must not look at any.
+    fn never_probed() -> roost_ipc::old_session::Candidates {
+        roost_ipc::old_session::Candidates::Closed("this test probes no old path")
+    }
+
+    /// A scratch session on an old path, answering `session.identify` as
+    /// a pre-M2 build would.
+    fn old_path_sentinel(socket: &Path) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let listener = tokio::net::UnixListener::bind(socket).expect("bind the sentinel");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = tokio::io::BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let request: serde_json::Value =
+                            serde_json::from_str(&line).expect("a request");
+                        let id = request["id"].as_str().and_then(|id| id.parse().ok());
+                        let identity = roost_ipc::messages::SessionIdentify {
+                            session_protocol: 6,
+                            session_id: "old-1".into(),
+                            ..Default::default()
+                        };
+                        let answer = roost_ipc::messages::Response::ok(
+                            id.expect("an id"),
+                            serde_json::to_value(identity).expect("an identity"),
+                        );
+                        let mut frame = serde_json::to_vec(&answer).expect("a frame");
+                        frame.push(b'\n');
+                        if write.write_all(&frame).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Plan 083 A-3: nothing at the configured socket and this machine's
+    /// session on an old path is a restart prompt naming that path — for
+    /// every mode that probes, the spawning ones included, so nothing is
+    /// started beside it.
+    #[tokio::test]
+    async fn a_session_on_an_old_path_needs_a_restart_and_nothing_is_spawned() {
+        let dir = short_dir();
+        let old_dir = dir.path().join("old");
+        std::fs::create_dir(&old_dir).unwrap();
+        std::fs::set_permissions(
+            &old_dir,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+        let old_socket = old_dir.join("roost.sock");
+        old_path_sentinel(&old_socket);
+        let configured = dir.path().join("new.sock");
+        for mode in [
+            ConnectMode::IfPresent,
+            ConnectMode::SpawnIfMissing,
+            ConnectMode::SpawnUnseeded,
+        ] {
+            let config = config(configured.clone(), HostTransport::LocalSession, mode);
+            let error = ensure_socket_among(&config, mode, || {
+                roost_ipc::old_session::Candidates::Test(old_socket.clone())
+            })
+            .await
+            .expect_err("a session on an old path is not a connection");
+            let AttemptError::Incompatible(mismatch) = error else {
+                panic!("{mode:?}: expected a restart prompt, got {error:?}");
+            };
+            assert_eq!(
+                mismatch.kind,
+                super::super::state::MismatchKind::OldSocketPath
+            );
+            assert_eq!(mismatch.old_socket.as_deref(), Some(old_socket.as_path()));
+            assert_eq!(
+                mismatch.restart,
+                super::super::state::RestartAction::RestartLocal
+            );
+            assert_eq!(mismatch.session_id, "old-1");
+            assert!(!configured.exists(), "{mode:?}: nothing was started");
+        }
+    }
+
+    /// Only this machine's own session is looked for on an old path: a
+    /// remote socket host is a plain absent socket.
+    #[tokio::test]
+    async fn a_remote_socket_host_never_looks_at_old_paths() {
+        let config = config(
+            PathBuf::from("/nonexistent/roost-host-conn-remote.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::IfPresent,
+        );
+        let error = ensure_socket_among(&config, ConnectMode::IfPresent, || {
+            panic!("a remote host must not read the old-path gate")
+        })
+        .await
+        .expect_err("absent");
+        assert!(matches!(error, AttemptError::Transport(_)), "{error:?}");
     }
 
     /// Connect-if-present is the launch rule: an absent socket is a
@@ -2769,7 +2925,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&socket);
         let config = config(socket, HostTransport::LocalSession, ConnectMode::IfPresent);
-        let error = ensure_socket(&config, ConnectMode::IfPresent)
+        let error = ensure_socket_among(&config, ConnectMode::IfPresent, never_probed)
             .await
             .expect_err("an absent socket is not a connection");
         let AttemptError::Transport(reason) = error else {

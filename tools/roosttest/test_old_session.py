@@ -16,11 +16,15 @@ Which checks run is chosen by the old binary's own generation, from
   lands in the right directory, typing round-trips, tabs and projects are
   created, renamed and closed, a relaunch comes back to the tab last
   viewed, and today's `roostctl` drives the old session directly.
-* **An older generation** — the forced update: the UI says the slot needs a
-  restart rather than hanging or erroring, the restart replaces the old
-  session with today's, and today's session reads the old one's
-  `state.json`. v0.0.19 (generation 2) is pinned for it, and "latest" gets
-  it too the day a protocol bump leaves the latest release behind.
+* **An older generation** — the upgrade across plan 083 M2, which moved the
+  session socket off `XDG_RUNTIME_DIR`: the released session is on a path
+  this tree no longer uses, so the UI finds it there and says the slot
+  needs a restart (`host.status`: `needs-restart`, reason `old socket
+  path`, the path in `detail`) — as do `roostctl session status` and
+  `doctor`, while a plain `roostctl session stop` leaves it alone — and the
+  restart stops it on its old socket and starts today's at the new one,
+  which reads the old one's `state.json`. v0.0.19 (generation 2) is pinned
+  for it, and "latest" gets it too.
 
 v0.0.20 is pinned as well, for ⌘T's `cwd_from_tab` → `unknown-field` retry
 (`open_host_tab_flow`): it predates the field, and "latest" soon will not.
@@ -37,13 +41,26 @@ build onto the shipped names (`roost_ipc::paths`, ignored by a packaged
 one), and it reaches everything here that resolves the session: the UI,
 the session the UI's restart spawns, and `roostctl`.
 
-# Owning the sentinel
+# Two sockets, kept apart
 
-`test_local_backend.py`'s arrangement: a private root, with
-`XDG_RUNTIME_DIR` and its siblings pointed into it **at import**, so the
-UI, both sessions and `roostctl` resolve one socket nobody else has.
-Hence its own pytest invocation (`make e2e-old-session`), and
+A private root, with `XDG_RUNTIME_DIR` and its siblings pointed into it
+**at import**. The released session — which predates M2 — binds the old
+path under that runtime dir (`World.old_socket`); it is also handed a
+private `ROOST_SESSION_SOCKET_DIR` naming that same directory, which a
+post-M2 release would honour instead. Today's debug UI, the session its
+restart spawns and `roostctl` run with no override at all, a scratch
+`ROOST_TEST_PASSWD_HOME` — so the new path is under that scratch home
+(`World.new_socket`) — and `ROOST_TEST_OLD_SESSION_DIR` naming the released
+session's directory, the one old path they may probe. Nothing here can
+resolve this user's real home or probe a real old path. Hence its own
+pytest invocation (`make e2e-old-session`), and
 `pytestmark = pytest.mark.host_client` so whole-directory runs deselect it.
+
+The compatibility checks need a release at this tree's generation, and no
+release that predates M2 is one, so they skip until the lane is revisited.
+Every release the lane runs must predate M2 (`LAST_PRE_M2_RELEASE`): a
+later one would bind where this tree looks, and there would be no old path
+to find.
 
 One module-scoped old session + UI per release, condition waits only, and
 every assertion on the op set — `host.status`, `tab.list`, the window's
@@ -58,6 +75,7 @@ import json
 import os
 import platform
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
@@ -90,15 +108,17 @@ os.environ["XDG_RUNTIME_DIR"] = str(_RUN)
 os.environ["XDG_DATA_HOME"] = str(_ROOT / "data")
 os.environ["XDG_STATE_HOME"] = str(_ROOT / "state")
 os.environ["XDG_CACHE_HOME"] = str(_ROOT / "cache")
-# A released session predates `ROOST_SESSION_SOCKET_DIR` and binds under
-# the private `XDG_RUNTIME_DIR` above, so today's UI, the session its
-# restart spawns and `roostctl` resolve that same default path: no
-# override, and a scratch passwd home, which is what lets a test-mode
-# debug build reach the default at all (`roost_ipc::paths`).
+# A released session predates M2 and binds under the private
+# `XDG_RUNTIME_DIR` above. Today's UI, the session its restart spawns and
+# `roostctl` take no override: their socket hangs off a scratch passwd
+# home, which is also what lets a test-mode debug build resolve the
+# default at all (`roost_ipc::paths`), and the released session's
+# directory is the one old path they may probe (`roost_ipc::old_session`).
 _PASSWD_HOME = _ROOT / "passwd-home"
 _PASSWD_HOME.mkdir()
 os.environ.pop(sessionlib.SESSION_SOCKET_DIR_ENV, None)
 os.environ[sessionlib.TEST_PASSWD_HOME_ENV] = str(_PASSWD_HOME)
+os.environ[sessionlib.TEST_OLD_SESSION_DIR_ENV] = str(_RUN / "roost-session")
 # The shell the restart's session reopens every tab with, as on the old
 # side (`make_env`): nothing may rewrite the titles and cwds compared.
 os.environ["SHELL"] = "/bin/sh"
@@ -119,9 +139,14 @@ FETCH = Path(__file__).resolve().parent / "old_session" / "fetch.sh"
 RETRY_PIN = "0.0.20"
 #: Generation 2: the forced update's subject whatever "latest" becomes.
 FORCED_UPDATE_PIN = "0.0.19"
+#: The last release before plan 083 M2 moved the session socket under the
+#: passwd home. Every release this lane runs must be at or below it.
+LAST_PRE_M2_RELEASE = (0, 0, 26)
 #: Every process here resolves the shipped session directory names.
 DIR_NAMES = "release"
 DIR_NAMES_ENV = {sessionlib.SESSION_DIR_NAMES_ENV: DIR_NAMES}
+#: Where today's builds bind and dial, under the scratch passwd home.
+NEW_SOCKET = _PASSWD_HOME / ".local/state/roost-session/run/roost.sock"
 #: The directory the pre-upgrade tab runs in, under the project's own —
 #: so a new tab that ignored its source tab would land somewhere else.
 WORK = _ROOT / "work"
@@ -139,6 +164,24 @@ class Release:
     binary: Path
     #: `SESSION_PROTOCOL_VERSION` as the binary itself reports it.
     generation: int
+
+
+def predates_m2(version: str) -> bool:
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", version)
+    assert match, f"not a release version: {version!r}"
+    return tuple(int(part) for part in match.groups()) <= LAST_PRE_M2_RELEASE
+
+
+def assert_predates_m2(version: str) -> None:
+    assert predates_m2(version), (
+        f"v{version} postdates plan 083 M2: it binds its session socket where this tree "
+        "looks, so this lane's old path does not exist for it. Revisit the lane with the "
+        "old-path probe's retirement (roost_ipc::old_session)."
+    )
+
+
+for _pin in (RETRY_PIN, FORCED_UPDATE_PIN):
+    assert_predates_m2(_pin)
 
 
 def generation(binary: Path) -> int:
@@ -186,6 +229,7 @@ def fetch(request: pytest.FixtureRequest, which: str) -> Release | str:
     if "skip" in fields:
         return fields["skip"]
     binary = Path(fields["binary"])
+    assert_predates_m2(fields["version"])
     return Release(fields["version"], binary, generation(binary))
 
 
@@ -277,10 +321,15 @@ def launch_ui(target: str) -> Roost:
 @dataclass
 class World:
     release: Release
+    #: The released session's profile; its `socket` is the old path.
     env: sessionlib.SessionEnv
     target: str
     old_session_id: str
     old_pid: int
+    #: Where the released session listens: a path this tree no longer uses.
+    old_socket: Path
+    #: Where today's UI dials, and where a restart brings the session up.
+    new_socket: Path
     project: int
     #: The tab that was there before the upgrade, and what it printed.
     tab: int
@@ -336,9 +385,12 @@ def write_backend(backend: str) -> None:
 
 
 def sessions_under_the_root() -> list[int]:
-    """Every `roost-session` resolving this module's private runtime dir:
-    the old one, or the one a restart spawned. Nothing else can resolve
-    that directory, so nothing else is found."""
+    """Every `roost-session` carrying this module's private runtime dir:
+    the old one, or the one a restart spawned. The restarted session binds
+    under the scratch passwd home rather than that runtime dir, but it
+    inherits the UI's environment, `XDG_RUNTIME_DIR` included — so it is
+    still matched here. Nothing else carries that directory, so nothing
+    else is found."""
     marker = f"XDG_RUNTIME_DIR={_RUN}".encode()
     found = []
     for proc in Path("/proc").iterdir():
@@ -402,7 +454,11 @@ class Worlds:
             honours_socket_dir=False,
         )
         assert env.namespace == "roost-session", env.namespace
+        assert env.socket == Path(os.environ[sessionlib.TEST_OLD_SESSION_DIR_ENV]) / "roost.sock", (
+            f"the released session binds {env.socket}, not the one old path this tree may probe"
+        )
         assert env.answering() is None, f"something already answers {env.socket}"
+        assert new_identity() is None, f"a session already answers the new path {NEW_SOCKET}"
         try:
             launch = env.start_daemonized()
             assert launch.verdict.kind == "ready" and launch.verdict.pid, launch
@@ -425,6 +481,8 @@ class Worlds:
                 target=self.target,
                 old_session_id=identity["session_id"],
                 old_pid=launch.verdict.pid,
+                old_socket=env.socket,
+                new_socket=NEW_SOCKET,
                 project=project,
                 tab=tab,
                 printed=printed,
@@ -436,9 +494,12 @@ class Worlds:
 
     def _tear_down(self, env: sessionlib.SessionEnv) -> None:
         """`env.teardown()` stops, then SIGTERMs and SIGKILLs, what it
-        tracks; the session a restart spawned is tracked here first."""
+        tracks; the session a restart spawned is asked to stop on its own
+        socket and tracked here first."""
         with contextlib.suppress(Exception):
             ui.quit(self.target)
+        with contextlib.suppress(Exception), Roost(NEW_SOCKET, timeout=scaled_timeout(90.0)) as c:
+            c.call("session.stop")
         try:
             for pid in sessions_under_the_root():
                 env.track_pid(pid)
@@ -841,6 +902,29 @@ def test_2_pinned_v0_0_20_new_tab_reaches_its_directory_through_the_unknown_fiel
 # ---------------------------------------------------------------------------
 
 
+def ui_side_roostctl(*args: str) -> subprocess.CompletedProcess:
+    """`roostctl` as today's UI sees the world: no override, the scratch
+    passwd home, the one old path it may probe — and a `HOME` of its own,
+    so `doctor` reads no real dotfile."""
+    home = _ROOT / "ctl-home"
+    home.mkdir(exist_ok=True)
+    return subprocess.run(
+        [util.roostctl_path(), *args],
+        env={**os.environ, **DIR_NAMES_ENV, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+        timeout=scaled_timeout(120.0),
+    )
+
+
+def new_identity() -> dict | None:
+    try:
+        with Roost(NEW_SOCKET, timeout=scaled_timeout(30.0)) as c:
+            return c.call("session.identify")
+    except (OSError, RoostError):
+        return None
+
+
 def test_an_older_session_is_named_restarted_and_its_layout_kept(older_generation: World):
     w = older_generation
     roost = w.roost
@@ -848,7 +932,7 @@ def test_an_older_session_is_named_restarted_and_its_layout_kept(older_generatio
         c.open_tab(w.project, cwd=str(WORK), title="second")
         before = layout(c.list())
 
-    # 1. Named: the slot settles needing a restart, and says why.
+    # 1. Named: the slot settles needing a restart, and says why and where.
     row = slot_settles(
         roost,
         "needs-restart",
@@ -856,26 +940,43 @@ def test_an_older_session_is_named_restarted_and_its_layout_kept(older_generatio
         f"the slot to settle needing a restart against v{w.release.version}",
     )
     assert "connect" not in row, row
+    assert row.get("reason") == "old socket path", row
+    assert row.get("detail") == str(w.old_socket), row
+    assert new_identity() is None, "the UI started a session beside the old one"
+
+    # ... and so do roostctl and doctor, while a plain stop leaves it be.
+    status = ui_side_roostctl("session", "status")
+    assert status.returncode == 3, (status.stdout, status.stderr)
+    assert f"running at an old path: {w.old_socket}" in status.stdout, status.stdout
+    stopped = ui_side_roostctl("session", "stop")
+    assert stopped.returncode == 0, (stopped.stdout, stopped.stderr)
+    assert f"not running (no session at {NEW_SOCKET})" in stopped.stdout, stopped.stdout
+    assert w.env.identify()["session_id"] == w.old_session_id, "a plain stop reached the old path"
+    doctor = ui_side_roostctl("doctor", "--json")
+    checks = {c["id"]: c for s in json.loads(doctor.stdout)["sections"] for c in s["checks"]}
+    assert checks["session.old_path"]["status"] == "warn", checks["session.old_path"]
+    assert str(w.old_socket) in checks["session.old_path"]["detail"], checks["session.old_path"]
+
     roost.call("host.connect", {"id": row["id"], "test_user_origin": True})
     card = roost.call("app.dialog_dump", {})
     assert card.get("dialog") == "confirm_restart", card
-    assert (
-        f"session protocol {w.release.generation}, this client speaks {main_generation()}"
-        in card["body"]
-    ), card["body"]
+    assert f"old socket path, {w.old_socket}" in card["body"], card["body"]
 
-    # 2. Restarted: today's session replaces the old one on the same socket.
+    # 2. Restarted: the old session stopped on its own socket, today's
+    #    started at the new one — two addresses.
     roost.call("app.dialog_answer", {"action": "confirm"})
     row = slot_settles(
         roost, "connected", 60.0, "the restart to connect the slot to today's session"
     )
     w.env.wait_pid_gone(w.old_pid)
-    now = w.env.identify()
+    assert w.env.answering() is None, f"something still answers the old path {w.old_socket}"
+    now = new_identity()
+    assert now is not None, f"nothing answers the new path {NEW_SOCKET}"
     assert now["session_protocol"] == main_generation(), now
     assert row["connect"]["session_id"] == now["session_id"] != w.old_session_id, (row, now)
 
     # 3. Kept: today's session read the old one's state.json.
-    with w.env.client() as c:
+    with Roost(NEW_SOCKET, timeout=scaled_timeout(30.0)) as c:
         assert layout(c.list()) == before
     wait_until(
         lambda: len(window_projects(roost, row["id"]).get("upgrade", [])) == len(before[0][2]),
