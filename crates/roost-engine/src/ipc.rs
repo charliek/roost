@@ -39,25 +39,26 @@ use roost_ipc::messages::{
     ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteFilesParams, ClipboardWriteParams,
     EventsSubscribeParams, EventsSubscribeResult, Host, HostActionParams, HostActionResult,
     HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult, HostDisconnectParams,
-    HostListParams, HostListResult, HostRemoveParams, HostStatusParams, HostStatusResult,
-    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
-    PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
-    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectEnsureParams, ProjectEnsureResult,
-    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
-    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
-    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
-    SessionSetAgentHooksParams, SessionSetThemeParams, SessionStopParams, SessionStopResult,
-    SidebarDumpParams, SidebarDumpResult, SidebarSetAgentsFractionParams, SidebarSetWidthParams,
-    TabAgentReportResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabClearNotificationResult, TabCloseParams,
-    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
-    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
-    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
-    TabMemoryUsageParams, TabMemoryUsageResult, TabOpenParams, TabOpenResult, TabReorderParams,
-    TabResizeParams, TabSendFileParams, TabSendFileResult, TabSetHookActiveParams,
-    TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
-    WindowResizeParams, WireProjectRef, WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
+    HostListParams, HostListResult, HostRemoveParams, HostSizeTraceParams, HostSizeTraceResult,
+    HostStatusParams, HostStatusResult, IdentifyParams, IdentifyResult, NotificationCreateParams,
+    PaletteActivateParams, PaletteDismissParams, PaletteOpenParams, PalettePresentParams,
+    PalettePresentResult, PaletteQueryParams, PaletteStateParams, PaletteStateResult,
+    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectEnsureParams,
+    ProjectEnsureResult, ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams,
+    ScreenshotResult, SelectionClearParams, SelectionDumpParams, SelectionDumpResult,
+    SelectionSetParams, SessionIdentify, SessionIdentifyParams, SessionPutFileParams,
+    SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams, SessionStopParams,
+    SessionStopResult, SidebarDumpParams, SidebarDumpResult, SidebarSetAgentsFractionParams,
+    SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
+    TabCapturePtyInputResult, TabClearNotificationParams, TabClearNotificationResult,
+    TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams,
+    TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams,
+    TabExpandSelectionAtResult, TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams,
+    TabFocusResult, TabListResult, TabMemoryUsageParams, TabMemoryUsageResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
+    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef, WireTabRef,
+    MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{AttachHandshake, SessionSetThemeResult};
@@ -464,7 +465,7 @@ pub enum UiRequest {
     /// path the real GestureClick / GestureDrag / EventControllerMotion
     /// take. Gated on `ROOST_TEST_MODE=1`.
     TabDispatchMouseEvent {
-        tab_id: i64,
+        tab_id: WireTabRef,
         kind: crate::pointer::PointerAction,
         button: Option<crate::pointer::PointerButton>,
         cell_x: u32,
@@ -772,6 +773,19 @@ pub enum UiRequest {
     HostRestart {
         id: String,
         reply: HostOpReply<HostActionResult>,
+    },
+    /// `tab.take_size` on a UI socket: the window's own client takes the
+    /// tab's size through the tab's session, and the reply is the
+    /// session's (`{}` for an in-process tab, which nothing else sizes).
+    TabTakeSize {
+        tab_id: WireTabRef,
+        reply: HostOpReply<serde_json::Value>,
+    },
+    /// `host.size_trace` — the size-ownership actions this window took
+    /// for one host tab. Gated (ROOST_TEST_MODE=1).
+    HostSizeTrace {
+        tab_id: WireTabRef,
+        reply: HostOpReply<HostSizeTraceResult>,
     },
 }
 
@@ -2829,6 +2843,7 @@ async fn dispatch_outcome(
         | ops::HOST_STATUS
         | ops::HOST_UPDATE
         | ops::HOST_RESTART
+        | ops::HOST_SIZE_TRACE
         | ops::AGENT_SET_HOOKS => {
             return Err(HandlerError::unknown_op(op));
         }
@@ -4779,6 +4794,26 @@ async fn dispatch(
                 .map_err(ws_err)?;
             encode(&result)
         }
+        // A session answers its own `tab.take_size` before `dispatch`;
+        // this is the UI socket's, for the window's own client.
+        ops::TAB_TAKE_SIZE => {
+            let p: roost_ipc::messages::TabTakeSizeParams = decode(params)?;
+            Ok(h.ui_call(move |reply| UiRequest::TabTakeSize {
+                tab_id: p.tab_id,
+                reply,
+            })
+            .await??)
+        }
+        ops::HOST_SIZE_TRACE => {
+            let p: HostSizeTraceParams = decode(params)?;
+            let result = h
+                .ui_call(move |reply| UiRequest::HostSizeTrace {
+                    tab_id: p.tab_id,
+                    reply,
+                })
+                .await??;
+            encode(&result)
+        }
         ops::HOST_UPDATE | ops::HOST_RESTART => {
             let p: HostActionParams = decode(params)?;
             let install = op == ops::HOST_UPDATE;
@@ -4948,13 +4983,16 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
         (ops::HOST_STATUS, &[UiSocketOnly, NeedsUi]),
         (ops::HOST_UPDATE, &[UiSocketOnly, NeedsUi]),
         (ops::HOST_RESTART, &[UiSocketOnly, NeedsUi]),
+        (ops::HOST_SIZE_TRACE, &[UiSocketOnly, NeedsUi, TestMode]),
         (ops::SESSION_IDENTIFY, &[SessionOnly]),
         (ops::SESSION_STOP, &[SessionOnly]),
         (ops::SESSION_SET_THEME, &[SessionOnly, ServerVt]),
         (ops::SESSION_SET_AGENT_HOOKS, &[SessionOnly]),
         (ops::SESSION_PUT_FILE, &[SessionOnly]),
         (ops::CLIENT_HELLO, &[SessionOnly]),
-        (ops::TAB_TAKE_SIZE, &[SessionOnly, ServerVt]),
+        // A session's own on a session socket, the window's on a UI
+        // socket — each needs what answers it there.
+        (ops::TAB_TAKE_SIZE, &[NeedsATerminal]),
         (ops::TAB_RELEASE_SIZE, &[SessionOnly, ServerVt]),
         (
             ops::TAB_FAIL_NEXT_RESIZE,
@@ -6187,6 +6225,7 @@ mod tests {
         "tab.set_hook_active",
         "tab.set_state",
         "tab.set_title",
+        "tab.take_size",
         "tab.write",
     ];
 
@@ -6208,6 +6247,7 @@ mod tests {
         "app.notification_activate",
         "app.set_window_focus",
         "clipboard.write_files",
+        "host.size_trace",
         "sidebar.set_agents_fraction",
         "sidebar.set_width",
         "tab.capture_pty_input",

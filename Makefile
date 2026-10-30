@@ -131,7 +131,7 @@ SESSION_E2E_TESTS := tools/roosttest/test_session.py tools/roosttest/test_sessio
 # `cargo build` mid-test). Own list, own target, own CI steps — the same
 # arrangement `e2e-session` has, and for the same reason: a daemon lifecycle
 # the shared UI lane knows nothing about.
-HOST_CLIENT_E2E_TESTS := tools/roosttest/test_host_client.py
+HOST_CLIENT_E2E_TESTS := tools/roosttest/test_host_client.py tools/roosttest/test_host_ownership.py
 # HS-3's UI-side ssh lane (plan 038 C5): the same two processes as
 # HOST_CLIENT_E2E_TESTS plus a real `SshTunnel` between them, over the
 # `fake-ssh.sh` fixture. Marked `host_client` (it needs both processes,

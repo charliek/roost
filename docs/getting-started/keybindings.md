@@ -245,6 +245,7 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 | `open_docs`           | unbound / unbound                                      |
 | `toggle_fullscreen`   | `ctrl+super+f` / unbound                               |
 | `toggle_secure_input` | unbound / unbound                                      |
+| `take_size`           | unbound / unbound                                      |
 | `font_increase`       | `super+plus`, `super+equal` / `alt+plus`, `alt+equal`  |
 | `font_decrease`       | `super+minus` / `alt+minus`                            |
 | `font_reset`          | `super+0` / `alt+0`                                    |
@@ -254,6 +255,8 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 `toggle_secure_input` flips the always-on Secure Keyboard Entry setting on macOS (`macos-secure-keyboard-entry`), the same as Roost → Secure Keyboard Entry in the menu bar and "Toggle Secure Keyboard Entry" in the command palette; Roost writes the choice to `config.conf`. It has no default shortcut. On Linux the action is accepted and does nothing. See [Secure Keyboard Entry](../reference/config.md#secure-keyboard-entry).
 
 `cycle_project_prev` and `cycle_project_next` are honored by Roost-Iced; the Swift Mac app (Roost.app) does not have them and logs the names as unknown actions.
+
+`take_size` makes this window the size owner of the host tab on screen, which its session then resizes to the window's grid — the tab band's **Take size** button, and "Take Size" in the command palette. It has no default shortcut. Roost-Iced only.
 
 `cycle_agent_panel_sort` steps the sidebar Agents panel's sort — grouped, priority, recent, and back — and writes the choice to `agent-panel-sort` in `config.conf`. It has no default shortcut; the command palette has it as "Cycle Agent Panel Sort". Roost-Iced only, like project cycling.
 

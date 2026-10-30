@@ -241,6 +241,10 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     // is the session's, and the window adds its own copy beside it.
     ("tab.memory_usage", OpClass::Rewrite(SlotIds::Tab("tab_id"))),
     ("tab.focus", OpClass::Rewrite(SlotIds::Tab("tab_id"))),
+    // The window's own client takes the size, through the host
+    // connection the tab rides: a forwarded request would arrive on a
+    // connection that never said `client.hello`.
+    ("tab.take_size", OpClass::Rewrite(SlotIds::Tab("tab_id"))),
     ("tab.send_file", OpClass::Rewrite(SlotIds::Tab("tab"))),
     ("tab.reorder", OpClass::Rewrite(SlotIds::TabOrder)),
     ("project.reorder", OpClass::Rewrite(SlotIds::ProjectOrder)),
@@ -263,7 +267,7 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ),
     (
         "tab.dispatch_mouse_event",
-        OpClass::Rewrite(SlotIds::ResolvedByTheUi),
+        OpClass::Rewrite(SlotIds::Tab("tab_id")),
     ),
     // No local workspace id to mean anything by.
     ("app.activate", OpClass::UiOwned),
@@ -329,6 +333,7 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("host.status", OpClass::UiOwned),
     ("host.update", OpClass::UiOwned),
     ("host.restart", OpClass::UiOwned),
+    ("host.size_trace", OpClass::Rewrite(SlotIds::Tab("tab_id"))),
     // Deliberately not forwarded even though the slot would serve it.
     // A subscription handed out here would be a stream this socket
     // cannot fence (`tab.list`'s `revision` is stripped for the same
@@ -341,7 +346,6 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("session.set_agent_hooks", OpClass::SessionOnly),
     ("session.put_file", OpClass::SessionOnly),
     ("client.hello", OpClass::SessionOnly),
-    ("tab.take_size", OpClass::SessionOnly),
     ("tab.release_size", OpClass::SessionOnly),
     ("tab.fail_next_resize", OpClass::SessionOnly),
     ("tab.drop_data_conns", OpClass::SessionOnly),

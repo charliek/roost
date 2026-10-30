@@ -141,7 +141,7 @@ roostctl rpc identify '{}'
 
 ## Rules
 
-- Always pass `--tab`. Without it, `notify`, `set-title`, `tab set-state`, `tab clear-notification`, `tab close`, `tab send`, `tab resize`, `tab focus`, `tab report`, and `tab prompt` act on `ROOST_TAB_ID`, which inside Roost is your own tab, and exit 2 when it is unset or empty. `tab dump` and `wait` also use `ROOST_TAB_ID` first, but when it is unset or empty they fall back to the UI's active tab, whichever tab the user last clicked.
+- Always pass `--tab`. Without it, `notify`, `set-title`, `tab set-state`, `tab clear-notification`, `tab close`, `tab send`, `tab resize`, `tab focus`, `tab report`, `tab prompt`, and `tab take-size` act on `ROOST_TAB_ID`, which inside Roost is your own tab, and exit 2 when it is unset or empty. `tab dump` and `wait` also use `ROOST_TAB_ID` first, but when it is unset or empty they fall back to the UI's active tab, whichever tab the user last clicked.
 - Parse ids from `--json` output. Never derive them from sidebar order, tab titles, or examples.
 - Never pass `--focus` or run `tab focus` unless the user asked to switch tabs. Opening a tab with `--no-activate` leaves the user's selection where it was; without it, opening may select the tab. A server that does not know the flag (`Roost.app` through v0.0.20) refuses `tab open` with `unknown-field`, and the Swift `Roost.app` refuses `open` with `unsupported` whatever the flags; either way no tab is opened, so re-read `tab list --json` rather than assuming one exists.
 - Never close a tab or delete a project you did not open, unless the user explicitly asked.

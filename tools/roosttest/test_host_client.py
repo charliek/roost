@@ -92,7 +92,6 @@ from util import (
     press_new_tab,
     set_sidebar_collapsed,
     spawned_tab_id,
-    widen_by_font,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
@@ -3589,24 +3588,52 @@ def assert_the_window_shows_the_sessions_screen(
     assert screen_text(shown) == screen_text(served)
 
 
+def view_grid(roost: Roost) -> tuple[int, int]:
+    """The grid the window has room for, from its own geometry — what a
+    tab it takes is sized to."""
+    m = roost.window_metrics()
+    pad = m["terminal_padding"]
+    width = m["window_width"] - m["terminal_left"] - 2 * pad
+    height = m["window_height"] - m["terminal_top"] - 2 * pad
+    return int(width // m["cell_width"]), int(height // m["cell_height"])
+
+
+def shrink_font_until_wider(roost: Roost, cols: int) -> None:
+    """Shrink the font a step at a time, at most eight, until the window
+    has room for more than `cols` columns."""
+    for _ in range(8):
+        if view_grid(roost)[0] > cols:
+            return
+        palette_command(roost, "font_decrease")
+
+
+def kept_at_the_sessions_grid(roost: Roost, session: Roost, tab: int, key: str) -> None:
+    """A detached host tab's terminal is its session's grid (plan 084 D6):
+    a window that changes around it moves no cell of it."""
+    served = session.tab_dump_resolved(tab)["cols"]
+    assert served < 100, f"the session's grid is {served} columns"
+    assert cols_of(roost, key) == served, "the kept terminal stays at the session's grid"
+
+
 def test_a_refocus_after_a_window_resize_never_replays_at_the_old_width(host, roost):
     """#564: a tab detached at a narrow width, the window widened past 100
     columns, output written at the width the session still has, and the
     tab focused again. The window must show what the session shows.
 
-    The client forgets the resume point when the re-grid moves the
-    detached tab (D4a), and the session refuses one across the attach's
-    own resize (D4b), so this holds with either half alone — the
-    old-session lane's check 7 is the client half's own end-to-end
-    control.
+    Since plan 084 the kept terminal is the session's grid, so the window
+    widening moves none of it and its resume point stays good; the
+    refocus is an explicit switch that takes the tab at the wide grid,
+    which the session refuses a resume across (D4b) and answers with a
+    snapshot at the new grid instead.
     """
     host.connect_and_wait()
     with window_restored(roost), host.client() as session:
         tab, key = detached_at_narrow(roost, session, host.env.launch_cwd)
         roost.window_resize(*WIDE_WINDOW)
-        wait_until(lambda: cols_of(roost, key) > 100, 30.0, "the kept terminal to widen")
+        kept_at_the_sessions_grid(roost, session, tab, key)
         feed_width_marker(session, tab)
         focus(roost, key)
+        wait_until(lambda: cols_of(roost, key) > 100, 30.0, "the refocus to take the wide grid")
         assert_the_window_shows_the_sessions_screen(roost, session, tab, key)
 
 
@@ -3617,12 +3644,15 @@ def test_a_refocus_after_a_font_change_never_replays_at_the_old_width(host, roos
     with window_restored(roost), host.client() as session:
         tab, key = detached_at_narrow(roost, session, host.env.launch_cwd)
         try:
-            widen_by_font(roost, key, 100)
-            wait_until(
-                lambda: cols_of(roost, key) > 100, 30.0, "the font to widen the kept terminal"
-            )
+            narrow = cols_of(roost, key)
+            shrink_font_until_wider(roost, 100)
+            kept_at_the_sessions_grid(roost, session, tab, key)
+            assert cols_of(roost, key) == narrow
             feed_width_marker(session, tab)
             focus(roost, key)
+            wait_until(
+                lambda: cols_of(roost, key) > 100, 30.0, "the refocus to take the wide grid"
+            )
             assert_the_window_shows_the_sessions_screen(roost, session, tab, key)
         finally:
             palette_command(roost, "font_reset")
@@ -3634,14 +3664,12 @@ def test_a_resize_while_a_resume_is_in_flight_never_replays_at_the_old_width(
     """The in-flight half (panel correction 1): the refocus's handshake
     carries the resume point at the narrow width, and the relay holds the
     session's answer. The window widens while it is held — the resize is
-    only withheld from the wire, but the kept terminal re-grids at once —
-    and the marker is written, at the session's narrow grid, onto the
-    held stream. Released, the resume must be refused and the tab
-    attached again from a snapshot.
-
-    The session answered for the grid the handshake carried and saw no
-    change, so only the client can refuse this one: D4a's in-flight rule
-    end to end, against today's session.
+    withheld from the wire, and since plan 084 the kept terminal stays at
+    the session's narrow grid — and the marker is written there, onto the
+    held stream. Released, the resume lands on a terminal at the grid it
+    was written for, the withheld resize goes out, and the `GRID` it
+    brings back reflows the window's terminal at the same place in the
+    stream the session's reflowed: the two agree cell for cell.
     """
     require_test_mode(roost)
     start_session(session_env)
@@ -3655,12 +3683,13 @@ def test_a_resize_while_a_resume_is_in_flight_never_replays_at_the_old_width(
                     focus(roost, key)
                     relay.wait_holding()
                     roost.window_resize(*WIDE_WINDOW)
-                    wait_until(
-                        lambda: cols_of(roost, key) > 100, 30.0, "the kept terminal to widen"
-                    )
+                    kept_at_the_sessions_grid(roost, session, tab, key)
                     feed_width_marker(session, tab)
                 finally:
                     release.set()
+                wait_until(
+                    lambda: cols_of(roost, key) > 100, 30.0, "the window's grid to reach the tab"
+                )
                 assert_the_window_shows_the_sessions_screen(roost, session, tab, key)
 
 

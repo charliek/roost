@@ -76,6 +76,11 @@ pub enum KeybindAction {
     /// Toggle the window's full-screen mode. Default `ctrl+super+f` on
     /// macOS; unbound on Linux, where F11 stays with terminal programs.
     ToggleFullScreen,
+    /// Make this window the size owner of the host tab on screen: its
+    /// session resizes the tab to the window's grid (plan 084 D7). The
+    /// tab band's Take size button does the same. **Default unbound**,
+    /// like every action the palette reaches by name. Roost-Iced only.
+    TakeSize,
     /// Flip the remembered Secure Keyboard Entry toggle
     /// (`macos-secure-keyboard-entry`, plan 074 §D3). Ghostty's name.
     /// Default unbound on both platforms; off macOS it is recognised and
@@ -155,6 +160,7 @@ impl KeybindAction {
             "open_docs" => Some(Self::OpenDocs),
             "toggle_fullscreen" => Some(Self::ToggleFullScreen),
             "toggle_secure_input" => Some(Self::ToggleSecureInput),
+            "take_size" => Some(Self::TakeSize),
             "font_increase" => Some(Self::FontIncrease),
             "font_decrease" => Some(Self::FontDecrease),
             "font_reset" => Some(Self::FontReset),
@@ -210,6 +216,7 @@ impl KeybindAction {
             Self::OpenDocs => "open_docs".into(),
             Self::ToggleFullScreen => "toggle_fullscreen".into(),
             Self::ToggleSecureInput => "toggle_secure_input".into(),
+            Self::TakeSize => "take_size".into(),
             Self::FontIncrease => "font_increase".into(),
             Self::FontDecrease => "font_decrease".into(),
             Self::FontReset => "font_reset".into(),
@@ -684,6 +691,7 @@ mod tests {
             KeybindAction::OpenDocs,
             KeybindAction::ToggleFullScreen,
             KeybindAction::ToggleSecureInput,
+            KeybindAction::TakeSize,
             KeybindAction::FontIncrease,
             KeybindAction::FontDecrease,
             KeybindAction::FontReset,
@@ -1121,6 +1129,17 @@ mod tests {
         assert!(!defaults
             .values()
             .any(|action| *action == KeybindAction::OpenDocs));
+    }
+
+    #[test]
+    fn take_size_is_named_and_unbound() {
+        assert_eq!(
+            KeybindAction::from_name("take_size"),
+            Some(KeybindAction::TakeSize)
+        );
+        assert!(!canonical_defaults()
+            .values()
+            .any(|action| *action == KeybindAction::TakeSize));
     }
 
     #[test]

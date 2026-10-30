@@ -105,7 +105,7 @@ use roost_ipc::messages::{
     TabDumpParams, TabDumpResult, TabFocusParams, TabListResult, TabMemoryUsageParams,
     TabMemoryUsageResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
     TabSendFileParams, TabSendFileResult, TabSetStateParams, TabSetTitleParams, TabState,
-    TabWriteParams, WireProjectRef, WireTabRef,
+    TabTakeSizeParams, TabTakeSizeResult, TabWriteParams, WireProjectRef, WireTabRef,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::session_launch::timeout_scale;
@@ -141,6 +141,7 @@ const MUTATING_TAB_VERBS: &[&str] = &[
     "tab focus",
     "tab report",
     "tab prompt",
+    "tab take-size",
 ];
 
 /// The agent skill `roostctl skill` prints: the repo's `skills/roost/SKILL.md`,
@@ -820,6 +821,18 @@ enum TabCmd {
         /// before this flag existed.
         #[arg(long, default_value_t = 0)]
         scrollback: u32,
+    },
+    /// Make this window the size owner of a host tab: the session resizes
+    /// it to the window's grid, the way typing into it would. Prints the
+    /// grid the tab now has; an in-process tab, which always follows the
+    /// window, prints its own. Asked of the UI, never of a
+    /// session socket: the window's own client is the one that takes.
+    /// Needs `--tab` or `ROOST_TAB_ID`.
+    TakeSize {
+        /// The tab: a bare id or `h<host>.<id>`. Defaults to
+        /// `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
+        tab: Option<String>,
     },
     /// Print how much memory the tab's terminal holds, as libghostty
     /// measures it — one line for the tab's authoritative terminal, and
@@ -1691,6 +1704,21 @@ async fn run_on_ui(
                 for line in &result.rows_text {
                     println!("{line}");
                 }
+            }
+        }
+        Cmd::Tab(TabCmd::TakeSize { tab }) => {
+            let tab_id = require_tab(
+                "tab take-size",
+                tab.as_deref().map(parse_tab_flag).transpose()?,
+                tab_env,
+            )?;
+            let result: serde_json::Value = ui
+                .call(ops::TAB_TAKE_SIZE, TabTakeSizeParams { tab_id })
+                .await?;
+            if json {
+                print_json(&result)?;
+            } else if let Ok(grid) = serde_json::from_value::<TabTakeSizeResult>(result) {
+                println!("{}x{}", grid.cols, grid.rows);
             }
         }
         Cmd::Tab(TabCmd::Memory { tab }) => {
@@ -3580,6 +3608,7 @@ mod tests {
         &["wait", "--state", "idle"],
         &["events"],
         &["tab", "focus"],
+        &["tab", "take-size"],
         &["tab", "send-file", "--tab", "7", "a.png"],
         &["tab", "list"],
         &["tab", "set-state", "--state", "idle"],

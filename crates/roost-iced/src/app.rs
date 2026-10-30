@@ -749,6 +749,7 @@ fn tab_band<'a>(
     tab_strip: ReorderStrip<'a>,
     add_tab_button: Element<'a, Message>,
     scroll_id: Id,
+    size_badge: Option<Element<'a, Message>>,
     lock: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     // The `+` is a sibling of the strip — never inside its content, since
@@ -771,9 +772,11 @@ fn tab_band<'a>(
         ))
         .width(Fill)
         .height(chrome::PILL_HEIGHT);
-    // The lock sits outside the scrollable, so it never scrolls away,
-    // and outside `ReorderStrip`, which hit-tests its own children.
+    // The badge and the lock sit outside the scrollable, so they never
+    // scroll away, and outside `ReorderStrip`, which hit-tests its own
+    // children.
     row![tab_scroller]
+        .extend(size_badge)
         .extend(lock)
         .spacing(6)
         .align_y(Alignment::Center)
@@ -1188,6 +1191,11 @@ pub enum EngineOpResult {
         connection: HostId,
         outcomes: Vec<background_resize::Outcome>,
     },
+    /// Take size, answered by the tab's session (plan 084 D7).
+    SizeTaken {
+        tab: TabKey,
+        result: Result<(), String>,
+    },
 }
 
 /// Build the future behind [`UiTask::EngineOp`]: the op runs on the
@@ -1273,7 +1281,8 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
         | EngineOpResult::HostVerified { .. }
         | EngineOpResult::LocalForward { .. }
         | EngineOpResult::HostTabMemory { .. }
-        | EngineOpResult::BackgroundResized { .. } => None,
+        | EngineOpResult::BackgroundResized { .. }
+        | EngineOpResult::SizeTaken { .. } => None,
         EngineOpResult::TabOpened {
             project, result, ..
         } => match result {
@@ -1332,7 +1341,8 @@ impl EngineOpResult {
             // not even be saved.
             Self::HostVerified { .. }
             | Self::HostTabMemory { .. }
-            | Self::BackgroundResized { .. } => None,
+            | Self::BackgroundResized { .. }
+            | Self::SizeTaken { .. } => None,
         }
     }
 
@@ -1361,7 +1371,8 @@ impl EngineOpResult {
             // opens, so the `palette.activate` that opened it was
             // answered then.
             | Self::HostVerified { .. }
-            | Self::BackgroundResized { .. } => None,
+            | Self::BackgroundResized { .. }
+            | Self::SizeTaken { .. } => None,
         }
     }
 
@@ -1905,6 +1916,11 @@ fn forget_resumes_moved_by_wave(
             }
         }
     }
+}
+
+/// `tab`'s owner epoch on the local session, as its mirror has folded it.
+fn owner_epoch(mirror: Option<&crate::host_conn::SharedMirror>, tab: TabKey) -> u64 {
+    mirror.map_or(0, |mirror| mirror.read().size_epoch(tab.tab).epoch)
 }
 
 /// [`App::current_grid`] for the launch's restored tabs, which spawn
@@ -2484,6 +2500,7 @@ fn terminal_cursor_focused(route: KeyboardRoute, window_focused: bool) -> bool {
 /// One key press into the terminal it is typed at, encoded with that
 /// tab's own encoder and modes. `tracked` is the window's modifier state,
 /// which disqualifies a bare page key just as the event's own bits do.
+/// Reports whether the key scrolled the tab's own viewport instead.
 fn type_into(
     tab: &mut TerminalTab,
     tab_id: i64,
@@ -2491,7 +2508,7 @@ fn type_into(
     tracked: keyboard::Modifiers,
     composing: bool,
     option: input::OptionKey,
-) {
+) -> bool {
     // A bare page key scrolls this tab's own scrollback whenever the shared
     // policy keeps it local — no snap, no encode, nothing on the PTY. The
     // bypass is the policy's decision, never the key's: `Forward` (mouse
@@ -2503,13 +2520,13 @@ fn type_into(
     };
     if let Some(direction) = page_direction {
         match tab.handle_page(direction) {
-            Ok(PageRoute::LocalViewport { .. }) => return,
+            Ok(PageRoute::LocalViewport { .. }) => return true,
             Ok(PageRoute::Forward) => {}
             Err(error) => {
                 // Only the repaint after a completed local move can fail,
                 // so the key is still consumed; the next refresh recovers.
                 tracing::warn!(?error, active_tab = tab_id, "terminal page scroll failed");
-                return;
+                return true;
             }
         }
     }
@@ -2523,7 +2540,9 @@ fn type_into(
         }
     }
     let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event, composing, option);
-    tab.session.send_input(bytes);
+    tab.session
+        .send_input(bytes, roost_ipc::dataframe::InputTake::Before);
+    false
 }
 
 /// Whether the terminal the window is drawing can take a keystroke: it
@@ -3445,6 +3464,12 @@ pub struct App {
     /// the connection incarnation, so a reconnect naturally orphans the
     /// stale entries and the purge drops them.
     host_resume: HashMap<TabKey, host_tab::ResumePoint>,
+    /// How long a local scroll of another client's host tab holds still
+    /// before it takes the size ([`host_tab::scroll_settle`]).
+    scroll_settle: Duration,
+    /// Each host tab's size-ownership actions, across its attaches, for
+    /// `host.size_trace`. Test mode only.
+    size_traces: HashMap<TabKey, host_tab::SizeTrace>,
     /// Host tabs that have rung since they were last focused.
     ///
     /// A bell is an effect, not workspace state (plan 037 §3.6): the
@@ -3930,6 +3955,8 @@ impl App {
             ),
             host_attach: HashMap::new(),
             host_resume: HashMap::new(),
+            scroll_settle: host_tab::scroll_settle(),
+            size_traces: HashMap::new(),
             host_bells: HashSet::new(),
             host_selection: None,
             last_selection_frame: Vec::new(),
@@ -5108,9 +5135,13 @@ impl App {
             EngineOpResult::BackgroundResized {
                 connection,
                 outcomes,
-            } => self
-                .background_resize
-                .settle(connection, outcomes, Instant::now()),
+            } => self.settle_background_resize(connection, outcomes),
+            EngineOpResult::SizeTaken { tab, result } => {
+                if let Err(error) = result {
+                    tracing::info!(%tab, %error, "take size refused");
+                    self.set_status(format!("take the size of tab {tab}: {error}"));
+                }
+            }
         }
         // After the match put a failed creation's error on the status
         // line: a buffer that held keys replaces it with a line that names
@@ -5205,14 +5236,20 @@ impl App {
             return UiTask::None;
         };
         let attached: HashSet<TabKey> = self.host_attach.keys().copied().collect();
-        let targets =
-            self.background_resize
-                .wave(connection, &listed, &attached, self.current_grid());
+        let mirror = self.hosts.mirror(connection).cloned();
+        let targets = self.background_resize.wave(
+            connection,
+            &listed,
+            &attached,
+            self.current_grid(),
+            |tab| owner_epoch(mirror.as_deref(), tab),
+        );
         if targets.is_empty() {
             return UiTask::None;
         }
         let sent = background_resize::send_wave(queue, &targets);
-        forget_resumes_moved_by_wave(&self.tabs, &mut self.host_resume, &targets);
+        let moved: Vec<(TabKey, (u16, u16))> = targets.iter().map(|t| (t.tab, t.grid)).collect();
+        forget_resumes_moved_by_wave(&self.tabs, &mut self.host_resume, &moved);
         self.engine_op(
             async move { Ok::<_, String>(sent.await) },
             move |outcomes| EngineOpResult::BackgroundResized {
@@ -5220,6 +5257,20 @@ impl App {
                 outcomes: outcomes.unwrap_or_default(),
             },
         )
+    }
+
+    /// A wave's answers, judged against the owner epochs the mirror has
+    /// now.
+    fn settle_background_resize(
+        &mut self,
+        connection: HostId,
+        outcomes: Vec<background_resize::Outcome>,
+    ) {
+        let mirror = self.hosts.mirror(connection).cloned();
+        self.background_resize
+            .settle(connection, outcomes, Instant::now(), |tab| {
+                owner_epoch(mirror.as_deref(), tab)
+            });
     }
 
     /// The status banner is up, so its expiry is due — `Message::StatusTick`.
@@ -5634,14 +5685,16 @@ impl App {
         let Some(tab) = self.tabs.get_mut(&active_key) else {
             return UiTask::None;
         };
-        type_into(
+        if type_into(
             tab,
             active_key.tab,
             event,
             self.modifiers,
             composing,
             option,
-        );
+        ) {
+            self.host_scrolled(active_key);
+        }
         UiTask::None
     }
 
@@ -5917,6 +5970,7 @@ impl App {
                 Ok(UiTask::None)
             }
             KeybindAction::CycleAgentPanelSort => Ok(self.cycle_agent_panel_sort()),
+            KeybindAction::TakeSize => Ok(self.take_size_of(self.active_tab_key())),
             KeybindAction::ToggleSecureInput => {
                 self.toggle_secure_input();
                 Ok(UiTask::None)
@@ -6618,6 +6672,26 @@ impl App {
         .into()
     }
 
+    /// The tab band's "Sized by" badge (plan 084 D7): another client sizes
+    /// the host tab on screen, so the window draws it at that client's
+    /// grid. Take size gives it this window's. In the band, never over
+    /// the terminal's rows.
+    fn size_badge(&self, key: TabKey) -> Option<Element<'_, Message>> {
+        let owner = self.host_attach.get(&key)?.other_owner()?;
+        let sized_by = text(format!("Sized by {}", owner.label))
+            .size(12)
+            .color(self.chrome.muted_text);
+        let take = button(text("Take size").size(12).color(self.chrome.text))
+            .padding([2, 8])
+            .style(chrome::transparent_button(&self.chrome))
+            .on_press(Message::TakeSize(key));
+        Some(
+            container(row![sized_by, take].spacing(4).align_y(Alignment::Center))
+                .center_y(chrome::PILL_HEIGHT)
+                .into(),
+        )
+    }
+
     /// The tab band's lock (plan 074 §D3): no click action, and a tooltip
     /// that says what it means.
     fn secure_input_lock(&self) -> Element<'_, Message> {
@@ -7025,6 +7099,7 @@ impl App {
             tab_strip,
             add_tab_button.into(),
             self.tab_strip_scroll_id.clone(),
+            self.size_badge(active_key),
             lock,
         ))
         .height(chrome::BAND_HEIGHT)
@@ -7044,6 +7119,8 @@ impl App {
                     self.window_focused,
                 ),
                 focused: terminal_cursor_focused(self.keyboard_route(), self.window_focused),
+                view: tab.view(),
+                row_offset: tab.grid_offset(),
             }
             .into(),
             // No frame to draw yet (the tab is spawning, or attached but
@@ -8018,7 +8095,7 @@ impl App {
             local_active: self.workspace.active().1,
         }));
         self.host_clear_notification(tab);
-        self.host_focus_tab(tab);
+        self.host_focus_tab(tab, host_tab::AttachIntent::Explicit);
         self.reconcile();
         Ok(())
     }
@@ -8467,7 +8544,7 @@ impl App {
             // stale value would blind the `local_active` watch above.
             local_active: self.workspace.active().1,
         }));
-        self.host_focus_tab(tab);
+        self.host_focus_tab(tab, host_tab::AttachIntent::Automatic);
         tracing::debug!(%tab, "host selection moved to the neighbour of a row that closed");
     }
 
@@ -10293,7 +10370,7 @@ impl App {
                     tab,
                     local_active: self.workspace.active().1,
                 }));
-                self.host_focus_tab(tab);
+                self.host_focus_tab(tab, host_tab::AttachIntent::Automatic);
                 tracing::info!(%tab, "attached the local session's tab");
             }
         }
@@ -10369,7 +10446,7 @@ impl App {
                     tab,
                     local_active: self.workspace.active().1,
                 }));
-                self.host_focus_tab(tab);
+                self.host_focus_tab(tab, host_tab::AttachIntent::Explicit);
             }
             (PendingStep::Wait, _) | (PendingStep::Select, None) => {}
         }
@@ -10405,7 +10482,7 @@ impl App {
                 local_active: self.workspace.active().1,
             }));
             self.host_clear_notification(tab);
-            self.host_focus_tab(tab);
+            self.host_focus_tab(tab, host_tab::AttachIntent::Explicit);
             answered.extend(focuses);
         }
         answered
@@ -10714,6 +10791,18 @@ impl Drop for App {
         // Again, for a teardown that did not come through Quit; it is
         // latched, so a second call gives nothing back twice.
         self.release_secure_input();
+        // Closing the window is a deliberate detach of the host tab it
+        // shows (plan 084 D6): its session hands the size on at once
+        // rather than holding it through a grace period for a window
+        // that is not coming back. The writers get their drain before
+        // the runtime goes.
+        let attached: Vec<TabKey> = self.host_attach.keys().copied().collect();
+        if !attached.is_empty() {
+            for key in attached {
+                self.host_detach_tab(key);
+            }
+            host_tab::wait_out_detach_drains(&self.runtime);
+        }
         // Freeze and fsync the authoritative layout before PTY-exit tasks can
         // observe teardown and attempt a later persistence write.
         //
@@ -11152,6 +11241,7 @@ impl Message {
             Self::BeginRenameProject(project_id) => return app.begin_rename_project(project_id),
             Self::AgentSelected(tab_id) => app.select_agent(tab_id),
             Self::CycleAgentPanelSort => return app.cycle_agent_panel_sort(),
+            Self::TakeSize(tab) => return app.take_size_of(tab),
             Self::TabSelected(tab_id) => app.select_tab(tab_id),
             Self::BeginRenameTab(tab_id) => return app.begin_rename_tab(tab_id),
             Self::CloseTab(tab_id) => return app.close_tab(tab_id),
@@ -11549,7 +11639,7 @@ mod tests {
                 .width(chrome::PILL_HEIGHT)
                 .height(chrome::PILL_HEIGHT);
             let lock = lock.then(|| Space::new().width(16).height(chrome::PILL_HEIGHT).into());
-            tab_band(strip, add.into(), Id::new("tab-strip"), lock)
+            tab_band(strip, add.into(), Id::new("tab-strip"), None, lock)
         };
         let mut tree = Tree::new(band(false));
         crate::strip_reorder::press_strip_under(&mut tree, 8);
@@ -11699,12 +11789,13 @@ mod tests {
         assert_eq!(wide_rows, default_rows, "sidebar width must not touch rows");
     }
 
-    /// #564 (plan 072 D4a): a window re-grid that moves a detached host
-    /// tab's terminal takes its resume point with it, so the next focus
-    /// attaches from a snapshot. One that moves no cell — the same grid,
-    /// or only the cell pixels — leaves it.
+    /// Plan 084 D6 over #564 (plan 072 D4a): a window re-grid lays a
+    /// host tab out in the new view and installs its cell metrics, but
+    /// its grid is its session's, so the mirror — and with it the resume
+    /// point the session wrote for that grid — stays. An in-process tab
+    /// beside it takes the window's grid as it always did.
     #[test]
-    fn a_window_regrid_forgets_a_detached_host_tabs_resume_point() {
+    fn a_window_regrid_moves_a_host_tabs_view_and_keeps_its_grid_and_resume_point() {
         let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
         let key = TabKey::new(HostId::new(3), 7);
         let mut tabs = HashMap::from([(key, laid_out_host_terminal(80, 24, metrics))]);
@@ -11716,17 +11807,17 @@ mod tests {
         let mut resumes = HashMap::from([(key, point)]);
 
         let other_pixels = TerminalMetrics::measure(14.0).expect("other test metrics");
-        regrid_window(&mut tabs, &mut resumes, (80, 24), other_pixels, 2);
+        regrid_window(&mut tabs, &mut resumes, (120, 30), other_pixels, 2);
+        assert_eq!(tabs[&key].grid(), (80, 24), "the session's grid");
+        assert_eq!(tabs[&key].view(), (120, 30), "drawn in the window's view");
+        assert_eq!(
+            tabs[&key].applied_metrics,
+            Some(other_pixels),
+            "with the window's cell metrics"
+        );
         assert!(
             resumes.contains_key(&key),
-            "a re-grid that moves no cell keeps the resume point"
-        );
-
-        regrid_window(&mut tabs, &mut resumes, (120, 24), other_pixels, 2);
-        assert_eq!(tabs[&key].grid(), (120, 24));
-        assert!(
-            !resumes.contains_key(&key),
-            "the terminal left the grid the session wrote for, so the next attach is a snapshot"
+            "the terminal is still at the grid the session wrote for"
         );
     }
 
@@ -14763,6 +14854,7 @@ mod tests {
         let original = TerminalGeometry {
             cols: 100,
             rows: 32,
+            view: (100, 32),
             metrics: original_metrics,
             metric_generation: 4,
         };
@@ -14790,6 +14882,7 @@ mod tests {
                         TerminalGeometry {
                             cols,
                             rows,
+                            view: (cols, rows),
                             metrics,
                             metric_generation,
                         },

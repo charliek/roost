@@ -1860,6 +1860,42 @@
       ],
       "type": "object"
     },
+    "HostSizeTraceParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "$ref": "#/$defs/WireTabRef"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "HostSizeTraceResult": {
+      "properties": {
+        "actions": {
+          "items": {
+            "$ref": "#/$defs/SizeTraceAction"
+          },
+          "type": "array"
+        },
+        "parked": {
+          "type": "boolean"
+        },
+        "wave_sends": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "actions",
+        "wave_sends",
+        "parked"
+      ],
+      "type": "object"
+    },
     "HostStatus": {
       "properties": {
         "connect": {
@@ -3735,6 +3771,120 @@
       ],
       "type": "object"
     },
+    "SizeTraceAction": {
+      "oneOf": [
+        {
+          "properties": {
+            "action": {
+              "const": "attach-sent",
+              "type": "string"
+            },
+            "take": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "action",
+            "take"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "attach-accepted",
+              "type": "string"
+            },
+            "resumed": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "action",
+            "resumed"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "copy-captured",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "take-sent",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "detach-sent",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "resize-sent",
+              "type": "string"
+            },
+            "focused": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "action",
+            "focused"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "grid-applied",
+              "type": "string"
+            },
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "cols",
+            "rows"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "SkippedFile": {
       "properties": {
         "path": {
@@ -4073,7 +4223,7 @@
           "type": "integer"
         },
         "tab_id": {
-          "type": "string"
+          "$ref": "#/$defs/WireTabRef"
         }
       },
       "required": [
@@ -4890,6 +5040,27 @@
       ],
       "type": "object"
     },
+    "WindowMetricsGrid": {
+      "properties": {
+        "cols": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cols",
+        "rows"
+      ],
+      "type": "object"
+    },
     "WindowMetricsParams": {
       "additionalProperties": false,
       "type": "object"
@@ -4910,6 +5081,24 @@
             "null"
           ]
         },
+        "grid_offset_rows": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mirror_grid": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WindowMetricsGrid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "native_focus_losses": {
           "format": "uint64",
           "minimum": 0,
@@ -4924,6 +5113,16 @@
         "sidebar_width": {
           "format": "double",
           "type": "number"
+        },
+        "size_owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WindowSizeOwner"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "terminal_font_family": {
           "type": [
@@ -4990,6 +5189,25 @@
       "required": [
         "width",
         "height"
+      ],
+      "type": "object"
+    },
+    "WindowSizeOwner": {
+      "properties": {
+        "client_id": {
+          "type": "string"
+        },
+        "is_me": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "client_id",
+        "label",
+        "is_me"
       ],
       "type": "object"
     },
@@ -5441,6 +5659,14 @@
       },
       "result": {
         "$ref": "#/$defs/HostActionResult"
+      }
+    },
+    "host.size_trace": {
+      "params": {
+        "$ref": "#/$defs/HostSizeTraceParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostSizeTraceResult"
       }
     },
     "host.status": {

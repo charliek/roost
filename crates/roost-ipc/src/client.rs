@@ -490,19 +490,50 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> DataConnection<R, W> {
     /// it are frames.
     pub async fn handshake(
         read: R,
-        mut write: W,
+        write: W,
         request: &AttachHandshake,
     ) -> Result<(AttachAccepted, Self), ClientError> {
+        Self::handshake_unless(read, write, request, std::future::pending(), |_| {})
+            .await?
+            .ok_or(ClientError::Disconnected)
+    }
+
+    /// [`Self::handshake`], given up when `detach` resolves before the
+    /// connection is ready: a `DETACH` frame goes out right behind the
+    /// handshake line, which cancels an attach the server has not
+    /// committed and is a deliberate detach of one it has, and the
+    /// answer is `Ok(None)`. A connection that just ended would read to
+    /// the server as a disconnect, which holds the tab's size for a
+    /// grace period.
+    ///
+    /// `accepted` hears the accepted reply the moment it is parsed —
+    /// the server committed the attach when it wrote that line, before
+    /// the preamble that follows it.
+    pub async fn handshake_unless(
+        read: R,
+        mut write: W,
+        request: &AttachHandshake,
+        detach: impl std::future::Future<Output = ()>,
+        accepted: impl FnOnce(&AttachAccepted),
+    ) -> Result<Option<(AttachAccepted, Self)>, ClientError> {
         let body = serde_json::to_vec(request).map_err(Error::from)?;
         write_frame(&mut write, &body).await?;
 
+        tokio::pin!(detach);
         let mut lines = FrameReader::new(read);
-        let line = match lines.read_line().await? {
+        let line = tokio::select! {
+            line = lines.read_line() => line?,
+            () = &mut detach => {
+                write_data_frame(&mut write, FRAME_DETACH, &[]).await?;
+                return Ok(None);
+            }
+        };
+        let line = match line {
             Some(line) => line,
             None => return Err(ClientError::Disconnected),
         };
-        let accepted = match serde_json::from_slice(&line).map_err(Error::from)? {
-            AttachHandshakeReply::Accepted(accepted) => accepted,
+        let reply = match serde_json::from_slice(&line).map_err(Error::from)? {
+            AttachHandshakeReply::Accepted(reply) => reply,
             AttachHandshakeReply::Rejected(error) => {
                 return Err(ClientError::Server {
                     code: error.code,
@@ -510,20 +541,28 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> DataConnection<R, W> {
                 })
             }
         };
+        accepted(&reply);
 
         // The handshake line and the first binary bytes routinely
         // arrive in one read, so what the line reader already buffered
         // has to be consumed before the socket is touched again.
         let (read, residue) = lines.into_parts();
         let mut reader = DataFrameReader::new(read, residue);
-        reader.read_preamble().await?;
-        Ok((
+        tokio::select! {
+            preamble = reader.read_preamble() => preamble?,
+            () = &mut detach => {
+                write_data_frame(&mut write, FRAME_DETACH, &[]).await?;
+                return Ok(None);
+            }
+        }
+        let accepted = reply;
+        Ok(Some((
             accepted,
             DataConnection {
                 reader,
                 writer: DataWriter { writer: write },
             },
-        ))
+        )))
     }
 
     /// The next frame, or `Ok(None)` on a clean EOF at a frame
@@ -594,6 +633,20 @@ impl DataConnection<OwnedReadHalf, OwnedWriteHalf> {
             .map_err(Error::from)?;
         let (read, write) = stream.into_split();
         Self::handshake(read, write, request).await
+    }
+
+    /// [`Self::dial`] by way of [`Self::handshake_unless`].
+    pub async fn dial_unless(
+        path: impl AsRef<Path>,
+        request: &AttachHandshake,
+        detach: impl std::future::Future<Output = ()>,
+        accepted: impl FnOnce(&AttachAccepted),
+    ) -> Result<Option<(AttachAccepted, Self)>, ClientError> {
+        let stream = UnixStream::connect(path.as_ref())
+            .await
+            .map_err(Error::from)?;
+        let (read, write) = stream.into_split();
+        Self::handshake_unless(read, write, request, detach, accepted).await
     }
 }
 
@@ -1044,6 +1097,137 @@ mod tests {
             })
             .unwrap(),
             ServerFrame::Snap(Vec::new())
+        );
+    }
+
+    fn test_handshake() -> crate::messages::AttachHandshake {
+        crate::messages::AttachHandshake::snapshot(
+            7,
+            crate::messages::AttachHandshakeTerms {
+                session_id: "s".into(),
+                kinds: Vec::new(),
+                cols: 80,
+                rows: 24,
+                cell_w_px: 0,
+                cell_h_px: 0,
+                libghostty_build: "gb".into(),
+                take: true,
+                client_id: "c1".into(),
+            },
+        )
+    }
+
+    /// The frames that follow a handshake line, read to EOF on the
+    /// server's side.
+    async fn frames_after_the_line(
+        lines: FrameReader<tokio::net::unix::OwnedReadHalf>,
+    ) -> Vec<DataFrame> {
+        let (read, residue) = lines.into_parts();
+        let mut frames = DataFrameReader::new(read, residue);
+        let mut read_back = Vec::new();
+        while let Some(frame) = frames.next_frame().await.expect("read") {
+            read_back.push(frame);
+        }
+        read_back
+    }
+
+    /// A detach while the handshake waits for its reply goes out as
+    /// `DETACH` right behind the handshake line, and nothing waits for
+    /// the reply after it.
+    #[tokio::test]
+    async fn a_detach_before_the_reply_follows_the_handshake_line() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let (read, write) = client.into_split();
+        let (detach_tx, detach_rx) = tokio::sync::oneshot::channel::<()>();
+        let attempt = tokio::spawn(async move {
+            let detach = async {
+                let _ = detach_rx.await;
+            };
+            DataConnection::handshake_unless(read, write, &test_handshake(), detach, |_| {}).await
+        });
+
+        let (server_read, _server_write) = server.into_split();
+        let mut lines = FrameReader::new(server_read);
+        let line = lines.read_line().await.expect("read").expect("a line");
+        let sent: serde_json::Value = serde_json::from_slice(&line).expect("json");
+        assert_eq!(sent["attach"], "7");
+        detach_tx.send(()).expect("the handshake is waiting");
+        assert!(
+            attempt.await.expect("join").expect("no error").is_none(),
+            "a detached handshake answers None"
+        );
+        let frames = frames_after_the_line(lines).await;
+        assert_eq!(
+            frames.iter().map(|f| f.frame_type).collect::<Vec<_>>(),
+            [FRAME_DETACH],
+            "DETACH and nothing after it"
+        );
+        assert!(frames[0].payload.is_empty());
+    }
+
+    /// The accepted line is heard the moment it is parsed, and a detach
+    /// that comes while the preamble behind it is late still goes out as
+    /// `DETACH`: the server committed the attach when it wrote that line,
+    /// so a bare close would read to it as a disconnect.
+    #[tokio::test]
+    async fn a_detach_while_the_preamble_is_late_still_sends_detach() {
+        use crate::messages::{
+            AttachAccepted, AttachHandshakeReply, AttachMode, AttachPayloadKind,
+        };
+
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let (read, write) = client.into_split();
+        let (detach_tx, detach_rx) = tokio::sync::oneshot::channel::<()>();
+        let (heard_tx, heard_rx) = tokio::sync::oneshot::channel::<u64>();
+        let attempt = tokio::spawn(async move {
+            let detach = async {
+                let _ = detach_rx.await;
+            };
+            DataConnection::handshake_unless(read, write, &test_handshake(), detach, |reply| {
+                let _ = heard_tx.send(reply.seq);
+            })
+            .await
+        });
+
+        let (server_read, mut server_write) = server.into_split();
+        let mut lines = FrameReader::new(server_read);
+        lines.read_line().await.expect("read").expect("a line");
+        let reply = AttachHandshakeReply::Accepted(AttachAccepted {
+            kind: AttachPayloadKind::from("ghostty-snapshot"),
+            mode: AttachMode::Snapshot,
+            seq: 41,
+            server_epoch: 1,
+            tab_generation: 1,
+            snapshot_cols: 80,
+            snapshot_rows: 24,
+            owner: None,
+        });
+        let body = serde_json::to_vec(&reply).expect("encode the reply");
+        crate::framing::write_frame(&mut server_write, &body)
+            .await
+            .expect("reply");
+        assert_eq!(
+            heard_rx
+                .await
+                .expect("the accepted reply was heard before any preamble"),
+            41
+        );
+        detach_tx
+            .send(())
+            .expect("the handshake is waiting on the preamble");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), attempt)
+                .await
+                .expect("the detach ended the wait for the preamble")
+                .expect("join")
+                .expect("no error")
+                .is_none(),
+            "a detached handshake answers None"
+        );
+        let frames = frames_after_the_line(lines).await;
+        assert_eq!(
+            frames.iter().map(|f| f.frame_type).collect::<Vec<_>>(),
+            [FRAME_DETACH]
         );
     }
 

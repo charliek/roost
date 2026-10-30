@@ -1237,9 +1237,9 @@ pub struct TabExpandSelectionAtParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabDispatchMouseEventParams {
-    #[serde(with = "string_int64")]
-    #[schemars(with = "String")]
-    pub tab_id: i64,
+    /// Bare engine id, or the `h<host>.<id>` wire spelling for an
+    /// attached host tab (UI socket only).
+    pub tab_id: WireTabRef,
     /// `"press" | "release" | "motion"`.
     pub kind: String,
     /// `"left" | "right" | "middle" | "wheel_up" | "wheel_down" | "none"`.
@@ -2027,6 +2027,35 @@ pub struct WindowMetricsResult {
     /// tell a native focus loss from its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_focus_losses: Option<u64>,
+    /// How many of the active host tab's mirror rows sit above the view:
+    /// the row offset its grid is drawn at when it is taller than the
+    /// window fits (another client sizes it). `0` when it fits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_offset_rows: Option<u32>,
+    /// The active host tab's mirror grid, which is the tab's PTY grid —
+    /// not the window's. Absent for an in-process tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_grid: Option<WindowMetricsGrid>,
+    /// Who sizes the active host tab, as its attach last heard it.
+    /// Absent when nobody does, or for an in-process tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_owner: Option<WindowSizeOwner>,
+}
+
+/// A grid, in cells: `app.window_metrics.mirror_grid`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WindowMetricsGrid {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// `app.window_metrics.size_owner`: the [`SizeOwner`] plus whether it is
+/// this window's own client.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WindowSizeOwner {
+    pub client_id: String,
+    pub label: String,
+    pub is_me: bool,
 }
 
 /// `app.sidebar_dump` request — nullary envelope (`{}`), matching
@@ -2795,7 +2824,8 @@ pub struct TabTakeSizeParams {
 }
 
 /// [`ops::TAB_TAKE_SIZE`] result: the tab's grid once the caller's
-/// client owns it.
+/// client owns it. A UI socket asked about an in-process tab answers that
+/// tab's own grid: it always follows the window.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabTakeSizeResult {
     pub cols: u16,
@@ -3493,6 +3523,47 @@ pub struct HostConnectionResult {
 pub struct HostStatusParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+}
+
+/// [`ops::HOST_SIZE_TRACE`] request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostSizeTraceParams {
+    /// The host tab, as `h<host>.<id>` (or a bare id meaning the local
+    /// session's, under `local-backend = session`).
+    pub tab_id: WireTabRef,
+}
+
+/// One size-ownership action a window took for a host tab, in the order
+/// it took them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "kebab-case")]
+pub enum SizeTraceAction {
+    /// An attach handshake went out, asking to take the size or not.
+    AttachSent { take: bool },
+    /// The session accepted an attach handshake, resuming the stream or
+    /// with a fresh snapshot.
+    AttachAccepted { resumed: bool },
+    /// A copy captured its text off the mirror.
+    CopyCaptured,
+    /// A `TAKE` frame was queued.
+    TakeSent,
+    /// A `DETACH` frame was queued.
+    DetachSent,
+    /// A `RESIZE` frame was queued, focused or not.
+    ResizeSent { focused: bool },
+    /// A `GRID` resized the mirror.
+    GridApplied { cols: u16, rows: u16 },
+}
+
+/// [`ops::HOST_SIZE_TRACE`] result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HostSizeTraceResult {
+    pub actions: Vec<SizeTraceAction>,
+    /// How many `tab.resize` ops the background resize wave sent the tab.
+    pub wave_sends: u32,
+    /// Whether the wave has parked the tab on an `owned` refusal.
+    pub parked: bool,
 }
 
 /// `host.update` / `host.restart` request.
@@ -4358,8 +4429,10 @@ pub mod ops {
     /// the connection's first request; session-only.
     pub const CLIENT_HELLO: &str = "client.hello";
     /// Make the caller's client the size owner of a tab it is attached
-    /// to — its newest attachment's grid applies. Session-only; the
-    /// connection must have said [`CLIENT_HELLO`].
+    /// to — its newest attachment's grid applies. On a session the
+    /// connection must have said [`CLIENT_HELLO`]; on a UI socket the UI
+    /// asks its tab's session for its own client and answers with the
+    /// session's reply.
     pub const TAB_TAKE_SIZE: &str = "tab.take_size";
     /// Give up the caller's client's size ownership of a tab: it is
     /// handed on at once, never back to that client. A no-op when the
@@ -4656,6 +4729,10 @@ pub mod ops {
     /// Restart a host's session onto the newest usable build (plan 076
     /// D4, D8). Answers at once, like [`HOST_UPDATE`].
     pub const HOST_RESTART: &str = "host.restart";
+    /// Test-only (`ROOST_TEST_MODE=1`): the size-ownership actions this
+    /// window took for one host tab, in order, plus what the background
+    /// resize wave did with it.
+    pub const HOST_SIZE_TRACE: &str = "host.size_trace";
 }
 
 // ============================================================================
@@ -5818,6 +5895,16 @@ mod tests {
             cell_height: Some(15.6),
             window_focused: Some(false),
             native_focus_losses: Some(2),
+            grid_offset_rows: Some(6),
+            mirror_grid: Some(WindowMetricsGrid {
+                cols: 120,
+                rows: 40,
+            }),
+            size_owner: Some(WindowSizeOwner {
+                client_id: "a1".into(),
+                label: "desk".into(),
+                is_me: false,
+            }),
         });
         let native = WindowMetricsResult {
             window_width: 1800.0,
@@ -5832,6 +5919,9 @@ mod tests {
             cell_height: None,
             window_focused: None,
             native_focus_losses: None,
+            grid_offset_rows: None,
+            mirror_grid: None,
+            size_owner: None,
         };
         let json = serde_json::to_string(&native).unwrap();
         for absent in [
@@ -5842,6 +5932,9 @@ mod tests {
             "cell_height",
             "window_focused",
             "native_focus_losses",
+            "grid_offset_rows",
+            "mirror_grid",
+            "size_owner",
         ] {
             assert!(
                 !json.contains(absent),
@@ -6181,7 +6274,7 @@ mod tests {
     #[test]
     fn tab_dispatch_mouse_event_params_round_trip() {
         let p = TabDispatchMouseEventParams {
-            tab_id: 11,
+            tab_id: WireTabRef::Local(11),
             kind: "press".into(),
             button: "left".into(),
             cell_x: 6,

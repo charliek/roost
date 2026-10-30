@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use roost_ipc::messages::{
     ops, ActiveChangedEvent, AgentReportChangedEvent, EventBatch, EventEnvelope,
     HookActiveChangedEvent, Project, ProjectCreatedEvent, ProjectDeletedEvent, ProjectRenamedEvent,
-    ProjectsReorderedEvent, Tab, TabClosedEvent, TabCwdChangedEvent, TabListResult,
-    TabNotificationEvent, TabOpenedEvent, TabPasswordInputEvent, TabStateChangedEvent,
-    TabTitleChangedEvent, TabsReorderedEvent,
+    ProjectsReorderedEvent, SizeOwner, Tab, TabClosedEvent, TabCwdChangedEvent, TabListResult,
+    TabNotificationEvent, TabOpenedEvent, TabPasswordInputEvent, TabResizedEvent,
+    TabStateChangedEvent, TabTitleChangedEvent, TabsReorderedEvent,
 };
 
 /// A host's projects and tabs, plus which of them the session considers
@@ -44,6 +44,19 @@ pub(crate) struct HostMirror {
     /// The tabs whose `password_input` [`Self::suspend_password_input`]
     /// took down, for [`Self::resume_password_input`] to put back.
     suspended_password_input: Vec<i64>,
+    /// Each tab's size owner, by `tab.resized`, for the background
+    /// resize wave alone: an attached tab's own marker reads its attach
+    /// (plan 084 D6). `tab.resized` is live-only, so a rebuilt mirror
+    /// starts with none.
+    size_owners: std::collections::HashMap<i64, SizeEpoch>,
+}
+
+/// A tab's size owner as `tab.resized` last said it, and how many times
+/// it has said anything — the epoch a wave's refusal is stamped with.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SizeEpoch {
+    pub(crate) epoch: u64,
+    pub(crate) owner: Option<SizeOwner>,
 }
 
 impl HostMirror {
@@ -61,7 +74,14 @@ impl HostMirror {
             active_tab_id: active.1,
             revision,
             suspended_password_input: Vec::new(),
+            size_owners: std::collections::HashMap::new(),
         }
+    }
+
+    /// The tab's [`SizeEpoch`] — epoch 0, no owner, before any
+    /// `tab.resized` this mirror has seen.
+    pub(crate) fn size_epoch(&self, tab_id: i64) -> SizeEpoch {
+        self.size_owners.get(&tab_id).cloned().unwrap_or_default()
     }
 
     /// Take every tab's `password_input` down, because the connection
@@ -145,6 +165,13 @@ impl HostMirror {
                 if self.active_tab_id == data.tab_id {
                     self.active_tab_id = 0;
                 }
+                self.size_owners.remove(&data.tab_id);
+            }
+            ops::EVENT_TAB_RESIZED => {
+                let data = decode!(TabResizedEvent);
+                let entry = self.size_owners.entry(data.tab_id).or_default();
+                entry.epoch += 1;
+                entry.owner = data.owner;
             }
             ops::EVENT_TAB_STATE_CHANGED => {
                 let data = decode!(TabStateChangedEvent);
@@ -455,6 +482,41 @@ mod tests {
         let mirror = HostMirror::from_list(list, 7);
         assert_eq!(mirror.revision, 7);
         assert_eq!((mirror.active_project_id, mirror.active_tab_id), (1, 10));
+    }
+
+    /// Plan 084 D6: `tab.resized` is folded for the background wave
+    /// alone — each one moves the tab's owner epoch, which is what an
+    /// `owned` refusal is judged stale against — and goes with the tab.
+    /// A rebuilt mirror starts with none: the event is live-only.
+    #[test]
+    fn each_tab_resized_moves_its_tabs_owner_epoch() {
+        let mut mirror = mirror();
+        assert_eq!(mirror.size_epoch(10), SizeEpoch::default());
+        let resized = |owner: serde_json::Value| {
+            event(
+                ops::EVENT_TAB_RESIZED,
+                serde_json::json!({"tab_id": "10", "cols": 100, "rows": 30, "owner": owner}),
+            )
+        };
+        mirror.apply_batch(&batch(
+            43,
+            vec![
+                resized(serde_json::json!({"client_id": "a1", "label": "desk"})),
+                resized(serde_json::Value::Null),
+            ],
+        ));
+        assert_eq!(mirror.size_epoch(10).epoch, 2);
+        assert_eq!(mirror.size_epoch(10).owner, None);
+        assert_eq!(mirror.size_epoch(11), SizeEpoch::default(), "per tab");
+
+        mirror.apply_batch(&batch(
+            44,
+            vec![event(
+                ops::EVENT_TAB_CLOSED,
+                serde_json::json!({"tab_id": "10"}),
+            )],
+        ));
+        assert_eq!(mirror.size_epoch(10), SizeEpoch::default());
     }
 
     /// The fence rule, which is the whole point of taking the snapshot

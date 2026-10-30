@@ -964,7 +964,7 @@ fn dispatch_mouse_event_vectors_decode_into_their_typed_shapes() {
         (
             "tab.dispatch_mouse_event.request.json",
             TabDispatchMouseEventParams {
-                tab_id: 5,
+                tab_id: WireTabRef::Local(5),
                 kind: "press".into(),
                 button: "left".into(),
                 cell_x: 10,
@@ -976,7 +976,7 @@ fn dispatch_mouse_event_vectors_decode_into_their_typed_shapes() {
         (
             "tab.dispatch_mouse_event.overshoot.request.json",
             TabDispatchMouseEventParams {
-                tab_id: 5,
+                tab_id: WireTabRef::Local(5),
                 kind: "motion".into(),
                 button: "left".into(),
                 cell_x: 0,
@@ -1008,7 +1008,7 @@ fn dispatch_mouse_event_params_omit_a_zero_overshoot() {
     use roost_ipc::messages::TabDispatchMouseEventParams;
 
     let params = TabDispatchMouseEventParams {
-        tab_id: 5,
+        tab_id: WireTabRef::Local(5),
         kind: "motion".into(),
         button: "left".into(),
         cell_x: 0,

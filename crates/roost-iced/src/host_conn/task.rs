@@ -3136,7 +3136,12 @@ mod tests {
         let (queue, mut worker) = super::super::queue::HostOps::channel();
         let dead = HostId::new(4);
         let tab = roost_ui_model::keys::TabKey::new(dead, 3);
-        let targets = [(tab, (120, 40))];
+        let targets = [crate::app::background_resize::Target {
+            tab,
+            grid: (120, 40),
+            epoch: 0,
+            mirror: 0,
+        }];
 
         let refused = crate::app::background_resize::send_wave(&queue, &targets);
         let intent = worker.recv().await.expect("the resize is on the queue");

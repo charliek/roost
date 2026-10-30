@@ -751,6 +751,13 @@ pub struct TerminalWidget {
     /// (mac parity, `TerminalView.cursorRenderMode` /
     /// `hasFocus = windowIsKey && viewIsFirstResponder`).
     pub focused: bool,
+    /// The grid the window has room for. A host tab's snapshot is its
+    /// session's grid, which can differ (plan 084 D7): it is drawn from
+    /// `row_offset` down, left-aligned, clipped or padded, and every
+    /// pixel→cell mapping goes through the same offset. An in-process
+    /// tab's view is its grid and its offset 0.
+    pub view: (u16, u16),
+    pub row_offset: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -910,7 +917,64 @@ impl PointerOutcome {
     }
 }
 
+/// The rows of a `grid_rows`-tall grid a `view_rows`-tall view shows,
+/// from `row_offset` down.
+pub(crate) fn drawn_rows(grid_rows: u16, row_offset: u32, view_rows: u16) -> u16 {
+    let below = u32::from(grid_rows).saturating_sub(row_offset);
+    u16::try_from(below).unwrap_or(u16::MAX).min(view_rows)
+}
+
 impl TerminalWidget {
+    /// Where row 0 of the grid would sit: the bounds' origin, raised by
+    /// the rows drawn above the view.
+    fn grid_origin(&self, bounds: Rectangle) -> Point {
+        Point::new(
+            bounds.x,
+            bounds.y - self.row_offset as f32 * self.metrics.cell_height,
+        )
+    }
+
+    fn drawn_rows(&self) -> u16 {
+        drawn_rows(self.snapshot.rows, self.row_offset, self.view.1)
+    }
+
+    /// Whether `row` is one the view draws: the rows a pixel maps to, from
+    /// the offset down, and none of those above it or below the view —
+    /// which would otherwise show through the padding where no click can
+    /// reach them.
+    fn draws_row(&self, row: u32) -> bool {
+        (self.row_offset..self.row_offset + u32::from(self.drawn_rows())).contains(&row)
+    }
+
+    /// The grid is not the view's: a pixel past it, in the view, means
+    /// the nearest cell rather than none.
+    fn padded(&self) -> bool {
+        (self.snapshot.cols, self.snapshot.rows) != self.view
+    }
+
+    /// [`cell_at`], in grid rows.
+    fn grid_cell_at(&self, point: Point) -> Option<(u32, u32)> {
+        cell_at(point, self.snapshot.cols, self.drawn_rows(), self.metrics)
+            .map(|(col, row)| (col, row + self.row_offset))
+    }
+
+    /// [`cell_at_clamped`], in grid rows.
+    fn grid_cell_at_clamped(&self, point: Point) -> Option<(u32, u32)> {
+        cell_at_clamped(point, self.snapshot.cols, self.drawn_rows(), self.metrics)
+            .map(|(col, row)| (col, row + self.row_offset))
+    }
+
+    /// The cell under `point` while the pointer is over the widget: the
+    /// one it is in, or — in a view the grid does not fill — the nearest.
+    fn cell_under(&self, point: Option<Point>, over: bool) -> Option<(u32, u32)> {
+        let point = point?;
+        match self.grid_cell_at(point) {
+            Some(cell) => Some(cell),
+            None if over && self.padded() => self.grid_cell_at_clamped(point),
+            None => None,
+        }
+    }
+
     /// The pointer half of `Widget::update` without a renderer: the
     /// pointer event one native event makes, if any, for the app's tests
     /// to hand to the model.
@@ -992,8 +1056,7 @@ impl TerminalWidget {
                 Event::Mouse(mouse::Event::ButtonReleased(_) | mouse::Event::CursorMoved { .. })
             );
         let point = cursor.position_from(Point::new(bounds.x, bounds.y));
-        let cell = point
-            .and_then(|point| cell_at(point, self.snapshot.cols, self.snapshot.rows, self.metrics));
+        let cell = self.cell_under(point, cursor.is_over(bounds));
         let inside = cursor.is_over(bounds) && cell.is_some();
         if !inside && !captured_gesture {
             if state.was_inside {
@@ -1010,15 +1073,11 @@ impl TerminalWidget {
             return None;
         }
         let cell = cell
-            .or_else(|| {
-                point.and_then(|point| {
-                    cell_at_clamped(point, self.snapshot.cols, self.snapshot.rows, self.metrics)
-                })
-            })
+            .or_else(|| point.and_then(|point| self.grid_cell_at_clamped(point)))
             .or(state.last_cell)?;
         let (col, row) = cell;
         let overshoot = point.map_or(0, |point| {
-            row_overshoot(point, self.snapshot.rows, self.metrics)
+            row_overshoot(point, self.drawn_rows(), self.metrics)
         });
         if !inside {
             state.clicks.reset();
@@ -1139,7 +1198,7 @@ impl TerminalWidget {
                 preedit_placement(preedit, cursor.col as u16, self.snapshot.cols).caret_col
             });
         Rectangle::new(
-            cell_position(bounds.position(), col, cursor.row, self.metrics),
+            cell_position(self.grid_origin(bounds), col, cursor.row, self.metrics),
             size,
         )
     }
@@ -1154,7 +1213,9 @@ impl TerminalWidget {
         // suppressed.
         let (Some(preedit), Some(cursor)) = (
             self.snapshot.preedit.as_ref(),
-            self.snapshot.cursor.filter(|cursor| cursor.visible),
+            self.snapshot
+                .cursor
+                .filter(|cursor| cursor.visible && cursor.row >= self.row_offset),
         ) else {
             return 0;
         };
@@ -1163,9 +1224,10 @@ impl TerminalWidget {
             return 0;
         }
         let metrics = self.metrics;
+        let grid_origin = self.grid_origin(bounds);
         let placement = preedit_placement(preedit, cursor.col as u16, self.snapshot.cols);
         let start_col = placement.start_col;
-        let origin = cell_position(bounds.position(), start_col, cursor.row, metrics);
+        let origin = cell_position(grid_origin, start_col, cursor.row, metrics);
         let span = f32::from(placement.total.min(self.snapshot.cols)) * metrics.cell_width;
         fill_quad(
             renderer,
@@ -1179,7 +1241,7 @@ impl TerminalWidget {
             if col >= self.snapshot.cols {
                 break;
             }
-            let position = cell_position(bounds.position(), col, cursor.row, metrics);
+            let position = cell_position(grid_origin, col, cursor.row, metrics);
             renderer.fill_text(
                 cell_text(
                     cluster.to_string(),
@@ -1225,9 +1287,7 @@ impl TerminalWidget {
         if !cursor.is_over(bounds) {
             return mouse::Interaction::default();
         }
-        let cell = cursor
-            .position_from(Point::new(bounds.x, bounds.y))
-            .and_then(|point| cell_at(point, self.snapshot.cols, self.snapshot.rows, self.metrics));
+        let cell = self.cell_under(cursor.position_from(Point::new(bounds.x, bounds.y)), true);
         if cell.is_none() {
             return mouse::Interaction::default();
         }
@@ -1331,7 +1391,8 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
         renderer.with_layer(clip, |renderer| {
             fill_quad(renderer, bounds, color(self.snapshot.background));
             let metrics = self.metrics;
-            let origin = bounds.position();
+            let origin = self.grid_origin(bounds);
+            let shown = |row: u32| self.draws_row(row);
 
             // iced paints a layer's quads in submission order and all of
             // its text after every quad, so the order that matters is the
@@ -1340,6 +1401,9 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
             // it sits on (`cell_ink`).
             for (row_idx, row) in self.snapshot.grid.iter().enumerate() {
                 let row_y = row_idx as u32;
+                if !shown(row_y) {
+                    continue;
+                }
                 for cell in row.cells.iter().filter(|cell| cell.explicit_background) {
                     fill_quad(
                         renderer,
@@ -1352,7 +1416,11 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                 }
             }
 
-            for span in self.snapshot.selection_backgrounds() {
+            for span in self
+                .snapshot
+                .selection_backgrounds()
+                .filter(|span| shown(u32::from(span.row)))
+            {
                 fill_quad(
                     renderer,
                     cells_rect(
@@ -1367,11 +1435,13 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
             }
 
             let block = self.snapshot.block_cursor(self.focused);
-            if let Some(block) = block {
+            if let Some(block) = block.filter(|block| shown(block.row)) {
                 fill_quad(renderer, block.rect(origin, metrics), color(block.color));
             }
 
-            for inked in inked_cells(&self.snapshot, block, metrics) {
+            for inked in
+                inked_cells(&self.snapshot, block, metrics).filter(|inked| shown(inked.row))
+            {
                 let position = cell_position(origin, inked.cell.col, inked.row, metrics);
                 let ink = color(inked.ink);
                 match &inked.sprite {
@@ -1397,7 +1467,11 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                 fill_text_calls += 1;
             }
 
-            if let Some(link) = self.snapshot.link_hover {
+            if let Some(link) = self
+                .snapshot
+                .link_hover
+                .filter(|link| shown(u32::from(link.row)))
+            {
                 for (col, cells, ink) in link_underline(&self.snapshot, link, block) {
                     let point = cell_position(origin, col, u32::from(link.row), metrics);
                     fill_quad(
@@ -1411,7 +1485,11 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                 }
             }
 
-            if let Some(cursor) = self.snapshot.cursor.filter(|cursor| cursor.visible) {
+            if let Some(cursor) = self
+                .snapshot
+                .cursor
+                .filter(|cursor| cursor.visible && shown(cursor.row))
+            {
                 let point = cell_position(origin, cursor.col as u16, cursor.row, metrics);
                 let cursor_color = color(effective_cursor_color(&cursor, &self.snapshot));
                 let visual_style = if self.focused {
@@ -1667,11 +1745,13 @@ mod tests {
     fn widget(tab_id: i64, snapshot: TerminalSnapshot) -> TerminalWidget {
         TerminalWidget {
             tab: TabKey::local(tab_id),
+            view: (snapshot.cols, snapshot.rows),
             snapshot,
             metrics: metrics(),
             cancelled_through: 0,
             ime_active: false,
             focused: true,
+            row_offset: 0,
         }
     }
 
@@ -2320,6 +2400,109 @@ mod tests {
             roost_vt::resolve_colors(None, None, (fg, bg), inverse, None),
             (bg, fg)
         );
+    }
+
+    /// What one native press at `point` reports, if anything.
+    fn press_at(widget: &TerminalWidget, point: Point) -> Option<TerminalPointerEvent> {
+        let mut state = TerminalWidgetState::default();
+        let bounds = Rectangle::new(
+            Point::ORIGIN,
+            Size::new(
+                2.0 * TERMINAL_PADDING + f32::from(widget.view.0) * CELL_WIDTH,
+                2.0 * TERMINAL_PADDING + f32::from(widget.view.1) * CELL_HEIGHT,
+            ),
+        );
+        widget.pointer_event(
+            &mut state,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            bounds,
+            mouse::Cursor::Available(point),
+        )
+    }
+
+    fn cell_center(col: f32, row: f32) -> Point {
+        Point::new(
+            TERMINAL_PADDING + (col + 0.5) * CELL_WIDTH,
+            TERMINAL_PADDING + (row + 0.5) * CELL_HEIGHT,
+        )
+    }
+
+    /// Plan 084 D7: a mirror taller and wider than the view is drawn from
+    /// its row offset down, and a pixel maps to the cell drawn there — in
+    /// the grid's own rows, so a mouse report and a selection both land
+    /// where the owner's program sees them.
+    #[test]
+    fn a_pixel_maps_through_the_row_offset_to_the_grid_cell_drawn_there() {
+        let mut widget = widget(7, TerminalSnapshot::blank(120, 50));
+        widget.view = (80, 24);
+        widget.row_offset = 26;
+        let press = press_at(&widget, cell_center(5.0, 3.0)).expect("a press");
+        assert_eq!((press.col, press.row), (5, 29));
+        let bottom = press_at(&widget, cell_center(79.0, 23.0)).expect("a press");
+        assert_eq!((bottom.col, bottom.row), (79, 49), "the grid's last row");
+    }
+
+    /// A mirror taller than the view draws exactly the rows a pixel maps
+    /// to: none above the offset, and none below the view's last row,
+    /// whose top would otherwise show in the part-row of bounds under the
+    /// view, where a click lands on the row above it.
+    #[test]
+    fn the_rows_drawn_are_the_rows_a_pixel_reaches() {
+        let mut widget = widget(7, TerminalSnapshot::blank(120, 50));
+        widget.view = (80, 24);
+        let bounds = Rectangle::new(
+            Point::ORIGIN,
+            Size::new(
+                2.0 * TERMINAL_PADDING + 80.0 * CELL_WIDTH,
+                2.0 * TERMINAL_PADDING + 24.5 * CELL_HEIGHT,
+            ),
+        );
+        let press = |widget: &TerminalWidget, point| {
+            widget
+                .pointer_event(
+                    &mut TerminalWidgetState::default(),
+                    &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    bounds,
+                    mouse::Cursor::Available(point),
+                )
+                .expect("a press")
+        };
+        for offset in [0, 10, 26] {
+            widget.row_offset = offset;
+            let first = press(&widget, cell_center(0.0, 0.0));
+            let last = press(&widget, cell_center(0.0, 23.0));
+            let under = press(&widget, cell_center(0.0, 23.75));
+            assert_eq!(
+                under.row, last.row,
+                "the part-row under the view is the last row's"
+            );
+            for row in 0..50 {
+                assert_eq!(
+                    widget.draws_row(row),
+                    (first.row..=last.row).contains(&row),
+                    "row {row} at offset {offset}"
+                );
+            }
+        }
+    }
+
+    /// A mirror smaller than the view leaves padding past its edges; a
+    /// press there clamps to the nearest cell rather than vanishing.
+    #[test]
+    fn a_press_in_a_view_the_grid_does_not_fill_clamps_to_the_grid() {
+        let mut widget = widget(7, TerminalSnapshot::blank(60, 20));
+        widget.view = (80, 24);
+        let press = press_at(&widget, cell_center(70.0, 22.0)).expect("a clamped press");
+        assert_eq!((press.col, press.row), (59, 19));
+        assert!(press.inside);
+    }
+
+    /// The same press with the grid filling the view — an in-process tab
+    /// — is outside it, exactly as it always was.
+    #[test]
+    fn a_press_past_a_grid_that_fills_its_view_is_not_a_cell() {
+        let widget = widget(7, TerminalSnapshot::blank(80, 24));
+        assert!(press_at(&widget, Point::new(TERMINAL_PADDING - 1.0, 5.0)).is_none());
     }
 
     #[test]

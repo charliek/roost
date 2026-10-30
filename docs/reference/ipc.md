@@ -1197,10 +1197,12 @@ Request:
             "cell_x": 10, "cell_y": 4, "mods": 0}}
 ```
 
-`kind` is `"press" | "release" | "motion"`; `button` is `"left" |
+`tab_id` is a bare id or, on the iced UI, an attached host tab's
+`h<host>.<id>`. `kind` is `"press" | "release" | "motion"`; `button` is `"left" |
 "right" | "middle" | "wheel_up" | "wheel_down" | "none"` (`"none"` for a
 plain hover motion). `cell_x` / `cell_y` are 0-based terminal cell
-coordinates. `mods` defaults to `0` and matches the key encoder's
+coordinates — a host tab's in its mirror's own grid, which may be drawn
+at a row offset (`app.window_metrics.grid_offset_rows`). `mods` defaults to `0` and matches the key encoder's
 `Mods` bit layout: shift(0), ctrl(1), alt(2), cmd/super(3).
 
 `overshoot` (iced only, optional) puts the pointer that many rows past
@@ -1740,6 +1742,21 @@ focus the UI acts on: the last native focus event, or a later
 since launch, and `app.set_window_focus` never adds to it. A test that forces
 focus can therefore tell a native focus loss that cancelled its gesture from
 its own.
+
+`grid_offset_rows`, `mirror_grid` and `size_owner` describe the active tab's
+[size ownership](#size-ownership). Only the iced UI reports them, and only
+in test mode (`ROOST_TEST_MODE=1`); otherwise they are omitted.
+`mirror_grid` (`{"cols", "rows"}`) is a host tab's terminal grid, which is
+its session's PTY grid rather than the window's: another client may size it.
+A grid taller than the view is drawn from `grid_offset_rows` down — the
+fewest rows that keep the cursor's row on screen — and a pixel maps to a
+cell through the same offset, so a cell's top-left is `(terminal_left +
+terminal_padding + col × cell_width, terminal_top + terminal_padding + (row −
+grid_offset_rows) × cell_height)`. `size_owner` is `{"client_id", "label",
+"is_me"}` as the tab's attach last heard it, `is_me` saying whether it is
+this window's own client; it is omitted when nobody sizes the tab.
+`mirror_grid` and `size_owner` are omitted for an in-process tab, whose
+`grid_offset_rows` is always `0`.
 
 ### `app.sidebar_dump`
 
@@ -3050,6 +3067,7 @@ A session socket answers `unknown-op` for every verb here — the same "no shado
 | `host.status` | `{}` or `{"id": "3f9a2b7c1d4e4f5a"}` | Every saved host's live connection state — the read-side twin of `host.connect`'s reply, and what a script polls instead of scraping the UI log. Bare `{}` answers for every saved host in registry order; `id` narrows it to one, and an unknown id is `not-found` exactly as `host.connect` gives. Response: `{"hosts": [<HostStatus>, ...]}`. Not test-mode gated: this is a read of state the user can already see in the sidebar. |
 | `host.update` | `{"id": "3f9a2b7c1d4e4f5a", "confirm": true}` | **Install Update** (plan 076): install this client's `roost-session` on an **ssh** host and leave the running session — and this client's stream to it — alone; a `host.restart` puts the new build to use. Response: `{"accepted": true}` as soon as the action starts; its outcome is `host.status`'s `update.action`. See [Install and restart](#install-and-restart) for every refusal. |
 | `host.restart` | `{"id": "3f9a2b7c1d4e4f5a", "confirm": true}` | **Restart Session** (plan 076): stop the host's session and start it again on the newest usable build Roost can find — never one older than the running session, never one this client cannot connect to. Every tab reopens as a fresh shell in its directory; running programs end. Response and outcome as `host.update`. |
+| `host.size_trace` | `{"tab_id": "h3.7"}` | **Test-only** (`ROOST_TEST_MODE=1`, else `not-enabled`). The [size-ownership](#size-ownership) actions this window took for one host tab, in order and across its attaches: `{"actions": [{"action": "attach-sent", "take": true}, {"action": "attach-accepted", "resumed": false}, {"action": "copy-captured"}, {"action": "take-sent"}, {"action": "detach-sent"}, {"action": "resize-sent", "focused": true}, {"action": "grid-applied", "cols": 120, "rows": 40}, ...], "wave_sends": 1, "parked": true}`. `wave_sends` counts the background resize wave's `tab.resize` ops the host queue took for the tab, and `parked` says the wave has left it alone since an `owned` refusal. A bare id means the local session's tab under `local-backend = session`. |
 
 `Host` is `{"id": "<hex>", "label": "<string>", "target": "<string>", "last_connected"?: "<ISO-8601>"}`. `state` is one of the wire's connection-state spellings: `disconnected` | `connecting` | `connected` | `stopped` | `needs-restart`.
 
@@ -3981,7 +3999,7 @@ like every other session op.
 
 ### `tab.take_size`
 
-Session-only (protocol 7). Makes the client this connection said
+Protocol 7. On a session, makes the client this connection said
 [`client.hello`](#clienthello) as the tab's size owner, at its newest
 attachment's own grid — the explicit transfer without typing (the "sized
 by" marker's **Take size**). Request:
@@ -3998,6 +4016,18 @@ first`). A client with no attachment to the tab is `not-found`
 refuses is `internal`, and nothing changes. The tab id is bare; the
 `h<host>.<id>` spelling is a UI socket's. Mutating: refused once a stop
 has latched.
+
+**On a UI socket** (iced) the window takes the size for its own client:
+the UI puts the session op to the tab's host, on the connection that
+said its hello, and answers with the session's reply — `{"cols", "rows"}`
+or the session's own refusal — rather than an acknowledgement that it
+asked. `tab_id` is a bare id (the local session's tab under
+`local-backend = session`) or `h<host>.<id>`. An in-process tab answers
+its own grid, `{"cols", "rows"}` like any other: it always follows this
+window. An id no tab has is `not-found`. It is the op behind the tab band's **Take
+size** button, the palette's **Take Size** and the `take_size` keybind
+action, and `roostctl tab take-size` sends it. The Swift app answers
+`unknown-op`.
 
 ### `tab.release_size`
 

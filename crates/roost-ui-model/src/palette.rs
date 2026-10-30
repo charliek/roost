@@ -243,6 +243,8 @@ impl PaletteCommands {
         ("open_config", "Open Settings File"),
         ("open_docs", "Open Documentation"),
         ("toggle_fullscreen", "Toggle Full Screen"),
+        // Roost-Iced only: the host tab on screen, sized for this window.
+        ("take_size", "Take Size"),
         ("new_tab", "New Tab"),
         ("close_tab", "Close Tab"),
         ("rename_tab", "Rename Tab"),

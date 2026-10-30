@@ -301,18 +301,23 @@ impl PendingKeyboard {
 }
 
 /// Type what a buffer kept into the tab it was for, in order, with that
-/// tab's own encoder.
-pub(super) fn deliver(tab: &mut TerminalTab, tab_id: i64, entries: Vec<PendingInput>) {
+/// tab's own encoder. Reports whether any of it scrolled the tab's own
+/// viewport (a kept Page Up), which on a host tab is a local scroll like
+/// any other.
+pub(super) fn deliver(tab: &mut TerminalTab, tab_id: i64, entries: Vec<PendingInput>) -> bool {
+    let mut scrolled = false;
     for entry in entries {
         match entry {
-            PendingInput::Key(event, option) => type_into(
-                tab,
-                tab_id,
-                event,
-                keyboard::Modifiers::empty(),
-                false,
-                option,
-            ),
+            PendingInput::Key(event, option) => {
+                scrolled |= type_into(
+                    tab,
+                    tab_id,
+                    event,
+                    keyboard::Modifiers::empty(),
+                    false,
+                    option,
+                );
+            }
             PendingInput::Text(text) => {
                 if let Err(error) = tab.commit_ime(&text) {
                     tracing::warn!(?error, tab_id, "typed-ahead IME commit failed");
@@ -320,6 +325,7 @@ pub(super) fn deliver(tab: &mut TerminalTab, tab_id: i64, entries: Vec<PendingIn
             }
         }
     }
+    scrolled
 }
 
 impl super::App {
@@ -377,7 +383,9 @@ impl super::App {
                 };
                 if let Some(tab) = self.tabs.get_mut(&target) {
                     tracing::debug!(%target, gesture, entries = entries.len(), "typed-ahead delivered");
-                    deliver(tab, target.tab, entries);
+                    if deliver(tab, target.tab, entries) {
+                        self.host_scrolled(target);
+                    }
                 }
             }
             Some(Step::Drop(reason)) => {
@@ -785,7 +793,8 @@ mod tests {
         assert_eq!(keyboard.step(&ready), Some(Step::Flush(target)));
         let (_, entries) = keyboard.take().expect("armed");
         deliver(&mut tab, target.tab, entries);
-        tab.session.send_input(b"\n".to_vec());
+        tab.session
+            .send_input(b"\n".to_vec(), roost_ipc::dataframe::InputTake::None);
 
         let seen = feed_text_until(&mut feed_rx, target, "kept-ok", Duration::from_secs(5)).await;
         assert!(
@@ -794,6 +803,36 @@ mod tests {
         );
         drop(tab);
         supervisor.close(93);
+    }
+
+    /// A kept Page Up that scrolls the tab's own history is a local scroll:
+    /// `deliver` says so, which is what arms the host settle behind it. A
+    /// kept letter is not one.
+    #[test]
+    fn a_kept_page_up_over_history_is_reported_as_a_local_scroll() {
+        let (input_tx, _input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut tab, _capture) =
+            crate::app::terminal_tab::attach_test_host_terminal(80, 24, input_tx);
+        for line in 0..100 {
+            tab.terminal
+                .vt_write(format!("history {line}\r\n").as_bytes());
+        }
+        let page_up = || {
+            PendingInput::Key(
+                keyboard::Event::KeyPressed {
+                    key: Key::Named(Named::PageUp),
+                    modified_key: Key::Named(Named::PageUp),
+                    physical_key: Physical::Code(Code::PageUp),
+                    location: Location::Standard,
+                    modifiers: Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                },
+                input::OptionKey::default(),
+            )
+        };
+        assert!(!deliver(&mut tab, 7, vec![press("a")]), "a letter types");
+        assert!(deliver(&mut tab, 7, vec![press("b"), page_up()]));
     }
 
     /// Typed-ahead keeps the Option side each press was typed with: under
