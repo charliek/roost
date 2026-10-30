@@ -746,8 +746,8 @@ let ipcProtocolVersion: UInt32 = 1
 /// `messages::SESSION_PROTOCOL_VERSION`.
 ///
 /// At `5` every same-UID connection to a session became symmetric: no
-/// owner, no lease, no foreground. Effects fan out to every subscriber,
-/// and the PTY is sized by the last interactor. `6` reshapes
+/// lease and no foreground. Effects fan out to every subscriber, and
+/// through `6` the PTY was sized by the last interactor. `6` reshapes
 /// `session.set_agent_hooks`: it carries the agents a client's own
 /// `agent-hooks` key allows, and a client only ever *raises* the host's
 /// setting — `mode` and `skip` are gone, and a client that allows
@@ -760,7 +760,12 @@ let ipcProtocolVersion: UInt32 = 1
 /// (OSC 7501) on the wire: `Tab.program_status`, a composed `Tab.state`,
 /// and two new `DroppedReport.reason` values (plan 082). This app keeps
 /// no program-status records, so a tab it serves never carries them and
-/// its `Tab.state` is never composed.
+/// its `Tab.state` is never composed. `7` also replaces "the last
+/// interactor sizes the PTY" with tab size ownership: one owning
+/// attachment per tab, taken by an explicit attach or deliberate input,
+/// announced in band and as `tab.resized`, with a background
+/// `tab.resize` of an owned tab refused `owned` (plan 084). This app
+/// dials no data connection, so none of it changes what it does.
 ///
 /// The rule: a **session-socket change bumps this when a pre-bump peer
 /// could not refuse it meaningfully**, in either direction. A new event

@@ -33,13 +33,15 @@
 //! calls. With the flag off, `spawn` builds no tab task and the reader
 //! feeds the publisher exactly as it always has.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use portable_pty::PtySize;
+use roost_ipc::dataframe::InputTake;
 use roost_ipc::messages::{
-    AttachPayloadKind, ClipboardEffectTarget, MemoryUsage, CLIPBOARD_EFFECT_MAX_BYTES,
+    AttachPayloadKind, ClipboardEffectTarget, MemoryUsage, SizeOwner, CLIPBOARD_EFFECT_MAX_BYTES,
 };
 use roost_ipc::program_status::StatusEvent;
 use roost_vt::{
@@ -53,6 +55,7 @@ use crate::ipc::{DumpData, ResolvedCellData, ResolvedCellsData};
 use crate::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscColorState, OscRgb, OscRouter};
 use crate::program_status::RawOscAuthority;
 use crate::pty::{Geometry, PtyOutputEvent, WriterCmd};
+use crate::size_owner::{AttachmentId, SizeOwnership, Sizer, TakeRefusal};
 use crate::workspace::TabEffectKind;
 
 /// Scrollback the server Terminal retains, matching both UIs' policy.
@@ -77,6 +80,9 @@ pub const MAX_CONCURRENT_SNAPSHOTS: usize = 4;
 /// How often the task retries a PTY write it could not hand off because
 /// the writer channel was full.
 const PENDING_FLUSH_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+/// How long a size owner that dropped without `DETACH` keeps the tab
+/// before it is handed on (plan 084 §4.B: rule 7's "a few seconds").
+pub const OWNER_GRACE: Duration = Duration::from_secs(5);
 /// How long an acked resize waits for the child's `TIOCSWINSZ`.
 ///
 /// Bounded because the winsize shares one FIFO with client input (#80),
@@ -133,6 +139,23 @@ pub trait ServerVtWorkspace: Send + Sync + 'static {
         events: Vec<StatusEvent>,
         now_ms: i64,
     ) -> RawOscAuthority;
+    /// A pipeline of `generation` now serves `tab_id`, before it can
+    /// decide anything: a `tab.resized` from an older one is dropped from
+    /// here on.
+    fn tab_pipeline(&self, tab_id: i64, generation: u64);
+    /// The tab's grid or size owner changed, as the pipeline of
+    /// `generation` decided: publish `tab.resized` to every subscriber, in
+    /// commit order with everything else — unless a newer pipeline has
+    /// registered for the tab, checked in the same critical section as
+    /// the publish.
+    fn tab_resized(
+        &self,
+        tab_id: i64,
+        generation: u64,
+        cols: u16,
+        rows: u16,
+        owner: Option<SizeOwner>,
+    );
 }
 
 impl ServerVtWorkspace for crate::Workspace {
@@ -162,6 +185,21 @@ impl ServerVtWorkspace for crate::Workspace {
                 RawOscAuthority::default()
             },
         )
+    }
+
+    fn tab_pipeline(&self, tab_id: i64, generation: u64) {
+        self.register_tab_pipeline(tab_id, generation);
+    }
+
+    fn tab_resized(
+        &self,
+        tab_id: i64,
+        generation: u64,
+        cols: u16,
+        rows: u16,
+        owner: Option<SizeOwner>,
+    ) {
+        self.publish_tab_resized(tab_id, generation, cols, rows, owner);
     }
 }
 
@@ -203,6 +241,9 @@ pub struct ServerVtConfig {
     capture_pty_input: bool,
     handoff_pause: Option<AttachPause>,
     admission_pause: Option<AttachPause>,
+    owner_grace: Duration,
+    attach_hold: Option<Duration>,
+    frozen_owner_clock: bool,
 }
 
 impl ServerVtConfig {
@@ -212,7 +253,35 @@ impl ServerVtConfig {
             capture_pty_input: false,
             handoff_pause: None,
             admission_pause: None,
+            owner_grace: OWNER_GRACE,
+            attach_hold: None,
+            frozen_owner_clock: false,
         }
+    }
+
+    /// How long a dropped owner keeps its tab. [`OWNER_GRACE`] unless a
+    /// test asks for a grace it can sit out (or one long enough to hold).
+    #[must_use]
+    pub fn with_owner_grace(mut self, grace: Duration) -> Self {
+        self.owner_grace = grace;
+        self
+    }
+
+    /// Hold every attach this long between its size decision and its
+    /// accepted reply — a test's window to race two attaches, or to
+    /// cancel one, inside.
+    #[must_use]
+    pub fn with_attach_hold(mut self, hold: Duration) -> Self {
+        self.attach_hold = Some(hold);
+        self
+    }
+
+    /// Stamp every attachment's advisory grid with the same instant, so
+    /// every handoff falls to the tie rule.
+    #[must_use]
+    pub fn with_frozen_owner_clock(mut self, frozen: bool) -> Self {
+        self.frozen_owner_clock = frozen;
+        self
     }
 
     /// Park every snapshot and resume hand-off, on the tab task, at
@@ -271,6 +340,14 @@ pub(crate) struct ServerVtState {
     /// interleaved fan-outs converge on the newest theme instead of on
     /// whichever send happened to land last.
     theme: Mutex<(u64, Option<OscColorSnapshot>)>,
+    owner_grace: Duration,
+    attach_hold: Option<Duration>,
+    frozen_owner_clock: bool,
+    /// How many tabs hold a grace record for each client id, and the
+    /// label the newest one keeps: what keeps a dropped client's label in
+    /// the session's registry, and names a data attach that comes back
+    /// before its client's hello does (plan 084 D1).
+    graces: Mutex<HashMap<String, (usize, String)>>,
 }
 
 impl ServerVtState {
@@ -284,6 +361,51 @@ impl ServerVtState {
             next_generation: AtomicU64::new(1),
             snapshot_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_SNAPSHOTS)),
             theme: Mutex::new((0, None)),
+            owner_grace: config.owner_grace,
+            attach_hold: config.attach_hold,
+            frozen_owner_clock: config.frozen_owner_clock,
+            graces: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn attach_hold(&self) -> Option<Duration> {
+        self.attach_hold
+    }
+
+    /// Whether any tab holds a grace record for this client.
+    pub(crate) fn holds_grace(&self, client_id: &str) -> bool {
+        self.graces
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(client_id)
+    }
+
+    /// The label a grace record keeps for this client, if any tab holds
+    /// one.
+    pub(crate) fn grace_label(&self, client_id: &str) -> Option<String> {
+        self.graces
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(client_id)
+            .map(|(_, label)| label.clone())
+    }
+
+    fn move_grace(&self, from: Option<&str>, to: Option<(&str, &str)>) {
+        let mut graces = self.graces.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(from) = from {
+            if let Some((count, _)) = graces.get_mut(from) {
+                *count -= 1;
+                if *count == 0 {
+                    graces.remove(from);
+                }
+            }
+        }
+        if let Some((client_id, label)) = to {
+            let entry = graces
+                .entry(client_id.to_string())
+                .or_insert_with(|| (0, label.to_string()));
+            entry.0 += 1;
+            label.clone_into(&mut entry.1);
         }
     }
 
@@ -343,11 +465,16 @@ pub struct SnapshotAt {
     pub tab_generation: u64,
     pub bytes: Vec<u8>,
     /// The grid the payload was encoded at, read at the encode itself so
-    /// it describes what the bytes actually say — an unfocused attach
+    /// it describes what the bytes actually say — a watching attach
     /// reports it back, because that snapshot is at the tab's size and
     /// not at the size the client asked for.
     pub cols: u16,
     pub rows: u16,
+    /// The size owner and its generation, read in the same turn: the
+    /// accepted reply's `owner`, and the floor below which a `GRID` this
+    /// attach's tee carries is already in the reply.
+    pub owner: Option<SizeOwner>,
+    pub grid_gen: u64,
 }
 
 /// The atomic resume handoff (D6): the ring records a client missed and a
@@ -368,16 +495,41 @@ pub struct ResumeAt {
     pub stored_exit: Option<(u64, i32)>,
     /// The tab's grid at the handoff, read on the task in the same turn
     /// the slice was cut — the grid every record in it was written for,
-    /// because the task refuses a slice that straddles a grid change. An
-    /// unfocused client can still be at another size, so the reply names
+    /// because the task refuses a slice that straddles a grid change. A
+    /// watching client can still be at another size, so the reply names
     /// this one rather than leaving it to guess.
     pub cols: u16,
     pub rows: u16,
+    /// As [`SnapshotAt::owner`] and [`SnapshotAt::grid_gen`].
+    pub owner: Option<SizeOwner>,
+    pub grid_gen: u64,
 }
 
 /// The child half of a resize, still in flight. See
 /// [`WriterCmd::Resize`](crate::pty::WriterCmd).
 type WinsizeAck = oneshot::Receiver<Result<(), String>>;
+
+/// The tab task's answer to [`TabCmd::Attach`].
+#[derive(Debug)]
+pub struct AttachDecision {
+    /// Whether this attachment took the tab, still provisionally — it
+    /// owns it for every decision until its commit, and a cancel rolls
+    /// it back.
+    pub provisional: bool,
+    winsize: Option<WinsizeAck>,
+}
+
+impl AttachDecision {
+    /// Wait out the child half of the take, so the snapshot that follows
+    /// cannot be encoded before the child was told — in the attach's own
+    /// task, never in the tab task. `Ok` carries `provisional`.
+    pub async fn settled(self, tab_id: i64) -> Result<bool, TabError> {
+        if let Some(ack) = self.winsize {
+            await_winsize(tab_id, ack).await?;
+        }
+        Ok(self.provisional)
+    }
+}
 
 /// Wait out the child half of a resize and report what happened to it.
 ///
@@ -420,6 +572,12 @@ pub enum TabError {
     },
     #[error("resume from seq {from_seq} straddles the grid change at seq {changed_at}")]
     Regridded { from_seq: u64, changed_at: u64 },
+    /// A background resize of a tab another client sizes; the label is
+    /// its owner's.
+    #[error("the tab is sized by {0}")]
+    Owned(String),
+    #[error("the tab could not be resized: {0}")]
+    ResizeFailed(String),
 }
 
 impl From<roost_vt::Error> for TabError {
@@ -432,46 +590,77 @@ impl From<roost_vt::Error> for TabError {
 /// caller distinguishes "the tab task answered no" from "the tab is
 /// gone" without inventing a sentinel.
 pub enum TabCmd {
-    /// Client keystrokes / `tab.write`.
+    /// Client keystrokes / `tab.write`. The bytes are always delivered,
+    /// at whatever size the tab has.
     Input {
         data: Vec<u8>,
-        /// The sending connection's declared geometry, applied ahead of
-        /// the bytes when it differs from the tab's — the PTY is sized
-        /// by the last geometry-bearing interaction, and typing is one
-        /// (plan 057, R15). The resize rides this same command rather
-        /// than a separate send, so it cannot arrive after the keys it
-        /// precedes.
-        ///
-        /// `None` for a control-plane `tab.write`: it carries no
-        /// geometry because there is no viewport behind it — a script
-        /// that pastes a line is not a client whose window has a size.
-        geometry: Option<Geometry>,
+        /// The attachment the bytes came from; `None` for a control-plane
+        /// `tab.write`, which never takes (rule 9).
+        from: Option<AttachmentId>,
+        /// What the bytes ask of the tab's size (rule 3). The take rides
+        /// this same command, so the winsize it queues cannot be ordered
+        /// after the keys it precedes, nor ahead of the click it follows.
+        take: InputTake,
     },
-    /// Client RESIZE / `tab.resize`.
-    ///
-    /// `ack` fires once the server terminal AND the PTY winsize have
-    /// both been given the new geometry — and reports the failure of
-    /// either half, including the child's, which happens on the PTY
-    /// writer's own task. A focused attach waits on it so the snapshot
-    /// it is about to take cannot be encoded at the old size; every
-    /// other caller passes `None` and stays fire-and-forget.
-    Resize {
+    /// An attachment's decision (rule 2): take the tab provisionally, or
+    /// record `geometry` as its advisory grid. Answered after the
+    /// server-terminal half of any take; the child half is the
+    /// [`AttachDecision`]'s to wait out.
+    Attach {
+        id: AttachmentId,
+        client_id: String,
+        label: String,
+        take: bool,
         geometry: Geometry,
-        ack: Option<oneshot::Sender<Result<(), TabError>>>,
+        reply: oneshot::Sender<AttachDecision>,
     },
-    /// `tab.resize` — a grid with no cell metrics behind it, which the
-    /// task fills in from the ones the tab already has.
-    ///
-    /// Zeroing them instead would spell "unknown" as "zero", and
-    /// libghostty would quote `0x0` pixels in every mode-2048 size
-    /// report the tab sent afterwards (R18). No caller of
-    /// `PtySupervisor::resize` — the only construction site — holds a
-    /// viewport to wait on, so unlike `TabCmd::Resize` this carries no
-    /// `ack`; add one back if a waiting grid-only caller shows up.
+    /// The attachment's accepted reply is on the wire.
+    AttachCommitted {
+        id: AttachmentId,
+    },
+    /// The attachment ended. `deliberate` is a `DETACH` frame (an
+    /// immediate handoff); without one it is a disconnect (grace). Before
+    /// its commit either is a cancel. An unknown id is a no-op.
+    Detach {
+        id: AttachmentId,
+        deliberate: bool,
+    },
+    /// An attachment's `RESIZE` frame (rule 4).
+    Resize {
+        id: AttachmentId,
+        geometry: Geometry,
+        focused: bool,
+    },
+    /// `tab.resize` — a background resize (rule 8), refused
+    /// [`TabError::Owned`] on a tab anybody owns. A grid with no cell
+    /// metrics behind it, which the task fills in from the ones the tab
+    /// already has: zeroing them would spell "unknown" as "zero", and
+    /// libghostty would quote `0x0` pixels in every mode-2048 size report
+    /// afterwards (R18). Answered after the decision and the server
+    /// terminal's half, never after the child's.
     ResizeGrid {
         cols: u16,
         rows: u16,
+        reply: oneshot::Sender<Result<(), TabError>>,
     },
+    /// An attachment's `TAKE` frame (rule 3's take after a copy or a
+    /// settled scroll).
+    TakeFrom {
+        id: AttachmentId,
+    },
+    /// `tab.take_size` (rule 5), answered with the tab's grid afterwards.
+    TakeSize {
+        client_id: String,
+        reply: oneshot::Sender<Result<(u16, u16), TakeRefusal>>,
+    },
+    /// `tab.release_size` (rule 6).
+    ReleaseSize {
+        client_id: String,
+        reply: oneshot::Sender<()>,
+    },
+    /// Test-mode `tab.fail_next_resize`: the next server-terminal resize
+    /// fails before it changes anything.
+    FailNextResize,
     /// `session.set_theme` — re-seed this tab's terminal (and its color
     /// tracker) with the attached client's palette. Fire-and-forget:
     /// the op's reply reports how many tabs it was sent to, and a tab
@@ -512,6 +701,37 @@ pub enum TabCmd {
         drain: bool,
         reply: oneshot::Sender<Vec<u8>>,
     },
+}
+
+impl TabCmd {
+    /// Whether this command can change the tab's geometry — the ones the
+    /// task first ingests every chunk the reader has already queued
+    /// ahead of, so output read before a resize reaches every client
+    /// before its `GRID`.
+    fn may_regrid(&self, sizes: &SizeOwnership) -> bool {
+        match self {
+            TabCmd::Input { take, from, .. } => {
+                *take != InputTake::None && sizes.input_taker(*from).is_some()
+            }
+            TabCmd::Attach { .. }
+            | TabCmd::Detach { .. }
+            | TabCmd::Resize { .. }
+            | TabCmd::ResizeGrid { .. }
+            | TabCmd::TakeFrom { .. }
+            | TabCmd::TakeSize { .. }
+            | TabCmd::ReleaseSize { .. } => true,
+            TabCmd::AttachCommitted { .. }
+            | TabCmd::FailNextResize
+            | TabCmd::SetTheme(..)
+            | TabCmd::Snapshot { .. }
+            | TabCmd::Resume { .. }
+            | TabCmd::Dump { .. }
+            | TabCmd::DumpResolved(_)
+            | TabCmd::MemoryUsage(_)
+            | TabCmd::FeedBytes(_)
+            | TabCmd::CaptureInput { .. } => false,
+        }
+    }
 }
 
 /// What the reap task tells the tab task about the child's death.
@@ -626,13 +846,25 @@ impl TabVt {
         tee: broadcast::Sender<PtyOutputEvent>,
         writer: mpsc::Sender<WriterCmd>,
     ) -> TabPipe {
+        self.state
+            .workspace
+            .tab_pipeline(tab_id, self.tab_generation);
         let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(TAB_CHANNEL_CHUNKS);
         let (exit_tx, exit_rx) = mpsc::unbounded_channel::<ExitSignal>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<TabCmd>(TAB_CMD_CAPACITY);
         let tab_generation = self.tab_generation;
         let capture = self.state.capture_pty_input;
+        let sizes = SizeOwnership::new(
+            (self.geometry.cols, self.geometry.rows),
+            u64::try_from(self.state.owner_grace.as_millis()).unwrap_or(u64::MAX),
+            self.state.frozen_owner_clock,
+        );
         let task = TabTask {
             tab_id,
+            sizes,
+            started: tokio::time::Instant::now(),
+            fail_next_resize: false,
+            graced: None,
             vt: self,
             tee,
             writer,
@@ -703,6 +935,17 @@ fn color_seed(terminal: &Terminal) -> Result<OscColorSnapshot, roost_vt::Error> 
 
 struct TabTask {
     tab_id: i64,
+    /// Which attachment sizes this tab (plan 084 D4). Decided here, on the
+    /// one task that already orders the tab's input and geometry, so two
+    /// clients racing for it resolve in receive order.
+    sizes: SizeOwnership,
+    /// The size-ownership clock's zero.
+    started: tokio::time::Instant,
+    /// `tab.fail_next_resize` armed.
+    fail_next_resize: bool,
+    /// The client whose grace record this tab is holding a label for in
+    /// [`ServerVtState::graces`].
+    graced: Option<String>,
     vt: TabVt,
     tee: broadcast::Sender<PtyOutputEvent>,
     writer: mpsc::Sender<WriterCmd>,
@@ -786,6 +1029,11 @@ impl TabTask {
         // ticking is allocation-free.
         let mut retry = tokio::time::interval(PENDING_FLUSH_RETRY);
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // One timer, reset whenever the armed grace record changes, for
+        // the same reason `retry` is built once.
+        let grace_timer = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(grace_timer);
+        let mut grace_armed: Option<(u64, u64)> = None;
         // The command channel closing is NOT the end: the reap task
         // removes the session — and with it the only long-lived `TabCmd`
         // sender — *before* it hands over the exit status, so a task that
@@ -798,6 +1046,17 @@ impl TabTask {
             // Here and not at the end of `ingest`, which is synchronous
             // while the encode's permit is an await.
             self.retry_deferred_snapshots().await;
+            // Nothing is decided once the wire has closed, so an expiry
+            // then would leave the record armed and the timer re-firing.
+            let deadline = self.sizes.grace_deadline().filter(|_| !self.wire_closed());
+            if deadline != grace_armed {
+                if let Some((until, _)) = deadline {
+                    grace_timer
+                        .as_mut()
+                        .reset(self.started + Duration::from_millis(until));
+                }
+                grace_armed = deadline;
+            }
             // Deliberately NOT `biased`: a fixed poll order would let a
             // saturated command channel starve PTY ingestion (stalling
             // the child) or the reverse; random polling gives both sides
@@ -810,26 +1069,29 @@ impl TabTask {
                         // reader will not EOF for who knows how long.
                         // Drain what it has already queued, then close
                         // the wire — the order the forwarders rely on.
-                        // Bounded: a descendant still writing refills
-                        // the channel as fast as this drains it, and an
-                        // unbounded loop would never publish. Anything
-                        // past the bound arrives through the ordinary
-                        // branch below and still reaches the VT
-                        // (post-exit bytes are never teed).
-                        for _ in 0..TAB_CHANNEL_CHUNKS {
-                            match bytes_rx.try_recv() {
-                                Ok(chunk) => self.ingest(chunk),
-                                Err(_) => break,
-                            }
-                        }
+                        // Anything past the drain's bound arrives through
+                        // the ordinary branch below and still reaches the
+                        // VT (post-exit bytes are never teed).
+                        self.ingest_queued(&mut bytes_rx);
                         self.publish_exit(code);
                     }
                     None => exit_open = false,
                 },
                 cmd = cmd_rx.recv(), if cmd_open => match cmd {
-                    Some(cmd) => self.handle(cmd).await,
+                    Some(cmd) => {
+                        if cmd.may_regrid(&self.sizes) {
+                            self.ingest_queued(&mut bytes_rx);
+                        }
+                        self.handle(cmd).await;
+                    }
                     None => cmd_open = false,
                 },
+                () = &mut grace_timer, if grace_armed.is_some() => {
+                    if let Some((_, incarnation)) = grace_armed.take() {
+                        self.ingest_queued(&mut bytes_rx);
+                        self.decide(|sizes, sizer| sizes.expire(incarnation, sizer));
+                    }
+                }
                 chunk = bytes_rx.recv(), if bytes_open => match chunk {
                     Some(chunk) => self.ingest(chunk),
                     None => {
@@ -853,7 +1115,91 @@ impl TabTask {
                 _ = retry.tick(), if !self.pending.is_empty() => {}
             }
         }
+        self.vt
+            .state
+            .move_grace(self.graced.take().as_deref(), None);
         debug!(tab_id = self.tab_id, "server-vt tab task ended");
+    }
+
+    /// Every chunk the reader has already queued, through the pipeline —
+    /// bounded by the channel's depth, so a child still writing cannot
+    /// hold a resize or its exit off. Bytes still in the kernel's PTY
+    /// buffer are inherent to any PTY and may reach a client after the
+    /// `GRID`.
+    fn ingest_queued(&mut self, bytes_rx: &mut mpsc::Receiver<Vec<u8>>) {
+        for _ in 0..TAB_CHANNEL_CHUNKS {
+            match bytes_rx.try_recv() {
+                Ok(chunk) => self.ingest(chunk),
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// The size-ownership clock, in milliseconds.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Run one size decision against this tab, then announce what it
+    /// changed. Nothing is decided once the wire has closed: after EXIT
+    /// a tab's geometry and owner are frozen and nothing more is teed.
+    fn decide<R>(
+        &mut self,
+        decision: impl FnOnce(&mut SizeOwnership, &mut TaskSizer<'_>) -> R,
+    ) -> Option<R> {
+        self.decide_acked(false, decision)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// [`Self::decide`], handing back the child half of the resize when
+    /// `acked` asks for it.
+    fn decide_acked<R>(
+        &mut self,
+        acked: bool,
+        decision: impl FnOnce(&mut SizeOwnership, &mut TaskSizer<'_>) -> R,
+    ) -> Option<(R, Option<WinsizeAck>)> {
+        if self.wire_closed() {
+            return None;
+        }
+        let mut sizes = std::mem::take(&mut self.sizes);
+        let mut sizer = TaskSizer {
+            task: self,
+            acked,
+            winsize: None,
+        };
+        let outcome = decision(&mut sizes, &mut sizer);
+        let winsize = sizer.winsize;
+        self.sizes = sizes;
+        self.announce();
+        Some((outcome, winsize))
+    }
+
+    /// One `GRID` and one `tab.resized` for whatever the last decision
+    /// changed, and the grace label hold moved with it.
+    fn announce(&mut self) {
+        let geometry = self.vt.geometry;
+        if let Some(gen) = self.sizes.announce((geometry.cols, geometry.rows)) {
+            let owner = self.sizes.owner();
+            let _ = self.tee.send(PtyOutputEvent::Grid {
+                seq: self.last_byte_seq,
+                gen,
+                cols: geometry.cols,
+                rows: geometry.rows,
+                owner: owner.clone(),
+            });
+            self.vt.state.workspace.tab_resized(
+                self.tab_id,
+                self.vt.tab_generation,
+                geometry.cols,
+                geometry.rows,
+                owner,
+            );
+        }
+        let graced = self.sizes.graced_client();
+        if graced.map(|(client_id, _)| client_id) != self.graced.as_deref() {
+            self.vt.state.move_grace(self.graced.as_deref(), graced);
+            self.graced = graced.map(|(client_id, _)| client_id.to_string());
+        }
     }
 
     /// Once `Exit` is out the wire is closed: no more seqs, tee sends or
@@ -892,6 +1238,8 @@ impl TabTask {
             bytes,
             cols: self.vt.geometry.cols,
             rows: self.vt.geometry.rows,
+            owner: self.sizes.owner(),
+            grid_gen: self.sizes.grid_gen(),
         }
     }
 
@@ -1138,10 +1486,10 @@ impl TabTask {
     }
 
     /// Size the tab: the server terminal first, then the child's
-    /// winsize. The single place either half moves — `TabCmd::Resize`
-    /// and a geometry-bearing `TabCmd::Input` both land here — so the
-    /// geometry recorded on [`TabVt`] cannot drift from what libghostty
-    /// and the child were told.
+    /// winsize. The single place either half moves — every size decision
+    /// lands here through [`TaskSizer`] — so the geometry recorded on
+    /// [`TabVt`] cannot drift from what libghostty and the child were
+    /// told.
     ///
     /// Geometry that has not changed is not re-applied: two clients
     /// alternating keystrokes at the same size would otherwise pay for a
@@ -1185,14 +1533,19 @@ impl TabTask {
             cell_w,
             cell_h,
         } = geometry;
-        let applied = self
-            .vt
-            .terminal
-            .resize(cols, rows, cell_w, cell_h)
-            .map_err(|error| {
-                warn!(tab_id = self.tab_id, %error, "server terminal resize failed");
-                TabError::from(error)
-            });
+        let applied = if std::mem::take(&mut self.fail_next_resize) {
+            Err(TabError::ResizeFailed(
+                "tab.fail_next_resize asked this resize to fail".into(),
+            ))
+        } else {
+            self.vt
+                .terminal
+                .resize(cols, rows, cell_w, cell_h)
+                .map_err(|error| {
+                    warn!(tab_id = self.tab_id, %error, "server terminal resize failed");
+                    TabError::from(error)
+                })
+        };
         // The child is told nothing the terminal refused, and nothing is
         // recorded either: the two halves move together or not at all.
         // Queued ahead of the drain below so the winsize `ioctl` still
@@ -1225,36 +1578,6 @@ impl TabTask {
         self.take_replies();
         applied?;
         Ok(queued)
-    }
-
-    /// Apply a resize command's geometry and answer its `ack`.
-    fn resize(&mut self, geometry: Geometry, ack: Option<oneshot::Sender<Result<(), TabError>>>) {
-        let applied = self.apply_geometry(geometry, ack.is_some());
-        // Answered only once BOTH halves are applied: a waiter that
-        // resumed at the terminal resize alone could still snapshot a
-        // tab whose child had not been told.
-        let Some(ack) = ack else { return };
-        match applied {
-            // Off the task, because the child half is another task's
-            // FIFO: a tab that blocked here would stop rendering its own
-            // output behind a child that stopped reading its input.
-            Ok(Some(winsize)) => {
-                let tab_id = self.tab_id;
-                tokio::spawn(async move {
-                    let _ = ack.send(await_winsize(tab_id, winsize).await);
-                });
-            }
-            // Nothing to wait for: either the geometry was already this
-            // one, so both halves are at it, or the PTY writer is gone
-            // and there is no child half left to tell. An exited tab
-            // still serves attaches, so the second is a success too.
-            Ok(None) => {
-                let _ = ack.send(Ok(()));
-            }
-            Err(error) => {
-                let _ = ack.send(Err(error));
-            }
-        }
     }
 
     fn flush_writer(&mut self) {
@@ -1317,26 +1640,84 @@ impl TabTask {
 
     async fn handle(&mut self, cmd: TabCmd) {
         match cmd {
-            TabCmd::Input { data, geometry } => {
-                // A refused geometry is warned about inside and the
-                // bytes still go: an INPUT frame is unacknowledged, so
-                // there is nobody to answer, and dropping a client's
-                // keystrokes over a resize the terminal disliked would
-                // be the worse failure.
-                if let Some(geometry) = geometry {
-                    let _ = self.apply_geometry(geometry, false);
+            TabCmd::Input { data, from, take } => {
+                // A take that fails is logged inside: the bytes go
+                // regardless, at whatever size the tab has.
+                match (self.sizes.input_taker(from), take) {
+                    (Some(id), InputTake::Before) => {
+                        self.decide(|sizes, sizer| sizes.take(id, sizer));
+                        self.queue_input(data);
+                    }
+                    (Some(id), InputTake::After) => {
+                        self.queue_input(data);
+                        self.decide(|sizes, sizer| sizes.take(id, sizer));
+                    }
+                    _ => self.queue_input(data),
                 }
-                self.queue_input(data);
             }
-            TabCmd::Resize { geometry, ack } => self.resize(geometry, ack),
-            TabCmd::ResizeGrid { cols, rows } => {
+            TabCmd::Attach {
+                id,
+                client_id,
+                label,
+                take,
+                geometry,
+                reply,
+            } => {
+                let now = self.now_ms();
+                let (provisional, winsize) = self
+                    .decide_acked(true, |sizes, sizer| {
+                        sizes.attach(id, &client_id, &label, take, geometry, now, sizer)
+                    })
+                    .unwrap_or((false, None));
+                let _ = reply.send(AttachDecision {
+                    provisional,
+                    winsize,
+                });
+            }
+            TabCmd::AttachCommitted { id } => {
+                self.decide(|sizes, _| sizes.commit(id));
+            }
+            TabCmd::Detach { id, deliberate } => {
+                let now = self.now_ms();
+                self.decide(|sizes, sizer| sizes.detach(id, deliberate, now, sizer));
+            }
+            TabCmd::Resize {
+                id,
+                geometry,
+                focused,
+            } => {
+                let now = self.now_ms();
+                self.decide(|sizes, sizer| sizes.resize(id, geometry, focused, now, sizer));
+            }
+            TabCmd::ResizeGrid { cols, rows, reply } => {
                 let geometry = Geometry {
                     cols,
                     rows,
                     ..self.vt.geometry
                 };
-                self.resize(geometry, None);
+                let answer = self
+                    .decide(|sizes, sizer| match sizes.owner() {
+                        Some(owner) => Err(TabError::Owned(owner.label)),
+                        None => sizer.resize(geometry),
+                    })
+                    .unwrap_or(Ok(()));
+                let _ = reply.send(answer);
             }
+            TabCmd::TakeFrom { id } => {
+                self.decide(|sizes, sizer| sizes.take(id, sizer));
+            }
+            TabCmd::TakeSize { client_id, reply } => {
+                let answer = self
+                    .decide(|sizes, sizer| sizes.take_size(&client_id, sizer))
+                    .unwrap_or(Ok(()))
+                    .map(|()| (self.vt.geometry.cols, self.vt.geometry.rows));
+                let _ = reply.send(answer);
+            }
+            TabCmd::ReleaseSize { client_id, reply } => {
+                self.decide(|sizes, sizer| sizes.release(&client_id, sizer));
+                let _ = reply.send(());
+            }
+            TabCmd::FailNextResize => self.fail_next_resize = true,
             TabCmd::SetTheme(seed, generation) => {
                 // Monotonic: a stale fan-out racing a fresh one (or the
                 // promotion's catch-up send) must not roll colors back.
@@ -1444,6 +1825,8 @@ impl TabTask {
             stored_exit: self.stored_exit,
             cols: self.vt.geometry.cols,
             rows: self.vt.geometry.rows,
+            owner: self.sizes.owner(),
+            grid_gen: self.sizes.grid_gen(),
         })
     }
 
@@ -1516,6 +1899,42 @@ impl TabTask {
             }
         }
         Ok(ResolvedCellsData { cols, rows, cells })
+    }
+}
+
+/// How a size decision reaches this tab's terminal and child: through
+/// [`TabTask::apply_geometry`], so every decision sizes both halves or
+/// neither.
+struct TaskSizer<'a> {
+    task: &'a mut TabTask,
+    /// Whether the child half's verdict is wanted — an attach waits on
+    /// it before its snapshot.
+    acked: bool,
+    winsize: Option<WinsizeAck>,
+}
+
+impl TaskSizer<'_> {
+    /// A background resize: applied as asked, its refusal reported.
+    fn resize(&mut self, geometry: Geometry) -> Result<(), TabError> {
+        self.task.apply_geometry(geometry, false).map(|_| ())
+    }
+}
+
+impl Sizer for TaskSizer<'_> {
+    fn apply(&mut self, grid: Geometry) -> bool {
+        match self.task.apply_geometry(grid, self.acked) {
+            Ok(winsize) => {
+                if winsize.is_some() {
+                    self.winsize = winsize;
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn current(&self) -> Geometry {
+        self.task.vt.geometry
     }
 }
 

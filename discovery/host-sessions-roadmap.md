@@ -305,6 +305,13 @@ adopted from Herdr:
 - **Detach does not resize.** Existing PTYs keep the last attached
   size (no SIGWINCH storm into TUI agents). Tabs created while
   detached get a configured headless default (e.g. 120×40).
+  *Superseded by plan 084 /
+  [DL-31](../docs/development/vision.md#dl-31-a-tab-has-one-size-owner-2026-10-30)
+  (2026-10-30): a tab has one size owner. A detach by the owner hands
+  the size to another attachment at once, so it can resize; with nobody
+  left the tab keeps its size and has no owner, which is where this
+  bullet still holds. "Sized from the last attached client" in D5 reads
+  the same way.*
 - `TERM`/`COLORTERM` are already forced by `pty.rs` — unchanged.
   Session PTYs get `ROOST_SOCKET` pointing at the session socket, so
   Claude hooks work unmodified.

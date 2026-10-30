@@ -1,6 +1,7 @@
 # Sessions everywhere: work that doesn't care where you sit
 
-**Status: discovery, 2026-10-23. Partly decided on 2026-10-28.**
+**Status: discovery, 2026-10-23. Partly decided on 2026-10-28. G2
+shipped in plan 084 (2026-10-30), see [G2](#g2-window-size-with-several-clients).**
 [protocol-7-release.md](protocol-7-release.md) is now the source of
 truth for G1, G2 and the new G9, and supersedes the leanings below
 where they differ. The [decision summary](#decided-2026-10-28-protocol-7-release)
@@ -173,6 +174,14 @@ is already running is still found during the transition. Also add a
 this context doesn't look at."
 
 ### G2. Window size with several clients
+
+**Status: shipped in plan 084, on the branch (PR pending).** The
+[decision above](#decided-2026-10-28-protocol-7-release) and
+[DL-31](../docs/development/vision.md#dl-31-a-tab-has-one-size-owner-2026-10-30)
+are what shipped; how it came out is in
+[protocol-7-release.md](protocol-7-release.md) § M3. What follows is the
+pre-decision analysis, kept as written: "Today's rule" is the rule before
+plan 084, and options 1 to 3 became size ownership.
 
 This is the one that decides whether "watch from here, type from there"
 *feels* right.

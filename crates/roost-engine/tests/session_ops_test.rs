@@ -464,6 +464,7 @@ async fn open_tab_reporting_size(f: &Fixture, size: Option<(u32, u32)>) -> (u16,
         assert!(!remaining.is_zero(), "stty never reported a size");
         match tokio::time::timeout(remaining, output.recv()).await {
             Ok(Ok(PtyOutputEvent::Bytes { data, .. })) => collected.extend_from_slice(&data),
+            Ok(Ok(PtyOutputEvent::Grid { .. })) => {}
             Ok(Ok(PtyOutputEvent::Exit { .. })) => break,
             Ok(Err(e)) => panic!("output channel: {e}"),
             Err(_) => panic!("stty never reported a size"),
@@ -550,6 +551,7 @@ async fn read_until(output: &mut broadcast::Receiver<PtyOutputEvent>, marker: &[
         assert!(!remaining.is_zero(), "{what}: the bytes never came back");
         match tokio::time::timeout(remaining, output.recv()).await {
             Ok(Ok(PtyOutputEvent::Bytes { data, .. })) => collected.extend_from_slice(&data),
+            Ok(Ok(PtyOutputEvent::Grid { .. })) => {}
             Ok(Ok(PtyOutputEvent::Exit { .. })) => {
                 panic!("{what}: the tab exited before the bytes came back")
             }

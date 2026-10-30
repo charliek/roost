@@ -282,10 +282,31 @@ What you get from two Roosts, or a Roost and a phone, on one session:
 - **A notification reaches every window, and the window you are looking at answers for you.** The session no longer decides who gets told — it tells everyone, every time. The window that is showing that tab, with the focus, shows no banner and quietly acknowledges the notification instead, which takes the dot down on *every* client. Every other window banners as usual. This is what stops a phone left open on a tab from silencing your laptop, which is what used to happen when a tab was muted for everybody while any one client was looking at it.
 
     Three consequences worth knowing. Another window may show the dot for the moment it takes the acknowledgement to travel — the window you are looking at never does. **Bringing a window back to the front does not clear anything**: focus alone has never acknowledged a notification, on a host or locally; clicking the tab does. And a banner your desktop has already put in front of you stays until you dismiss it, even if another client clears the tab — the dot and the inbox row go, the banner is yours.
-- **The PTY is sized by whoever typed or resized last.** Every client that interacts sets the tab's size; connecting from somewhere else does not by itself resize anything. A client that only watches (never typing) never shrinks the one that is working.
+- **A tab has one size owner, and watching never takes it.** Connecting from somewhere else, or looking at a tab, does not resize anything; the window that is working keeps its size. [Who sizes a tab](#who-sizes-a-tab) says what does take it.
 - **The session-wide theme is last-writer-wins**, from whichever client sent it most recently. Two clients with different themes flip it on every reconnect; that is by design, not a bug. **Agent hooks are not last-writer-wins**: a connecting client can only ever *raise* the host's `agent-hooks` key — union its own allow-list into whatever the host already has, never removing — so two clients with different lists both win, additively, rather than fighting over the same key (see [Agent Hooks](agents.md#remote-hosts) for the file side of it). **File uploads are not a setting and do not compete either**: every upload lands in a directory of its own, named at random, so two clients sending the same filename at the same moment get two files rather than one overwriting the other.
 
 **Nothing stops anyone from typing.** There was never a "steal" step and there still isn't — every same-UID client could always attach and type, and reading a session never required anything either. What changed with this release is that there is no longer a single client whose window the effects and notifications route through by default: they route to everyone, and each client decides for itself what to do with what it gets.
+
+### Who sizes a tab
+
+A program in a terminal sees exactly one window size, so a tab shown in two windows can fit only one of them. Roost names that window the tab's **size owner**: the tab's grid is the owner's, and every other window shows that grid.
+
+**A window takes the size by doing something with the tab**, not by looking at it:
+
+- selecting the tab yourself (the sidebar, the tab strip, a keybind, the palette, `roostctl tab focus`);
+- typing or pasting into it, or clicking or scrolling the wheel in a program that is listening for the mouse;
+- copying a selection, or scrolling back through its history and stopping;
+- resizing the window while it has focus (dragging it, or changing the font size).
+
+**A window does not take the size** when it only shows the tab: restoring the selected tab at launch, reconnecting after a drop, a display waking up or a monitor change while you are elsewhere, or a program asking the terminal a question. Sending text with `roostctl tab send` or the compose box never takes it either. A tab nobody sizes — the owner left, say — is taken by whichever window attaches to it next.
+
+**When the owner leaves, the size passes on.** Switching tabs or closing the window hands it to another window of yours that is attached to the tab, else to the window whose size was set most recently (by attaching or resizing). If the connection just drops (a network blip, a laptop waking from sleep), the tab stays the owner's for five seconds, so the same window reconnecting gets it back with nothing reflowing; anyone else taking it ends the wait. With nobody left, the tab keeps its size.
+
+**A window that is not the owner** draws the owner's grid inside its own. When the grid is taller than the window, the window scrolls to keep the cursor row on screen; when it is smaller, the rest of the pane stays empty. The tab band shows **Sized by ‹label›** next to a **Take size** button, where the label is the owner's host name. Clicks and selection land on the cells you see, not on the window's own grid.
+
+**Take size** gives the tab your window's grid without typing. It is the band's button, the **Take Size** row in the command palette, the `take_size` [keybind action](../getting-started/keybindings.md#available-actions) (unbound by default), and `roostctl tab take-size --tab h2.7` ([reference](../reference/cli.md#tab-take-size)). A tab that lives in this window's own process (no session behind it) always follows the window, so there is nothing to take there. Roost-Iced only; Roost.app has no host tabs.
+
+A script's `roostctl tab resize` only sizes a tab nobody owns; on an owned tab it is refused with an `owned` error naming the owner. The wire rules are in [`ipc.md`](../reference/ipc.md#size-ownership).
 
 ## The upgrade / restart flow
 

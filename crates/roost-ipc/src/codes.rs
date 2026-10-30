@@ -22,6 +22,7 @@ pub const SHUTTING_DOWN: &str = "shutting-down";
 pub const HOST_UNAVAILABLE: &str = "host-unavailable";
 pub const NOT_ENABLED: &str = "not-enabled";
 pub const BUSY: &str = "busy";
+pub const OWNED: &str = "owned";
 
 pub const REPLAY_EXPIRED: &str = "replay-expired";
 pub const REVISION_AHEAD: &str = "revision-ahead";
@@ -55,6 +56,7 @@ pub const ALL: &[&str] = &[
     HOST_UNAVAILABLE,
     NOT_ENABLED,
     BUSY,
+    OWNED,
     REPLAY_EXPIRED,
     REVISION_AHEAD,
     SESSION_MISMATCH,

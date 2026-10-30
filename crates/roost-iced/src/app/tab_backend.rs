@@ -14,6 +14,7 @@
 //! one for the same reason: rediscovering them later would mean
 //! re-cutting a landed abstraction.
 
+use roost_ipc::dataframe::InputTake;
 use roost_ui_model::keys::HostId;
 
 use super::*;
@@ -144,14 +145,23 @@ impl InProcessBackend {
 /// Input and resize share one channel so they reach the wire in
 /// submission order — the same serial-channel rule the local PTY path
 /// pins (CLAUDE.md threading table).
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum HostDataMsg {
-    Input(Vec<u8>),
+    /// Bytes, and what they ask of the tab's size (plan 084 D6).
+    Input { bytes: Vec<u8>, take: InputTake },
     Resize {
         cols: u16,
         rows: u16,
         cell_w: u32,
         cell_h: u32,
+        /// Whether the window had focus when it resized.
+        focused: bool,
     },
+    /// Take the tab's size at this window's grid: after a copy, or once
+    /// a local scroll has settled.
+    Take,
+    /// This window is done with the tab: the session hands its size on.
+    Detach,
 }
 
 /// A host tab's attachment: the queue the per-attempt writer task
@@ -232,7 +242,9 @@ impl TabHandle {
         self.capture.as_ref()
     }
 
-    pub(super) fn send_input(&self, data: Vec<u8>) {
+    /// `take` is what the bytes ask of a host tab's size; nothing else
+    /// sizes an in-process tab, so it ignores it.
+    pub(super) fn send_input(&self, data: Vec<u8>, take: InputTake) {
         match &self.kind {
             // `TabSession` taps the capture itself on the way past; a
             // host tab has no session to do it, so the tap is here.
@@ -241,9 +253,16 @@ impl TabHandle {
                 if let Some(Ok(mut bytes)) = self.capture.as_ref().map(|c| c.lock()) {
                     bytes.extend_from_slice(&data);
                 }
-                let _ = session.input_tx.send(HostDataMsg::Input(data));
+                let _ = session
+                    .input_tx
+                    .send(HostDataMsg::Input { bytes: data, take });
             }
         }
+    }
+
+    /// Whether this tab lives on a host session, which sizes it.
+    pub(super) fn is_host(&self) -> bool {
+        matches!(self.kind, TabHandleKind::Host(_))
     }
 
     pub(super) fn send_resize(&self, cols: u16, rows: u16) {
@@ -269,7 +288,7 @@ impl TabHandle {
     /// change owes a program that asked for it.
     pub(super) fn send_replies(&self, data: Vec<u8>) {
         match self.reply_policy() {
-            ReplyPolicy::DrainToPty => self.send_input(data),
+            ReplyPolicy::DrainToPty => self.send_input(data, InputTake::None),
             ReplyPolicy::Discard => {}
         }
     }
@@ -383,7 +402,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_input_reaches_the_pty() {
         let (_backend, handle, mut feed, supervisor) = cat(8_602);
-        handle.send_input(b"backend-marker\n".to_vec());
+        handle.send_input(b"backend-marker\n".to_vec(), InputTake::None);
         let seen = feed_text_until(
             &mut feed,
             TabKey::local(8_602),
@@ -433,7 +452,7 @@ mod tests {
     async fn send_resize_reaches_the_pty() {
         let (_backend, handle, mut feed, supervisor) = attached(8_604, &["/bin/sh".into()], true);
         handle.send_resize(90, 40);
-        handle.send_input(b"stty size\nexit\n".to_vec());
+        handle.send_input(b"stty size\nexit\n".to_vec(), InputTake::None);
         let seen = feed_text_until(
             &mut feed,
             TabKey::local(8_604),

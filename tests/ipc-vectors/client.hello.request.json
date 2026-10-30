@@ -1,0 +1,8 @@
+{
+  "id": "1",
+  "op": "client.hello",
+  "params": {
+    "client_id": "5d0c7e21a9f3b846",
+    "label": "charlie-laptop"
+  }
+}

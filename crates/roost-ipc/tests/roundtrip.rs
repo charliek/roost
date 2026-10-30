@@ -413,6 +413,26 @@ fn reorder_tab_ids_serialize_as_string_array() {
     );
 }
 
+/// Plan 084 D1: the hello vectors decode into their typed shapes and
+/// re-encode to the fixture, and the request is one the session admits.
+#[test]
+fn client_hello_vectors_decode_as_typed_params_and_results() {
+    let request = vector("client.hello.request.json");
+    assert_eq!(request["op"], ops::CLIENT_HELLO);
+    let params: ClientHelloParams =
+        serde_json::from_value(request["params"].clone()).expect("client.hello params decode");
+    assert_eq!(serde_json::to_value(&params).unwrap(), request["params"]);
+    params
+        .validate()
+        .expect("the vector is a hello the session admits");
+
+    let response = vector("client.hello.response.json");
+    let result: ClientHelloResult =
+        serde_json::from_value(response["result"].clone()).expect("client.hello result decode");
+    assert!(result.bridged);
+    assert_eq!(serde_json::to_value(&result).unwrap(), response["result"]);
+}
+
 /// The plan-047 file-transfer ops. Both vectors are decoded into the
 /// typed shapes *and* re-encoded against the fixture, so a field the
 /// struct spells differently — or a `bytes` written as a string —

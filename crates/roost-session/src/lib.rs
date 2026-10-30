@@ -61,7 +61,7 @@ pub mod start;
 mod build_info;
 
 pub use readiness::{Readiness, Verdict};
-pub use serve::{serve, SessionConfig};
+pub use serve::{serve, OwnershipKnobs, SessionConfig};
 pub use start::{
     capture_first_project, capture_launch_cwd, report, set_process_umask, start, Outcome,
 };

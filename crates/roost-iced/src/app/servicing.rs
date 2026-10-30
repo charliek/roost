@@ -207,6 +207,14 @@ fn memory_unreadable(tab: WireTabRef, error: &roost_vt::Error) -> HostOpFailure 
     )
 }
 
+/// What [`App::take_size`] does with a tab.
+pub(super) enum SizeTake<F> {
+    /// An in-process tab, whose grid is this window's own.
+    Local(roost_ipc::messages::TabTakeSizeResult),
+    /// A host tab: the session's call.
+    Host(F),
+}
+
 /// How far a tab ref gets towards a terminal this UI holds.
 #[derive(Clone, Copy)]
 enum TabPresence<'a> {
@@ -825,6 +833,9 @@ enum HostEnvelopeAction {
     ProjectDeleted(i64),
     /// The session's layout stopped — or started — reaching disk (#481).
     Durability(Option<String>),
+    /// A tab's grid or size owner changed: the background wave's to
+    /// follow (plan 084 D6).
+    Resized(roost_ipc::messages::TabResizedEvent),
     /// A workspace fact the mirror already folded in, or an event from a
     /// newer session this client does not know. Both are silent by
     /// contract (`ipc.md` #versioning: old clients ignore new events).
@@ -872,6 +883,8 @@ fn host_envelope_action(envelope: &roost_ipc::messages::EventEnvelope) -> HostEn
             .map_or_else(HostEnvelopeAction::Undecodable, |event| {
                 HostEnvelopeAction::Durability(event.error)
             }),
+        ops::EVENT_TAB_RESIZED => decode(envelope)
+            .map_or_else(HostEnvelopeAction::Undecodable, HostEnvelopeAction::Resized),
         _ => HostEnvelopeAction::Ignore,
     }
 }
@@ -1741,7 +1754,14 @@ impl App {
     /// attach detaches first — client memory and data connections stay
     /// bounded at one per host. C6's sidebar click and C7's creation
     /// routing are the callers.
-    pub(super) fn host_focus_tab(&mut self, key: TabKey) {
+    ///
+    /// `intent` says whether the attach takes the tab's size (plan 084
+    /// D6). A tab already attached is left as it is — re-selecting it
+    /// takes nothing, which is what Take size is for — unless the attach
+    /// is the window's own and no handshake of it has been accepted yet:
+    /// an explicit switch resolving in the same pass (a creation or a
+    /// `tab.focus` the listing just answered) must still take the tab.
+    pub(super) fn host_focus_tab(&mut self, key: TabKey, intent: host_tab::AttachIntent) {
         debug_assert!(!key.is_local(), "local tabs focus through the workspace");
         let others: Vec<TabKey> = self
             .host_attach
@@ -1752,13 +1772,20 @@ impl App {
         for other in others {
             self.host_detach_tab(other);
         }
-        if self.host_attach.contains_key(&key) {
+        if let Some(attach) = self.host_attach.get_mut(&key) {
+            if intent == host_tab::AttachIntent::Explicit && attach.make_explicit() {
+                self.host_begin_attach(key);
+            }
             return;
         }
         let (cols, rows) = self.current_grid();
         let geometry = self.host_geometry(cols, rows);
-        let attach =
-            host_tab::HostAttach::new(key, geometry).with_resume(self.host_resume.remove(&key));
+        let trace = self
+            .test_mode
+            .then(|| Arc::clone(self.size_traces.entry(key).or_default()));
+        let attach = host_tab::HostAttach::new(key, geometry, intent)
+            .with_resume(self.host_resume.remove(&key))
+            .with_trace(trace);
         let handle = TabHandle::host(attach.input_tx(), self.test_mode);
         match self.tabs.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -1833,13 +1860,94 @@ impl App {
         }
     }
 
-    /// The attached host tabs' sessions follow the window's grid too —
-    /// the machine decides when (immediately while live; withheld during
-    /// hydration, where a mid-snapshot resize forfeits history).
-    pub(super) fn note_host_grid(&mut self, (cols, rows): (u16, u16)) {
+    /// The attached host tabs' sessions hear the window's grid too, with
+    /// whether the window has focus as it resizes: a focused resize takes
+    /// the tab's size, an unfocused one only says what this window would
+    /// like (plan 084 D6). A window not yet laid out is never resizing
+    /// ([`super::WindowLayout`]). The machine decides when (immediately while
+    /// live; withheld during hydration, where a mid-snapshot resize
+    /// forfeits history).
+    pub(super) fn note_host_grid(&mut self, (cols, rows): (u16, u16), regrid: super::Regrid) {
         let geometry = self.host_geometry(cols, rows);
+        let focused = self.window_layout.focused(regrid, self.window_focused);
         for attach in self.host_attach.values_mut() {
-            attach.note_resize(geometry);
+            attach.note_resize(geometry, focused);
+        }
+    }
+
+    /// The host tab's viewport moved locally (wheel, Page Up/Down).
+    pub(super) fn host_scrolled(&mut self, key: TabKey) {
+        if let Some(attach) = self.host_attach.get_mut(&key) {
+            let _guard = self.runtime.enter();
+            attach.scrolled(self.scroll_settle, &self.feed_tx);
+        }
+    }
+
+    /// A copy captured its text off the host tab.
+    pub(super) fn host_copied(&mut self, key: TabKey) {
+        if let Some(attach) = self.host_attach.get_mut(&key) {
+            attach.copied();
+        }
+    }
+
+    /// Take size (plan 084 D7), the one function behind every surface
+    /// that offers it: a host tab asks its session for its size on this
+    /// window's client's behalf, and the reply is the session's. An
+    /// in-process tab always follows this window, so its own grid is
+    /// the answer; one nothing lists is `not-found`, as for any tab op.
+    pub(super) fn take_size(
+        &self,
+        key: TabKey,
+    ) -> Result<
+        SizeTake<
+            impl std::future::Future<
+                    Output = Result<serde_json::Value, crate::host_conn::HostOpError>,
+                > + Send
+                + 'static,
+        >,
+        HostOpFailure,
+    > {
+        if key.is_local() {
+            let (cols, rows) = match self.tabs.get(&key) {
+                Some(tab) => tab.grid(),
+                None if self.workspace.tab(key.tab).is_ok() => self.current_grid(),
+                None => {
+                    return Err(HostOpFailure::new(
+                        codes::NOT_FOUND,
+                        format!("tab {} has no live terminal", key.tab),
+                    ))
+                }
+            };
+            return Ok(SizeTake::Local(roost_ipc::messages::TabTakeSizeResult {
+                cols,
+                rows,
+            }));
+        }
+        let ops = self.hosts.ops_for(key.host).ok_or_else(no_connected_host)?;
+        let params = serde_json::to_value(roost_ipc::messages::TabTakeSizeParams {
+            tab_id: WireTabRef::Local(key.tab),
+        })
+        .map_err(|error| HostOpFailure::new(codes::INTERNAL, error.to_string()))?;
+        Ok(SizeTake::Host(ops.call_at(
+            key.host,
+            roost_ipc::messages::ops::TAB_TAKE_SIZE,
+            params,
+        )))
+    }
+
+    /// [`Self::take_size`] from the UI itself: a refusal is the status
+    /// line's to report.
+    pub(super) fn take_size_of(&mut self, key: TabKey) -> UiTask {
+        match self.take_size(key) {
+            Ok(SizeTake::Local(_)) => UiTask::None,
+            Ok(SizeTake::Host(call)) => self.engine_op(
+                async move { call.await.map(drop).map_err(|error| error.to_string()) },
+                move |result| EngineOpResult::SizeTaken { tab: key, result },
+            ),
+            Err(failure) => {
+                self.set_status(format!("take the size of tab {key}: {}", failure.message));
+                UiTask::None
+            }
         }
     }
 
@@ -1850,6 +1958,9 @@ impl App {
         if let Some(attach) = self.host_attach.remove(&key) {
             self.background_resize.detached(key, Instant::now());
             let kept = self.tabs.get(&key).map(TerminalTab::grid);
+            // The detach leaves its data task a moment to say so on the
+            // wire, which needs the app runtime ambient.
+            let _guard = self.runtime.enter();
             if let Some(resume) = attach.detach(kept) {
                 self.host_resume.insert(key, resume);
             }
@@ -1926,6 +2037,7 @@ impl App {
             session_id,
             socket,
             &roost_vt::libghostty_build(),
+            self.hosts.client_id(),
             &self.feed_tx,
         );
     }
@@ -2047,6 +2159,12 @@ impl App {
                         self.set_durability(DurabilitySource::Host(name), error);
                     }
                 }
+                HostEnvelopeAction::Resized(resized) => self.background_resize.tab_resized(
+                    TabKey::new(host, resized.tab_id),
+                    (resized.cols, resized.rows),
+                    resized.owner.is_none(),
+                    Instant::now(),
+                ),
                 HostEnvelopeAction::Undecodable(error) => tracing::debug!(
                     ?host, event = %envelope.event, %error,
                     "a host event envelope did not decode"
@@ -2171,7 +2289,7 @@ impl App {
     /// an attached host tab's client-side terminal (plan 037 §3.4). A
     /// ref from a dead connection epoch simply misses the map — the
     /// staleness contract `HostId` minting exists for.
-    fn wire_tab_key(&self, tab: roost_ipc::messages::WireTabRef) -> Option<TabKey> {
+    pub(super) fn wire_tab_key(&self, tab: roost_ipc::messages::WireTabRef) -> Option<TabKey> {
         match tab {
             roost_ipc::messages::WireTabRef::Local(tab_id) => self.local_tab_key(tab_id),
             roost_ipc::messages::WireTabRef::Host { host, tab } => {
@@ -2571,6 +2689,9 @@ impl App {
                     // `try_next` already marked the batch for it (a host
                     // mirror is workspace state), so a request later in
                     // this same batch reconciles before it reads.
+                    if matches!(event, crate::host_conn::HostWorkspaceEvent::Reset(_)) {
+                        self.background_resize.mirror_reset(host, Instant::now());
+                    }
                     self.hosts.apply_workspace(host, event);
                 }
                 EngineFeed::HostTab(key, frame) => {
@@ -3900,6 +4021,50 @@ impl App {
                     elide_nanos: stats.elide_nanos as i64,
                 }));
             }
+            UiRequest::TabTakeSize { tab_id, reply } => {
+                let Some(key) = self.wire_tab_key(tab_id) else {
+                    let _ = reply.send(slot_unavailable());
+                    return task;
+                };
+                match self.take_size(key) {
+                    Ok(SizeTake::Local(grid)) => {
+                        let _ = reply.send(serde_json::to_value(grid).map_err(|error| {
+                            HostOpFailure::new(codes::INTERNAL, error.to_string())
+                        }));
+                    }
+                    Ok(SizeTake::Host(call)) => {
+                        self.runtime_handle.spawn(async move {
+                            let _ =
+                                reply.send(call.await.map_err(|error| forwarded_failure(&error)));
+                        });
+                    }
+                    Err(failure) => {
+                        let _ = reply.send(Err(failure));
+                    }
+                }
+            }
+            UiRequest::HostSizeTrace { tab_id, reply } => {
+                let result = if !self.test_mode {
+                    Err(HostOpFailure::new(
+                        codes::NOT_ENABLED,
+                        "ROOST_TEST_MODE=1 is required",
+                    ))
+                } else {
+                    match self.wire_tab_key(tab_id) {
+                        Some(key) => Ok(roost_ipc::messages::HostSizeTraceResult {
+                            actions: self
+                                .size_traces
+                                .get(&key)
+                                .and_then(|trace| trace.lock().ok().map(|trace| trace.clone()))
+                                .unwrap_or_default(),
+                            wave_sends: self.background_resize.sends(key),
+                            parked: self.background_resize.parked(key),
+                        }),
+                        None => slot_unavailable(),
+                    }
+                };
+                let _ = reply.send(result);
+            }
             UiRequest::WindowMetrics { reply } => {
                 let collapsed = self.workspace.sidebar_collapsed();
                 let resolved_family = self
@@ -3908,11 +4073,30 @@ impl App {
                     .name
                     .to_string();
                 // The metrics the view hands the active tab's widget.
-                let metrics = self
-                    .tabs
-                    .get(&self.active_tab_key())
+                let active = self.active_tab_key();
+                let active_tab = self.tabs.get(&active);
+                let metrics = active_tab
                     .and_then(|tab| tab.applied_metrics)
                     .unwrap_or(self.terminal_metrics);
+                // The size-ownership readouts are test mode's (plan 084 D7).
+                let readout = active_tab.filter(|_| self.test_mode);
+                let mirror_grid = readout.filter(|tab| tab.session.is_host()).map(|tab| {
+                    let (cols, rows) = tab.grid();
+                    roost_ipc::messages::WindowMetricsGrid { cols, rows }
+                });
+                let size_owner = self
+                    .host_attach
+                    .get(&active)
+                    .filter(|_| self.test_mode)
+                    .and_then(|attach| {
+                        attach
+                            .owner()
+                            .map(|owner| roost_ipc::messages::WindowSizeOwner {
+                                client_id: owner.client_id.clone(),
+                                label: owner.label.clone(),
+                                is_me: attach.is_me(owner),
+                            })
+                    });
                 let sidebar_width = self.effective_sidebar_width();
                 let viewport = terminal_viewport(self.window_size, sidebar_width);
                 let _ = reply.send(Ok(WindowMetricsResult {
@@ -3928,6 +4112,9 @@ impl App {
                     cell_height: Some(f64::from(metrics.cell_height)),
                     window_focused: Some(self.window_focused),
                     native_focus_losses: Some(self.native_focus_losses),
+                    grid_offset_rows: readout.map(TerminalTab::grid_offset),
+                    mirror_grid,
+                    size_owner,
                 }));
             }
             UiRequest::WindowResize {
@@ -3944,7 +4131,7 @@ impl App {
                     // the requested logical geometry immediately for the
                     // deterministic test port; a compositor Resized event
                     // remains authoritative if it sends one afterward.
-                    self.resize(size);
+                    self.resize(size, super::Regrid::Window);
                     if let Some(id) = self.window_id {
                         task = task.then(UiTask::Resize(id, size));
                     } else {
@@ -3966,7 +4153,7 @@ impl App {
                     // the one the layout and the next relaunch both see.
                     self.commit_sidebar_drag();
                     self.workspace.set_sidebar_width(width);
-                    self.resize(self.window_size);
+                    self.resize(self.window_size, super::Regrid::User);
                     Ok(())
                 };
                 let _ = reply.send(result);
@@ -7460,7 +7647,10 @@ mod tests {
             live_feed,
         )
         .expect("re-attach the PTY the discarded tab left running");
-        tab.session.send_input(b"forwarder-marker\n".to_vec());
+        tab.session.send_input(
+            b"forwarder-marker\n".to_vec(),
+            roost_ipc::dataframe::InputTake::None,
+        );
 
         let live = feed_text_until(
             &mut live_rx,

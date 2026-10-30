@@ -2122,15 +2122,16 @@ impl App {
     /// [`TerminalTab::synthetic_press_seq`]'s.
     pub(super) fn dispatch_test_pointer(
         &mut self,
-        tab_id: i64,
+        tab_id: roost_ipc::messages::WireTabRef,
         action: PointerAction,
         button: Option<PointerButton>,
         (col, row): (u32, u32),
         mods: u16,
         overshoot: i16,
     ) -> std::result::Result<UiTask, String> {
-        // A bare id means the slot under `session` (plan 063 §D10).
-        let Some((key, press_seq)) = self.local_tab_key(tab_id).and_then(|key| {
+        // A bare id means the slot under `session` (plan 063 §D10); a
+        // host-qualified one names an attached host tab.
+        let Some((key, press_seq)) = self.wire_tab_key(tab_id).and_then(|key| {
             self.tabs
                 .get(&key)
                 .map(|tab| (key, tab.synthetic_press_seq(action, button)))
@@ -2233,11 +2234,14 @@ impl App {
             None
         };
         refresh_or_warn(tab_id, tab, "pointer dispatch");
-        enqueue_selection_copy(
+        let copied = enqueue_selection_copy(
             &mut self.clipboard,
             CopyKind::OnSelect(self.config.copy_on_select),
             selected_text,
         );
+        if copied > 0 {
+            self.host_copied(key);
+        }
         if outcome.paste_selection {
             // Middle-click paste doesn't sit in the `Result`-returning
             // keybind dispatcher (`dispatch_keybind_action`), so a
@@ -2269,16 +2273,18 @@ impl App {
             tracing::debug!(tab_id, "ignored terminal wheel event for a closed tab");
             return UiTask::None;
         };
-        if let Err(error) = tab
+        let scrolled = tab
             .handle_wheel(
                 history_rows,
                 col,
                 row,
                 input::ghostty_modifiers(self.modifiers),
             )
-            .and_then(|()| tab.refresh_snapshot())
-        {
-            tracing::warn!(?error, tab_id, "terminal wheel dispatch failed");
+            .and_then(|scrolled| tab.refresh_snapshot().map(|()| scrolled));
+        match scrolled {
+            Ok(true) => self.host_scrolled(key),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(?error, tab_id, "terminal wheel dispatch failed"),
         }
         UiTask::None
     }
@@ -3112,7 +3118,9 @@ impl App {
             },
             None => return UiTask::None,
         };
-        enqueue_selection_copy(&mut self.clipboard, CopyKind::Explicit, text);
+        if enqueue_selection_copy(&mut self.clipboard, CopyKind::Explicit, text) > 0 {
+            self.host_copied(tab);
+        }
         self.clipboard.start_next()
     }
 
@@ -6370,7 +6378,8 @@ mod tests {
             false,
             input::OptionKey::default(),
         );
-        tab.session.send_input(bytes);
+        tab.session
+            .send_input(bytes, roost_ipc::dataframe::InputTake::Before);
     }
 
     fn captured_input(tab: &TerminalTab) -> Vec<u8> {
@@ -7490,6 +7499,8 @@ mod tests {
             cancelled_through: tab.cancelled_through,
             ime_active: false,
             focused: true,
+            view: tab.view(),
+            row_offset: tab.grid_offset(),
         }
     }
 

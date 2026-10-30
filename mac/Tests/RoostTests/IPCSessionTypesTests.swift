@@ -215,7 +215,7 @@ final class IPCSessionTypesTests: XCTestCase {
             "attach.handshake.request.json",
             "attach.handshake.vt.request.json",
             "attach.handshake.resume.request.json",
-            "attach.handshake.unfocused.request.json",
+            "attach.handshake.watch.request.json",
         ] {
             let raw = try Data(contentsOf: vectorURL(name))
             let line = try XCTUnwrap(
@@ -231,7 +231,8 @@ final class IPCSessionTypesTests: XCTestCase {
             XCTAssertEqual(line["protocol_version"] as? Int, 7, name)
             XCTAssertNotNil(line["session_id"] as? String, name)
             XCTAssertNotNil(line["kinds"] as? [String], name)
-            XCTAssertNotNil(line["focus"] as? Bool, name)
+            XCTAssertNotNil(line["take"] as? Bool, name)
+            XCTAssertEqual(line["client_id"] as? String, "5d0c7e21a9f3b846", name)
         }
 
         let resumeRaw = try Data(contentsOf: vectorURL("attach.handshake.resume.request.json"))
@@ -242,12 +243,12 @@ final class IPCSessionTypesTests: XCTestCase {
         // a Swift side that routed it through a Double would drift.
         XCTAssertEqual(resume["server_epoch"] as? Int, 6_032_428_321_756_423_947)
 
-        let unfocusedRaw = try Data(contentsOf: vectorURL("attach.handshake.unfocused.request.json"))
-        let unfocused = try XCTUnwrap(
-            try JSONSerialization.jsonObject(with: unfocusedRaw) as? [String: Any])
+        let watchRaw = try Data(contentsOf: vectorURL("attach.handshake.watch.request.json"))
+        let watch = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: watchRaw) as? [String: Any])
         XCTAssertEqual(
-            unfocused["focus"] as? Bool, false,
-            "the unfocused vector is the one that claims no geometry")
+            watch["take"] as? Bool, false,
+            "the watch vector is the one that takes no size")
 
         let acceptedRaw = try Data(contentsOf: vectorURL("attach.handshake.accepted.json"))
         let accepted = try XCTUnwrap(
@@ -258,6 +259,9 @@ final class IPCSessionTypesTests: XCTestCase {
         XCTAssertEqual(accepted["server_epoch"] as? Int, 6_032_428_321_756_423_947)
         XCTAssertEqual(accepted["snapshot_cols"] as? Int, 120)
         XCTAssertEqual(accepted["snapshot_rows"] as? Int, 40)
+        let owner = try XCTUnwrap(accepted["owner"] as? [String: Any])
+        XCTAssertEqual(owner["client_id"] as? String, "5d0c7e21a9f3b846")
+        XCTAssertEqual(owner["label"] as? String, "charlie-laptop")
 
         let rejectedRaw = try Data(contentsOf: vectorURL("attach.handshake.rejected.json"))
         let rejected = try XCTUnwrap(

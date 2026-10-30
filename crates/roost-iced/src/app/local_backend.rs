@@ -2394,7 +2394,7 @@ impl super::App {
                     tab,
                     local_active: self.workspace.active().1,
                 }));
-                self.host_focus_tab(tab);
+                self.host_focus_tab(tab, super::host_tab::AttachIntent::Automatic);
                 return true;
             }
         }

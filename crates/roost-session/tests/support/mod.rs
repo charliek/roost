@@ -144,6 +144,7 @@ impl Layout {
             // Likewise: the shipped window, which no in-process test
             // drives past.
             replay_window: None,
+            ownership: Default::default(),
             exe_path: None,
             identity_override: None,
         }

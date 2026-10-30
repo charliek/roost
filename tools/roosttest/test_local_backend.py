@@ -101,6 +101,7 @@ from client import Roost, RoostError, scaled_timeout  # noqa: E402
 from eventstream import ENDED_EVENT, EventStream  # noqa: E402
 from relay import Relay  # noqa: E402
 from session import wait_until  # noqa: E402
+from test_host_client import view_grid  # noqa: E402
 from test_host_local_spawn import roostctl_session, running_session_id  # noqa: E402
 from test_password_input import (  # noqa: E402
     READY,
@@ -109,6 +110,7 @@ from test_password_input import (  # noqa: E402
     prompt_argv,
     raised_on,
 )
+from test_session_ownership import attached as raw_attached, geometry, no_grid_within  # noqa: E402
 
 pytestmark = pytest.mark.host_client
 
@@ -1980,6 +1982,125 @@ def show(lane: Lane, roost: Roost, tab: int) -> None:
     )
 
 
+def wave_trace(roost: Roost, tab: int) -> dict:
+    return roost.call("host.size_trace", {"tab_id": str(tab)})
+
+
+def test_a17_the_wave_parks_a_tab_another_client_sizes_until_nobody_does(lane: Lane):
+    """Plan 084 A17's iced half: the slot's background resize wave sends
+    a tab another client sizes one `tab.resize`, takes its `owned` as
+    final and parks the tab — a further window resize sends it nothing —
+    and once that client leaves (`tab.resized` with no owner) resizes it
+    exactly once more. The stale-refusal cases are the wave's unit tests
+    (`a_refusal_from_an_owner_since_gone_parks_nothing`,
+    `a_refusal_is_judged_by_its_own_sends_epoch_not_a_later_waves`): the
+    slot's connection cannot be put behind a relay."""
+    roost = session_ui(lane)
+    desk_grid = (52, 14)
+    with lane.session() as c:
+        project = int(c.list()[0]["id"])
+        argv = ["/bin/sh", "-c", "exec sleep 300"]
+        owned = c.open_tab(project, cwd="/tmp", cols=80, rows=24, argv=argv)
+        free = c.open_tab(project, cwd="/tmp", cols=80, rows=24, argv=argv)
+        desk = raw_attached(lane.env, c, owned, "desk-a17", True, desk_grid)[0]
+    wait_until(
+        lambda: slot_key(roost, owned) and slot_key(roost, free),
+        scaled_timeout(30.0),
+        "the window to list both background tabs",
+    )
+
+    def grid_of(tab: int) -> tuple[int, int]:
+        with lane.session() as c:
+            return geometry(c, tab)
+
+    before = roost.window_metrics()
+    try:
+        for step, shrink in enumerate((40, 80), start=1):
+            roost.window_resize(before["window_width"] - shrink, before["window_height"] - shrink)
+            grid = view_grid(roost)
+            wait_until(
+                lambda: grid_of(free) == grid,
+                scaled_timeout(30.0),
+                f"wave {step} to resize the tab nobody sizes",
+            )
+            wait_until(
+                lambda: wave_trace(roost, owned)["parked"],
+                scaled_timeout(30.0),
+                f"wave {step}'s refusal to park the owned tab",
+            )
+            assert wave_trace(roost, owned)["wave_sends"] == 1, f"wave {step}"
+            assert grid_of(owned) == desk_grid
+
+        desk.detach()
+        wait_until(
+            lambda: grid_of(owned) == view_grid(roost),
+            scaled_timeout(30.0),
+            "the wave to resize the tab nobody sizes any more",
+        )
+        # A send is counted when its answer is back, which can trail the
+        # session's own resize.
+        wait_until(
+            lambda: (wave_trace(roost, owned)["wave_sends"], wave_trace(roost, owned)["parked"])
+            == (2, False),
+            scaled_timeout(30.0),
+            "the wave's answer for the tab nobody sizes any more",
+        )
+    finally:
+        roost.window_resize(before["window_width"], before["window_height"])
+        desk.close()
+
+
+def test_a1_a_window_launched_onto_a_tab_another_client_sizes_leaves_its_size(lane: Lane):
+    """Plan 084 A1's launch case (C5): a window that comes up re-attaches
+    the slot's tab on its own, and nothing it does while it settles is a
+    resize anyone made — the first layout included, which reports the
+    window's grid unchanged and focused. The desk keeps the size, and
+    the window shows the tab sized by it.
+
+    Only Wayland orders it this way: there the first layout lands after
+    the attach is under way, and under X11 before it, where this passes
+    either way. The rule itself is pinned by the host-tab unit test
+    `a_windows_first_layout_takes_nothing_and_its_next_resize_does`."""
+    roost = session_ui(lane)
+    tab = roost.identify()["active_tab_id"]
+    desk_grid = (52, 14)
+    with lane.session() as c:
+        desk = raw_attached(lane.env, c, tab, "desk-a1-launch", True, desk_grid)[0]
+        wait_until(
+            lambda: geometry(c, tab) == desk_grid,
+            scaled_timeout(30.0),
+            "the desk to size the tab",
+        )
+    try:
+        roost = lane.restart()
+        wait_until(
+            lambda: roost.identify()["active_tab_id"] == tab,
+            scaled_timeout(60.0),
+            "the relaunched window to re-attach the slot's tab",
+        )
+        key = wait_until(
+            lambda: slot_key(roost, tab), scaled_timeout(30.0), "the window to list the tab"
+        )
+
+        def trace() -> list[dict]:
+            return roost.call("host.size_trace", {"tab_id": key})["actions"]
+
+        wait_until(
+            lambda: any(entry["action"] == "attach-accepted" for entry in trace())
+            and roost.window_metrics().get("mirror_grid") == {"cols": 52, "rows": 14},
+            scaled_timeout(30.0),
+            "the window's attach to be accepted and its mirror live",
+        )
+        no_grid_within(desk, 1.0)
+        assert {"action": "resize-sent", "focused": True} not in trace(), trace()
+        owner = roost.window_metrics().get("size_owner") or {}
+        assert owner.get("client_id") == "desk-a1-launch", owner
+        with lane.session() as c:
+            assert geometry(c, tab) == desk_grid
+    finally:
+        desk.close()
+
+
 def test_a_raw_dump_of_a_slot_tab_the_window_left_reads_the_session(lane: Lane):
     """#515: raw `tab.dump` on the UI socket, for a slot tab the window
     showed and then left, is answered by the session.
@@ -2542,6 +2663,17 @@ def with_cwds(projects: list[dict]) -> list[tuple]:
     ]
 
 
+def has_a_live_pty(client: Roost, tab_id: int) -> None:
+    """`tab.resize` reaches a tab only through a live PTY. On a session, a
+    tab this window is attached to is the window's to size, and the session
+    refuses a background resize of it `owned` (plan 084) — which a row with
+    no shell behind it never answers."""
+    try:
+        client.resize(tab_id, 100, 30)
+    except RoostError as refused:
+        assert refused.code == "owned", refused
+
+
 def migrated(lane: Lane, roost: Roost, timeout: float = 240.0) -> None:
     """Wait for §D5's launch migration to finish."""
     wait_until(
@@ -2584,7 +2716,7 @@ def test_a_hand_edited_key_moves_the_layout_at_launch(lane: Lane):
     with lane.session() as c:
         for project in c.list():
             for tab in project["tabs"]:
-                c.resize(int(tab["id"]), 100, 30)
+                has_a_live_pty(c, int(tab["id"]))
 
     # The band is the slot's, and the tab the migration selected is the
     # one that was active in the source — asserted through the

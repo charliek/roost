@@ -249,7 +249,7 @@ fn the_attach_handshake_vectors_decode_into_their_typed_shapes() {
         "attach.handshake.request.json",
         "attach.handshake.vt.request.json",
         "attach.handshake.resume.request.json",
-        "attach.handshake.unfocused.request.json",
+        "attach.handshake.watch.request.json",
     ] {
         let h = handshake(name);
         assert_eq!(h.protocol_version, SESSION_PROTOCOL_VERSION, "{name}");
@@ -266,6 +266,10 @@ fn the_attach_handshake_vectors_decode_into_their_typed_shapes() {
             h.terms.kinds.first().map(AttachPayloadKind::as_str),
             Some(AttachPayloadKind::GHOSTTY_SNAPSHOT),
             "{name}: the snapshot kind stays first in every preference list",
+        );
+        assert_eq!(
+            h.terms.client_id, "5d0c7e21a9f3b846",
+            "{name}: every attachment names its client"
         );
     }
 
@@ -288,12 +292,10 @@ fn the_attach_handshake_vectors_decode_into_their_typed_shapes() {
         "the plain vector asks for a snapshot",
     );
 
-    assert!(handshake("attach.handshake.request.json").terms.focus);
+    assert!(handshake("attach.handshake.request.json").terms.take);
     assert!(
-        !handshake("attach.handshake.unfocused.request.json")
-            .terms
-            .focus,
-        "the unfocused vector is the one that claims no geometry",
+        !handshake("attach.handshake.watch.request.json").terms.take,
+        "the watch vector is the one that takes no size",
     );
 
     let accepted: AttachHandshakeReply =
@@ -307,6 +309,11 @@ fn the_attach_handshake_vectors_decode_into_their_typed_shapes() {
         (accepted.snapshot_cols, accepted.snapshot_rows),
         (120, 40),
         "the geometry the bytes were written for rides every accepted reply",
+    );
+    assert_eq!(
+        accepted.owner.map(|owner| owner.label).as_deref(),
+        Some("charlie-laptop"),
+        "and so does the size owner at the same instant",
     );
 
     let rejected: AttachHandshakeReply =

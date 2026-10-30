@@ -41,7 +41,8 @@ fn handshake_line(tab_id: i64) -> String {
         "cols": 80,
         "rows": 24,
         "libghostty_build": "ghostty-1a2b3c4d5e6f7a8b+snapshot.v1",
-        "focus": true,
+        "take": true,
+        "client_id": "5d0c7e21a9f3b846",
     }))
     .expect("encode a handshake line")
 }

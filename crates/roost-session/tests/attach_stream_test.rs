@@ -31,7 +31,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use roost_ipc::client::{ClientError, DataConnection};
-use roost_ipc::dataframe::{DataFrame, FRAME_EXIT, FRAME_INPUT, FRAME_PTY, FRAME_SNAP};
+use roost_ipc::dataframe::{
+    DataFrame, FRAME_EXIT, FRAME_INPUT, FRAME_PTY, FRAME_RESIZE, FRAME_SNAP,
+};
 use roost_ipc::messages::{
     ops, AttachAccepted, AttachHandshake, AttachHandshakeTerms, AttachMode, AttachPayloadKind,
     ResolvedCell, TabCapturePtyInputParams, TabCapturePtyInputResult, TabCloseParams,
@@ -241,7 +243,8 @@ impl Session {
             cell_w_px: 0,
             cell_h_px: 0,
             libghostty_build: roost_vt::libghostty_build(),
-            focus: true,
+            take: true,
+            client_id: "stream-test".into(),
         }
     }
 
@@ -351,7 +354,8 @@ impl<R: AsyncRead + Unpin> DataClient<R> {
     /// Client → server. The only thing this file ever writes: proving
     /// the client's *own* device-query answers stay off the wire is a
     /// claim about what was never sent, and it is only worth anything
-    /// because every send goes through here.
+    /// because every send goes through here. An `INPUT` payload leads
+    /// with its flag byte; the ones here ask nothing of the size.
     async fn send(&mut self, frame_type: u8, payload: &[u8]) {
         self.0
             .send_frame(frame_type, payload)
@@ -1051,7 +1055,7 @@ async fn input_echo_and_replies() {
         .set_write_pty_buffer(Arc::clone(&replies))
         .expect("install the client's reply sink");
 
-    data.send(FRAME_INPUT, b"HELLO_TYPED").await;
+    data.send(FRAME_INPUT, b"\0HELLO_TYPED").await;
     apply_pty_until(
         &mut data,
         &mut decoded.terminal,
@@ -1064,7 +1068,7 @@ async fn input_echo_and_replies() {
         "plain text asks the terminal nothing"
     );
 
-    data.send(FRAME_INPUT, b"\x1b[6n").await;
+    data.send(FRAME_INPUT, b"\0\x1b[6n").await;
     apply_pty_until(&mut data, &mut decoded.terminal, &mut last_seq, b"\x1b[6n").await;
     let client_reply = replies.lock().expect("reply sink").clone();
     assert!(
@@ -1311,8 +1315,10 @@ async fn exit_during_attach() {
 ///
 /// The comparison at the end is only meaningful once BOTH ends are at
 /// the new geometry, so the server is resized to match before the dumps
-/// are taken — the snapshot was encoded at the old size, and pretending
-/// otherwise would be comparing two different screens. The scrollback
+/// are taken — by this client's own RESIZE frame, as the owner a client
+/// that resized its decoder is, since a background `tab.resize` of an
+/// owned tab is refused. The snapshot was encoded at the old size, and
+/// pretending otherwise would be comparing two different screens. The scrollback
 /// behind the viewport is genuinely gone on the client; nothing here
 /// claims otherwise, and a re-attach is what recovers it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1350,9 +1356,8 @@ async fn resize_mid_history() {
         "a page validated after a resize prepends nothing: {trace:?}"
     );
 
-    support::resize_tab(&mut session.control, tab_id, 60, 12)
-        .await
-        .expect("tab.resize");
+    data.send(FRAME_RESIZE, &[60, 0, 12, 0, 0, 0, 0, 0, 0])
+        .await;
     let server = session.wait_for_geometry(tab_id, 60, 12).await;
     // Content, not just equality: two blank 60x12 viewports would agree
     // with each other and prove nothing.

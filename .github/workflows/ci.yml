@@ -886,6 +886,7 @@ jobs:
           xvfb-run -a --server-args="-screen 0 1920x1080x24"
           uv run --group test pytest
           tools/roosttest/test_host_client.py
+          tools/roosttest/test_host_ownership.py
           --roost-target iced --roost-fresh -v
 
       # HS-3's SSH-transport lane (plan 038 C5): the same two processes
@@ -1154,6 +1155,7 @@ jobs:
           tools/wayland/weston-run.sh
           uv run --group test pytest
           tools/roosttest/test_host_client.py
+          tools/roosttest/test_host_ownership.py
           --roost-target iced --roost-fresh -v
 
       # The Wayland twin of the X11 SSH-transport step. Same ordering

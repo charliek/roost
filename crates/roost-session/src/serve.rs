@@ -31,6 +31,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle};
@@ -118,6 +119,11 @@ pub struct SessionConfig {
     /// the environment is read once at the edge and a production daemon
     /// keeps `REPLAY_WINDOW`.
     pub replay_window: Option<usize>,
+    /// The size-ownership test knobs ([`crate::consts::OWNER_GRACE_MS_ENV`]
+    /// and its siblings). All unset in every shipped run, filled the way
+    /// `replay_window` is: read once at the edge, only while `test_mode`
+    /// is on.
+    pub ownership: OwnershipKnobs,
     /// Whether a first-ever start seeds itself a project (plan 063 §D4)
     /// or leaves the workspace empty for whoever started it to fill
     /// (§D8's switch destination).
@@ -162,6 +168,7 @@ impl SessionConfig {
                 .ok()
                 .as_deref(),
         );
+        let ownership = OwnershipKnobs::from_env(test_mode, |name| std::env::var(name).ok());
         let files_dir = match profile.files_dir() {
             Ok(dir) => Some(dir),
             // Handled, not propagated: the only way this fails is a
@@ -184,10 +191,55 @@ impl SessionConfig {
             fake_libghostty_build,
             legacy_payload_kinds: identity::legacy_kinds_env(test_mode),
             replay_window,
+            ownership,
             first_project,
             exe_path,
             identity_override,
         }
+    }
+}
+
+/// Size-ownership test knobs; the default is the shipped behaviour.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnershipKnobs {
+    pub owner_grace: Option<Duration>,
+    pub attach_hold: Option<Duration>,
+    pub frozen_owner_clock: bool,
+}
+
+impl OwnershipKnobs {
+    /// Read through `var` so the gate and the parse are testable without
+    /// a process-global environment. Production reads nothing; a value
+    /// that does not parse is named and ignored.
+    pub fn from_env(test_mode: bool, var: impl Fn(&str) -> Option<String>) -> Self {
+        if !test_mode {
+            return Self::default();
+        }
+        let millis = |name: &str| {
+            let raw = var(name)?;
+            match raw.parse::<u64>() {
+                Ok(ms) => Some(Duration::from_millis(ms)),
+                Err(_) => {
+                    warn!(value = %raw, "ignoring an unusable {name}");
+                    None
+                }
+            }
+        };
+        Self {
+            owner_grace: millis(crate::consts::OWNER_GRACE_MS_ENV),
+            attach_hold: millis(crate::consts::ATTACH_HOLD_MS_ENV),
+            frozen_owner_clock: var(crate::consts::OWNER_CLOCK_ENV).as_deref() == Some("frozen"),
+        }
+    }
+
+    fn apply(&self, mut config: ServerVtConfig) -> ServerVtConfig {
+        if let Some(grace) = self.owner_grace {
+            config = config.with_owner_grace(grace);
+        }
+        if let Some(hold) = self.attach_hold {
+            config = config.with_attach_hold(hold);
+        }
+        config.with_frozen_owner_clock(self.frozen_owner_clock)
     }
 }
 
@@ -243,11 +295,13 @@ pub async fn serve(
     let test_mode = config.test_mode;
     supervisor
         .enable_server_vt(
-            ServerVtConfig::new(Arc::clone(&workspace) as Arc<dyn ServerVtWorkspace>)
-                // The capture buffer only grows, so it is test-mode
-                // only — the same gate `tab.capture_pty_input` itself
-                // is behind.
-                .with_input_capture(test_mode),
+            config.ownership.apply(
+                ServerVtConfig::new(Arc::clone(&workspace) as Arc<dyn ServerVtWorkspace>)
+                    // The capture buffer only grows, so it is test-mode
+                    // only — the same gate `tab.capture_pty_input` itself
+                    // is behind.
+                    .with_input_capture(test_mode),
+            ),
         )
         .context("enable the server-VT pipeline")?;
 
@@ -372,7 +426,8 @@ pub async fn serve(
         // A forwarded socket is opened as the forwarding user, so the
         // filesystem mode alone stops nobody once this session is
         // reachable over SSH. The kernel's answer is the one that counts.
-        .require_same_uid();
+        .require_same_uid()
+        .accept_bridge_preamble();
 
     // Recorded from the bound socket, not from the path we asked for:
     // the tail unlinks by identity so a successor that rebinds the same
@@ -670,6 +725,31 @@ mod tests {
         run_stop(&stop, None).await;
 
         assert!(stop.finalized.load(Ordering::Acquire));
+    }
+
+    /// The ownership knobs are test-harness knobs too, and a value that
+    /// is not a count of milliseconds leaves its default in place.
+    #[test]
+    fn the_ownership_knobs_are_test_mode_only_and_parsed_once() {
+        let env = |name: &str| match name {
+            crate::consts::OWNER_GRACE_MS_ENV => Some("250".to_string()),
+            crate::consts::ATTACH_HOLD_MS_ENV => Some("soon".to_string()),
+            crate::consts::OWNER_CLOCK_ENV => Some("frozen".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            OwnershipKnobs::from_env(true, env),
+            OwnershipKnobs {
+                owner_grace: Some(Duration::from_millis(250)),
+                attach_hold: None,
+                frozen_owner_clock: true,
+            }
+        );
+        assert_eq!(
+            OwnershipKnobs::from_env(false, env),
+            OwnershipKnobs::default(),
+            "a production daemon reads none of them"
+        );
     }
 
     /// The knob is a test-harness knob and nothing else: a production

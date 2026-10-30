@@ -380,10 +380,25 @@ derives the tab's state from `agent_lifecycle` + `shell_state` +
 a closed enum, gained `program_status` and `foreign_app`. A Swift UI
 target keeps no records, so its `Tab.state` is never composed. `7` is
 unreleased, so it may still be amended in place under the rule above,
-and it was once: the session socket's `tab.memory_usage` (plan 082 D6)
-rides the same generation rather than spending one of its own, and
-`session.identify.ops.response.v7.json` was re-cut to list it.
-The identify vectors were re-cut at `7`
+and it has been: the session socket's `tab.memory_usage` (plan 082 D6)
+rides the same generation rather than spending one of its own, as do
+`client.hello` and the `client-bridge` preamble (plan 084), and
+`session.identify.ops.response.v7.json` was re-cut to list each new op.
+So does **tab size ownership** (plan 084), which is breaking in both
+directions: the attach handshake's required `focus` is replaced by two
+required fields, `take` and `client_id`, so a pre-amendment client's
+handshake is a `parse-error` naming `take`; the accepted reply gains a
+required `owner`; the data plane's preamble moves to `ROOSTDP3` because
+`INPUT` and `RESIZE` gain a flag byte and `GRID` (server → client),
+`TAKE` and `DETACH` (client → server) are new frame types an older peer
+treats as fatal; a background `tab.resize` of an owned tab is refused
+with the new code `owned`; and the session gains `tab.take_size`,
+`tab.release_size` and the live-only `tab.resized` event (plus two
+test-mode seams). `attach.handshake.unfocused.request.json` was re-cut
+as `attach.handshake.watch.request.json` (`take: false`), the other
+handshake vectors gained `take` and `client_id`, the accepted reply
+gained `owner`, and the ops vector lists the two new ops. The identify
+vectors were re-cut at `7`
 (`session.identify{,.ops,.persist_error}.response.v7.json`) beside the
 frozen `v6` files, and the attach handshake vectors carry `7`.
 

@@ -29,10 +29,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roost_ipc::client::{ClientError, DataConnection, ServerCode, ServerFrame};
-use roost_ipc::messages::{AttachHandshake, AttachHandshakeTerms, AttachPayloadKind};
+use roost_ipc::messages::{
+    AttachHandshake, AttachHandshakeTerms, AttachPayloadKind, SizeOwner, SizeTraceAction,
+};
 use roost_ui_model::keys::TabKey;
 use roost_vt::{HistoryStep, ReadyState, SnapshotDecodeOptions, SnapshotDecoder, Terminal};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::tab_backend::HostDataMsg;
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
@@ -49,6 +51,54 @@ const PAGES_PER_PASS: usize = 8;
 /// forfeits the remaining history pages, so a withheld one is sent when
 /// the hydration completes — but never held longer than this).
 const WITHHOLD_DEADLINE: Duration = Duration::from_secs(2);
+/// How long a detach leaves the data connection's writer to put `DETACH`
+/// on the wire before the attempt is aborted (plan 084 §4.B).
+pub(super) const DETACH_DRAIN: Duration = Duration::from_millis(200);
+
+/// Give every detach queued so far its [`DETACH_DRAIN`] on `runtime`,
+/// from a thread outside it — the window's teardown, after which the
+/// runtime goes. The sleep is built inside the runtime: a timer made
+/// outside one panics.
+pub(super) fn wait_out_detach_drains(runtime: &tokio::runtime::Runtime) {
+    runtime.block_on(async { tokio::time::sleep(DETACH_DRAIN).await });
+}
+
+/// How long a local scroll of another client's tab must hold still
+/// before it takes the tab's size (plan 084 §4.B).
+const SCROLL_SETTLE: Duration = Duration::from_millis(300);
+
+/// [`SCROLL_SETTLE`], or `ROOST_TEST_SCROLL_SETTLE_MS` in test mode.
+/// Read once, at startup.
+pub(super) fn scroll_settle() -> Duration {
+    use crate::host_conn::reconnect::{parse_millis, test_override};
+    parse_millis(
+        test_override("ROOST_TEST_SCROLL_SETTLE_MS").as_deref(),
+        SCROLL_SETTLE,
+    )
+}
+
+/// Attempt numbers, unique across every attach this process makes: a frame
+/// a draining connection of one attach still delivers must never match
+/// the attach that replaced it on the same tab.
+static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_attempt() -> u64 {
+    NEXT_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Why a host tab is being attached (plan 084 D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachIntent {
+    /// The user switched to it: the attach takes the tab's size.
+    Explicit,
+    /// The window attached on its own — a restore, a fallback, a
+    /// re-attach: it takes only a tab nobody sizes.
+    Automatic,
+}
+
+/// A host tab's size-ownership actions, in order, for `host.size_trace`.
+/// Kept by the app across attaches; only in test mode.
+pub(crate) type SizeTrace = Arc<std::sync::Mutex<Vec<SizeTraceAction>>>;
 
 /// Re-attach backoff: base doubling, capped. Deterministic (no jitter):
 /// one client re-attaching one focused tab is not a thundering herd.
@@ -81,12 +131,6 @@ pub(super) struct Geometry {
     pub(crate) rows: u16,
     pub(crate) cell_w: u32,
     pub(crate) cell_h: u32,
-}
-
-impl Geometry {
-    fn grid(&self) -> (u16, u16) {
-        (self.cols, self.rows)
-    }
 }
 
 /// Which of [`CLIENT_PAYLOAD_KINDS`] an attach was accepted as, and so
@@ -174,11 +218,11 @@ pub(crate) enum HostTabFrame {
         fence: u64,
         server_epoch: u64,
         tab_generation: u64,
-        /// The geometry the payload was encoded at, when the session
-        /// says it is not the one this attach asked for — an unfocused
-        /// attach, which resizes nothing. `None` on a focused attach, on
-        /// a resume, and from every session predating `open_input`.
-        snapshot_size: Option<(u16, u16)>,
+        /// The tab's grid as the payload was composed — the PTY's, which
+        /// is this attach's own only when it took the tab.
+        grid: (u16, u16),
+        /// Who sizes the tab, as of the same moment.
+        owner: Option<SizeOwner>,
     },
     /// The attach op or the dial failed before any frame flowed.
     Failed {
@@ -207,6 +251,14 @@ pub(crate) enum HostTabFrame {
         final_seq: u64,
         code: i32,
     },
+    /// A `GRID` frame: the tab's grid or size owner changed, after PTY
+    /// frame `seq` and before the next one.
+    Grid {
+        attempt: u64,
+        seq: u64,
+        grid: (u16, u16),
+        owner: Option<SizeOwner>,
+    },
     /// An `ERROR` frame: the connection closes after it.
     Error {
         attempt: u64,
@@ -228,6 +280,12 @@ pub(crate) enum HostTabFrame {
     /// Self-wake: history pages remain and the per-pass budget was hit.
     StepDecoder {
         attempt: u64,
+    },
+    /// A local scroll held still for [`scroll_settle`]: `generation`
+    /// names the scroll that armed it.
+    ScrollSettled {
+        attempt: u64,
+        generation: u64,
     },
 }
 
@@ -304,11 +362,11 @@ struct Hydration {
     /// fence early would let an aborted hydration "resume" onto a
     /// terminal that never took the snapshot — permanent divergence.
     identity: ResumePoint,
-    /// PTY frames that arrived before the payload could take them,
-    /// replayed in order once it can. The server holds live PTY on its
+    /// PTY and GRID frames that arrived before the payload could take
+    /// them, replayed in order once it can. The server holds both on its
     /// side too, so this is belt-and-braces for the tiny window the two
     /// rules can miss.
-    deferred: VecDeque<Vec<u8>>,
+    deferred: VecDeque<Deferred>,
     /// Bytes queued in `deferred` — bounded, because a server violating
     /// its own hold rule must not grow client memory without limit.
     deferred_bytes: usize,
@@ -323,13 +381,17 @@ struct Hydration {
     /// Bounded stepping left pages behind; a `StepDecoder` self-wake is
     /// in flight.
     stepping: bool,
-    /// The cols/rows the terminal being built here is at — the
-    /// snapshot's own where the session reported one
-    /// (`AttachAccepted.snapshot_cols/rows`), this attach's otherwise.
-    /// What [`HostAttach::finish_hydration`] resizes *from* once the
-    /// payload is whole; nothing else touches it while the hydration
-    /// runs.
+    /// The cols/rows the terminal being built here is at: the
+    /// snapshot's own (`AttachAccepted.snapshot_cols/rows`), then each
+    /// `GRID` the hydration applied. What [`HostAttach::finish_hydration`]
+    /// installs the terminal at.
     built_at: (u16, u16),
+}
+
+/// One frame [`Hydration::deferred`] holds.
+enum Deferred {
+    Pty(Vec<u8>),
+    Grid((u16, u16)),
 }
 
 impl Hydration {
@@ -380,24 +442,27 @@ pub(super) struct HostAttach {
     /// What the last accepted attach on this tab negotiated. `None`
     /// until one has been accepted; read by `host.status`.
     kind: Option<PayloadKind>,
-    /// The latest user resize withheld during hydration (latest-wins).
-    withheld: Option<Geometry>,
-    /// The geometry the current attempt negotiated (or is negotiating).
-    geometry: Geometry,
-    /// The grid the current attempt's handshake carried — what a
-    /// session that answers `resume` wrote the records it replays for.
-    /// The terminal can move past it while the handshake is in flight: a
-    /// resize then is only withheld from the wire.
-    handshake_grid: (u16, u16),
-    /// Whether a RESIZE was queued for the session after the current
-    /// attempt's handshake. The session applies it somewhere among the
-    /// records already in flight, so the records past the resume point
-    /// were written at a grid this client can't identify — and an old
-    /// session's `Accepted` reports only the grid at the handoff, not the
-    /// one each record it replays was written at. So the resume point
-    /// goes no further than this attempt: neither a detach nor a
-    /// re-attach carries it, and the next attach is a snapshot (#564).
-    resized_since_handshake: bool,
+    /// Whether the next handshake takes the tab's size: an explicit
+    /// switch's, until the first handshake the session accepts.
+    take_pending: bool,
+    /// Whether the session has accepted any handshake of this attach.
+    accepted: bool,
+    /// The latest user resize withheld while the stream is not live
+    /// (latest-wins), with the window focus it happened under.
+    withheld: Option<(Geometry, bool)>,
+    /// This window's grid and cells — what the handshake and every
+    /// RESIZE carry. Never the mirror's: the tab's session sizes that.
+    advisory: Geometry,
+    /// The grid the session last said the rendered terminal is at: an
+    /// accepted resume's, a finished hydration's, or a live `GRID`'s.
+    /// `None` until this attach has heard one.
+    pty_grid: Option<(u16, u16)>,
+    /// Who sizes the tab, from the accepted handshake and every `GRID`
+    /// since: the only source the marker reads.
+    owner: Option<SizeOwner>,
+    /// The client this window attaches as — what tells "me" from
+    /// another client in [`Self::owner`].
+    client_id: String,
     /// The persistent input queue: keystrokes survive re-attach windows
     /// here. The sender side also lives in the tab's `TabHandle`.
     input_tx: mpsc::UnboundedSender<HostDataMsg>,
@@ -405,6 +470,18 @@ pub(super) struct HostAttach {
     /// The current attempt's tasks (dial/reader/writer/timers), aborted
     /// wholesale on detach or re-attach.
     tasks: Vec<tokio::task::AbortHandle>,
+    /// The current attempt's data-connection task, kept apart from
+    /// `tasks`: the one a detach lets finish writing `DETACH`.
+    data_task: Option<tokio::task::AbortHandle>,
+    /// Set once this attach is detaching: a dial still waiting for its
+    /// reply writes `DETACH` behind its handshake, and the data task
+    /// stops feeding the frames it still reads, which nothing will apply.
+    detaching: watch::Sender<bool>,
+    /// The settle timer of the last local scroll, and which scroll it
+    /// was armed for.
+    settle: Option<tokio::task::AbortHandle>,
+    settle_generation: u64,
+    trace: Option<SizeTrace>,
     backoff_step: u32,
     /// Permits refused by a full queue since the stream was last Live —
     /// see [`FULL_QUEUE_RETRIES`].
@@ -412,7 +489,7 @@ pub(super) struct HostAttach {
 }
 
 impl HostAttach {
-    pub(super) fn new(key: TabKey, geometry: Geometry) -> Self {
+    pub(super) fn new(key: TabKey, advisory: Geometry, intent: AttachIntent) -> Self {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         Self {
             key,
@@ -420,13 +497,21 @@ impl HostAttach {
             phase: Phase::Requesting,
             resume: None,
             kind: None,
+            take_pending: intent == AttachIntent::Explicit,
+            accepted: false,
             withheld: None,
-            geometry,
-            handshake_grid: geometry.grid(),
-            resized_since_handshake: false,
+            advisory,
+            pty_grid: None,
+            owner: None,
+            client_id: String::new(),
             input_tx,
             input_rx: Arc::new(tokio::sync::Mutex::new(input_rx)),
             tasks: Vec::new(),
+            data_task: None,
+            detaching: watch::Sender::new(false),
+            settle: None,
+            settle_generation: 0,
+            trace: None,
             backoff_step: 0,
             full_refusals: 0,
         }
@@ -439,6 +524,12 @@ impl HostAttach {
         self
     }
 
+    /// Record this attach's size-ownership actions into `trace`.
+    pub(super) fn with_trace(mut self, trace: Option<SizeTrace>) -> Self {
+        self.trace = trace;
+        self
+    }
+
     /// The sender the tab's `TabHandle` queues input on.
     pub(super) fn input_tx(&self) -> mpsc::UnboundedSender<HostDataMsg> {
         self.input_tx.clone()
@@ -448,6 +539,32 @@ impl HostAttach {
     /// `payload_kind` reports.
     pub(super) fn payload_kind(&self) -> Option<PayloadKind> {
         self.kind
+    }
+
+    /// Who sizes the tab, as this attach last heard it.
+    pub(super) fn owner(&self) -> Option<&SizeOwner> {
+        self.owner.as_ref()
+    }
+
+    pub(super) fn is_me(&self, owner: &SizeOwner) -> bool {
+        owner.client_id == self.client_id
+    }
+
+    /// The client sizing the tab, when it is not this window's.
+    pub(super) fn other_owner(&self) -> Option<&SizeOwner> {
+        self.owner.as_ref().filter(|owner| !self.is_me(owner))
+    }
+
+    pub(super) fn owned_by_another(&self) -> bool {
+        self.other_owner().is_some()
+    }
+
+    fn owned_by_me(&self) -> bool {
+        self.owner.as_ref().is_some_and(|owner| self.is_me(owner))
+    }
+
+    fn trace(&self, action: SizeTraceAction) {
+        record(self.trace.as_ref(), action);
     }
 
     /// Whether input queued here still has a reader.
@@ -494,24 +611,23 @@ impl HostAttach {
     /// publishing `Connected` and publishing its facts, which is a
     /// "not yet", not a refusal — the attempt fails retryably and the
     /// ordinary backoff picks it up.
+    #[allow(clippy::too_many_arguments)] // One attempt's whole context, as the app holds it.
     pub(super) fn begin(
         &mut self,
         ops: &HostOps,
         session_id: Option<&str>,
         socket: std::path::PathBuf,
         libghostty_build: &str,
+        client_id: &str,
         feed: &EngineFeedSender,
     ) {
         self.abort_tasks();
-        self.attempt += 1;
+        self.attempt = next_attempt();
         self.phase = Phase::Requesting;
+        self.client_id = client_id.to_string();
         let attempt = self.attempt;
         let key = self.key;
-        let geometry = self.geometry;
-        self.handshake_grid = geometry.grid();
-        if std::mem::take(&mut self.resized_since_handshake) {
-            self.resume = None;
-        }
+        let advisory = self.advisory;
         let resume = self.resume;
         let Some(session_id) = session_id else {
             feed.send(EngineFeed::HostTab(
@@ -528,15 +644,15 @@ impl HostAttach {
         let terms = AttachHandshakeTerms {
             session_id: session_id.to_string(),
             kinds: CLIENT_PAYLOAD_KINDS.map(AttachPayloadKind::from).to_vec(),
-            cols: geometry.cols,
-            rows: geometry.rows,
-            cell_w_px: cell_px(geometry.cell_w),
-            cell_h_px: cell_px(geometry.cell_h),
+            cols: advisory.cols,
+            rows: advisory.rows,
+            cell_w_px: cell_px(advisory.cell_w),
+            cell_h_px: cell_px(advisory.cell_h),
             libghostty_build: libghostty_build.to_string(),
-            // Attach is on-focus in this client, so the claim is always
-            // true.
-            focus: true,
+            take: self.take_pending,
+            client_id: client_id.to_string(),
         };
+        self.trace(SizeTraceAction::AttachSent { take: terms.take });
         let dial = Dial {
             socket,
             handshake: choose_handshake(key.tab, terms, resume),
@@ -553,9 +669,24 @@ impl HostAttach {
             permit,
             dial,
             input_rx,
+            self.detaching.subscribe(),
             feed.clone(),
         ));
-        self.tasks.push(task.abort_handle());
+        self.data_task = Some(task.abort_handle());
+    }
+
+    /// An explicit switch to a tab this attach is already for. An attach
+    /// the window made on its own that no handshake of has been accepted
+    /// yet becomes the switch's — it will take the size — and reports so,
+    /// for the caller to dial again with that intent; one the session has
+    /// accepted is an established attachment, which re-selecting leaves
+    /// alone (Take size is for that).
+    pub(super) fn make_explicit(&mut self) -> bool {
+        if self.accepted || self.take_pending {
+            return false;
+        }
+        self.take_pending = true;
+        true
     }
 
     /// Arm the re-attach backoff timer: one `ReattachDue` for the
@@ -575,43 +706,81 @@ impl HostAttach {
         // the end of the attempt: there is nothing left to abort in a
         // timer that already sent.
         self.tasks.retain(|task| !task.is_finished());
-        let key = self.key;
-        let feed = feed.clone();
-        let timer = tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            feed.send(EngineFeed::HostTab(key, frame));
-        });
-        self.tasks.push(timer.abort_handle());
+        let timer = spawn_after(delay, self.key, feed, frame);
+        self.tasks.push(timer);
     }
 
     /// Adopt `geometry` and queue its RESIZE behind whatever input is
     /// already waiting, so the wire sees the two in submission order.
-    fn queue_geometry(&mut self, geometry: Geometry) {
-        self.geometry = geometry;
-        self.resized_since_handshake = true;
+    fn queue_geometry(&mut self, geometry: Geometry, focused: bool) {
+        self.advisory = geometry;
+        self.trace(SizeTraceAction::ResizeSent { focused });
         let _ = self.input_tx.send(HostDataMsg::Resize {
             cols: geometry.cols,
             rows: geometry.rows,
             cell_w: geometry.cell_w,
             cell_h: geometry.cell_h,
+            focused,
         });
     }
 
-    /// A user resize while attached. Live: queued onto the wire in order
-    /// with input. Hydrating: withheld (latest-wins) — sent at FINISH or
-    /// at the 2 s deadline, because a mid-snapshot resize forfeits the
-    /// remaining history pages.
-    pub(super) fn note_resize(&mut self, geometry: Geometry) {
-        if geometry == self.geometry {
-            return;
-        }
+    /// A window resize while attached, and whether the window had focus
+    /// when it happened. Live: queued onto the wire in order with input.
+    /// Requesting or hydrating: withheld (latest-wins) — sent once the
+    /// stream is live or at the 2 s deadline, because a resize that
+    /// moves the tab mid-snapshot forfeits the remaining history pages.
+    ///
+    /// A focused resize of a tab this window does not size is a deliberate
+    /// take even at the grid already advertised — a font change that
+    /// lands on the same cells, a drag that comes back to where it began —
+    /// so only an unfocused or already-owned one at that grid is dropped.
+    pub(super) fn note_resize(&mut self, geometry: Geometry, focused: bool) {
+        let news = geometry != self.advisory || (focused && !self.owned_by_me());
         match &self.phase {
-            Phase::Live => self.queue_geometry(geometry),
+            Phase::Live => {
+                if news {
+                    self.queue_geometry(geometry, focused);
+                }
+            }
             Phase::Requesting | Phase::Hydrating(_) => {
-                self.withheld = Some(geometry);
+                self.withheld = news.then_some((geometry, focused));
             }
             Phase::Ended => {}
         }
+    }
+
+    /// Ask the session for the tab's size at this window's grid.
+    pub(super) fn take(&mut self) {
+        self.trace(SizeTraceAction::TakeSent);
+        let _ = self.input_tx.send(HostDataMsg::Take);
+    }
+
+    /// A copy captured its text off this tab's mirror. Another client's
+    /// tab is taken after the capture, so the copy holds the text as it
+    /// was laid out when the user chose it (plan 084 D6).
+    pub(super) fn copied(&mut self) {
+        self.trace(SizeTraceAction::CopyCaptured);
+        if !self.owned_by_me() {
+            self.take();
+        }
+    }
+
+    /// The viewport moved locally. On another client's tab, a scroll
+    /// that then holds still for `settle` takes the size; each further
+    /// scroll starts the wait over.
+    pub(super) fn scrolled(&mut self, settle: Duration, feed: &EngineFeedSender) {
+        if self.owned_by_me() {
+            return;
+        }
+        if let Some(previous) = self.settle.take() {
+            previous.abort();
+        }
+        self.settle_generation += 1;
+        let frame = HostTabFrame::ScrollSettled {
+            attempt: self.attempt,
+            generation: self.settle_generation,
+        };
+        self.settle = Some(spawn_after(settle, self.key, feed, frame));
     }
 
     /// Drive one feed frame through the machine. `tab` is this tab's
@@ -635,13 +804,21 @@ impl HostAttach {
                 fence,
                 server_epoch,
                 tab_generation,
-                snapshot_size,
+                grid,
+                owner,
                 ..
             } => {
-                if resumed && !resume_survives_regrid(self.handshake_grid, tab.grid()) {
-                    return self.discard_resume(tab.grid());
+                // The session committed the explicit switch this attach was
+                // made for: every attach after this one is the window's own,
+                // however this one ends.
+                self.take_pending = false;
+                self.accepted = true;
+                self.trace(SizeTraceAction::AttachAccepted { resumed });
+                if resumed && !resume_survives_regrid(tab.grid(), grid) {
+                    return self.discard_resume();
                 }
                 self.kind = Some(kind);
+                self.owner = owner;
                 let identity = ResumePoint {
                     server_epoch,
                     tab_generation,
@@ -654,28 +831,19 @@ impl HostAttach {
                     // why the fence installs immediately here but only
                     // at FINISH in snapshot mode.
                     self.resume = Some(identity);
+                    self.pty_grid = Some(grid);
                     // Reaching Live is what resets the backoff ladder —
                     // a mere accept from a server that then dies would
                     // otherwise hot-loop at the base delay.
                     self.reset_ladder();
                     self.phase = Phase::Live;
-                    if let Some(geometry) = self.withheld.take() {
-                        // A stale withhold from a previous attempt's
-                        // hydration: send it now, it gates nothing.
-                        self.note_resize(geometry);
-                    }
+                    self.flush_withheld();
                 } else {
-                    // The payload's own geometry when the session named
-                    // one, this attach's otherwise. A session names it
-                    // whenever it can — this attach's own request is no
-                    // evidence, because raw input is open and anything
-                    // else may have sized the tab between the resize and
-                    // the encode. Replaying a payload composed at
-                    // another width into a terminal of this width wraps
-                    // its lines and misplaces its absolute cursor moves,
-                    // so the terminal is built at the payload's size and
-                    // resized to this client's afterwards.
-                    let built_at = snapshot_size.unwrap_or(self.geometry.grid());
+                    // Built at the payload's own grid, which is the
+                    // tab's: replaying a payload composed at another
+                    // width into a terminal of this width wraps its
+                    // lines and misplaces its absolute cursor moves.
+                    let built_at = grid;
                     let hydrator = match kind {
                         PayloadKind::GhosttySnapshot => Hydrator::Snapshot(SnapshotDecoder::new(
                             SnapshotDecodeOptions::default(),
@@ -714,7 +882,7 @@ impl HostAttach {
                         HostTabFrame::WithholdDeadline { attempt },
                     );
                 }
-                AttachStep::None
+                AttachStep::Refresh
             }
             HostTabFrame::Failed { reason, .. } => self.apply_failure(reason),
             HostTabFrame::PermitRefused { error, .. } => {
@@ -723,6 +891,9 @@ impl HostAttach {
             }
             HostTabFrame::Snap { bytes, .. } => self.apply_snap(&bytes, tab, feed),
             HostTabFrame::Pty { seq, bytes, .. } => self.apply_pty(seq, bytes, tab),
+            HostTabFrame::Grid {
+                seq, grid, owner, ..
+            } => self.apply_grid(seq, grid, owner, tab),
             HostTabFrame::Exit {
                 final_seq, code, ..
             } => {
@@ -765,51 +936,22 @@ impl HostAttach {
                 delay: Duration::ZERO,
             },
             HostTabFrame::WithholdDeadline { .. } => {
-                // Still hydrating with a resize on hold: stop holding.
-                let Phase::Hydrating(hydration) = &mut self.phase else {
+                if !matches!(self.phase, Phase::Hydrating(_)) {
                     return AttachStep::None;
-                };
-                let Some(geometry) = self.withheld.take() else {
-                    // Nothing on hold *yet*. What this bounds is the
-                    // hold, not the attach, so the next deadline is
-                    // armed here: a hydration outlives this one (a `vt`
-                    // payload by its whole length), and a resize
-                    // arriving from now on would otherwise have nothing
-                    // left to act on it until the payload ended.
-                    let attempt = self.attempt;
-                    self.arm_timer(
-                        WITHHOLD_DEADLINE,
-                        feed,
-                        HostTabFrame::WithholdDeadline { attempt },
-                    );
-                    return AttachStep::None;
-                };
-                let Some(decoder) = hydration.live_decoder() else {
-                    // Nothing to mirror it onto: a decoder short of READY
-                    // has no screen yet, and a `vt` payload was composed
-                    // for the attach geometry and cannot be re-cut.
-                    // Attach fresh at the new size — attach is when the
-                    // server resizes.
-                    tracing::debug!(key = %self.key, "withhold deadline with no hydration to mirror it; re-attaching at the new size");
-                    self.geometry = geometry;
-                    return self.schedule_reattach();
-                };
-                // The decoder mirrors the resize before the RESIZE goes
-                // out — the remaining history pages are forfeited, which
-                // the decoder reports as zero-row pages (snapshot.h). A
-                // decoder that refuses leaves the wire untouched: the
-                // stream is about to be replaced anyway.
-                if let Err(error) = decoder.resize(
-                    geometry.cols,
-                    geometry.rows,
-                    geometry.cell_w,
-                    geometry.cell_h,
-                ) {
-                    tracing::debug!(key = %self.key, %error, "decoder resize failed; re-attaching");
-                    self.geometry = geometry;
-                    return self.schedule_reattach();
                 }
-                self.queue_geometry(geometry);
+                // Bound the hold, not the hydration: the resize goes to
+                // the session now, and any `GRID` it brings back applies
+                // to the payload at its place in the stream — forfeiting
+                // the history pages still to come, which is the price of
+                // not holding the user's geometry hostage. The next
+                // deadline covers whatever is withheld from here on.
+                self.flush_withheld();
+                let attempt = self.attempt;
+                self.arm_timer(
+                    WITHHOLD_DEADLINE,
+                    feed,
+                    HostTabFrame::WithholdDeadline { attempt },
+                );
                 AttachStep::None
             }
             HostTabFrame::StepDecoder { .. } => {
@@ -818,6 +960,29 @@ impl HostAttach {
                 }
                 self.drive_decoder(tab, feed)
             }
+            HostTabFrame::ScrollSettled { generation, .. } => {
+                if generation == self.settle_generation && self.owned_by_another() {
+                    self.take();
+                }
+                AttachStep::None
+            }
+        }
+    }
+
+    /// Stop a pending scroll settle, including one whose frame is already
+    /// on the feed: an attempt that ended takes nothing on the next one's
+    /// behalf.
+    fn cancel_settle(&mut self) {
+        if let Some(settle) = self.settle.take() {
+            settle.abort();
+        }
+        self.settle_generation += 1;
+    }
+
+    /// Send the withheld resize, if any.
+    fn flush_withheld(&mut self) {
+        if let Some((geometry, focused)) = self.withheld.take() {
+            self.queue_geometry(geometry, focused);
         }
     }
 
@@ -825,45 +990,75 @@ impl HostAttach {
     /// decoder on this thread — never dropping it mid-`feed` from an
     /// aborted task, which is why the decoder lives here and not there.
     ///
-    /// The resume point survives in the return value only while no
-    /// RESIZE went after the handshake and `kept`, the grid of the
-    /// terminal the tab keeps, is still the handshake's. A resize
-    /// withheld behind a handshake that never landed, or a re-grid that
-    /// sent no RESIZE, leaves the session writing for a grid the kept
-    /// terminal has left.
+    /// The resume point survives in the return value only while `kept`,
+    /// the grid of the terminal the tab keeps, is the one the session
+    /// last said it is at: the records past the point were written for
+    /// that grid.
     pub(super) fn detach(mut self, kept: Option<(u16, u16)>) -> Option<ResumePoint> {
-        self.abort_tasks();
+        if matches!(self.phase, Phase::Ended) {
+            self.abort_tasks();
+        } else {
+            self.detach_on_the_wire();
+        }
         if let Phase::Hydrating(hydration) = std::mem::replace(&mut self.phase, Phase::Ended) {
             hydration.hydrator.abandon();
         }
-        let given = self.handshake_grid;
+        let given = self.pty_grid;
         self.resume.filter(|_| {
-            !self.resized_since_handshake
-                && kept.is_some_and(|kept| resume_survives_regrid(given, kept))
+            kept.is_some_and(|kept| given.is_none_or(|given| resume_survives_regrid(given, kept)))
         })
     }
 
-    /// Refuse an accepted resume written for [`Self::handshake_grid`]
-    /// once the terminal has left it: the attempt ends, and a fresh one
-    /// goes at the terminal's grid with no resume point — a snapshot.
-    fn discard_resume(&mut self, grid: (u16, u16)) -> AttachStep {
-        tracing::debug!(key = %self.key, "a resume for a grid the terminal has left; attaching fresh");
+    /// Refuse an accepted resume written for a grid the terminal is not
+    /// at: the attempt ends, and a fresh one goes with no resume point —
+    /// a snapshot.
+    fn discard_resume(&mut self) -> AttachStep {
+        tracing::debug!(key = %self.key, "a resume for a grid the terminal is not at; attaching fresh");
         self.abort_tasks();
         self.resume = None;
-        let latest = self.withheld.take().unwrap_or(self.geometry);
-        self.geometry = Geometry {
-            cols: grid.0,
-            rows: grid.1,
-            ..latest
-        };
         AttachStep::Reattach {
             delay: Duration::ZERO,
         }
     }
 
     fn abort_tasks(&mut self) {
+        if let Some(task) = self.data_task.take() {
+            task.abort();
+        }
+        self.cancel_settle();
         for task in self.tasks.drain(..) {
             task.abort();
+        }
+    }
+
+    /// Tell the session this is a deliberate detach, so it hands the
+    /// tab's size on at once instead of holding it for this client's
+    /// grace: `DETACH` is queued behind whatever input is waiting (or,
+    /// for a dial still waiting on its reply, written right behind its
+    /// handshake), the data task gets [`DETACH_DRAIN`] to write it, and
+    /// everything else goes now. Outside a runtime there is nothing to
+    /// wait on, and the detach is the disconnect it always was.
+    fn detach_on_the_wire(&mut self) {
+        self.trace(SizeTraceAction::DetachSent);
+        self.detaching.send_replace(true);
+        let _ = self.input_tx.send(HostDataMsg::Detach);
+        if let Some(settle) = self.settle.take() {
+            settle.abort();
+        }
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        let Some(data_task) = self.data_task.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    tokio::time::sleep(DETACH_DRAIN).await;
+                    data_task.abort();
+                });
+            }
+            Err(_) => data_task.abort(),
         }
     }
 
@@ -945,6 +1140,7 @@ impl HostAttach {
         tab: &mut super::terminal_tab::TerminalTab,
         feed: &EngineFeedSender,
     ) -> AttachStep {
+        let cells = self.advisory;
         let Phase::Hydrating(hydration) = &mut self.phase else {
             // SNAP outside hydration — including a non-empty one after a
             // `vt` terminator: the stream is confused. Rebuild.
@@ -961,7 +1157,22 @@ impl HostAttach {
                 // server held behind it goes in now, in arrival order —
                 // the same replay READY does on the other arm.
                 while let Some(deferred) = hydration.deferred.pop_front() {
-                    terminal.vt_write(&deferred);
+                    match deferred {
+                        Deferred::Pty(bytes) => terminal.vt_write(&bytes),
+                        Deferred::Grid(grid) => {
+                            if let Err(error) = terminal.resize(
+                                grid.0,
+                                grid.1,
+                                cells.cell_w.max(1),
+                                cells.cell_h.max(1),
+                            ) {
+                                tracing::debug!(key = %self.key, %error, "deferred GRID failed; re-attaching");
+                                return self.schedule_reattach();
+                            }
+                            hydration.built_at = grid;
+                            trace_grid(self.trace.as_ref(), grid);
+                        }
+                    }
                 }
                 self.finish_hydration(tab)
             }
@@ -976,11 +1187,19 @@ impl HostAttach {
                         Ok(ReadyState::Ready) => {
                             hydration.ready = true;
                             // Replay the deferral in arrival order —
-                            // these are live bytes from after the
+                            // these are live frames from after the
                             // snapshot's fence, and the decoder
                             // interleaves them correctly from READY.
-                            while let Some(bytes) = hydration.deferred.pop_front() {
-                                if let Err(error) = decoder.vt_write(&bytes) {
+                            while let Some(deferred) = hydration.deferred.pop_front() {
+                                let applied = match deferred {
+                                    Deferred::Pty(bytes) => decoder.vt_write(&bytes),
+                                    Deferred::Grid(grid) => {
+                                        hydration.built_at = grid;
+                                        trace_grid(self.trace.as_ref(), grid);
+                                        decoder.resize(grid.0, grid.1, cells.cell_w, cells.cell_h)
+                                    }
+                                };
+                                if let Err(error) = applied {
                                     tracing::debug!(key = %self.key, %error, "deferred replay failed; re-attaching");
                                     return self.schedule_reattach();
                                 }
@@ -997,24 +1216,33 @@ impl HostAttach {
         }
     }
 
-    fn apply_pty(
-        &mut self,
-        seq: u64,
-        bytes: Vec<u8>,
-        tab: &mut super::terminal_tab::TerminalTab,
-    ) -> AttachStep {
+    /// Check a frame's place in the stream: `seq` must be the one the
+    /// next PTY frame carries (or, for a `GRID`, the one before it).
+    fn in_sequence(&mut self, seq: u64, what: &str) -> Result<(), AttachStep> {
         let Some(expected) = self.expected_next_seq() else {
-            tracing::debug!(key = %self.key, "PTY before an accepted handshake; re-attaching");
-            return self.schedule_reattach();
+            tracing::debug!(key = %self.key, "{what} before an accepted handshake; re-attaching");
+            return Err(self.schedule_reattach());
         };
         if seq != expected {
             // A gap or a duplicate: the terminal would silently diverge
             // and could never tell. Fatal by contract; re-attach.
             tracing::debug!(
                 key = %self.key, seq, expected,
-                "PTY seq discontinuity; re-attaching"
+                "{what} seq discontinuity; re-attaching"
             );
-            return self.schedule_reattach();
+            return Err(self.schedule_reattach());
+        }
+        Ok(())
+    }
+
+    fn apply_pty(
+        &mut self,
+        seq: u64,
+        bytes: Vec<u8>,
+        tab: &mut super::terminal_tab::TerminalTab,
+    ) -> AttachStep {
+        if let Err(step) = self.in_sequence(seq, "PTY") {
+            return step;
         }
         match &mut self.phase {
             Phase::Hydrating(hydration) => {
@@ -1041,7 +1269,7 @@ impl HostAttach {
                             );
                             return self.schedule_reattach();
                         }
-                        hydration.deferred.push_back(bytes);
+                        hydration.deferred.push_back(Deferred::Pty(bytes));
                         AttachStep::None
                     }
                 }
@@ -1052,6 +1280,52 @@ impl HostAttach {
                 };
                 resume.next_seq += 1;
                 tab.write_vt(&bytes);
+                AttachStep::Refresh
+            }
+            Phase::Requesting | Phase::Ended => AttachStep::None,
+        }
+    }
+
+    /// Follow a `GRID`: the mirror takes the tab's grid at the frame's
+    /// place in the stream (plan 084 D6) — the hydrating terminal while
+    /// a payload is in flight, the rendered one once live. Never echoed:
+    /// the window's own grid stays what it is, and no RESIZE goes out.
+    fn apply_grid(
+        &mut self,
+        seq: u64,
+        grid: (u16, u16),
+        owner: Option<SizeOwner>,
+        tab: &mut super::terminal_tab::TerminalTab,
+    ) -> AttachStep {
+        if let Err(step) = self.in_sequence(seq.saturating_add(1), "GRID") {
+            return step;
+        }
+        self.owner = owner;
+        let cells = self.advisory;
+        match &mut self.phase {
+            Phase::Hydrating(hydration) => {
+                let Some(decoder) = hydration.live_decoder() else {
+                    hydration.deferred.push_back(Deferred::Grid(grid));
+                    return AttachStep::Refresh;
+                };
+                // A resize mid-history forfeits the pages still to come,
+                // which the decoder reports as zero-row pages.
+                if let Err(error) = decoder.resize(grid.0, grid.1, cells.cell_w, cells.cell_h) {
+                    tracing::debug!(key = %self.key, %error, "decoder GRID failed; re-attaching");
+                    return self.schedule_reattach();
+                }
+                hydration.built_at = grid;
+                trace_grid(self.trace.as_ref(), grid);
+                AttachStep::Refresh
+            }
+            Phase::Live => {
+                if let Err(error) = tab.resize_for_host(grid.0, grid.1, cells.cell_w, cells.cell_h)
+                {
+                    tracing::warn!(key = %self.key, %error, "mirror GRID failed; re-attaching");
+                    return self.schedule_reattach();
+                }
+                self.pty_grid = Some(grid);
+                trace_grid(self.trace.as_ref(), grid);
                 AttachStep::Refresh
             }
             Phase::Requesting | Phase::Ended => AttachStep::None,
@@ -1114,6 +1388,9 @@ impl HostAttach {
             // bytes are in this terminal.
             Hydrator::Vt(terminal) => terminal,
         };
+        // At the grid the payload ended at — its own, or the last GRID
+        // the hydration applied. The mirror is the tab's grid; the
+        // window draws it at whatever offset that takes.
         if let Err(error) = tab.swap_terminal(terminal, built_at.0, built_at.1) {
             tracing::warn!(key = %self.key, %error, "hydrated terminal swap failed; re-attaching");
             return self.schedule_reattach();
@@ -1122,31 +1399,42 @@ impl HostAttach {
         // terminal — this is what makes an aborted hydration resume from
         // the OLD point instead of claiming bytes it never applied.
         self.resume = Some(identity);
+        self.pty_grid = Some(built_at);
         // The stream proved itself end to end; the next failure starts
         // the ladder from the bottom.
         self.reset_ladder();
-        if let Some(geometry) = self.withheld.take() {
-            // Held through hydration; send it now, in order behind any
-            // buffered input.
-            self.queue_geometry(geometry);
-        }
-        // The swapped-in terminal is at the geometry its payload was
-        // composed for, which is not always this client's: a resize
-        // withheld through the hydration has just moved it, and an
-        // unfocused attach hydrated at the snapshot's own size. Either
-        // way nothing else would ever correct it — no later resize pass
-        // runs unless the window moves again.
-        let target = self.geometry;
-        if built_at != target.grid() {
-            if let Err(error) =
-                tab.resize_for_host(target.cols, target.rows, target.cell_w, target.cell_h)
-            {
-                tracing::warn!(key = %self.key, %error, "post-swap resize failed; re-attaching");
-                return self.schedule_reattach();
-            }
-        }
+        // Held through hydration; send it now, in order behind any
+        // buffered input.
+        self.flush_withheld();
         AttachStep::Refresh
     }
+}
+
+/// Append `action` to `trace`, when the trace is on.
+fn record(trace: Option<&SizeTrace>, action: SizeTraceAction) {
+    if let Some(Ok(mut trace)) = trace.map(|trace| trace.lock()) {
+        trace.push(action);
+    }
+}
+
+fn trace_grid(trace: Option<&SizeTrace>, (cols, rows): (u16, u16)) {
+    record(trace, SizeTraceAction::GridApplied { cols, rows });
+}
+
+/// Put `frame` on the feed after `delay`. Must be called inside the app
+/// runtime.
+fn spawn_after(
+    delay: Duration,
+    key: TabKey,
+    feed: &EngineFeedSender,
+    frame: HostTabFrame,
+) -> tokio::task::AbortHandle {
+    let feed = feed.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        feed.send(EngineFeed::HostTab(key, frame));
+    })
+    .abort_handle()
 }
 
 /// Whether a `tab.dump` the engine flagged `defer_unless_streaming` is
@@ -1168,11 +1456,13 @@ fn frame_attempt(frame: &HostTabFrame) -> u64 {
         | HostTabFrame::Snap { attempt, .. }
         | HostTabFrame::Pty { attempt, .. }
         | HostTabFrame::Exit { attempt, .. }
+        | HostTabFrame::Grid { attempt, .. }
         | HostTabFrame::Error { attempt, .. }
         | HostTabFrame::Closed { attempt }
         | HostTabFrame::ReattachDue { attempt }
         | HostTabFrame::WithholdDeadline { attempt }
-        | HostTabFrame::StepDecoder { attempt } => *attempt,
+        | HostTabFrame::StepDecoder { attempt }
+        | HostTabFrame::ScrollSettled { attempt, .. } => *attempt,
     }
 }
 
@@ -1296,25 +1586,29 @@ async fn run_attempt(
     permit: impl std::future::Future<Output = Result<AttachPermit, HostOpError>>,
     dial: Dial,
     input_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<HostDataMsg>>>,
+    detaching: watch::Receiver<bool>,
     feed: EngineFeedSender,
 ) {
     let Dial { socket, handshake } = dial;
-    let fail = |reason: FailReason, feed: &EngineFeedSender| {
-        feed.send(EngineFeed::HostTab(
-            key,
-            HostTabFrame::Failed { attempt, reason },
-        ));
+    // Once the attach is detaching nothing it says applies to anything:
+    // the tab may already be on a new attach that this attempt's frames
+    // would corrupt.
+    let publish = |frame: HostTabFrame| {
+        if !*detaching.borrow() {
+            feed.send(EngineFeed::HostTab(key, frame));
+        }
     };
-    let refused = |error: HostOpError, feed: &EngineFeedSender| {
-        feed.send(EngineFeed::HostTab(
-            key,
-            HostTabFrame::PermitRefused { attempt, error },
-        ));
-    };
+    let fail = |reason: FailReason| publish(HostTabFrame::Failed { attempt, reason });
+    let refused = |error: HostOpError| publish(HostTabFrame::PermitRefused { attempt, error });
     let permit = match permit.await {
         Ok(permit) => permit,
-        Err(error) => return refused(error, &feed),
+        Err(error) => return refused(error),
     };
+    // Detached while it queued: nothing has reached the session to
+    // cancel, and nothing should.
+    if *detaching.borrow() {
+        return;
+    }
     // Bounded, on the same budget a control leg gets. `DataConnection::dial`
     // has no timeout of its own, and the socket it dials is not always a
     // local one: over the ssh transport it is a bridge whose accept is a
@@ -1323,48 +1617,83 @@ async fn run_attempt(
     // timeout is a failed dial like any other — retryable, and the
     // re-attach backoff decides what happens next.
     let budget = crate::host_conn::leg_budget();
+    // The accept is published the moment its line is parsed: the session
+    // committed the attach when it wrote it, so the explicit intent is
+    // spent even if the preamble behind it never comes.
+    let decodable = std::sync::atomic::AtomicBool::new(false);
+    let announce =
+        |accepted: &roost_ipc::messages::AttachAccepted| match negotiated_kind(&accepted.kind) {
+            Ok(kind) => {
+                decodable.store(true, std::sync::atomic::Ordering::Relaxed);
+                publish(HostTabFrame::Accepted {
+                    attempt,
+                    resumed: accepted.mode == roost_ipc::messages::AttachMode::Resume,
+                    kind,
+                    fence: accepted.seq,
+                    server_epoch: accepted.server_epoch,
+                    tab_generation: accepted.tab_generation,
+                    grid: (accepted.snapshot_cols, accepted.snapshot_rows),
+                    owner: accepted.owner.clone(),
+                });
+            }
+            Err(message) => fail(FailReason::Retryable(message)),
+        };
     // Through the permit, never beside it: the grant said where the
     // queue stood, and the connection it was granted for can end before
     // this opens anything ([`AttachPermit::guarding`]).
     let dialed = permit
         .guarding(tokio::time::timeout(
             budget,
-            DataConnection::dial(&socket, &handshake),
+            DataConnection::dial_unless(
+                &socket,
+                &handshake,
+                until_detached(detaching.clone()),
+                announce,
+            ),
         ))
         .await;
-    let (accepted, conn) = match dialed {
-        Ok(Ok(Ok(accepted))) => accepted,
-        Ok(Ok(Err(error))) => return fail(classify_failure(&error), &feed),
+    let conn = match dialed {
+        Ok(Ok(Ok(Some((_, conn))))) => conn,
+        // Detached on the way: `DETACH` went out behind the handshake
+        // line, and nothing will apply what the session answers.
+        Ok(Ok(Ok(None))) => return,
+        Ok(Ok(Err(error))) => return fail(classify_failure(&error)),
         Ok(Err(_elapsed)) => {
-            return fail(
-                FailReason::Retryable(format!(
-                    "attaching to {} timed out after {}s",
-                    socket.display(),
-                    budget.as_secs().max(1)
-                )),
-                &feed,
-            )
+            return fail(FailReason::Retryable(format!(
+                "attaching to {} timed out after {}s",
+                socket.display(),
+                budget.as_secs().max(1)
+            )))
         }
         // Refused by the fence: the connection this attach was admitted
         // for is gone.
-        Err(error) => return refused(error, &feed),
+        Err(error) => return refused(error),
     };
-    let kind = match negotiated_kind(&accepted.kind) {
-        Ok(kind) => kind,
-        Err(message) => return fail(FailReason::Retryable(message), &feed),
-    };
-    feed.send(EngineFeed::HostTab(
-        key,
-        HostTabFrame::Accepted {
-            attempt,
-            resumed: accepted.mode == roost_ipc::messages::AttachMode::Resume,
-            kind,
-            fence: accepted.seq,
-            server_epoch: accepted.server_epoch,
-            tab_generation: accepted.tab_generation,
-            snapshot_size: Some((accepted.snapshot_cols, accepted.snapshot_rows)),
-        },
-    ));
+    if !decodable.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut rx = input_rx.lock().await;
+    stream_attempt(key, attempt, conn, &mut rx, &detaching, &feed).await;
+}
+
+/// Resolves once the attach is detaching — never, for one whose state was
+/// dropped without a detach.
+async fn until_detached(mut detaching: watch::Receiver<bool>) {
+    if detaching.wait_for(|detaching| *detaching).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// One accepted attempt's connection, until its reader ends it — or, once
+/// the attach is detaching, until `DETACH` is written.
+async fn stream_attempt(
+    key: TabKey,
+    attempt: u64,
+    conn: DataConnection,
+    rx: &mut mpsc::UnboundedReceiver<HostDataMsg>,
+    detaching: &watch::Receiver<bool>,
+    feed: &EngineFeedSender,
+) {
     let (mut reader, mut writer) = conn.into_split();
     // Both halves are futures of THIS task rather than spawned children,
     // so aborting the attempt takes the writer with it and releases the
@@ -1375,7 +1704,7 @@ async fn run_attempt(
     // The lock serializes attempts over the persistent queue: a
     // previous attempt's writer holds it until dropped, and this one
     // takes over draining the same keystrokes.
-    let mut rx = input_rx.lock().await;
+    //
     // ONE loop over both halves, and only the READER decides when the
     // attempt is over. A write error just parks the writer branch: the
     // server labels its closes (`superseded`, `ERROR`
@@ -1386,6 +1715,11 @@ async fn run_attempt(
     loop {
         tokio::select! {
             read = read_server_frame(&mut reader) => match read {
+                // Draining for its `DETACH` only: whatever it reads, its own
+                // end included, is no news for a tab whose next attach may
+                // already be on this attempt number.
+                Ok(Some(_)) if *detaching.borrow() => {}
+                _ if *detaching.borrow() => return,
                 Ok(Some(frame)) => {
                     let done = matches!(frame, ServerFrame::Exit { .. } | ServerFrame::Error(_));
                     feed.send(EngineFeed::HostTab(key, lift_frame(attempt, frame)));
@@ -1411,16 +1745,24 @@ async fn run_attempt(
                     continue;
                 };
                 let outcome = match msg {
-                    HostDataMsg::Input(bytes) => writer.send_input(&bytes).await,
+                    HostDataMsg::Input { bytes, take } => writer.send_input(&bytes, take).await,
                     HostDataMsg::Resize {
                         cols,
                         rows,
                         cell_w,
                         cell_h,
+                        focused,
                     } => {
                         writer
-                            .send_resize(cols, rows, cell_w as u16, cell_h as u16)
+                            .send_resize(cols, rows, cell_px(cell_w), cell_px(cell_h), focused)
                             .await
+                    }
+                    HostDataMsg::Take => writer.send_take().await,
+                    // Terminal on the wire: nothing more is written, and
+                    // the attempt is over.
+                    HostDataMsg::Detach => {
+                        let _ = writer.send_detach().await;
+                        return;
                     }
                 };
                 if outcome.is_err() {
@@ -1458,6 +1800,12 @@ fn lift_frame(attempt: u64, frame: ServerFrame) -> HostTabFrame {
             code: error.code,
             message: error.message,
         },
+        ServerFrame::Grid(grid) => HostTabFrame::Grid {
+            attempt,
+            seq: grid.seq,
+            grid: (grid.cols, grid.rows),
+            owner: grid.owner,
+        },
     }
 }
 
@@ -1466,6 +1814,7 @@ mod tests {
     use roost_ui_model::keys::HostId;
     use roost_vt::{Terminal, TerminalOptions};
 
+    use super::super::Regrid;
     use super::*;
     use crate::app::terminal_tab::TerminalTab;
     use crate::engine_feed::{self, EngineFeedReceiver};
@@ -1478,8 +1827,44 @@ mod tests {
         cell_h: 18,
     };
 
+    impl Geometry {
+        fn grid(&self) -> (u16, u16) {
+            (self.cols, self.rows)
+        }
+    }
+
     fn key() -> TabKey {
         TabKey::new(HostId::new(3), 7)
+    }
+
+    /// This window's client id, and another client's.
+    const ME: &str = "iced-test";
+    const DESK: &str = "desk-1";
+
+    fn owner(client_id: &str) -> Option<SizeOwner> {
+        Some(SizeOwner {
+            client_id: client_id.into(),
+            label: format!("{client_id}-label"),
+        })
+    }
+
+    /// The trace, without the accepts — the cases that count those use
+    /// [`accepts_of`].
+    fn trace_of(attach: &HostAttach) -> Vec<SizeTraceAction> {
+        full_trace(attach)
+            .into_iter()
+            .filter(|action| !matches!(action, SizeTraceAction::AttachAccepted { .. }))
+            .collect()
+    }
+
+    fn full_trace(attach: &HostAttach) -> Vec<SizeTraceAction> {
+        attach
+            .trace
+            .as_ref()
+            .expect("a traced attach")
+            .lock()
+            .expect("trace lock")
+            .clone()
     }
 
     /// The terms [`HostAttach::begin`] assembles, for the cases that
@@ -1493,7 +1878,8 @@ mod tests {
             cell_w_px: cell_px(GEOMETRY.cell_w),
             cell_h_px: cell_px(GEOMETRY.cell_h),
             libghostty_build: "gb".into(),
-            focus: true,
+            take: true,
+            client_id: "iced-test".into(),
         }
     }
 
@@ -1505,10 +1891,12 @@ mod tests {
         EngineFeedReceiver,
     ) {
         let (feed_tx, feed_rx) = engine_feed::channel();
-        let mut attach = HostAttach::new(key(), GEOMETRY);
+        let mut attach = HostAttach::new(key(), GEOMETRY, AttachIntent::Explicit)
+            .with_trace(Some(SizeTrace::default()));
         // The frames below are hand-fed, so the machine must be on the
-        // attempt they carry.
+        // attempt they carry, and it attaches as this client.
         attach.attempt = 1;
+        attach.client_id = ME.into();
         let (tab, _capture) = crate::app::terminal_tab::attach_test_host_terminal(
             GEOMETRY.cols,
             GEOMETRY.rows,
@@ -1522,17 +1910,17 @@ mod tests {
     }
 
     fn accepted_as(kind: PayloadKind, resumed: bool, fence: u64) -> HostTabFrame {
-        accepted_at(kind, resumed, fence, None)
+        accepted_at(kind, resumed, fence, GEOMETRY.grid(), owner(ME))
     }
 
-    /// The accepted handshake as an *unfocused* attach gets it: the
-    /// session reports the geometry it composed the payload at, because
-    /// it did not resize the tab to this client's.
+    /// The accepted handshake with the tab's own grid and owner, which
+    /// are this window's only when it took the tab.
     fn accepted_at(
         kind: PayloadKind,
         resumed: bool,
         fence: u64,
-        snapshot_size: Option<(u16, u16)>,
+        grid: (u16, u16),
+        owner: Option<SizeOwner>,
     ) -> HostTabFrame {
         HostTabFrame::Accepted {
             attempt: 1,
@@ -1541,7 +1929,17 @@ mod tests {
             fence,
             server_epoch: 11,
             tab_generation: 2,
-            snapshot_size,
+            grid,
+            owner,
+        }
+    }
+
+    fn grid(seq: u64, grid: (u16, u16), owner: Option<SizeOwner>) -> HostTabFrame {
+        HostTabFrame::Grid {
+            attempt: 1,
+            seq,
+            grid,
+            owner,
         }
     }
 
@@ -1608,7 +2006,8 @@ mod tests {
         let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
         assert_eq!(
             attach.on_frame(accepted(true, 41), &mut tab, &feed_tx),
-            AttachStep::None
+            AttachStep::Refresh,
+            "the owner it names is news for the tab band"
         );
         assert!(matches!(attach.phase, Phase::Live));
         assert_eq!(
@@ -1637,17 +2036,11 @@ mod tests {
         ..GEOMETRY
     };
 
-    /// The window resizing under `tab` the way `App::resize` does it: the
-    /// attach hears the new geometry, and the kept terminal re-grids at
-    /// once whatever the attach does with it.
-    fn resize_window(attach: &mut HostAttach, tab: &mut TerminalTab, to: Geometry) {
-        attach.note_resize(to);
-        tab.resize_for_host(to.cols, to.rows, to.cell_w, to.cell_h)
-            .expect("re-grid the kept terminal");
-    }
-
-    fn widen(attach: &mut HostAttach, tab: &mut TerminalTab) {
-        resize_window(attach, tab, WIDER);
+    /// The window resizing under the attach the way `App::resize` does
+    /// it: the attach hears the new geometry, and the mirror keeps the
+    /// tab's grid.
+    fn widen(attach: &mut HostAttach) {
+        attach.note_resize(WIDER, true);
     }
 
     #[test]
@@ -1669,35 +2062,45 @@ mod tests {
         );
     }
 
-    /// Plan 072 D4a, the in-flight half (#564).
+    /// Plan 072 D4a, the in-flight half (#564), now keyed off the
+    /// session's grid: a resume the session cut at a grid the mirror is
+    /// not at is refused, and a fresh attach goes at once.
     #[tokio::test]
-    async fn an_accepted_resume_for_a_grid_the_terminal_left_is_discarded() {
+    async fn an_accepted_resume_at_a_grid_the_mirror_is_not_at_is_discarded() {
         let (attach, mut tab, feed_tx, _feed_rx) = rig();
         let mut attach = attach.with_resume(Some(POINT));
-        widen(&mut attach, &mut tab);
-
         assert_eq!(
-            attach.on_frame(accepted(true, 41), &mut tab, &feed_tx),
+            attach.on_frame(
+                accepted_at(
+                    PayloadKind::GhosttySnapshot,
+                    true,
+                    41,
+                    WIDER.grid(),
+                    owner(ME)
+                ),
+                &mut tab,
+                &feed_tx
+            ),
             AttachStep::Reattach {
                 delay: Duration::ZERO
             },
             "the resumed stream is refused and a fresh attach goes at once"
         );
         assert_eq!(attach.resume, None, "the fresh attach asks for a snapshot");
-        assert_eq!(attach.geometry, WIDER, "at the grid the terminal is at");
         assert!(matches!(attach.phase, Phase::Requesting));
     }
 
-    /// Plan 072 D4a, the detach guard (#564).
+    /// Plan 072 D4a, the detach guard (#564): the point survives only
+    /// while the kept terminal is at the grid the session last said it
+    /// is at.
     #[tokio::test]
-    async fn a_detach_keeps_the_resume_point_only_at_the_grid_the_session_was_given() {
-        let (attach, mut tab, _feed_tx, _feed_rx) = rig();
-        let mut attach = attach.with_resume(Some(POINT));
-        widen(&mut attach, &mut tab);
+    async fn a_detach_keeps_the_resume_point_only_at_the_grid_the_session_said() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
         assert_eq!(
             attach.detach(Some(tab.grid())),
-            None,
-            "the resize waited on a handshake that never landed"
+            Some(POINT),
+            "the kept terminal is at the session's grid"
         );
 
         let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
@@ -1707,61 +2110,71 @@ mod tests {
         assert_eq!(
             attach.detach(Some(tab.grid())),
             None,
-            "a live terminal re-gridded with no RESIZE sent"
+            "a kept terminal at a grid the session never named"
         );
+
+        let (attach, mut tab, _feed_tx, _feed_rx) = rig();
+        let attach = attach.with_resume(Some(POINT));
+        assert_eq!(
+            attach.detach(Some(tab.grid())),
+            Some(POINT),
+            "an attach that never heard a grid hands the point back untouched"
+        );
+        let _ = &mut tab;
     }
 
-    /// Plan 072 D4a, a live resize (#564): the kept terminal ends at the
-    /// grid the attach sent, but the records past the point may have
-    /// been written at the one before it.
+    /// A window resize never moves the mirror, so it costs the resume
+    /// point nothing: the session's own `Regridded` refusal covers a
+    /// resize it applied before this client heard of it. A `GRID` moves
+    /// the mirror and the point together.
     #[tokio::test]
-    async fn an_attach_resized_after_its_handshake_carries_no_resume_point() {
+    async fn a_window_resize_keeps_the_resume_point_and_a_grid_moves_it_with_the_mirror() {
         let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
         attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
-        attach.on_frame(pty(42, b"at the handshake's grid"), &mut tab, &feed_tx);
+        widen(&mut attach);
+        assert_eq!(
+            tab.grid(),
+            GEOMETRY.grid(),
+            "the mirror keeps the tab's grid"
+        );
+        assert_eq!(
+            attach.detach(Some(tab.grid())),
+            Some(POINT),
+            "resized live: the refocus still resumes"
+        );
+
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+        attach.on_frame(pty(42, b"at the old grid"), &mut tab, &feed_tx);
+        assert_eq!(
+            attach.on_frame(grid(42, WIDER.grid(), owner(ME)), &mut tab, &feed_tx),
+            AttachStep::Refresh
+        );
+        assert_eq!(tab.grid(), WIDER.grid());
         assert_eq!(
             attach.detach(Some(tab.grid())),
             Some(ResumePoint {
                 next_seq: 43,
                 ..POINT
             }),
-            "never resized: the refocus resumes"
-        );
-
-        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
-        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
-        widen(&mut attach, &mut tab);
-        assert_eq!(
-            attach.detach(Some(tab.grid())),
-            None,
-            "resized live: the refocus takes a snapshot"
-        );
-
-        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
-        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
-        widen(&mut attach, &mut tab);
-        resize_window(&mut attach, &mut tab, GEOMETRY);
-        assert_eq!(
-            attach.detach(Some(tab.grid())),
-            None,
-            "resized away and back: the grid is the handshake's again, not the records'"
+            "the GRID moved the mirror and the point it resumes from"
         );
 
         let (ops, _worker) = HostOps::channel();
         let nowhere = std::path::PathBuf::from("/nonexistent/roost-resize-resume.sock");
-        for (resize, expected) in [(false, Some(POINT)), (true, None)] {
-            let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
-            attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
-            if resize {
-                widen(&mut attach, &mut tab);
-            }
-            assert!(matches!(
-                attach.on_frame(HostTabFrame::Closed { attempt: 1 }, &mut tab, &feed_tx),
-                AttachStep::Reattach { .. }
-            ));
-            attach.begin(&ops, None, nowhere.clone(), "gb", &feed_tx);
-            assert_eq!(attach.resume, expected, "a re-attach after resize={resize}");
-        }
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+        widen(&mut attach);
+        assert!(matches!(
+            attach.on_frame(HostTabFrame::Closed { attempt: 1 }, &mut tab, &feed_tx),
+            AttachStep::Reattach { .. }
+        ));
+        attach.begin(&ops, None, nowhere, "gb", ME, &feed_tx);
+        assert_eq!(
+            attach.resume,
+            Some(POINT),
+            "a re-attach after a resize resumes"
+        );
     }
 
     /// `mode: "snapshot"` (the resume-miss fallback rides the same
@@ -1873,7 +2286,8 @@ mod tests {
             "in this client's preference order"
         );
         assert_eq!((stated.cols, stated.rows), (80, 24));
-        assert!(stated.focus, "this client only attaches what it shows");
+        assert!(stated.take, "this client only attaches what it shows");
+        assert_eq!(stated.client_id, "iced-test");
 
         let resumed = choose_handshake(
             7,
@@ -1992,22 +2406,28 @@ mod tests {
         assert_eq!(delay, BACKOFF_BASE);
     }
 
-    /// A resize during hydration is withheld (latest-wins) and fires
-    /// once at FINISH.
+    /// A resize during hydration is withheld (latest-wins, with the focus
+    /// it happened under) and fires once at FINISH.
     #[tokio::test]
     async fn a_withheld_resize_fires_at_finish() {
         let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
         attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
-        attach.note_resize(Geometry {
-            cols: 100,
-            rows: 30,
-            ..GEOMETRY
-        });
-        attach.note_resize(Geometry {
-            cols: 120,
-            rows: 40,
-            ..GEOMETRY
-        });
+        attach.note_resize(
+            Geometry {
+                cols: 100,
+                rows: 30,
+                ..GEOMETRY
+            },
+            true,
+        );
+        attach.note_resize(
+            Geometry {
+                cols: 120,
+                rows: 40,
+                ..GEOMETRY
+            },
+            false,
+        );
         assert!(
             attach.test_drain_input().is_empty(),
             "nothing reaches the wire pre-FINISH"
@@ -2019,26 +2439,30 @@ mod tests {
             &mut feed_rx,
             snapshot_with("x"),
         );
-        let sent = attach.test_drain_input();
-        assert_eq!(sent.len(), 1, "latest-wins: one RESIZE, not two");
-        assert!(
-            matches!(
-                sent[0],
-                HostDataMsg::Resize {
-                    cols: 120,
-                    rows: 40,
-                    ..
-                }
-            ),
-            "the latest geometry is the one sent"
+        assert_eq!(
+            attach.test_drain_input(),
+            vec![HostDataMsg::Resize {
+                cols: 120,
+                rows: 40,
+                cell_w: GEOMETRY.cell_w,
+                cell_h: GEOMETRY.cell_h,
+                focused: false,
+            }],
+            "latest-wins: one RESIZE, the latest, with the focus it was made under"
+        );
+        assert_eq!(
+            tab.grid(),
+            GEOMETRY.grid(),
+            "a RESIZE never moves the mirror"
         );
     }
 
-    /// The same withhold fires at the 2 s deadline once READY has
-    /// landed, forfeiting the remaining history rather than holding the
-    /// user's geometry hostage.
+    /// The withhold ends at the 2 s deadline: the RESIZE goes to the
+    /// session while the payload is still hydrating, and nothing here
+    /// resizes the decoder to this window's grid — a `GRID` back is what
+    /// would.
     #[tokio::test]
-    async fn a_withheld_resize_fires_at_the_deadline() {
+    async fn a_withheld_resize_is_sent_at_the_deadline_and_moves_nothing_here() {
         let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
         attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
         // Feed exactly the prefix through READY — hydrating, not done.
@@ -2052,11 +2476,14 @@ mod tests {
             &mut tab,
             &feed_tx,
         );
-        attach.note_resize(Geometry {
-            cols: 132,
-            rows: 50,
-            ..GEOMETRY
-        });
+        attach.note_resize(
+            Geometry {
+                cols: 132,
+                rows: 50,
+                ..GEOMETRY
+            },
+            true,
+        );
         assert_eq!(
             attach.on_frame(
                 HostTabFrame::WithholdDeadline { attempt: 1 },
@@ -2066,61 +2493,88 @@ mod tests {
             AttachStep::None
         );
         let sent = attach.test_drain_input();
-        assert_eq!(sent.len(), 1);
         assert!(matches!(
-            sent[0],
-            HostDataMsg::Resize {
+            sent.as_slice(),
+            [HostDataMsg::Resize {
                 cols: 132,
                 rows: 50,
+                focused: true,
                 ..
-            }
+            }]
         ));
+        let Phase::Hydrating(hydration) = &attach.phase else {
+            panic!("still hydrating");
+        };
+        assert_eq!(
+            hydration.built_at,
+            GEOMETRY.grid(),
+            "the decoder is untouched"
+        );
     }
 
-    /// A deadline that beats READY re-attaches at the new geometry
-    /// instead — a decoder that has not reached READY cannot mirror a
-    /// resize, and attach is when the server resizes anyway.
+    /// The same before READY: the RESIZE goes, the stream stays — there
+    /// is nothing to re-attach for when the session sizes the mirror.
     #[tokio::test]
-    async fn a_deadline_before_ready_reattaches_at_the_new_size() {
+    async fn a_deadline_before_ready_sends_the_resize_and_keeps_the_stream() {
         let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
         attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
-        attach.note_resize(Geometry {
-            cols: 132,
-            rows: 50,
-            ..GEOMETRY
-        });
-        assert!(matches!(
+        attach.note_resize(
+            Geometry {
+                cols: 132,
+                rows: 50,
+                ..GEOMETRY
+            },
+            true,
+        );
+        assert_eq!(
             attach.on_frame(
                 HostTabFrame::WithholdDeadline { attempt: 1 },
                 &mut tab,
                 &feed_tx,
             ),
-            AttachStep::Reattach { .. }
+            AttachStep::None
+        );
+        assert!(matches!(attach.phase, Phase::Hydrating(_)));
+        assert!(matches!(
+            attach.test_drain_input().as_slice(),
+            [HostDataMsg::Resize { cols: 132, .. }]
         ));
-        assert!(
-            attach.test_drain_input().is_empty(),
-            "no RESIZE rides a stream about to be replaced"
-        );
-        assert_eq!(
-            attach.geometry.cols, 132,
-            "the retry attaches at the new size"
-        );
     }
 
-    /// While live, a resize goes straight out — in order behind input.
+    /// While live, a resize goes straight out — in order behind input,
+    /// with the window's focus as it happened.
     #[tokio::test]
     async fn a_live_resize_queues_behind_input() {
         let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
         attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
-        tab.session.send_input(b"typed".to_vec());
-        attach.note_resize(Geometry {
-            cols: 90,
-            rows: 28,
-            ..GEOMETRY
-        });
+        tab.session
+            .send_input(b"typed".to_vec(), roost_ipc::dataframe::InputTake::Before);
+        attach.note_resize(
+            Geometry {
+                cols: 90,
+                rows: 28,
+                ..GEOMETRY
+            },
+            false,
+        );
         let sent = attach.test_drain_input();
-        assert!(matches!(sent[0], HostDataMsg::Input(ref bytes) if bytes == b"typed"));
-        assert!(matches!(sent[1], HostDataMsg::Resize { cols: 90, .. }));
+        assert!(matches!(
+            &sent[0],
+            HostDataMsg::Input { bytes, take: roost_ipc::dataframe::InputTake::Before }
+                if bytes == b"typed"
+        ));
+        assert!(matches!(
+            sent[1],
+            HostDataMsg::Resize {
+                cols: 90,
+                focused: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            trace_of(&attach),
+            vec![SizeTraceAction::ResizeSent { focused: false }]
+        );
     }
 
     /// Keys typed while a new host tab opens reach it only once its
@@ -2178,7 +2632,8 @@ mod tests {
                 fence: 0,
                 server_epoch: 11,
                 tab_generation: 2,
-                snapshot_size: None,
+                grid: GEOMETRY.grid(),
+                owner: owner(ME),
             },
             &mut tab,
             &feed_tx,
@@ -2207,8 +2662,8 @@ mod tests {
             .test_drain_input()
             .into_iter()
             .flat_map(|msg| match msg {
-                HostDataMsg::Input(bytes) => bytes,
-                HostDataMsg::Resize { .. } => Vec::new(),
+                HostDataMsg::Input { bytes, .. } => bytes,
+                HostDataMsg::Resize { .. } | HostDataMsg::Take | HostDataMsg::Detach => Vec::new(),
             })
             .collect();
         assert_eq!(
@@ -2345,23 +2800,17 @@ mod tests {
         );
     }
 
-    /// An **unfocused** attach gets a payload composed at the server's
-    /// geometry, not at the one it asked for — it resized nothing — and
-    /// the accepted handshake says so (plan 057 §3.3). A `vt` client has
-    /// to build its terminal at that size, because those bytes replay
-    /// into a terminal *of the payload's* width: replaying them into a
-    /// narrower one wraps their lines and misplaces their absolute cursor
-    /// moves. Then it resizes to its own, which nothing else would ever
-    /// do — no resize pass runs again unless the window moves.
-    ///
-    /// Roost's own client always attaches focused today, so this is the
-    /// path a future unfocused attacher takes; the negative control below
-    /// is the one this build exercises.
+    /// A payload is composed at the tab's grid, which is another
+    /// client's when this attach did not take it (plan 084 D6): the
+    /// terminal is built at that grid and **stays** there — the mirror is
+    /// the PTY's grid, and the window draws it at whatever offset that
+    /// takes. Replaying a `vt` payload into a terminal of another width
+    /// would wrap its lines and misplace its absolute cursor moves.
     #[tokio::test]
-    async fn a_vt_payload_hydrates_at_the_snapshot_geometry_and_then_takes_this_clients() {
+    async fn a_vt_payload_hydrates_at_the_tabs_grid_and_stays_there() {
         let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
         attach.on_frame(
-            accepted_at(PayloadKind::Vt, false, 100, Some((100, 30))),
+            accepted_at(PayloadKind::Vt, false, 100, (100, 30), owner(DESK)),
             &mut tab,
             &feed_tx,
         );
@@ -2383,37 +2832,33 @@ mod tests {
             attach.on_frame(snap(b""), &mut tab, &feed_tx),
             AttachStep::Refresh
         );
-        tab.refresh_snapshot().expect("refresh");
-        assert_eq!(
-            tab.dump(0).expect("dump").rows_text.len(),
-            usize::from(GEOMETRY.rows),
-            "and the swapped-in terminal is then this client's size, not the server's"
+        assert_eq!(tab.grid(), (100, 30), "the mirror keeps the tab's grid");
+        assert!(screen(&mut tab).contains("bottom-of-the-servers-screen"));
+        assert!(
+            attach.test_drain_input().is_empty(),
+            "and asks the session for nothing"
         );
+        assert!(attach.owned_by_another());
     }
 
-    /// The negative control, and the path every attach roost makes today
-    /// takes: a focused attach resized the tab to this client's geometry
-    /// before composing, so the handshake reports no snapshot size and
-    /// nothing resizes after the swap.
+    /// The other side of the same rule: an attach that took the tab gets
+    /// a payload at its own grid, and hydrates there.
     #[tokio::test]
-    async fn a_focused_attach_hydrates_at_its_own_geometry_and_resizes_nothing() {
+    async fn a_taking_attach_hydrates_at_its_own_grid() {
         let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
-        attach.on_frame(
-            accepted_at(PayloadKind::Vt, false, 100, None),
-            &mut tab,
-            &feed_tx,
-        );
+        attach.on_frame(accepted_as(PayloadKind::Vt, false, 100), &mut tab, &feed_tx);
         let Phase::Hydrating(hydration) = &attach.phase else {
             panic!("a fresh vt payload hydrates");
         };
         assert_eq!(hydration.built_at, (GEOMETRY.cols, GEOMETRY.rows));
 
-        attach.on_frame(snap(b"focused"), &mut tab, &feed_tx);
+        attach.on_frame(snap(b"taken"), &mut tab, &feed_tx);
         attach.on_frame(snap(b""), &mut tab, &feed_tx);
         tab.refresh_snapshot().expect("refresh");
         let dump = tab.dump(0).expect("dump");
         assert_eq!(dump.rows_text.len(), usize::from(GEOMETRY.rows));
-        assert!(dump.rows_text.join("\n").contains("focused"));
+        assert!(dump.rows_text.join("\n").contains("taken"));
+        assert!(!attach.owned_by_another());
     }
 
     /// Input queued at an attach has a reader in every phase but the
@@ -2636,12 +3081,13 @@ mod tests {
         let _serving = stand_in.ops.serving().open(key().host);
 
         let (feed_tx, _feed_rx) = engine_feed::channel();
-        let mut attach = HostAttach::new(key(), GEOMETRY);
+        let mut attach = HostAttach::new(key(), GEOMETRY, AttachIntent::Explicit);
         attach.begin(
             &stand_in.ops,
             Some("sess-1"),
             stand_in.socket.clone(),
             "gb",
+            "iced-test",
             &feed_tx,
         );
 
@@ -2679,6 +3125,7 @@ mod tests {
             Some("sess-1"),
             stand_in.socket.clone(),
             "gb",
+            "iced-test",
             &feed_tx,
         );
 
@@ -2744,6 +3191,7 @@ mod tests {
             Some("sess-1"),
             stand_in.socket.clone(),
             "gb",
+            "iced-test",
             &feed_tx,
         );
         let refusal = next_permit_refusal(&mut feed_rx).await;
@@ -2769,6 +3217,7 @@ mod tests {
             Some("sess-1"),
             stand_in.socket.clone(),
             "gb",
+            "iced-test",
             &feed_tx,
         );
 
@@ -2797,6 +3246,7 @@ mod tests {
                 Some("sess-1"),
                 std::path::PathBuf::from("/nonexistent/roost-full-queue.sock"),
                 "gb",
+                "iced-test",
                 &feed_tx,
             );
             let refusal = next_permit_refusal(&mut feed_rx).await;
@@ -2858,6 +3308,7 @@ mod tests {
             Some("sess-1"),
             std::path::PathBuf::from("/nonexistent/roost-gone-worker.sock"),
             "gb",
+            "iced-test",
             &feed_tx,
         );
         let refusal = next_permit_refusal(&mut feed_rx).await;
@@ -2911,44 +3362,42 @@ mod tests {
         .expect("the attempt put the frame on the feed")
     }
 
-    /// A resize that runs out of patience during a `vt` payload
-    /// re-attaches at the new size instead of being mirrored: the server
-    /// composed those bytes for the old geometry, and unlike the
-    /// decoder's screen there is nothing here to re-cut.
+    /// A resize that runs out of patience during a `vt` payload is sent
+    /// rather than re-attached for: the payload keeps its grid, and a
+    /// `GRID` the session sends back is what moves it — after the
+    /// terminator, where the session holds it.
     #[tokio::test]
-    async fn a_withheld_resize_during_a_vt_payload_reattaches_at_the_new_size() {
+    async fn a_withheld_resize_during_a_vt_payload_is_sent_at_the_deadline() {
         let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
         attach.on_frame(accepted_as(PayloadKind::Vt, false, 100), &mut tab, &feed_tx);
         attach.on_frame(snap(b"half a payload"), &mut tab, &feed_tx);
-        attach.note_resize(Geometry {
-            cols: 132,
-            rows: 50,
-            ..GEOMETRY
-        });
-        assert!(matches!(
+        attach.note_resize(
+            Geometry {
+                cols: 132,
+                rows: 50,
+                ..GEOMETRY
+            },
+            true,
+        );
+        assert_eq!(
             attach.on_frame(
                 HostTabFrame::WithholdDeadline { attempt: 1 },
                 &mut tab,
                 &feed_tx,
             ),
-            AttachStep::Reattach { .. }
+            AttachStep::None
+        );
+        assert!(matches!(
+            attach.test_drain_input().as_slice(),
+            [HostDataMsg::Resize { cols: 132, .. }]
         ));
-        assert!(
-            attach.test_drain_input().is_empty(),
-            "no RESIZE rides a stream about to be replaced"
-        );
-        assert_eq!(
-            attach.geometry.cols, 132,
-            "the retry attaches at the new size"
-        );
+        assert!(matches!(attach.phase, Phase::Hydrating(_)));
     }
 
     /// The deadline bounds the *hold*, not the accept, so a resize that
-    /// arrives after one has already fired is still acted on within it.
+    /// arrives after one has already fired is still sent within the next.
     /// A `vt` hydration is where this bites: it holds for the whole
-    /// payload, so most of its life is after that first deadline, and a
-    /// resize landing there would otherwise wait out the entire attach
-    /// and then be applied to a terminal replayed at the old size.
+    /// payload, so most of its life is after that first deadline.
     #[tokio::test(start_paused = true)]
     async fn a_resize_after_the_deadline_is_still_bounded_by_it() {
         let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
@@ -2961,21 +3410,25 @@ mod tests {
             attach.on_frame(deadline, &mut tab, &feed_tx),
             AttachStep::None
         );
+        assert!(attach.test_drain_input().is_empty());
 
         // Only now does the user drag the window, mid-payload.
-        attach.note_resize(Geometry {
-            cols: 132,
-            rows: 50,
-            ..GEOMETRY
-        });
+        attach.note_resize(
+            Geometry {
+                cols: 132,
+                rows: 50,
+                ..GEOMETRY
+            },
+            true,
+        );
         let deadline = next_withhold_deadline(&mut feed_rx).await;
-        assert!(matches!(
-            attach.on_frame(deadline, &mut tab, &feed_tx),
-            AttachStep::Reattach { .. }
-        ));
-        assert_eq!(
-            attach.geometry.cols, 132,
-            "the retry attaches at the size the user is looking at"
+        attach.on_frame(deadline, &mut tab, &feed_tx);
+        assert!(
+            matches!(
+                attach.test_drain_input().as_slice(),
+                [HostDataMsg::Resize { cols: 132, .. }]
+            ),
+            "the re-armed deadline sent it"
         );
     }
 
@@ -2992,6 +3445,811 @@ mod tests {
                 return frame;
             }
         }
+    }
+
+    /// A detaching attempt's connection ends without a word: the attach
+    /// that replaced it may be on the same attempt number, and a `Closed`
+    /// from this one would abort that.
+    #[tokio::test]
+    async fn a_detaching_connection_ends_without_a_word() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+        let (read, write) = client.into_split();
+        let (server_read, mut server_write) = server.into_split();
+        let reply = roost_ipc::messages::AttachHandshakeReply::Accepted(
+            roost_ipc::messages::AttachAccepted {
+                kind: AttachPayloadKind::from("ghostty-snapshot"),
+                mode: roost_ipc::messages::AttachMode::Snapshot,
+                seq: 0,
+                server_epoch: 1,
+                tab_generation: 1,
+                snapshot_cols: GEOMETRY.cols,
+                snapshot_rows: GEOMETRY.rows,
+                owner: None,
+            },
+        );
+        let body = serde_json::to_vec(&reply).expect("encode the reply");
+        roost_ipc::framing::write_frame(&mut server_write, &body)
+            .await
+            .expect("reply");
+        server_write
+            .write_all(&roost_ipc::dataframe::PREAMBLE)
+            .await
+            .expect("preamble");
+        let handshake = choose_handshake(key().tab, terms(), None);
+        let (_, conn) = DataConnection::handshake(read, write, &handshake)
+            .await
+            .expect("accepted");
+        drop((server_read, server_write));
+
+        let (feed_tx, mut feed_rx) = engine_feed::channel();
+        let (_input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let detaching = watch::Sender::new(true).subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_attempt(key(), 1, conn, &mut input_rx, &detaching, &feed_tx),
+        )
+        .await
+        .expect("the attempt ends with its connection");
+        let mut batch = crate::engine_feed::EngineBatch::default();
+        assert!(
+            feed_rx.try_next(&mut batch).is_none(),
+            "a detaching attempt publishes nothing"
+        );
+    }
+
+    /// The `take` each handshake sent, as the trace has them.
+    fn takes_sent(attach: &HostAttach) -> Vec<bool> {
+        trace_of(attach)
+            .into_iter()
+            .filter_map(|action| match action {
+                SizeTraceAction::AttachSent { take } => Some(take),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Plan 084 D6: an explicit switch's attach takes the tab's size on
+    /// every attempt up to and including the first the session accepts
+    /// — a refused dial is no switch done — and never after it: every
+    /// later re-attach is the window's own.
+    #[tokio::test]
+    async fn an_explicit_attach_takes_until_its_first_accepted_handshake() {
+        let (ops, _worker) = HostOps::channel();
+        let nowhere = std::path::PathBuf::from("/nonexistent/roost-intent.sock");
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.begin(&ops, Some("sess-1"), nowhere.clone(), "gb", ME, &feed_tx);
+        assert!(matches!(
+            attach.on_frame(
+                HostTabFrame::Failed {
+                    attempt: attach.attempt,
+                    reason: FailReason::Retryable("dial refused".into()),
+                },
+                &mut tab,
+                &feed_tx,
+            ),
+            AttachStep::Reattach { .. }
+        ));
+        attach.begin(&ops, Some("sess-1"), nowhere.clone(), "gb", ME, &feed_tx);
+        let second = attach.attempt;
+        attach.on_frame(
+            HostTabFrame::Accepted {
+                attempt: second,
+                resumed: true,
+                kind: PayloadKind::GhosttySnapshot,
+                fence: 41,
+                server_epoch: 11,
+                tab_generation: 2,
+                grid: GEOMETRY.grid(),
+                owner: owner(ME),
+            },
+            &mut tab,
+            &feed_tx,
+        );
+        attach.on_frame(HostTabFrame::Closed { attempt: second }, &mut tab, &feed_tx);
+        attach.begin(&ops, Some("sess-1"), nowhere, "gb", ME, &feed_tx);
+        assert_eq!(takes_sent(&attach), vec![true, true, false]);
+        attach.abort_tasks();
+    }
+
+    /// An attach the window made on its own never asks to take: it gets
+    /// the tab only if nobody sizes it.
+    #[tokio::test]
+    async fn an_automatic_attach_never_asks_to_take() {
+        let (ops, _worker) = HostOps::channel();
+        let nowhere = std::path::PathBuf::from("/nonexistent/roost-intent.sock");
+        let (feed_tx, _feed_rx) = engine_feed::channel();
+        let mut attach = HostAttach::new(key(), GEOMETRY, AttachIntent::Automatic)
+            .with_trace(Some(SizeTrace::default()));
+        attach.begin(&ops, Some("sess-1"), nowhere.clone(), "gb", ME, &feed_tx);
+        attach.begin(&ops, Some("sess-1"), nowhere, "gb", ME, &feed_tx);
+        assert_eq!(takes_sent(&attach), vec![false, false]);
+        attach.abort_tasks();
+    }
+
+    /// A `GRID` applies at its place in the stream — after PTY frame
+    /// `seq` — and resizes the mirror, never the window: no RESIZE goes
+    /// back (no echo) and the window's own grid stays what it was.
+    #[tokio::test]
+    async fn a_live_grid_resizes_the_mirror_at_its_place_and_sends_nothing_back() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+        attach.on_frame(pty(42, b"at 80 columns"), &mut tab, &feed_tx);
+        assert_eq!(
+            attach.on_frame(grid(42, (120, 30), owner(DESK)), &mut tab, &feed_tx),
+            AttachStep::Refresh
+        );
+        assert_eq!(tab.grid(), (120, 30));
+        assert_eq!(attach.advisory, GEOMETRY, "the window's grid is untouched");
+        assert!(attach.test_drain_input().is_empty(), "no echo");
+        assert_eq!(
+            trace_of(&attach),
+            vec![SizeTraceAction::GridApplied {
+                cols: 120,
+                rows: 30
+            }]
+        );
+        assert_eq!(
+            attach.on_frame(pty(43, b"after"), &mut tab, &feed_tx),
+            AttachStep::Refresh,
+            "and the next PTY frame follows it"
+        );
+    }
+
+    /// A `GRID` names the PTY frame it follows; one that names any other
+    /// is a stream this client cannot place, which re-attach rebuilds.
+    #[tokio::test]
+    async fn a_grid_out_of_its_place_in_the_stream_reattaches() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+        assert!(matches!(
+            attach.on_frame(grid(43, (120, 30), None), &mut tab, &feed_tx),
+            AttachStep::Reattach { .. }
+        ));
+        assert_eq!(tab.grid(), GEOMETRY.grid());
+    }
+
+    /// The size owner is what the accepted handshake and every `GRID`
+    /// after it say, and nothing else.
+    #[tokio::test]
+    async fn the_owner_is_what_the_accept_and_each_grid_say() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(
+            accepted_at(
+                PayloadKind::GhosttySnapshot,
+                true,
+                41,
+                GEOMETRY.grid(),
+                owner(DESK),
+            ),
+            &mut tab,
+            &feed_tx,
+        );
+        assert!(attach.owned_by_another());
+        attach.on_frame(grid(41, GEOMETRY.grid(), owner(ME)), &mut tab, &feed_tx);
+        let mine = attach.owner().expect("an owner").clone();
+        assert!(attach.is_me(&mine));
+        assert!(!attach.owned_by_another());
+        attach.on_frame(grid(41, GEOMETRY.grid(), None), &mut tab, &feed_tx);
+        assert_eq!(attach.owner(), None);
+        assert!(!attach.owned_by_another(), "nobody is not another client");
+    }
+
+    /// Past READY a `GRID` resizes the payload's decoder at its place
+    /// (forfeiting the history pages still to come), and FINISH installs
+    /// the terminal at that grid, never back at the one the payload
+    /// started at.
+    #[tokio::test]
+    async fn a_grid_during_hydration_applies_to_the_payload_and_finish_keeps_it() {
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
+        let encoded = snapshot_with("mid-hydration");
+        let boundary = roost_vt::ready_boundary(&encoded).expect("READY boundary");
+        attach.on_frame(snap(&encoded[..boundary]), &mut tab, &feed_tx);
+        attach.on_frame(grid(100, (100, 30), owner(DESK)), &mut tab, &feed_tx);
+        let Phase::Hydrating(hydration) = &attach.phase else {
+            panic!("still hydrating");
+        };
+        assert_eq!(hydration.built_at, (100, 30));
+        assert_eq!(
+            tab.grid(),
+            GEOMETRY.grid(),
+            "the rendered terminal waits for FINISH"
+        );
+        hydrate_fully(
+            &mut attach,
+            &mut tab,
+            &feed_tx,
+            &mut feed_rx,
+            encoded[boundary..].to_vec(),
+        );
+        assert!(matches!(attach.phase, Phase::Live));
+        assert_eq!(tab.grid(), (100, 30), "FINISH kept the GRID's grid");
+        assert!(attach.test_drain_input().is_empty());
+    }
+
+    /// Short of READY a `GRID` has no screen to apply to, so it waits
+    /// with the PTY frames, in their order.
+    #[tokio::test]
+    async fn a_grid_before_ready_waits_its_turn_with_the_pty_frames() {
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
+        attach.on_frame(pty(101, b"before"), &mut tab, &feed_tx);
+        attach.on_frame(grid(101, (100, 30), owner(DESK)), &mut tab, &feed_tx);
+        attach.on_frame(pty(102, b"-after"), &mut tab, &feed_tx);
+        assert!(trace_of(&attach).is_empty(), "nothing applied yet");
+        hydrate_fully(
+            &mut attach,
+            &mut tab,
+            &feed_tx,
+            &mut feed_rx,
+            snapshot_with("base "),
+        );
+        assert_eq!(tab.grid(), (100, 30));
+        assert!(screen(&mut tab).contains("before-after"));
+        assert_eq!(
+            trace_of(&attach),
+            vec![SizeTraceAction::GridApplied {
+                cols: 100,
+                rows: 30
+            }]
+        );
+    }
+
+    /// The same inside a `vt` payload, which is a screen only once its
+    /// terminator lands: the `GRID` applies there, in order.
+    #[tokio::test]
+    async fn a_grid_inside_a_vt_payload_applies_at_the_terminator() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted_as(PayloadKind::Vt, false, 100), &mut tab, &feed_tx);
+        attach.on_frame(snap(b"payload"), &mut tab, &feed_tx);
+        attach.on_frame(grid(100, (100, 30), owner(DESK)), &mut tab, &feed_tx);
+        assert_eq!(
+            attach.on_frame(snap(b""), &mut tab, &feed_tx),
+            AttachStep::Refresh
+        );
+        assert_eq!(tab.grid(), (100, 30));
+        assert!(screen(&mut tab).contains("payload"));
+    }
+
+    /// Plan 084 D6: a copy off another client's tab takes the size
+    /// **after** the text is captured, so the copy holds the text as it
+    /// was laid out when the user chose it; a copy off this window's own
+    /// tab takes nothing.
+    #[tokio::test]
+    async fn a_copy_takes_another_clients_tab_after_the_capture() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(
+            accepted_at(
+                PayloadKind::GhosttySnapshot,
+                true,
+                41,
+                GEOMETRY.grid(),
+                owner(DESK),
+            ),
+            &mut tab,
+            &feed_tx,
+        );
+        attach.copied();
+        assert_eq!(
+            trace_of(&attach),
+            vec![SizeTraceAction::CopyCaptured, SizeTraceAction::TakeSent]
+        );
+        assert_eq!(attach.test_drain_input(), vec![HostDataMsg::Take]);
+
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+        attach.copied();
+        assert_eq!(trace_of(&attach), vec![SizeTraceAction::CopyCaptured]);
+        assert!(attach.test_drain_input().is_empty());
+    }
+
+    /// The settle, with a paused clock: scrolls every 100 ms keep pushing
+    /// it out, so only the last one's timer survives, and it takes the
+    /// tab 300 ms after the scrolling stopped.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_scroll_takes_another_clients_tab_once_it_has_settled() {
+        let settle = Duration::from_millis(300);
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(
+            accepted_at(
+                PayloadKind::GhosttySnapshot,
+                true,
+                41,
+                GEOMETRY.grid(),
+                owner(DESK),
+            ),
+            &mut tab,
+            &feed_tx,
+        );
+        for _ in 0..10 {
+            attach.scrolled(settle, &feed_tx);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let settled = drain_settled(&mut feed_rx);
+        assert!(settled.is_empty(), "nothing settled while scrolling");
+        tokio::time::sleep(settle).await;
+        let settled = drain_settled(&mut feed_rx);
+        assert_eq!(settled.len(), 1, "one settle, the last scroll's");
+        for frame in settled {
+            attach.on_frame(frame, &mut tab, &feed_tx);
+        }
+        assert_eq!(trace_of(&attach), vec![SizeTraceAction::TakeSent]);
+        assert_eq!(attach.test_drain_input(), vec![HostDataMsg::Take]);
+    }
+
+    /// A settle that comes due on a tab this window has taken meanwhile
+    /// — or that it owned all along — takes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_settled_scroll_takes_nothing_from_this_window_itself() {
+        let settle = Duration::from_millis(300);
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+        attach.scrolled(settle, &feed_tx);
+        tokio::time::sleep(settle * 2).await;
+        assert!(
+            drain_settled(&mut feed_rx).is_empty(),
+            "its own tab arms nothing"
+        );
+
+        attach.on_frame(grid(41, GEOMETRY.grid(), owner(DESK)), &mut tab, &feed_tx);
+        attach.scrolled(settle, &feed_tx);
+        attach.on_frame(grid(41, GEOMETRY.grid(), owner(ME)), &mut tab, &feed_tx);
+        tokio::time::sleep(settle * 2).await;
+        for frame in drain_settled(&mut feed_rx) {
+            attach.on_frame(frame, &mut tab, &feed_tx);
+        }
+        assert!(attach.test_drain_input().is_empty(), "taken meanwhile");
+    }
+
+    fn drain_settled(feed_rx: &mut EngineFeedReceiver) -> Vec<HostTabFrame> {
+        let mut batch = crate::engine_feed::EngineBatch::default();
+        let mut settled = Vec::new();
+        while let Some(item) = feed_rx.try_next(&mut batch) {
+            if let EngineFeed::HostTab(_, frame @ HostTabFrame::ScrollSettled { .. }) = item {
+                settled.push(frame);
+            }
+        }
+        settled
+    }
+
+    /// Plan 084 D6: a detach while the handshake's reply is still on its
+    /// way puts `DETACH` right behind the handshake line — what cancels
+    /// an attach the session has not committed, and deliberately ends
+    /// one it has. A connection that merely closed would hold the tab's
+    /// size for a grace period.
+    #[tokio::test]
+    async fn a_detach_while_the_reply_is_on_its_way_follows_the_handshake_with_detach() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("roost.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let (ops, mut ops_rx) = HostOps::channel();
+        let _serving = ops.serving().open(key().host);
+        let (feed_tx, _feed_rx) = engine_feed::channel();
+        let mut attach = HostAttach::new(key(), GEOMETRY, AttachIntent::Explicit)
+            .with_trace(Some(SizeTrace::default()));
+        attach.begin(&ops, Some("sess-1"), socket, "gb", ME, &feed_tx);
+        tokio::time::timeout(Duration::from_secs(5), ops_rx.recv())
+            .await
+            .expect("the permit was asked for")
+            .expect("on an open queue")
+            .answer(Ok(serde_json::Value::Null));
+        let (conn, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("the dial")
+            .expect("accept");
+        let (read, _write) = conn.into_split();
+        let mut lines = roost_ipc::framing::FrameReader::new(read);
+        let line = lines
+            .read_line()
+            .await
+            .expect("read")
+            .expect("the handshake");
+        let handshake: serde_json::Value = serde_json::from_slice(&line).expect("json");
+        assert_eq!(handshake["take"], true);
+
+        let trace = attach.trace.clone().expect("traced");
+        assert_eq!(attach.detach(None), None);
+        let (read, residue) = lines.into_parts();
+        let mut frames = roost_ipc::dataframe::DataFrameReader::new(read, residue);
+        let frame = tokio::time::timeout(Duration::from_secs(5), frames.next_frame())
+            .await
+            .expect("DETACH within the drain")
+            .expect("read")
+            .expect("a frame, not EOF");
+        assert_eq!(frame.frame_type, roost_ipc::dataframe::FRAME_DETACH);
+        assert_eq!(
+            trace.lock().expect("trace").last(),
+            Some(&SizeTraceAction::DetachSent)
+        );
+    }
+
+    /// A live detach queues `DETACH` behind whatever input is still
+    /// waiting, for the data task's drain to write.
+    #[tokio::test]
+    async fn a_live_detach_queues_detach_behind_input() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+        tab.session
+            .send_input(b"last".to_vec(), roost_ipc::dataframe::InputTake::Before);
+        let queue = Arc::clone(&attach.input_rx);
+        attach.detach(Some(tab.grid()));
+        let mut rx = queue.try_lock().expect("no writer task in tests");
+        assert!(matches!(rx.try_recv(), Ok(HostDataMsg::Input { .. })));
+        assert_eq!(rx.try_recv(), Ok(HostDataMsg::Detach));
+    }
+
+    /// The intent is spent by the accept itself, before anything else
+    /// about that attempt is judged: an accepted resume this client then
+    /// refuses (it is at a grid the mirror is not at) was still committed
+    /// by the session, and the fresh attach behind it must not take.
+    #[tokio::test]
+    async fn an_accepted_resume_that_is_refused_still_spends_the_intent() {
+        let (ops, _worker) = HostOps::channel();
+        let nowhere = std::path::PathBuf::from("/nonexistent/roost-intent.sock");
+        let (attach, mut tab, feed_tx, _feed_rx) = rig();
+        let mut attach = attach.with_resume(Some(POINT));
+        attach.on_frame(
+            accepted_at(
+                PayloadKind::GhosttySnapshot,
+                true,
+                41,
+                WIDER.grid(),
+                owner(DESK),
+            ),
+            &mut tab,
+            &feed_tx,
+        );
+        attach.begin(&ops, Some("sess-1"), nowhere, "gb", ME, &feed_tx);
+        assert_eq!(takes_sent(&attach), vec![false]);
+        attach.abort_tasks();
+    }
+
+    /// The session committed the attach when it wrote the accepted line;
+    /// a connection that then drops before the preamble behind it must
+    /// not leave the explicit intent to be sent again. The accept reaches
+    /// the tab before the drop does, and the re-attach asks for nothing.
+    #[tokio::test]
+    async fn a_drop_between_the_accept_and_the_preamble_spends_the_intent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("roost.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.expect("accept");
+            let (read, mut write) = conn.into_split();
+            let mut lines = roost_ipc::framing::FrameReader::new(read);
+            lines
+                .read_line()
+                .await
+                .expect("read")
+                .expect("the handshake");
+            let reply = roost_ipc::messages::AttachHandshakeReply::Accepted(
+                roost_ipc::messages::AttachAccepted {
+                    kind: AttachPayloadKind::from("ghostty-snapshot"),
+                    mode: roost_ipc::messages::AttachMode::Snapshot,
+                    seq: 0,
+                    server_epoch: 1,
+                    tab_generation: 1,
+                    snapshot_cols: GEOMETRY.cols,
+                    snapshot_rows: GEOMETRY.rows,
+                    owner: owner(ME),
+                },
+            );
+            let body = serde_json::to_vec(&reply).expect("encode");
+            roost_ipc::framing::write_frame(&mut write, &body)
+                .await
+                .expect("reply");
+        });
+        let (ops, mut ops_rx) = HostOps::channel();
+        let _serving = ops.serving().open(key().host);
+        let (feed_tx, mut feed_rx) = engine_feed::channel();
+        let (mut attach, mut tab, _, _) = rig();
+        attach.begin(&ops, Some("sess-1"), socket, "gb", ME, &feed_tx);
+        tokio::time::timeout(Duration::from_secs(5), ops_rx.recv())
+            .await
+            .expect("the permit was asked for")
+            .expect("on an open queue")
+            .answer(Ok(serde_json::Value::Null));
+        server.await.expect("the server answered and hung up");
+
+        let mut seen = Vec::new();
+        while !seen
+            .iter()
+            .any(|f| matches!(f, HostTabFrame::Failed { .. } | HostTabFrame::Closed { .. }))
+        {
+            seen.push(next_host_frame(&mut feed_rx, |_| true).await);
+        }
+        assert!(
+            matches!(seen[0], HostTabFrame::Accepted { .. }),
+            "the accept went out before the preamble it never got"
+        );
+        for frame in seen {
+            attach.on_frame(frame, &mut tab, &feed_tx);
+        }
+        let (ops, _worker) = HostOps::channel();
+        let nowhere = std::path::PathBuf::from("/nonexistent/roost-intent.sock");
+        attach.begin(&ops, Some("sess-1"), nowhere, "gb", ME, &feed_tx);
+        assert_eq!(takes_sent(&attach), vec![true, false]);
+        attach.abort_tasks();
+    }
+
+    /// An explicit switch to a tab the window is already attaching on its
+    /// own, before any handshake of that attach was accepted, makes it
+    /// take; once one has been accepted, re-selecting changes nothing.
+    #[tokio::test]
+    async fn an_explicit_switch_upgrades_an_automatic_attach_not_yet_accepted() {
+        let (ops, _worker) = HostOps::channel();
+        let nowhere = std::path::PathBuf::from("/nonexistent/roost-intent.sock");
+        let (feed_tx, _feed_rx) = engine_feed::channel();
+        let mut attach = HostAttach::new(key(), GEOMETRY, AttachIntent::Automatic)
+            .with_trace(Some(SizeTrace::default()));
+        attach.begin(&ops, Some("sess-1"), nowhere.clone(), "gb", ME, &feed_tx);
+        assert!(
+            attach.make_explicit(),
+            "not accepted yet: it becomes the switch"
+        );
+        assert!(!attach.make_explicit(), "already explicit");
+        attach.begin(&ops, Some("sess-1"), nowhere, "gb", ME, &feed_tx);
+        assert_eq!(takes_sent(&attach), vec![false, true]);
+        attach.abort_tasks();
+
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.take_pending = false;
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+        assert!(
+            !attach.make_explicit(),
+            "an established attachment is left alone"
+        );
+    }
+
+    /// A settle whose frame is already on the feed when the attempt it was
+    /// armed in ends takes nothing on the next attempt's behalf.
+    #[tokio::test(start_paused = true)]
+    async fn a_settle_queued_before_a_close_takes_nothing() {
+        let settle = Duration::from_millis(300);
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(
+            accepted_at(
+                PayloadKind::GhosttySnapshot,
+                true,
+                41,
+                GEOMETRY.grid(),
+                owner(DESK),
+            ),
+            &mut tab,
+            &feed_tx,
+        );
+        attach.scrolled(settle, &feed_tx);
+        tokio::time::sleep(settle * 2).await;
+        let settled = drain_settled(&mut feed_rx);
+        assert_eq!(settled.len(), 1, "the settle is on the feed");
+        assert!(matches!(
+            attach.on_frame(HostTabFrame::Closed { attempt: 1 }, &mut tab, &feed_tx),
+            AttachStep::Reattach { .. }
+        ));
+        for frame in settled {
+            attach.on_frame(frame, &mut tab, &feed_tx);
+        }
+        assert!(attach.test_drain_input().is_empty(), "no TAKE");
+        assert_eq!(trace_of(&attach), vec![]);
+    }
+
+    /// Two attaches of one tab never share an attempt number, so what a
+    /// draining connection of the first still delivers cannot land on the
+    /// second.
+    #[tokio::test]
+    async fn attempt_numbers_are_unique_across_attaches() {
+        let (ops, _worker) = HostOps::channel();
+        let nowhere = std::path::PathBuf::from("/nonexistent/roost-attempt.sock");
+        let (feed_tx, _feed_rx) = engine_feed::channel();
+        let mut first = HostAttach::new(key(), GEOMETRY, AttachIntent::Explicit);
+        let mut second = HostAttach::new(key(), GEOMETRY, AttachIntent::Explicit);
+        first.begin(&ops, Some("sess-1"), nowhere.clone(), "gb", ME, &feed_tx);
+        second.begin(&ops, Some("sess-1"), nowhere, "gb", ME, &feed_tx);
+        assert_ne!(first.attempt, second.attempt);
+        first.abort_tasks();
+        second.abort_tasks();
+    }
+
+    /// A data task whose attach is detaching publishes nothing, whatever
+    /// it hears: a refused permit included.
+    #[tokio::test]
+    async fn a_detaching_attempt_publishes_nothing() {
+        let (ops, worker) = HostOps::channel();
+        drop(worker);
+        let (feed_tx, mut feed_rx) = engine_feed::channel();
+        let (input_tx, input_rx) = mpsc::unbounded_channel::<HostDataMsg>();
+        let detaching = watch::Sender::new(true);
+        run_attempt(
+            key(),
+            1,
+            ops.attach_permit(key().host),
+            Dial {
+                socket: std::path::PathBuf::from("/nonexistent/roost-detaching.sock"),
+                handshake: choose_handshake(key().tab, terms(), None),
+            },
+            Arc::new(tokio::sync::Mutex::new(input_rx)),
+            detaching.subscribe(),
+            feed_tx,
+        )
+        .await;
+        drop(input_tx);
+        let mut batch = crate::engine_feed::EngineBatch::default();
+        assert!(feed_rx.try_next(&mut batch).is_none(), "nothing published");
+    }
+
+    /// Plan 084 D6's launch case: a window attaches another client's tab
+    /// on its own, and its first layout then reports the grid the
+    /// handshake already carried, with the window focused. That is the
+    /// window settling, and sends nothing; a resize once it is laid out
+    /// is one the user made, and takes.
+    #[tokio::test]
+    async fn a_windows_first_layout_takes_nothing_and_its_next_resize_does() {
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(
+            accepted_at(
+                PayloadKind::GhosttySnapshot,
+                false,
+                100,
+                GEOMETRY.grid(),
+                owner(DESK),
+            ),
+            &mut tab,
+            &feed_tx,
+        );
+        let mut layout = super::super::WindowLayout::default();
+        attach.note_resize(GEOMETRY, layout.focused(Regrid::Window, true));
+        hydrate_fully(
+            &mut attach,
+            &mut tab,
+            &feed_tx,
+            &mut feed_rx,
+            snapshot_with("x"),
+        );
+        assert!(
+            attach.test_drain_input().is_empty(),
+            "the first layout is no resize"
+        );
+        layout.resized();
+        attach.note_resize(GEOMETRY, layout.focused(Regrid::Window, true));
+        assert!(matches!(
+            attach.test_drain_input().as_slice(),
+            [HostDataMsg::Resize { focused: true, .. }]
+        ));
+    }
+
+    /// iced drops a subscription's events when its queue is full, so a
+    /// window's first native resize can go missing. A font or sidebar
+    /// change the user makes in a focused window then lays it out itself,
+    /// and takes; so does a re-grid of the window's own size after it. In
+    /// an unfocused window the same change only advises.
+    #[tokio::test]
+    async fn a_users_regrid_lays_out_a_window_whose_first_resize_never_came() {
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(
+            accepted_at(
+                PayloadKind::GhosttySnapshot,
+                false,
+                100,
+                GEOMETRY.grid(),
+                owner(DESK),
+            ),
+            &mut tab,
+            &feed_tx,
+        );
+        hydrate_fully(
+            &mut attach,
+            &mut tab,
+            &feed_tx,
+            &mut feed_rx,
+            snapshot_with("x"),
+        );
+        let wider = Geometry {
+            cols: 90,
+            ..GEOMETRY
+        };
+
+        let mut unfocused = super::super::WindowLayout::default();
+        assert!(!unfocused.focused(Regrid::User, false));
+
+        let mut layout = super::super::WindowLayout::default();
+        attach.note_resize(wider, layout.focused(Regrid::User, true));
+        assert!(matches!(
+            attach.test_drain_input().as_slice(),
+            [HostDataMsg::Resize {
+                cols: 90,
+                focused: true,
+                ..
+            }]
+        ));
+        attach.note_resize(GEOMETRY, layout.focused(Regrid::Window, true));
+        assert!(matches!(
+            attach.test_drain_input().as_slice(),
+            [HostDataMsg::Resize {
+                cols: 80,
+                focused: true,
+                ..
+            }]
+        ));
+    }
+
+    /// A focused resize of a tab this window does not size is a take even
+    /// at the grid it already advertised. Withheld, latest-wins keeps it:
+    /// focused to 90 columns and back to 80 still sends a focused 80.
+    /// Unfocused, or of a tab it sizes, the same grid sends nothing.
+    #[tokio::test]
+    async fn a_focused_resize_at_the_advertised_grid_still_takes_another_clients_tab() {
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(
+            accepted_at(
+                PayloadKind::GhosttySnapshot,
+                false,
+                100,
+                GEOMETRY.grid(),
+                owner(DESK),
+            ),
+            &mut tab,
+            &feed_tx,
+        );
+        attach.note_resize(
+            Geometry {
+                cols: 90,
+                ..GEOMETRY
+            },
+            true,
+        );
+        attach.note_resize(GEOMETRY, true);
+        hydrate_fully(
+            &mut attach,
+            &mut tab,
+            &feed_tx,
+            &mut feed_rx,
+            snapshot_with("x"),
+        );
+        assert!(matches!(
+            attach.test_drain_input().as_slice(),
+            [HostDataMsg::Resize {
+                cols: 80,
+                focused: true,
+                ..
+            }]
+        ));
+
+        attach.note_resize(GEOMETRY, false);
+        assert!(
+            attach.test_drain_input().is_empty(),
+            "unfocused: nothing new"
+        );
+        attach.note_resize(GEOMETRY, true);
+        assert!(matches!(
+            attach.test_drain_input().as_slice(),
+            [HostDataMsg::Resize {
+                cols: 80,
+                focused: true,
+                ..
+            }]
+        ));
+
+        attach.on_frame(grid(100, GEOMETRY.grid(), owner(ME)), &mut tab, &feed_tx);
+        attach.note_resize(GEOMETRY, true);
+        assert!(
+            attach.test_drain_input().is_empty(),
+            "its own tab: nothing new"
+        );
+    }
+
+    /// The window's teardown waits out the detach drains from outside the
+    /// runtime, which is where a timer must not be built.
+    #[test]
+    fn waiting_out_the_detach_drains_from_outside_the_runtime_does_not_panic() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let started = std::time::Instant::now();
+        wait_out_detach_drains(&runtime);
+        assert!(started.elapsed() >= DETACH_DRAIN);
     }
 
     /// FINISH promotes the hydration's fence — the moment it becomes

@@ -180,6 +180,8 @@ enum Message {
     AgentSelected(TabKey),
     /// The Agents panel header's sort word.
     CycleAgentPanelSort,
+    /// The tab band's Take size button (plan 084 D7).
+    TakeSize(TabKey),
     TabSelected(TabKey),
     BeginRenameTab(TabKey),
     TabStrip(strip_reorder::StripEvent),
@@ -821,6 +823,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::BeginRenameProject(_)
         | Message::AgentSelected(_)
         | Message::CycleAgentPanelSort
+        | Message::TakeSize(_)
         | Message::TabSelected(_)
         | Message::BeginRenameTab(_)
         | Message::CloseTab(_)

@@ -72,7 +72,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use roost_ipc::messages::{
-    ops, AgentHooksOutcome, AttachPayloadKind, EventEnvelope, OscColorsParams, RetrySchedule,
+    ops, AgentHooksOutcome, AttachPayloadKind, ClientHelloParams, EventEnvelope, OscColorsParams,
+    RetrySchedule, MAX_CLIENT_FIELD,
 };
 use roost_ipc::ssh::{SshFailure, SshTunnel};
 use roost_ui_model::keys::HostId;
@@ -579,6 +580,10 @@ pub(crate) struct HostConnSet {
     /// seeds the theme that is current *now*, not the one at spawn.
     theme: Arc<Mutex<OscColorsParams>>,
     client_build: String,
+    /// Who this process is to every session it connects to (plan 084
+    /// D1): one id for the process's whole life, so every connection and
+    /// every reconnect names the same client.
+    client: ClientHelloParams,
     /// Everything this set holds for one saved host, keyed on the saved
     /// host's stable id (`HostSnapshot.id`). See [`HostEntry`] — one
     /// entry per host is what makes "what does this host currently
@@ -948,6 +953,7 @@ impl HostConnSet {
         runtime: tokio::runtime::Handle,
         feed: crate::engine_feed::EngineFeedSender,
         theme: &Theme,
+        client_id: String,
     ) -> Self {
         Self {
             runtime,
@@ -955,6 +961,13 @@ impl HostConnSet {
             minter: HostIdMinter::new(),
             theme: Arc::new(Mutex::new(theme_colors(theme))),
             client_build: roost_vt::libghostty_build(),
+            client: ClientHelloParams {
+                client_id,
+                label: crate::app::agent_hooks::client_label()
+                    .chars()
+                    .take(MAX_CLIENT_FIELD)
+                    .collect(),
+            },
             entries: HashMap::new(),
             mirrors: HashMap::new(),
             next_generation: 0,
@@ -1097,6 +1110,7 @@ impl HostConnSet {
             mode,
             resume,
             client_build: self.client_build.clone(),
+            client: self.client.clone(),
             theme: Arc::clone(&self.theme),
             uploads: ops.uploads(),
             serving: ops.serving(),
@@ -2466,6 +2480,12 @@ impl HostConnSet {
         Some(self.facts(&host)?.session_id.as_str())
     }
 
+    /// This process's client id, which every attach handshake names
+    /// beside the hello its control connection said.
+    pub(crate) fn client_id(&self) -> &str {
+        &self.client.client_id
+    }
+
     /// The theme changed. The slot every task re-reads on reconnect is
     /// updated first, then every connected host is told — so a session
     /// that reconnects during the round trip still gets the new colors.
@@ -2919,6 +2939,7 @@ pub(crate) mod fixtures {
             tokio::runtime::Handle::current(),
             feed,
             &Theme::roost_dark(),
+            "0123456789abcdef".into(),
         );
         (set, rx)
     }

@@ -21,15 +21,17 @@ use roost_engine::program_status::RawOscAuthority;
 use roost_engine::tab_task::{AttachPause, AttachReleases, ServerVtConfig, ServerVtWorkspace};
 use roost_engine::{PtySupervisor, Workspace};
 use roost_ipc::dataframe::{
-    write_data_frame, DataFrame, DataFrameReader, FRAME_ERROR, FRAME_EXIT, FRAME_INPUT, FRAME_PTY,
-    FRAME_RESIZE, FRAME_SNAP, MAX_DATA_FRAME_BYTES,
+    write_data_frame, DataFrame, DataFrameReader, InputTake, FRAME_DETACH, FRAME_ERROR, FRAME_EXIT,
+    FRAME_GRID, FRAME_INPUT, FRAME_PTY, FRAME_RESIZE, FRAME_SNAP, FRAME_TAKE, MAX_DATA_FRAME_BYTES,
+    RESIZE_FOCUSED,
 };
 use roost_ipc::framing::{write_frame, FrameReader};
 use roost_ipc::messages::{
-    ops, AttachAccepted, AttachHandshakeReply, AttachMode, AttachPayloadKind, ResponseError,
-    SessionStopParams, SessionStopResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabCloseParams, TabDumpParams, TabDumpResult, TabFeedPtyBytesParams, TabOpenParams,
-    TabOpenResult, TabResizeParams, TabWriteParams, WireTabRef, SESSION_PROTOCOL_VERSION,
+    ops, AttachAccepted, AttachHandshakeReply, AttachMode, AttachPayloadKind, GridFrame,
+    ResponseError, SessionStopParams, SessionStopResult, SizeOwner, TabCapturePtyInputParams,
+    TabCapturePtyInputResult, TabCloseParams, TabDumpParams, TabDumpResult, TabFeedPtyBytesParams,
+    TabOpenParams, TabOpenResult, TabResizeParams, TabWriteParams, WireTabRef,
+    SESSION_PROTOCOL_VERSION,
 };
 use roost_ipc::{IpcClient, IpcServer};
 use tempfile::TempDir;
@@ -91,7 +93,21 @@ impl ServerVtWorkspace for NoopWorkspace {
     ) -> RawOscAuthority {
         RawOscAuthority::default()
     }
+    fn tab_pipeline(&self, _tab_id: i64, _generation: u64) {}
+
+    fn tab_resized(
+        &self,
+        _tab_id: i64,
+        _generation: u64,
+        _cols: u16,
+        _rows: u16,
+        _owner: Option<SizeOwner>,
+    ) {
+    }
 }
+
+/// The client id every handshake here names unless a test says otherwise.
+const CLIENT: &str = "fwd-client";
 
 const SESSION_ID: &str = "01K3S8TQ4F0Q9YB2K6WZ5D7XN";
 
@@ -135,6 +151,24 @@ async fn harness_pausing_admission() -> (Harness, AttachReleases) {
 enum Seam {
     Admission(AttachPause),
     Handoff(AttachPause),
+    /// Every attach waits this long between its size decision and its
+    /// accepted reply.
+    Hold(Duration),
+    /// Every dropped owner keeps its tab this long.
+    Grace(Duration),
+}
+
+/// A session whose attaches each hold between decision and reply.
+async fn harness_holding(hold: Duration) -> Harness {
+    let dir = tempfile::tempdir().expect("tempdir");
+    harness_with(dir, SESSION_ID, &BOTH_KINDS, Some(Seam::Hold(hold))).await
+}
+
+/// A session whose tab tasks park at every snapshot and resume hand-off,
+/// and whose dropped owners keep their tabs for `grace`.
+async fn harness_with_grace(grace: Duration) -> Harness {
+    let dir = tempfile::tempdir().expect("tempdir");
+    harness_with(dir, SESSION_ID, &BOTH_KINDS, Some(Seam::Grace(grace))).await
 }
 
 /// Bind a session into an existing directory under a stated identity —
@@ -163,6 +197,8 @@ async fn harness_with(
     match seam {
         Some(Seam::Admission(pause)) => config = config.with_admission_pause(pause),
         Some(Seam::Handoff(pause)) => config = config.with_handoff_pause(pause),
+        Some(Seam::Hold(hold)) => config = config.with_attach_hold(hold),
+        Some(Seam::Grace(grace)) => config = config.with_owner_grace(grace),
         None => {}
     }
     supervisor
@@ -216,20 +252,21 @@ impl Harness {
     }
 
     /// The handshake this session would accept for `tab_id`, spelled
-    /// out as JSON so a test can lie about exactly one term.
+    /// out as JSON so a test can lie about exactly one term. It takes the
+    /// tab's size, as an explicit switch does.
     fn handshake(&self, tab_id: i64) -> serde_json::Value {
         self.sized_handshake(tab_id, (80, 24), (0, 0), true)
     }
 
-    /// The same at an explicit viewport. `focus` is the attach-time
-    /// geometry claim: `true` resizes the tab, `false` attaches at
-    /// whatever size it already is.
+    /// The same at an explicit viewport. `take` is the attach-time size
+    /// claim: `true` resizes the tab, `false` attaches at whatever size
+    /// it already is unless nobody owns it.
     fn sized_handshake(
         &self,
         tab_id: i64,
         (cols, rows): (u16, u16),
         (cell_w_px, cell_h_px): (u16, u16),
-        focus: bool,
+        take: bool,
     ) -> serde_json::Value {
         serde_json::json!({
             "attach": tab_id.to_string(),
@@ -241,7 +278,8 @@ impl Harness {
             "cell_w_px": cell_w_px,
             "cell_h_px": cell_h_px,
             "libghostty_build": roost_vt::libghostty_build(),
-            "focus": focus,
+            "take": take,
+            "client_id": CLIENT,
         })
     }
 
@@ -383,21 +421,32 @@ impl Harness {
         tab_id: i64,
         grid: (u16, u16),
         cell: (u16, u16),
-        focus: bool,
+        take: bool,
     ) -> (AttachAccepted, DataClient) {
-        let (accepted, mut data) = dial(
-            &self.socket,
-            self.sized_handshake(tab_id, grid, cell, focus),
-        )
-        .await
-        .expect("accepted");
+        self.attached_as(CLIENT, tab_id, grid, cell, take).await
+    }
+
+    /// [`Self::attached_at`] as a named client.
+    async fn attached_as(
+        &self,
+        client: &str,
+        tab_id: i64,
+        grid: (u16, u16),
+        cell: (u16, u16),
+        take: bool,
+    ) -> (AttachAccepted, DataClient) {
+        let mut line = self.sized_handshake(tab_id, grid, cell, take);
+        line["client_id"] = serde_json::json!(client);
+        let (accepted, mut data) = dial(&self.socket, line).await.expect("accepted");
         data.read_snapshot().await;
         (accepted, data)
     }
 
     /// A tab that has been attached once and has gone quiet again, with
-    /// the data connection dropped the way a client's would be. The seq
-    /// is the last record that client applied — what it would carry into
+    /// the data connection detached the way a client's would be — a
+    /// `DETACH`, so the tab is nobody's again rather than held for a
+    /// grace, and a background resize may move it. The seq is the last
+    /// record that client applied — what it would carry into
     /// `resume_from_seq + 1` — and the accepted reply is where the
     /// identity a resume hands back comes from, now that there is no
     /// control leg to learn it on.
@@ -413,7 +462,7 @@ impl Harness {
         let after = pty.last().map_or(accepted.seq, |(seq, _)| *seq);
         feed(&mut client, tab_id, b"ROOST_CAUGHT_UP\r\n".to_vec()).await;
         let (applied, _) = data.read_pty_until(after, b"ROOST_CAUGHT_UP").await;
-        drop(data);
+        data.detach().await;
         (client, tab_id, applied, accepted)
     }
 }
@@ -427,6 +476,8 @@ impl Harness {
 struct DataClient {
     reader: DataFrameReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
+    /// Every `GRID` read so far, in order.
+    grids: Vec<GridFrame>,
 }
 
 impl std::fmt::Debug for DataClient {
@@ -464,7 +515,14 @@ async fn dial(
         .await
         .expect("a preamble in time")
         .expect("the preamble follows an accepted handshake");
-    Ok((accepted, DataClient { reader, writer }))
+    Ok((
+        accepted,
+        DataClient {
+            reader,
+            writer,
+            grids: Vec::new(),
+        },
+    ))
 }
 
 /// Wait until a tab task has reached a hand-off. It stays parked there
@@ -502,6 +560,55 @@ impl DataClient {
         self.writer.flush().await.expect("flush");
     }
 
+    /// An `INPUT` frame, stating what it asks of the tab's size.
+    async fn input(&mut self, take: InputTake, bytes: &[u8]) {
+        let mut payload = vec![take.flags()];
+        payload.extend_from_slice(bytes);
+        self.send(FRAME_INPUT, &payload).await;
+    }
+
+    /// A `RESIZE` frame.
+    async fn resize(
+        &mut self,
+        (cols, rows): (u16, u16),
+        (cell_w, cell_h): (u16, u16),
+        focused: bool,
+    ) {
+        let mut payload = Vec::new();
+        for value in [cols, rows, cell_w, cell_h] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        payload.push(if focused { RESIZE_FOCUSED } else { 0 });
+        self.send(FRAME_RESIZE, &payload).await;
+    }
+
+    /// `DETACH`, then the end of the connection as the server closes it.
+    async fn detach(mut self) {
+        self.send(FRAME_DETACH, &[]).await;
+        while self.next().await.is_some() {}
+    }
+
+    /// Read until a `GRID` arrives, skipping PTY frames — which stay
+    /// contiguous across it.
+    async fn next_grid(&mut self) -> GridFrame {
+        let seen = self.grids.len();
+        while self.grids.len() == seen {
+            let frame = self.frame().await;
+            self.observe(&frame);
+        }
+        self.grids.last().cloned().expect("a GRID")
+    }
+
+    /// Account for a frame a reader is not otherwise interested in:
+    /// `GRID`s are recorded, PTY passes, anything else is a failure.
+    fn observe(&mut self, frame: &DataFrame) {
+        match frame.frame_type {
+            FRAME_GRID => self.grids.push(grid_of(frame)),
+            FRAME_PTY => {}
+            other => panic!("unexpected frame {other:#04x}"),
+        }
+    }
+
     /// Read until the snapshot's FINISH record has arrived, returning
     /// the snapshot bytes and every PTY frame that interleaved with
     /// them.
@@ -515,6 +622,13 @@ impl DataClient {
             match frame.frame_type {
                 FRAME_SNAP => snapshot.extend_from_slice(&frame.payload),
                 FRAME_PTY => pty.push(split_pty(&frame)),
+                FRAME_GRID => {
+                    assert!(
+                        has_tag(&snapshot, TAG_READY),
+                        "a GRID is held until the snapshot is READY"
+                    );
+                    self.grids.push(grid_of(&frame));
+                }
                 other => panic!("unexpected frame {other:#04x} during the snapshot"),
             }
         }
@@ -525,13 +639,18 @@ impl DataClient {
 impl DataClient {
     /// Read PTY frames until `marker` has come through, asserting the
     /// stream is contiguous from `after + 1` and carries nothing but PTY
-    /// frames — which is also what makes "a resume sends no SNAP"
-    /// observable. Returns the last seq seen and the bytes read.
+    /// frames and the `GRID`s beside them — which is also what makes "a
+    /// resume sends no SNAP" observable. Returns the last seq seen and
+    /// the bytes read.
     async fn read_pty_until(&mut self, after: u64, marker: &[u8]) -> (u64, Vec<u8>) {
         let mut next = after + 1;
         let mut text = Vec::new();
         while !contains(&text, marker) {
             let frame = self.frame().await;
+            if frame.frame_type == FRAME_GRID {
+                self.grids.push(grid_of(&frame));
+                continue;
+            }
             assert_eq!(
                 frame.frame_type, FRAME_PTY,
                 "expected PTY frames and nothing else"
@@ -558,6 +677,11 @@ fn split_pty(frame: &DataFrame) -> (u64, Vec<u8>) {
     );
     let seq = u64::from_le_bytes(frame.payload[..8].try_into().unwrap());
     (seq, frame.payload[8..].to_vec())
+}
+
+fn grid_of(frame: &DataFrame) -> GridFrame {
+    assert_eq!(frame.frame_type, FRAME_GRID, "expected a GRID frame");
+    serde_json::from_slice(&frame.payload).expect("a GRID frame carries {seq, cols, rows, owner}")
 }
 
 fn error_of(frame: &DataFrame) -> ResponseError {
@@ -595,8 +719,8 @@ async fn feed(client: &mut IpcClient, tab_id: i64, data: Vec<u8>) {
         .expect("tab.feed_pty_bytes");
 }
 
-/// Bytes into the tab from the CONTROL plane, which states no geometry
-/// of its own — the only way to reach a child without also sizing it.
+/// Bytes into the tab from the CONTROL plane, which never takes the
+/// tab's size (rule 9) — the way to reach a child without sizing it.
 async fn write_tab(client: &mut IpcClient, tab_id: i64, data: &[u8]) {
     client
         .call::<_, serde_json::Value>(
@@ -608,6 +732,33 @@ async fn write_tab(client: &mut IpcClient, tab_id: i64, data: &[u8]) {
         )
         .await
         .expect("tab.write");
+}
+
+/// Raise this process's `RLIMIT_NOFILE` soft limit, never lower it.
+///
+/// The tests in this binary share one process, and both ends of every
+/// socket live in it. macOS starts a process at a 256 soft limit, which a
+/// burst of connections plus the siblings' sockets and PTYs exhausts — and
+/// an `EMFILE` from `accept` ends that harness's accept loop for good.
+fn raise_fd_soft_limit(target: libc::rlim_t) {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` writes one `rlimit`, which is what it is given.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    assert_eq!(rc, 0, "getrlimit: {}", std::io::Error::last_os_error());
+    let wanted = target.min(limit.rlim_max);
+    if limit.rlim_cur >= wanted {
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: wanted,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: `setrlimit` reads one `rlimit`, which is what it is given.
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) };
+    assert_eq!(rc, 0, "setrlimit: {}", std::io::Error::last_os_error());
 }
 
 async fn resize(client: &mut IpcClient, tab_id: i64, cols: u32, rows: u32) {
@@ -721,13 +872,14 @@ async fn a_snapshot_attach_streams_ready_then_finish_then_live_frames() {
 }
 
 /// The dump the session serves and the terminal the client is attached
-/// to are the same terminal, so a RESIZE frame moves both.
+/// to are the same terminal, so the owner's RESIZE frame moves both —
+/// focused or not: an owner's resize always applies (rule 4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_resize_frame_reaches_the_tabs_terminal() {
+async fn the_owners_resize_frame_reaches_the_tabs_terminal() {
     let h = harness().await;
     let (mut client, tab_id) = h.live_tab().await;
 
-    // A focused attach resizes the tab to the geometry the handshake
+    // A taking attach resizes the tab to the geometry the handshake
     // asked for, before anything is encoded from it.
     let (_accepted, mut data) = dial(
         &h.socket,
@@ -741,11 +893,7 @@ async fn a_resize_frame_reaches_the_tabs_terminal() {
     .await;
     data.read_snapshot().await;
 
-    let mut payload = Vec::new();
-    for value in [90u16, 20, 9, 18] {
-        payload.extend_from_slice(&value.to_le_bytes());
-    }
-    data.send(FRAME_RESIZE, &payload).await;
+    data.resize((90, 20), (9, 18), false).await;
     wait_for_dump(&mut client, tab_id, "the RESIZE frame to land", |d| {
         (d.cols, d.rows) == (90, 20)
     })
@@ -759,7 +907,7 @@ async fn an_input_frame_reaches_the_pty() {
     let h = harness().await;
     let (mut client, tab_id, mut data) = h.attached().await;
 
-    data.send(FRAME_INPUT, b"ROOST_TYPED").await;
+    data.input(InputTake::None, b"ROOST_TYPED").await;
 
     let deadline = Instant::now() + BUDGET;
     let mut captured = Vec::new();
@@ -973,9 +1121,10 @@ async fn an_oversized_frame_ends_the_connection() {
     assert!(data.next().await.is_none());
 }
 
-/// A tab admits as many data connections as are dialed (plan 057, R15):
-/// both see the same PTY output and both can type into it. Nothing is
-/// superseded — a second attach used to close the first.
+/// A tab admits as many data connections as are dialed (plan 057 R15,
+/// kept by plan 084): both see the same PTY output and both can type
+/// into it. Nothing is superseded — a second attach used to close the
+/// first — and typing that asks for nothing takes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_attaches_to_one_tab_both_stream_and_both_type() {
     let h = harness().await;
@@ -987,7 +1136,9 @@ async fn two_attaches_to_one_tab_both_stream_and_both_type() {
     let (_snapshot, pty) = a.read_snapshot().await;
     let a_at = pty.last().map_or(a_accepted.seq, |(seq, _)| *seq);
 
-    let (b_accepted, mut b) = dial(&h.socket, h.handshake(tab_id))
+    let mut watching = h.sized_handshake(tab_id, (60, 20), (0, 0), false);
+    watching["client_id"] = serde_json::json!("fwd-other");
+    let (b_accepted, mut b) = dial(&h.socket, watching)
         .await
         .expect("the first attach is untouched and a second is admitted");
     let (_snapshot, pty) = b.read_snapshot().await;
@@ -1000,11 +1151,17 @@ async fn two_attaches_to_one_tab_both_stream_and_both_type() {
 
     // And both write: the input side is open to every admitted
     // connection, not to one of them.
-    a.send(FRAME_INPUT, b"ROOST_FROM_A").await;
-    b.send(FRAME_INPUT, b"ROOST_FROM_B").await;
+    a.input(InputTake::None, b"ROOST_FROM_A").await;
+    b.input(InputTake::None, b"ROOST_FROM_B").await;
     let typed =
         read_pty_input_until(&mut client, tab_id, &[b"ROOST_FROM_A", b"ROOST_FROM_B"]).await;
     assert!(contains(&typed, b"ROOST_FROM_A") && contains(&typed, b"ROOST_FROM_B"));
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!(
+        (d.cols, d.rows),
+        (80, 24),
+        "unflagged input from the watcher resizes nothing"
+    );
 }
 
 /// Dropping one attach leaves the others alone: the registry keeps a
@@ -1084,7 +1241,7 @@ async fn a_stop_labels_a_data_connection_that_only_ever_attached() {
 }
 
 // ---------------------------------------------------------------------
-// Geometry: the last geometry-bearing interaction sizes the PTY
+// Geometry: the size owner's grid is the PTY's (plan 084)
 // ---------------------------------------------------------------------
 
 /// Enable libghostty's mode-2048 in-band size reports on a tab. Every
@@ -1134,24 +1291,28 @@ fn index_of(captured: &[u8], needle: &[u8]) -> usize {
         })
 }
 
-/// Typing is a geometry-bearing interaction: an INPUT frame carries its
-/// connection's declared geometry, and the tab takes that size *before*
-/// the bytes are written. Both ride one command channel, so the order is
-/// the task's receive order and needs no fence.
+/// Keys take the tab: an INPUT frame flagged `TAKE_BEFORE` from a
+/// watcher makes it the owner at its own grid, and the tab takes that
+/// size *before* the bytes are written. Both ride one command channel,
+/// so the order is the task's receive order and needs no fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_input_frame_applies_its_connections_geometry_first() {
+async fn a_take_before_input_resizes_ahead_of_its_bytes() {
     let h = harness().await;
     let (mut client, tab_id) = h.live_tab().await;
 
-    let (_desktop, _a) = h.attached_at(tab_id, (100, 30), (8, 16), true).await;
-    let (_phone, mut b) = h.attached_at(tab_id, (60, 20), (8, 16), false).await;
-    wait_for_dump(&mut client, tab_id, "the focused attach's geometry", |d| {
+    let (_desktop, mut a) = h
+        .attached_as("desk", tab_id, (100, 30), (8, 16), true)
+        .await;
+    let (_phone, mut b) = h
+        .attached_as("phone", tab_id, (60, 20), (8, 16), false)
+        .await;
+    wait_for_dump(&mut client, tab_id, "the taking attach's geometry", |d| {
         (d.cols, d.rows) == (100, 30)
     })
     .await;
 
     watch_size_reports(&mut client, tab_id).await;
-    b.send(FRAME_INPUT, b"ROOST_TYPED").await;
+    b.input(InputTake::Before, b"ROOST_TYPED").await;
 
     let captured = read_pty_input_until(&mut client, tab_id, &[b"ROOST_TYPED"]).await;
     let resized = index_of(&captured, b"48;20;60");
@@ -1167,24 +1328,57 @@ async fn an_input_frame_applies_its_connections_geometry_first() {
             (d.cols, d.rows)
         },
         (60, 20),
-        "the PTY follows whoever typed last"
+        "the typist owns the tab now"
     );
+    let grid = a.next_grid().await;
+    assert_eq!((grid.cols, grid.rows), (60, 20));
+    assert_eq!(
+        grid.owner.map(|owner| owner.client_id).as_deref(),
+        Some("phone"),
+        "the old owner hears it in band"
+    );
+}
+
+/// The other half of rule 3: input that asks for nothing — a focus
+/// report, a button-less mouse move — is delivered and takes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unflagged_input_from_a_watcher_never_resizes() {
+    let h = harness().await;
+    let (mut client, tab_id) = h.live_tab().await;
+
+    let (_desktop, _a) = h
+        .attached_as("desk", tab_id, (100, 30), (8, 16), true)
+        .await;
+    let (_phone, mut b) = h
+        .attached_as("phone", tab_id, (60, 20), (8, 16), false)
+        .await;
+    watch_size_reports(&mut client, tab_id).await;
+    b.input(InputTake::None, b"\x1b[I").await;
+    b.input(InputTake::None, b"ROOST_UNFLAGGED").await;
+    let captured = read_pty_input_until(&mut client, tab_id, &[b"ROOST_UNFLAGGED"]).await;
+    assert_eq!(size_reports(&captured, (60, 20)), 0, "{captured:?}");
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!((d.cols, d.rows), (100, 30));
 }
 
 /// Geometry is four numbers, not two. A connection at the tab's own grid
 /// but with different cell metrics is a different viewport — libghostty's
-/// size reports quote the pixel dimensions — so its input resizes the tab
+/// size reports quote the pixel dimensions — so its take resizes the tab
 /// even though `tab.dump` cannot tell the difference.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_grid_different_cell_metrics_still_counts_as_a_change() {
     let h = harness().await;
     let (mut client, tab_id) = h.live_tab().await;
 
-    let (_accepted, mut same) = h.attached_at(tab_id, (100, 30), (8, 16), true).await;
-    let (_accepted, mut wider_cells) = h.attached_at(tab_id, (100, 30), (9, 16), false).await;
+    let (_accepted, mut same) = h
+        .attached_as("desk", tab_id, (100, 30), (8, 16), true)
+        .await;
+    let (_accepted, mut wider_cells) = h
+        .attached_as("phone", tab_id, (100, 30), (9, 16), false)
+        .await;
 
     watch_size_reports(&mut client, tab_id).await;
-    same.send(FRAME_INPUT, b"ROOST_UNCHANGED").await;
+    same.input(InputTake::Before, b"ROOST_UNCHANGED").await;
     let captured = read_pty_input_until(&mut client, tab_id, &[b"ROOST_UNCHANGED"]).await;
     assert_eq!(
         size_reports(&captured, (100, 30)),
@@ -1193,7 +1387,9 @@ async fn same_grid_different_cell_metrics_still_counts_as_a_change() {
         String::from_utf8_lossy(&captured)
     );
 
-    wider_cells.send(FRAME_INPUT, b"ROOST_WIDER_CELLS").await;
+    wider_cells
+        .input(InputTake::Before, b"ROOST_WIDER_CELLS")
+        .await;
     let captured = read_pty_input_until(&mut client, tab_id, &[b"ROOST_WIDER_CELLS"]).await;
     assert_eq!(
         size_reports(&captured, (100, 30)),
@@ -1204,14 +1400,16 @@ async fn same_grid_different_cell_metrics_still_counts_as_a_change() {
 }
 
 /// `tab.resize` states two of the four numbers, so the tab keeps the
-/// cell metrics its last geometry-bearing client declared — and the
-/// report it emits quotes the child real pixels rather than `0x0`.
+/// cell metrics its last owner declared — and the report it emits quotes
+/// the child real pixels rather than `0x0`. The owner detaches first: a
+/// background resize of an owned tab is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grid_resize_keeps_the_cell_metrics_a_client_declared() {
     let h = harness().await;
     let (mut client, tab_id) = h.live_tab().await;
 
-    let (_accepted, _data) = h.attached_at(tab_id, (100, 30), (9, 18), true).await;
+    let (_accepted, data) = h.attached_at(tab_id, (100, 30), (9, 18), true).await;
+    data.detach().await;
     watch_size_reports(&mut client, tab_id).await;
 
     let mut other = h.control().await;
@@ -1235,7 +1433,8 @@ async fn a_grid_resize_to_the_size_the_tab_already_has_reports_nothing() {
     let h = harness().await;
     let (mut client, tab_id) = h.live_tab().await;
 
-    let (_accepted, _data) = h.attached_at(tab_id, (100, 30), (9, 18), true).await;
+    let (_accepted, data) = h.attached_at(tab_id, (100, 30), (9, 18), true).await;
+    data.detach().await;
     watch_size_reports(&mut client, tab_id).await;
 
     // The second resize is the fence: both ride the tab's one command
@@ -1255,25 +1454,29 @@ async fn a_grid_resize_to_the_size_the_tab_already_has_reports_nothing() {
 }
 
 /// Two clients typing into one tab do not race for the PTY's size: each
-/// INPUT applies its own geometry, and the tab ends up wherever the last
-/// command the task *received* asked for — not the last one sent.
+/// key takes the tab at its own grid, and the tab ends up wherever the
+/// last take the task *received* asked for — not the last one sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_senders_linearize_in_receive_order() {
+async fn two_typists_take_in_receive_order() {
     let h = harness().await;
     let (mut client, tab_id) = h.live_tab().await;
 
-    let (_accepted, mut desktop) = h.attached_at(tab_id, (100, 30), (8, 16), true).await;
-    let (_accepted, mut phone) = h.attached_at(tab_id, (60, 20), (8, 16), false).await;
+    let (_accepted, mut desktop) = h
+        .attached_as("desk", tab_id, (100, 30), (8, 16), true)
+        .await;
+    let (_accepted, mut phone) = h
+        .attached_as("phone", tab_id, (60, 20), (8, 16), false)
+        .await;
 
     // Sequenced, not raced: each marker is read back before the next
     // sender types, so which command the task took first is a fact of
     // the test rather than of the scheduler.
-    phone.send(FRAME_INPUT, b"ROOST_PHONE").await;
+    phone.input(InputTake::Before, b"ROOST_PHONE").await;
     read_pty_input_until(&mut client, tab_id, &[b"ROOST_PHONE"]).await;
     let d = dump(&mut client, tab_id).await;
     assert_eq!((d.cols, d.rows), (60, 20));
 
-    desktop.send(FRAME_INPUT, b"ROOST_DESKTOP").await;
+    desktop.input(InputTake::Before, b"ROOST_DESKTOP").await;
     read_pty_input_until(&mut client, tab_id, &[b"ROOST_DESKTOP"]).await;
     let d = dump(&mut client, tab_id).await;
     assert_eq!((d.cols, d.rows), (100, 30));
@@ -1288,15 +1491,11 @@ async fn a_zero_sized_resize_frame_is_ignored() {
     let (mut client, tab_id) = h.live_tab().await;
     let (_accepted, mut data) = h.attached_at(tab_id, (100, 30), (8, 16), true).await;
 
-    let mut payload = Vec::new();
-    for value in [0u16, 20, 8, 16] {
-        payload.extend_from_slice(&value.to_le_bytes());
-    }
-    data.send(FRAME_RESIZE, &payload).await;
+    data.resize((0, 20), (8, 16), true).await;
 
     // Read a later frame back, so "nothing happened" is a fact about a
     // tab that has processed the zero-sized one, not about timing.
-    data.send(FRAME_INPUT, b"ROOST_AFTER_ZERO").await;
+    data.input(InputTake::None, b"ROOST_AFTER_ZERO").await;
     read_pty_input_until(&mut client, tab_id, &[b"ROOST_AFTER_ZERO"]).await;
     let d = dump(&mut client, tab_id).await;
     assert_eq!(
@@ -1306,30 +1505,44 @@ async fn a_zero_sized_resize_frame_is_ignored() {
     );
 }
 
-/// An unfocused attach claims nothing: the tab keeps the size the
-/// focused client gave it, and the accepted handshake reports the
+/// A watching attach (`take: false`) claims nothing on an owned tab: the
+/// tab keeps its owner's size, and the accepted handshake reports the
 /// geometry its snapshot was actually encoded at — which is what a `vt`
-/// client has to build its terminal at.
+/// client has to build its terminal at — and whose size it is.
 ///
-/// A focused attach hears it too. Its own resize lands before the
-/// encode, but raw input is open and any other client may size the tab
-/// in between, so "what I asked for" is never evidence of what the
-/// encode composed — `a_resume_reports_the_geometry_the_ring_was_written_at`
-/// is the case where the two differ.
+/// A taking attach hears it too. Its own resize lands before the
+/// encode, but another client may take the tab in between, so "what I
+/// asked for" is never evidence of what the encode composed —
+/// `a_resume_reports_the_geometry_the_ring_was_written_at` is the case
+/// where the two differ.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unfocused_attach_never_resizes_and_reports_the_snapshot_geometry() {
+async fn a_watching_attach_never_resizes_and_reports_the_snapshot_geometry() {
     let h = harness().await;
     let (mut client, tab_id) = h.live_tab().await;
 
-    let (desktop, _a) = h.attached_at(tab_id, (100, 30), (8, 16), true).await;
+    let (desktop, _a) = h
+        .attached_as("desk", tab_id, (100, 30), (8, 16), true)
+        .await;
     assert_eq!(
         (desktop.snapshot_cols, desktop.snapshot_rows),
         (100, 30),
         "the size the payload was encoded at, which here is what was asked for"
     );
+    assert_eq!(
+        desktop.owner.as_ref().map(|owner| owner.client_id.as_str()),
+        Some("desk"),
+        "a taking attach is the owner in its own reply"
+    );
 
-    let (phone, _b) = h.attached_at(tab_id, (60, 20), (8, 16), false).await;
+    let (phone, _b) = h
+        .attached_as("phone", tab_id, (60, 20), (8, 16), false)
+        .await;
     assert_eq!((phone.snapshot_cols, phone.snapshot_rows), (100, 30));
+    assert_eq!(
+        phone.owner.map(|owner| owner.client_id).as_deref(),
+        Some("desk"),
+        "and a watcher is told whose size it is shown"
+    );
     let d = dump(&mut client, tab_id).await;
     assert_eq!(
         (d.cols, d.rows),
@@ -1349,11 +1562,7 @@ async fn a_dump_never_resizes() {
     let d = dump(&mut client, tab_id).await;
     assert_eq!((d.cols, d.rows), (100, 30));
 
-    let mut payload = Vec::new();
-    for value in [70u16, 22, 8, 16] {
-        payload.extend_from_slice(&value.to_le_bytes());
-    }
-    data.send(FRAME_RESIZE, &payload).await;
+    data.resize((70, 22), (8, 16), false).await;
     wait_for_dump(&mut client, tab_id, "the RESIZE frame to land", |d| {
         (d.cols, d.rows) == (70, 22)
     })
@@ -1509,13 +1718,13 @@ async fn a_resume_replays_the_ring_and_sends_no_snapshot() {
 }
 
 /// A resume names the tab's geometry too, read at the handoff (review
-/// F1).
+/// F1), and its owner.
 ///
-/// The other client's resize lands while this one is still attached and
-/// is followed by output it read, so the slice it resumes from starts
-/// after the change. The dial is unfocused on purpose: a focused resume
-/// states its geometry, so the handoff would find the tab already at it
-/// and the assertion would say nothing.
+/// Another client takes the tab while this one is still attached, and
+/// output this one read follows the change, so the slice it resumes from
+/// starts after it. The dial watches on purpose: a taking resume states
+/// its geometry, so the handoff would find the tab already at it and the
+/// assertion would say nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resume_reports_the_geometry_the_ring_was_written_at() {
     let h = harness().await;
@@ -1526,10 +1735,16 @@ async fn a_resume_reports_the_geometry_the_ring_was_written_at() {
     let (_snapshot, pty) = data.read_snapshot().await;
     let after = pty.last().map_or(identity.seq, |(seq, _)| *seq);
 
-    let mut other = h.control().await;
-    resize(&mut other, tab_id, 60, 20).await;
+    let (_other, _taker) = h
+        .attached_as("fwd-other", tab_id, (60, 20), (0, 0), true)
+        .await;
     feed(&mut client, tab_id, b"ROOST_AT_SIXTY\r\n".to_vec()).await;
     let (applied, _) = data.read_pty_until(after, b"ROOST_AT_SIXTY").await;
+    assert_eq!(
+        data.grids.last().map(|grid| (grid.cols, grid.rows)),
+        Some((60, 20)),
+        "the take reached this attachment in band"
+    );
     drop(data);
 
     let mut watching = h.resume_handshake(
@@ -1540,7 +1755,7 @@ async fn a_resume_reports_the_geometry_the_ring_was_written_at() {
     );
     watching["cols"] = serde_json::json!(100);
     watching["rows"] = serde_json::json!(30);
-    watching["focus"] = serde_json::json!(false);
+    watching["take"] = serde_json::json!(false);
 
     let (accepted, _data) = dial(&h.socket, watching).await.expect("accepted");
     assert_eq!(accepted.mode, AttachMode::Resume);
@@ -1549,13 +1764,17 @@ async fn a_resume_reports_the_geometry_the_ring_was_written_at() {
         (60, 20),
         "a resume names the grid its records were written at, not the one asked for"
     );
+    assert_eq!(
+        accepted.owner.map(|owner| owner.client_id).as_deref(),
+        Some("fwd-other")
+    );
 }
 
 /// A resume must not straddle a grid change (#564). Here the change is
 /// another client's resize with **no output after it**, and the resume
-/// asks for the grid the tab is already at — so this attach's own
-/// focused resize changes nothing, and only the marker the resize left
-/// can refuse it. The case a marker at `last_byte_seq` would miss.
+/// asks for the grid the tab is already at — so this attach's own take
+/// changes nothing, and only the marker the resize left can refuse it.
+/// The case a marker at `last_byte_seq` would miss.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resize_with_no_output_after_it_refuses_the_resume() {
     let h = harness().await;
@@ -1584,11 +1803,11 @@ async fn a_resize_with_no_output_after_it_refuses_the_resume() {
     .await;
 }
 
-/// The resuming attach's own focused resize is a grid change like any
-/// other: the records the client missed were written at the grid it
-/// left, not the one it comes back at.
+/// The resuming attach's own take is a grid change like any other: the
+/// records the client missed were written at the grid it left, not the
+/// one it comes back at.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_focused_resume_at_another_grid_refuses_the_resume() {
+async fn a_taking_resume_at_another_grid_refuses_the_resume() {
     let h = harness().await;
     let (_client, tab_id, applied, identity) = h.caught_up().await;
 
@@ -1600,7 +1819,7 @@ async fn a_focused_resume_at_another_grid_refuses_the_resume() {
     );
     wider["cols"] = serde_json::json!(100);
     wider["rows"] = serde_json::json!(30);
-    falls_back(&h.socket, wider, "a focused resume at a new grid").await;
+    falls_back(&h.socket, wider, "a taking resume at a new grid").await;
 }
 
 /// Away and back (A→B→A): the grid the client resumes at is the one it
@@ -1961,7 +2180,6 @@ async fn tab_attach_is_not_an_op_any_more() {
                 "cols": 80,
                 "rows": 24,
                 "libghostty_build": roost_vt::libghostty_build(),
-                "focus": true,
             }),
         )
         .await
@@ -2056,17 +2274,29 @@ async fn a_handshake_missing_a_term_is_a_parse_error_naming_it() {
     let h = harness().await;
     let (_client, tab_id) = h.live_tab().await;
 
-    let mut no_session = h.handshake(tab_id);
-    no_session.as_object_mut().unwrap().remove("session_id");
-    let error = dial(&h.socket, no_session)
-        .await
-        .expect_err("session_id is required");
-    assert_eq!(error.code, "parse-error");
-    assert!(
-        error.message.contains("session_id"),
-        "the rejection names the missing term: {}",
-        error.message
+    for term in ["session_id", "take", "client_id"] {
+        let mut missing = h.handshake(tab_id);
+        missing.as_object_mut().unwrap().remove(term);
+        let error = dial(&h.socket, missing)
+            .await
+            .expect_err("every term is required");
+        assert_eq!(error.code, "parse-error", "{term}");
+        assert!(
+            error.message.contains(term),
+            "the rejection names the missing term: {}",
+            error.message
+        );
+    }
+    // `focus` is gone: a line that still says it, and not `take`, is
+    // one this session cannot read.
+    let mut stale = h.handshake(tab_id);
+    stale.as_object_mut().unwrap().remove("take");
+    stale["focus"] = serde_json::json!(true);
+    assert_eq!(
+        dial(&h.socket, stale).await.unwrap_err().code,
+        "parse-error"
     );
+    h.wait_for_data_conns(0).await;
 }
 
 /// A newer client's extra term is tolerated: the handshake is the one
@@ -2154,16 +2384,26 @@ async fn the_refusals_keep_their_order() {
         "build-mismatch"
     );
 
-    // And then the grid, which is checked for an unfocused attach too:
-    // it is still the geometry this connection's first frame applies.
-    for focus in [true, false] {
+    // And then the grid, which is checked for a watching attach too: it
+    // is still this attachment's advisory grid. A malformed client id
+    // with it: the grid first.
+    for take in [true, false] {
         let mut zero_grid = h.handshake(tab_id);
         zero_grid["rows"] = serde_json::json!(0);
-        zero_grid["focus"] = serde_json::json!(focus);
-        assert_eq!(
-            dial(&h.socket, zero_grid).await.unwrap_err().code,
-            "invalid-param"
-        );
+        zero_grid["take"] = serde_json::json!(take);
+        zero_grid["client_id"] = serde_json::json!("not a client id");
+        let error = dial(&h.socket, zero_grid).await.unwrap_err();
+        assert_eq!(error.code, "invalid-param");
+        assert!(error.message.contains("rows"), "{}", error.message);
+    }
+
+    // Then the client id, in `client.hello`'s own format.
+    for malformed in ["", "has space", &"x".repeat(65)] {
+        let mut line = h.handshake(tab_id);
+        line["client_id"] = serde_json::json!(malformed);
+        let error = dial(&h.socket, line).await.unwrap_err();
+        assert_eq!(error.code, "invalid-param", "{malformed:?}");
+        assert!(error.message.contains("client_id"), "{}", error.message);
     }
     h.wait_for_data_conns(0).await;
 }
@@ -2335,20 +2575,12 @@ async fn an_attach_refused_for_a_respawn_never_resizes_the_replacement() {
         .expect_err("the generation it was admitted for is gone");
     assert_eq!(error.code, "not-found");
 
-    // An unfocused attach states no geometry of its own, so the size it
-    // reports is the replacement tab's own — the one it was spawned at,
-    // unless the refused attach reached it.
-    let mut watching = h.handshake(tab_id);
-    watching["focus"] = serde_json::json!(false);
-    let socket = h.socket.clone();
-    let second = tokio::spawn(async move { dial(&socket, watching).await });
-    let _ = parked(&mut admitted).await.send(());
-    let (accepted, _data) = second
-        .await
-        .expect("join")
-        .expect("the replacement tab attaches");
+    // The replacement is at the size it was spawned at, unless the
+    // refused attach reached it.
+    let mut client = h.control().await;
+    let d = dump(&mut client, tab_id).await;
     assert_eq!(
-        (accepted.snapshot_cols, accepted.snapshot_rows),
+        (d.cols, d.rows),
         (80, 24),
         "a refused attach resized the tab that replaced its own"
     );
@@ -2403,17 +2635,16 @@ async fn a_respawn_around_the_resume_handoff_is_refused() {
     h.wait_for_data_conns(0).await;
 }
 
-/// What the focused resize is actually for, measured on the **child**:
-/// a program in the tab reads the geometry the handshake stated, not the
-/// one the tab had when the connection was dialed.
+/// What a taking attach's resize is actually for, measured on the
+/// **child**: a program in the tab reads the geometry the handshake
+/// stated, not the one the tab had when the connection was dialed.
 ///
-/// The prompt is written from the CONTROL connection (`tab.write` states
-/// no geometry, so it cannot size anything itself) — an INPUT frame from
-/// this data connection would carry the handshake's geometry with it and
-/// resize the tab on its own, which would make the assertion true
-/// whatever the handshake did.
+/// The prompt is written from the CONTROL connection (`tab.write` never
+/// takes, so it cannot size anything itself) — a flagged INPUT frame from
+/// this data connection could take the tab on its own, which would make
+/// the assertion true whatever the handshake did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_focused_attach_sizes_the_child_before_it_can_be_read() {
+async fn a_taking_attach_sizes_the_child_before_it_can_be_read() {
     let h = harness().await;
     let (mut client, tab_id) = h.shell_tab(80, 24).await;
 
@@ -2433,4 +2664,660 @@ async fn a_focused_attach_sizes_the_child_before_it_can_be_read() {
         "the child reported the handshake's rows and cols: {:?}",
         String::from_utf8_lossy(&text)
     );
+}
+
+// ---------------------------------------------------------------------
+// Size ownership: the decision, the cancel, the guard, GRID (plan 084)
+// ---------------------------------------------------------------------
+
+/// A data connection that has sent its handshake line and nothing else,
+/// with its reply still unread — the shape every cancel case needs.
+struct Pending {
+    lines: FrameReader<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
+}
+
+async fn dial_raw(socket: &Path, handshake: serde_json::Value) -> Pending {
+    let stream = UnixStream::connect(socket).await.expect("dial");
+    let (read_half, mut writer) = stream.into_split();
+    let body = serde_json::to_vec(&handshake).expect("encode the handshake");
+    write_frame(&mut writer, &body).await.expect("write");
+    Pending {
+        lines: FrameReader::new(read_half),
+        writer,
+    }
+}
+
+impl Pending {
+    /// The connection ended with no accepted reply on it.
+    async fn expect_no_reply(mut self) {
+        let line = timeout(BUDGET, self.lines.read_line())
+            .await
+            .expect("the cancelled attach closes in time");
+        assert!(
+            matches!(line, Ok(None) | Err(_)),
+            "a cancelled attach is never answered: {:?}",
+            line.map(|l| l.map(|l| String::from_utf8_lossy(&l).into_owned()))
+        );
+    }
+
+    /// The code of the rejection line the connection was answered with.
+    async fn rejection(mut self) -> String {
+        let line = timeout(BUDGET, self.lines.read_line())
+            .await
+            .expect("a reply in time")
+            .expect("read the reply")
+            .expect("a reply line");
+        match serde_json::from_slice(&line).expect("a handshake reply") {
+            AttachHandshakeReply::Rejected(error) => error.code,
+            AttachHandshakeReply::Accepted(accepted) => panic!("accepted: {accepted:?}"),
+        }
+    }
+
+    async fn write_frames(&mut self, frames: &[(u8, &[u8])]) {
+        let mut bytes = Vec::new();
+        for (frame_type, payload) in frames {
+            write_data_frame(&mut bytes, *frame_type, payload)
+                .await
+                .expect("frame");
+        }
+        self.writer.write_all(&bytes).await.expect("write");
+    }
+}
+
+/// Dial through a harness that parks every hand-off, letting this one
+/// through.
+async fn dial_through(
+    h: &Harness,
+    releases: &mut AttachReleases,
+    line: serde_json::Value,
+) -> (AttachAccepted, DataClient) {
+    let socket = h.socket.clone();
+    let dialing = tokio::spawn(async move { dial(&socket, line).await });
+    let _ = parked(releases).await.send(());
+    let (accepted, mut data) = dialing.await.expect("join").expect("accepted");
+    data.read_snapshot().await;
+    (accepted, data)
+}
+
+fn owner_of(grid: &GridFrame) -> Option<&str> {
+    grid.owner.as_ref().map(|owner| owner.client_id.as_str())
+}
+
+fn as_client(mut line: serde_json::Value, client: &str) -> serde_json::Value {
+    line["client_id"] = serde_json::json!(client);
+    line
+}
+
+/// A taking attach whose client half-closes while its tab is fenced is
+/// cancelled, not committed: the take is rolled back to the owner it
+/// replaced, at that owner's grid, and the cancelled client never owns
+/// the tab (rule 10, D4 step 3). Through a bridge the accepted reply's
+/// write would succeed after the client left; a half-close is the local
+/// shape of that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_gone_during_the_fence_cancels_its_take() {
+    let (h, mut releases) = harness_pausing_handoffs().await;
+    let (mut client, tab_id) = h.live_tab().await;
+    let (_accepted, mut desk) = dial_through(
+        &h,
+        &mut releases,
+        as_client(h.sized_handshake(tab_id, (80, 24), (0, 0), true), "desk"),
+    )
+    .await;
+
+    let mut phone = dial_raw(
+        &h.socket,
+        as_client(h.sized_handshake(tab_id, (100, 30), (0, 0), true), "phone"),
+    )
+    .await;
+    let release = parked(&mut releases).await;
+    let took = desk.next_grid().await;
+    assert_eq!(
+        (owner_of(&took), took.cols, took.rows),
+        (Some("phone"), 100, 30)
+    );
+
+    phone.writer.shutdown().await.expect("half-close");
+    // Give the forwarder's reader the EOF before the fence answers.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = release.send(());
+
+    let back = desk.next_grid().await;
+    assert_eq!(
+        (owner_of(&back), back.cols, back.rows),
+        (Some("desk"), 80, 24),
+        "the take is rolled back"
+    );
+    phone.expect_no_reply().await;
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!((d.cols, d.rows), (80, 24));
+    h.wait_for_data_conns(1).await;
+}
+
+/// The same cancel inside the test-mode hold between the decision and
+/// the reply — where an EOF lands that a bridge would otherwise hide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_gone_during_the_hold_cancels_its_take() {
+    let h = harness_holding(Duration::from_millis(1500)).await;
+    let (mut client, tab_id) = h.live_tab().await;
+    let (_accepted, mut desk) = h.attached_as("desk", tab_id, (80, 24), (0, 0), true).await;
+
+    let mut phone = dial_raw(
+        &h.socket,
+        as_client(h.sized_handshake(tab_id, (100, 30), (0, 0), true), "phone"),
+    )
+    .await;
+    let took = desk.next_grid().await;
+    assert_eq!(owner_of(&took), Some("phone"));
+    phone.writer.shutdown().await.expect("half-close");
+
+    let back = desk.next_grid().await;
+    assert_eq!(
+        (owner_of(&back), back.cols, back.rows),
+        (Some("desk"), 80, 24)
+    );
+    phone.expect_no_reply().await;
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!((d.cols, d.rows), (80, 24));
+}
+
+/// A `DETACH` that arrives before the attach commits cancels it: no
+/// accepted reply, the take rolled back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_before_commit_cancels_the_attach() {
+    let (h, mut releases) = harness_pausing_handoffs().await;
+    let (_client, tab_id) = h.live_tab().await;
+    let (_accepted, mut desk) = dial_through(
+        &h,
+        &mut releases,
+        as_client(h.sized_handshake(tab_id, (80, 24), (0, 0), true), "desk"),
+    )
+    .await;
+
+    let mut phone = dial_raw(
+        &h.socket,
+        as_client(h.sized_handshake(tab_id, (100, 30), (0, 0), true), "phone"),
+    )
+    .await;
+    let release = parked(&mut releases).await;
+    assert_eq!(owner_of(&desk.next_grid().await), Some("phone"));
+
+    let mut detach = Vec::new();
+    write_data_frame(&mut detach, FRAME_DETACH, &[])
+        .await
+        .expect("frame");
+    phone.writer.write_all(&detach).await.expect("write");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = release.send(());
+
+    let back = desk.next_grid().await;
+    assert_eq!(
+        (owner_of(&back), back.cols, back.rows),
+        (Some("desk"), 80, 24)
+    );
+    phone.expect_no_reply().await;
+}
+
+/// A `DETACH` behind as many early frames as an uncommitted attach may
+/// queue still cancels it: the reader never stops reading before the
+/// commit, so nothing the client sent waits behind the cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_behind_a_full_early_queue_still_cancels() {
+    let (h, mut releases) = harness_pausing_handoffs().await;
+    let (mut client, tab_id) = h.live_tab().await;
+    let (_accepted, mut desk) = dial_through(
+        &h,
+        &mut releases,
+        as_client(h.sized_handshake(tab_id, (80, 24), (0, 0), true), "desk"),
+    )
+    .await;
+
+    let mut phone = dial_raw(
+        &h.socket,
+        as_client(h.sized_handshake(tab_id, (100, 30), (0, 0), true), "phone"),
+    )
+    .await;
+    let release = parked(&mut releases).await;
+    assert_eq!(owner_of(&desk.next_grid().await), Some("phone"));
+
+    let mut frames: Vec<(u8, &[u8])> = vec![(FRAME_INPUT, b"\0Z"); 64];
+    frames.push((FRAME_DETACH, &[]));
+    phone.write_frames(&frames).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = release.send(());
+
+    let back = desk.next_grid().await;
+    assert_eq!(
+        (owner_of(&back), back.cols, back.rows),
+        (Some("desk"), 80, 24),
+        "the take is rolled back"
+    );
+    phone.expect_no_reply().await;
+    write_tab(&mut client, tab_id, b"FENCE").await;
+    let typed = read_pty_input_until(&mut client, tab_id, &[b"FENCE"]).await;
+    assert!(
+        !contains(&typed, b"Z"),
+        "a cancelled attach's early input never reaches the tab: {:?}",
+        String::from_utf8_lossy(&typed)
+    );
+}
+
+/// One frame more than an uncommitted attach may queue is a
+/// `protocol-error`, and the attach is cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn more_early_frames_than_the_queue_holds_is_a_protocol_error() {
+    let (h, mut releases) = harness_pausing_handoffs().await;
+    let (_client, tab_id) = h.live_tab().await;
+    let (_accepted, mut desk) = dial_through(
+        &h,
+        &mut releases,
+        as_client(h.sized_handshake(tab_id, (80, 24), (0, 0), true), "desk"),
+    )
+    .await;
+
+    let mut phone = dial_raw(
+        &h.socket,
+        as_client(h.sized_handshake(tab_id, (100, 30), (0, 0), true), "phone"),
+    )
+    .await;
+    let release = parked(&mut releases).await;
+    assert_eq!(owner_of(&desk.next_grid().await), Some("phone"));
+
+    phone
+        .write_frames(&vec![(FRAME_INPUT, b"\0Z".as_slice()); 65])
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = release.send(());
+    let back = desk.next_grid().await;
+    assert_eq!(
+        (owner_of(&back), back.cols, back.rows),
+        (Some("desk"), 80, 24),
+        "the take is rolled back"
+    );
+    assert_eq!(phone.rejection().await, "protocol-error");
+}
+
+/// A frame already buffered behind a `DETACH` that cancels an attach is
+/// still a `protocol-error`, as it is after the commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_behind_a_cancelling_detach_is_a_protocol_error() {
+    let (h, mut releases) = harness_pausing_handoffs().await;
+    let (_client, tab_id) = h.live_tab().await;
+    let mut phone = dial_raw(
+        &h.socket,
+        as_client(h.sized_handshake(tab_id, (100, 30), (0, 0), true), "phone"),
+    )
+    .await;
+    let release = parked(&mut releases).await;
+    phone
+        .write_frames(&[(FRAME_DETACH, &[]), (FRAME_TAKE, &[])])
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = release.send(());
+    assert_eq!(phone.rejection().await, "protocol-error");
+}
+
+/// A `DETACH` the server has read is a deliberate detach however the
+/// connection then ends — here a write to a client that already left,
+/// while the forwarder was blocked writing to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_read_before_a_failed_write_still_hands_off() {
+    let h = harness_with_grace(Duration::from_secs(60)).await;
+    let (mut client, tab_id) = h.live_tab().await;
+    let (_accepted, mut desk) = h.attached_as("desk", tab_id, (100, 30), (0, 0), true).await;
+
+    // Never read, so the forwarder ends up blocked in a write.
+    for _ in 0..4 {
+        feed(&mut client, tab_id, vec![b'x'; 1 << 20]).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    desk.send(FRAME_DETACH, &[]).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(desk);
+
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        let resized = client
+            .call::<_, serde_json::Value>(
+                ops::TAB_RESIZE,
+                TabResizeParams {
+                    tab_id,
+                    cols: 60,
+                    rows: 20,
+                },
+            )
+            .await;
+        match resized {
+            Ok(_) => break,
+            Err(error) => {
+                assert_eq!(
+                    error.server_code(),
+                    Some(roost_ipc::client::ServerCode::Owned),
+                    "{error}"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "the detach was taken for a disconnect, and its grace holds the tab"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// A `DETACH` hands the size on at once — the guard sends the detach it
+/// carries, not a disconnect — and an owner that only drops keeps the tab
+/// through its grace, so a background resize is refused meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_hands_off_at_once_and_a_dropped_owner_keeps_its_grace() {
+    let h = harness_with_grace(Duration::from_secs(60)).await;
+    let (mut client, tab_id) = h.live_tab().await;
+
+    let (_accepted, desk) = h.attached_as("desk", tab_id, (80, 24), (0, 0), true).await;
+    let (_accepted, mut phone) = h
+        .attached_as("phone", tab_id, (100, 30), (0, 0), false)
+        .await;
+    desk.detach().await;
+    let handed = phone.next_grid().await;
+    assert_eq!(
+        (owner_of(&handed), handed.cols, handed.rows),
+        (Some("phone"), 100, 30),
+        "a deliberate detach hands off at once"
+    );
+
+    drop(phone);
+    let refused = client
+        .call::<_, serde_json::Value>(
+            ops::TAB_RESIZE,
+            TabResizeParams {
+                tab_id,
+                cols: 60,
+                rows: 20,
+            },
+        )
+        .await
+        .expect_err("a dropped owner keeps the tab through its grace");
+    assert_eq!(
+        refused.server_code(),
+        Some(roost_ipc::client::ServerCode::Owned)
+    );
+    assert!(
+        refused.to_string().contains("sized by client phone"),
+        "the label of an attach with no hello names its client: {refused}"
+    );
+}
+
+/// The detach of an attachment whose tab task's command channel is full
+/// still arrives: the guard waits for room on a task of its own rather
+/// than dropping it, which would leave the tab owned by a connection
+/// that no longer exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_command_channel_never_loses_a_detach() {
+    raise_fd_soft_limit(1024);
+    let (h, mut releases) = harness_pausing_handoffs().await;
+    let (_client, tab_id) = h.live_tab().await;
+    let (_accepted, desk) = dial_through(
+        &h,
+        &mut releases,
+        as_client(h.sized_handshake(tab_id, (80, 24), (0, 0), true), "desk"),
+    )
+    .await;
+    let (_accepted, mut phone) = dial_through(
+        &h,
+        &mut releases,
+        as_client(h.sized_handshake(tab_id, (100, 30), (0, 0), false), "phone"),
+    )
+    .await;
+
+    // Park the task inside a third attach's hand-off, so it drains
+    // nothing while its channel fills. The phone's own second window, so
+    // whichever of the two the handoff lands on, the phone owns the tab.
+    let _third = dial_raw(
+        &h.socket,
+        as_client(h.sized_handshake(tab_id, (100, 30), (0, 0), false), "phone"),
+    )
+    .await;
+    let release = parked(&mut releases).await;
+    let mut writers = Vec::new();
+    for _ in 0..(roost_engine::TAB_CMD_CAPACITY + 8) {
+        let socket = h.socket.clone();
+        writers.push(tokio::spawn(async move {
+            let mut client = IpcClient::connect(&socket).await.expect("connect");
+            write_tab(&mut client, tab_id, b"x").await;
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    desk.detach().await;
+    drop(releases);
+    let _ = release.send(());
+
+    let handed = phone.next_grid().await;
+    assert_eq!(owner_of(&handed), Some("phone"), "the detach was not lost");
+    for writer in writers {
+        writer.await.expect("join");
+    }
+}
+
+/// A `GRID` repeats the seq of the PTY record before it and consumes
+/// none, so it sits between two contiguous PTY frames without breaking
+/// them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grid_sits_between_contiguous_pty_frames() {
+    let h = harness().await;
+    let (mut client, tab_id) = h.live_tab().await;
+    let (accepted, mut desk) = h.attached_as("desk", tab_id, (80, 24), (0, 0), true).await;
+    let (_accepted, mut phone) = h
+        .attached_as("phone", tab_id, (100, 30), (0, 0), false)
+        .await;
+
+    feed(&mut client, tab_id, b"ROOST_BEFORE\r\n".to_vec()).await;
+    let (before, _) = desk.read_pty_until(accepted.seq, b"ROOST_BEFORE").await;
+    phone.input(InputTake::Before, b"x").await;
+    let grid = desk.next_grid().await;
+    assert_eq!(
+        grid.seq, before,
+        "the GRID names the last PTY seq before it"
+    );
+    feed(&mut client, tab_id, b"ROOST_AFTER\r\n".to_vec()).await;
+    desk.read_pty_until(before, b"ROOST_AFTER").await;
+}
+
+/// A `GRID` that lands while a snapshot's READY prefix is still owed is
+/// held with the PTY records until READY, like them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grid_is_held_until_the_snapshot_is_ready() {
+    let h = harness_holding(Duration::from_millis(2000)).await;
+    let (_client, tab_id) = h.live_tab().await;
+    let (_accepted, mut desk) = h.attached_as("desk", tab_id, (80, 24), (0, 0), true).await;
+
+    let socket = h.socket.clone();
+    let line = as_client(h.sized_handshake(tab_id, (100, 30), (0, 0), false), "phone");
+    let dialing = tokio::spawn(async move { dial(&socket, line).await });
+    // The phone's snapshot is cut; it is inside its hold.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    desk.resize((90, 25), (0, 0), false).await;
+
+    let (accepted, mut phone) = dialing.await.expect("join").expect("accepted");
+    assert_eq!((accepted.snapshot_cols, accepted.snapshot_rows), (80, 24));
+    phone.read_snapshot().await;
+    let grid = match phone.grids.first() {
+        Some(grid) => grid.clone(),
+        None => phone.next_grid().await,
+    };
+    assert_eq!((grid.cols, grid.rows), (90, 25));
+}
+
+/// Every malformed client frame `ipc.md` lists is a `protocol-error`,
+/// and the connection closes after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_client_frames_are_protocol_errors() {
+    let h = harness().await;
+    let mut detach_then_input = Vec::new();
+    write_data_frame(&mut detach_then_input, FRAME_DETACH, &[])
+        .await
+        .unwrap();
+    write_data_frame(&mut detach_then_input, FRAME_INPUT, b"\0x")
+        .await
+        .unwrap();
+    let cases: Vec<(&str, u8, Vec<u8>)> = vec![
+        ("an INPUT with no bytes", FRAME_INPUT, vec![0]),
+        (
+            "an INPUT with both take bits",
+            FRAME_INPUT,
+            vec![0x03, b'x'],
+        ),
+        (
+            "an INPUT with a reserved bit",
+            FRAME_INPUT,
+            vec![0x04, b'x'],
+        ),
+        (
+            "an 8-byte RESIZE",
+            FRAME_RESIZE,
+            vec![80, 0, 24, 0, 0, 0, 0, 0],
+        ),
+        (
+            "a RESIZE with a reserved bit",
+            FRAME_RESIZE,
+            vec![80, 0, 24, 0, 0, 0, 0, 0, 0x02],
+        ),
+        ("a non-empty TAKE", FRAME_TAKE, vec![1]),
+        ("a non-empty DETACH", FRAME_DETACH, vec![1]),
+    ];
+    for (what, frame_type, payload) in cases {
+        let (_client, _tab_id, mut data) = h.attached().await;
+        data.send(frame_type, &payload).await;
+        assert_eq!(
+            error_of(&data.frame().await).code,
+            "protocol-error",
+            "{what}"
+        );
+        assert!(data.next().await.is_none(), "{what}: the connection closes");
+    }
+
+    let (_client, _tab_id, mut data) = h.attached().await;
+    data.raw(&detach_then_input).await;
+    let error = error_of(&data.frame().await);
+    assert_eq!(error.code, "protocol-error", "a frame after DETACH");
+    assert!(error.message.contains("DETACH"), "{}", error.message);
+    assert!(data.next().await.is_none());
+}
+
+/// `tab.drop_data_conns` (test mode) ends a tab's data connections the
+/// way a network drop does: no label on the wire, and the owner's grace
+/// begins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_data_connections_close_unlabelled_as_a_disconnect() {
+    let h = harness_with_grace(Duration::from_secs(60)).await;
+    let (mut client, tab_id) = h.live_tab().await;
+    let (_accepted, mut desk) = h.attached_as("desk", tab_id, (100, 30), (0, 0), true).await;
+
+    client
+        .call::<_, serde_json::Value>(
+            ops::TAB_DROP_DATA_CONNS,
+            roost_ipc::messages::TabDropDataConnsParams { tab_id },
+        )
+        .await
+        .expect("tab.drop_data_conns");
+    assert!(
+        desk.next().await.is_none(),
+        "a drop is an EOF, never an ERROR frame"
+    );
+    h.wait_for_data_conns(0).await;
+    let refused = client
+        .call::<_, serde_json::Value>(
+            ops::TAB_RESIZE,
+            TabResizeParams {
+                tab_id,
+                cols: 60,
+                rows: 20,
+            },
+        )
+        .await
+        .expect_err("the dropped owner's grace holds the tab");
+    assert_eq!(
+        refused.server_code(),
+        Some(roost_ipc::client::ServerCode::Owned)
+    );
+}
+
+/// An attachment copies its client's label, and a dropped owner's grace
+/// keeps it: a data connection that comes back before its client says
+/// hello again is still named by it, so the tab's owner does not change
+/// name under everybody watching.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grace_keeps_the_label_a_returning_attach_is_named_by() {
+    let h = harness_with_grace(Duration::from_secs(60)).await;
+    let (_client, tab_id) = h.live_tab().await;
+
+    let mut hello = h.control().await;
+    hello
+        .call::<_, serde_json::Value>(
+            ops::CLIENT_HELLO,
+            serde_json::json!({"client_id": "desk", "label": "charlie-desk"}),
+        )
+        .await
+        .expect("client.hello");
+    let (accepted, desk) = h.attached_as("desk", tab_id, (100, 30), (0, 0), true).await;
+    assert_eq!(
+        accepted.owner.map(|owner| owner.label).as_deref(),
+        Some("charlie-desk")
+    );
+    drop(desk);
+    drop(hello);
+    h.wait_for_data_conns(0).await;
+
+    let (back, _desk) = h
+        .attached_as("desk", tab_id, (100, 30), (0, 0), false)
+        .await;
+    assert_eq!(
+        back.owner.map(|owner| owner.label).as_deref(),
+        Some("charlie-desk"),
+        "the reclaim is named by the label the grace kept"
+    );
+}
+
+/// The label goes with the grace that kept it, though nothing closes when
+/// a grace runs out: an attach after the expiry, with no hello, is named
+/// by its client id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_label_a_grace_kept_ends_with_the_grace() {
+    let h = harness_with_grace(Duration::from_secs(1)).await;
+    let (_client, tab_id) = h.live_tab().await;
+
+    let mut hello = h.control().await;
+    hello
+        .call::<_, serde_json::Value>(
+            ops::CLIENT_HELLO,
+            serde_json::json!({"client_id": "desk", "label": "charlie-desk"}),
+        )
+        .await
+        .expect("client.hello");
+    let (_accepted, desk) = h.attached_as("desk", tab_id, (100, 30), (0, 0), true).await;
+    drop(desk);
+    h.wait_for_data_conns(0).await;
+    wait_until("the grace to be armed", || h.supervisor.holds_grace("desk")).await;
+    // Its close is the last that could sweep the label, and comes while
+    // the grace still holds it.
+    drop(hello);
+    wait_until("the grace to run out", || !h.supervisor.holds_grace("desk")).await;
+
+    let (back, _desk) = h
+        .attached_as("desk", tab_id, (100, 30), (0, 0), false)
+        .await;
+    assert_eq!(
+        back.owner.map(|owner| owner.label).as_deref(),
+        Some("client desk"),
+        "nothing holds charlie-desk any more"
+    );
+}
+
+async fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + BUDGET;
+    while !done() {
+        assert!(Instant::now() < deadline, "waited too long for {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

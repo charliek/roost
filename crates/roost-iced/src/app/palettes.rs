@@ -875,7 +875,7 @@ impl App {
             }
         }
         commit_typography_regrid(&mut self.tabs, &mut self.host_resume, applied, operation);
-        self.note_host_grid((cols, rows));
+        self.note_host_grid((cols, rows), super::Regrid::User);
         self.background_resize.trigger(Instant::now());
         Ok(())
     }
@@ -1524,6 +1524,10 @@ impl App {
                 "cycle_agent_panel_sort" => {
                     self.clear_palette_state();
                     dispatch.task = self.cycle_agent_panel_sort();
+                }
+                "take_size" => {
+                    self.clear_palette_state();
+                    dispatch.task = self.take_size_of(self.active_tab_key());
                 }
                 SECURE_INPUT_ROW_ID => {
                     self.clear_palette_state();
@@ -3526,47 +3530,37 @@ mod tests {
         assert_eq!(current, before);
     }
 
-    /// #564 (plan 072 D4a) through the font path, which re-grids every
-    /// kept terminal the way a window resize does: a detached host tab
-    /// whose terminal moves loses its resume point, and one whose grid
-    /// the new font happens to keep does not.
+    /// #564 (plan 072 D4a) through the font path, after plan 084 D6: a
+    /// font change installs a host tab's new cell metrics and view, never
+    /// its grid, so a detached tab's resume point survives whatever grid
+    /// the new font would fit.
     #[test]
-    fn a_font_regrid_forgets_a_detached_host_tabs_resume_point() {
+    fn a_font_regrid_keeps_a_detached_host_tabs_grid_and_resume_point() {
         let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
         let bigger = TerminalMetrics::measure(18.0).expect("bigger test metrics");
-        let moved = TabKey::new(HostId::new(3), 7);
-        let kept = TabKey::new(HostId::new(3), 8);
-        let mut tabs = HashMap::from([
-            (moved, laid_out_host_terminal(80, 24, metrics)),
-            (kept, laid_out_host_terminal(80, 24, metrics)),
-        ]);
+        let key = TabKey::new(HostId::new(3), 7);
+        let mut tabs = HashMap::from([(key, laid_out_host_terminal(80, 24, metrics))]);
         let point = host_tab::ResumePoint {
             server_epoch: 11,
             tab_generation: 2,
             next_seq: 42,
         };
-        let mut resumes = HashMap::from([(moved, point), (kept, point)]);
+        let mut resumes = HashMap::from([(key, point)]);
 
-        let applied = [(moved, (58, 17)), (kept, (80, 24))]
-            .map(|(key, (cols, rows))| {
-                let change = tabs
-                    .get_mut(&key)
-                    .expect("tab")
-                    .apply_geometry(cols, rows, bigger, 2)
-                    .expect("apply the new font")
-                    .expect("new metrics are a change");
-                (key, change)
-            })
-            .to_vec();
-        commit_typography_regrid(&mut tabs, &mut resumes, applied, "font size");
+        let change = tabs
+            .get_mut(&key)
+            .expect("tab")
+            .apply_geometry(58, 17, bigger, 2)
+            .expect("apply the new font")
+            .expect("new metrics are a change");
+        assert!(!change.grid_changed(), "the grid is the session's");
+        commit_typography_regrid(&mut tabs, &mut resumes, vec![(key, change)], "font size");
 
+        assert_eq!(tabs[&key].grid(), (80, 24));
+        assert_eq!(tabs[&key].view(), (58, 17));
         assert!(
-            !resumes.contains_key(&moved),
-            "the font moved this terminal off the grid the session wrote for"
-        );
-        assert!(
-            resumes.contains_key(&kept),
-            "a font change that keeps the grid moves no cell"
+            resumes.contains_key(&key),
+            "the terminal is still at the grid the session wrote for"
         );
     }
 

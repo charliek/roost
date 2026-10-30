@@ -38,7 +38,7 @@ flowchart LR
 
   Control -- "session.identify, session.set_theme,<br/>workspace mutations" --> SessionIPC
   EventsConn -- "events.subscribe →<br/>EventBatch stream" --> SessionIPC
-  Data -- "ROOSTDP2 handshake →<br/>SNAP / PTY / EXIT frames" --> TabTask
+  Data -- "ROOSTDP3 handshake →<br/>SNAP / PTY / EXIT frames" --> TabTask
 ```
 
 **Three connections per host, not one.** `IpcClient` is strictly request/response and sequential (`roost-ipc/src/client.rs`), so a single connection can't both serve ordinary control calls *and* stream events or terminal bytes without one blocking the other. `HostConn` (`crates/roost-iced/src/host_conn.rs`) owns three: **control** for everything request/response against the *session* (identify, connect, `session.set_theme`, the workspace mutations a host's rows accept — serialized through a per-host op queue, plan 037 §3.9; an attach dials on its own socket, and takes a *permit* from that queue first so every op enqueued before it has already been answered when it does); **events**, a push reader subscribed once and read forever, feeding a `SharedMirror` — a client-side projection of that host's workspace, fenced against the subscribe ack revision exactly like `tools/roosttest/eventstream.py` does; and **data**, one per *attached* tab (attach is on-focus — background host tabs stay current via the mirror alone, and only the focused tab pays for a live byte stream). The mirror and the decoded terminal are read by the UI at draw time and updated in place — there is no per-commit clone to keep, which is what keeps a chatty host from piling full-workspace copies onto an unbounded channel.
@@ -52,7 +52,7 @@ Attach is **on-focus**: a tab dials its data connection only while it's the one 
 ```mermaid
 flowchart LR
   Focus["tab gains focus"] --> Permit["op-queue permit<br/>(every queued op answered)"]
-  Permit --> Handshake["data-plane handshake<br/>(tab + terms + resume point)<br/>→ accepted line → ROOSTDP2 preamble"]
+  Permit --> Handshake["data-plane handshake<br/>(tab + terms + resume point)<br/>→ accepted line → ROOSTDP3 preamble"]
   Handshake --> Check{"resume_from_seq<br/>covered by the<br/>replay ring, and<br/>no grid change since?"}
   Check -- "no (first attach,<br/>or a miss)" --> Snap["SNAP frames<br/>(encoded snapshot bytes)"]
   Check -- "yes" --> ResumeMode["mode: resume<br/>(no SNAP at all)"]
@@ -88,7 +88,7 @@ flowchart LR
   Commit(("a workspace commit")) -- "events.subscribe" --> Batch["every subscriber's<br/>stream gets the<br/>same EventBatch"]
   Effect(("tab.effect<br/>(bell / OSC 52)")) -- "fanned out<br/>unfiltered" --> EachClient["each client applies it<br/>by its own policy:<br/>bell → mark the tab;<br/>clipboard → only if viewed"]
   Notify(("notification.fired<br/>(every raise)")) -- "fanned out<br/>unfiltered" --> EachWindow["each client decides:<br/>viewing + focused → no banner,<br/>ack with the generation;<br/>otherwise → banner"]
-  Size(("attach / tab.write /<br/>INPUT / RESIZE")) -- "last one wins" --> PtySize["the tab's PTY size"]
+  Size(("deliberate interaction<br/>(see Who sizes a tab)")) -- "takes" --> PtySize["the tab's one size owner"]
   Stop(("session.stop<br/>(any client)")) --> Stopping["latches stopping;<br/>every control/data/event<br/>connection labeled + closed"]
   Stopping --> StoppingS["session.stopping<br/>{reason: stop}<br/>(terminal, on every stream)"]
   StoppingS --> UIS["iced: Stopped state —<br/>frozen frame + banner,<br/>Start a new session"]
@@ -136,11 +136,91 @@ without it, "A fires → the viewing client acks A → B fires → the ack
 lands" erases a notification nobody has seen. A stale generation is
 answered `cleared: false` and changes nothing.
 
-**Geometry is last-interactor** ([DL-25](vision.md#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)),
-unchanged by this plan: whichever connection last sent a geometry-
-bearing frame (a focused attach handshake, `tab.resize`, or a
-data-plane `INPUT`/`RESIZE`) sizes the tab. Nothing elects a size
-holder; the PTY simply has the size the last such frame asked for.
+### Who sizes a tab
+
+A tab has at most one **size owner**, an attachment, and the owner's grid
+is the PTY's ([DL-31](vision.md#dl-31-a-tab-has-one-size-owner-2026-10-30),
+plan 084; it replaced the last-interactor rule of
+[DL-25](vision.md#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)
+and the roadmap's "detach never resizes back"). Deliberate interaction
+takes it; watching never does. The wire is in
+[`ipc.md`](../reference/ipc.md#size-ownership) and the user-facing view in
+[the guide](../guides/host-sessions.md#who-sizes-a-tab); this is the
+shape of the implementation.
+
+```mermaid
+flowchart LR
+  Attach(("attach take:true<br/>INPUT TAKE_BEFORE/AFTER<br/>focused RESIZE, TAKE,<br/>tab.take_size")) -- "takes" --> Owner["the tab task's<br/>size owner<br/>(size_owner.rs)"]
+  Watch(("attach take:false,<br/>unflagged INPUT,<br/>unfocused RESIZE,<br/>tab.write")) -- "advisory grid only" --> Owner
+  Owner -- "applies the decision<br/>(one serializer)" --> Pty["PTY winsize"]
+  Owner -- "GRID, ordered with output" --> Data["every attachment"]
+  Owner -- "tab.resized (live-only)" --> Events["every subscriber"]
+  Leave(("DETACH / release /<br/>disconnect")) --> Owner
+```
+
+**One serializer.** `crates/roost-engine/src/size_owner.rs` is a pure
+state machine with an injected clock: the ownership record, each
+attachment's advisory grid and timestamp, provisional takes, grace and the
+per-client `released` set. It decides; `tab_task.rs` is the only thing that
+performs the decisions (the terminal resize, the `GRID` frame, the
+`tab.resized` event, the grace timer), so two attaches to one tab at the
+same moment resolve in one place. It ingests any PTY output already queued
+before a geometry change, so the `GRID` lands at the right sequence
+position, and freezes size and owner once the tab has exited.
+
+**`GRID` is ordered with output.** It is a data-plane frame (`ROOSTDP3`)
+that consumes no `seq`; its own `seq` names the PTY frame it follows. The
+forwarder lets it bypass the seq filter, holds it with the tee records
+until READY, and filters it by `grid_gen` against both the snapshot and a
+resume. A client resizes its mirror when it reaches the frame. The
+control-plane `tab.resized` goes to every subscriber for sidebar and
+mirror state; a mirror folds it into an owner epoch, which the iced
+background wave uses to tell stale refusals from current ones.
+
+**A provisional take.** An attach with `take: true` must resize before
+the snapshot is encoded, so it is the owner provisionally until its
+accepted line is written. The client reader starts before that decision,
+so an EOF or `DETACH` read while it is being decided, fenced or held
+cancels the attach and rolls the take back to what it replaced (when that
+is still there), else hands the size on. A detach guard created before the
+attach sends `Detach` exactly once. Frames sent before the accepted line
+queue (64 at most; one more is a `protocol-error`) and are handled after
+it.
+
+**`DETACH` against a disconnect.** The `DETACH` frame is a deliberate
+leave, so the size is handed on at once; a connection that ends without
+one gets the 5 s grace (`OWNER_GRACE` in `tab_task.rs`; test builds use
+`ROOST_TEST_OWNER_GRACE_MS`) unless the same client has another
+attachment. Grace holds the owner's label and the PTY's grid, so a
+cancelled reclaim restores it. iced drains its own `DETACH` for at most
+200 ms (`DETACH_DRAIN`), or every detach would leave a grace refusing the
+background wave.
+
+**`client.hello` and the bridge preamble.** Ownership names clients, so
+iced's first request on a session control connection is `client.hello
+{client_id, label}`, and every data attach carries the same `client_id`.
+The session keeps a registry of id to label while any connection of that
+id is open. A hello is optional, but only as a connection's first
+request: a later one is refused `invalid-param`. Only the ops that act
+for the caller's client, `tab.take_size` and `tab.release_size`, need
+one, and refuse a connection that never said it with `invalid-param`. A `client-bridge` writes one preamble line toward the
+daemon, `{"bridge":{"ssh_connection":…,"ssh_client":…}}`, and waits for
+`{"bridge":"accepted"}`; anything else (a pre-M3 daemon's `parse-error`,
+silence for 2 s) makes it re-dial and relay with no preamble, so an old
+daemon sees the connection as local. The preamble sets `bridged` on the
+connection (reported by `client.hello`) for M4. See
+[`ipc.md`](../reference/ipc.md) for both.
+
+**The iced client** follows the frame rather than its window: the mirror
+is always the PTY's grid, and the window's own grid is kept apart as the
+advisory one it sends in `RESIZE`. The attach carries an intent (a user
+switch, a pending creation and `roostctl` activation take; a close
+fallback, restore and slot re-arm watch), and input is marked on its
+frames (`InputTake`). A grid that differs from the window is drawn through
+a row offset that keeps the cursor row on screen, with the "Sized by"
+badge in the tab band; mouse and selection coordinates map through the
+offset. The code is `host_tab.rs` (attach, `GRID`, `DETACH`),
+`terminal_tab.rs` (the offset) and `background_resize.rs` (the wave).
 
 **A window keeps its local session's unshown tabs at its grid** (#563).
 The shown tab follows the window through its attach's `RESIZE`, font
@@ -151,7 +231,9 @@ tab the window opened (or forwarded an open for) is listed, and 150 ms
 after the window stops showing a tab, whose attach may have ended before
 its last `RESIZE` was written. The wave goes after any attach the same
 edge starts, skips a tab already at the grid, and retries a full queue
-with backoff. A tab it moves to a new grid forgets its resume point, as a
+with backoff. It only ever sizes a tab nobody owns: an owned tab refuses
+`tab.resize` with `owned`, and the wave parks it until a `tab.resized`
+says it has no owner. A tab it moves to a new grid forgets its resume point, as a
 re-gridded one does. A remote host's unshown tabs keep
 their size until shown (#568): its op queue is strictly sequential, so a
 wave would hold the next attach for a round trip per tab.
@@ -217,7 +299,7 @@ client (roost-iced)                                    remote machine
 - **One `ssh` binary is trusted the whole way, and it never prompts.** The generated `ssh_config` `Include`s the user's own `~/.ssh/config` and `/etc/ssh/ssh_config` **first** — their settings, including any keepalive of their own, win over Roost's fallback — then appends a `Host *` block (`ServerAliveInterval 15`, `ServerAliveCountMax 4`, `ConnectTimeout 15`). Every invocation runs with `BatchMode=yes`: key/agent auth only, no password and no interactive 2FA prompt, this slice. `ROOST_SSH_BIN` overrides the `ssh` binary (the test suite points it at a fake — `tools/roosttest/fixtures/fake-ssh.sh`).
 - **Teardown is explicit.** Disconnecting runs `ssh -O exit` against the control socket, tearing the shared master down (and every multiplexed connection riding it) before the scratch directory is removed. `SshTunnel`'s `Drop` owes the same teardown synchronously if `shutdown` was never called.
 - **The reason overlay.** A failed connection attempt is classified into one of six families (`SshFailure` — changed/unknown host key, auth, no session, `roost-session` not found, or an opaque transport failure) with copy written for a user to act on. It reaches the sidebar band as `disconnected — <reason>`, `host.status`'s `reason`, and the log; an attempt the user asked for additionally raises a toast. See the [user guide's troubleshooting table](../guides/host-sessions.md#troubleshooting) for the full set and remedies. **Where to read the family while a retry is armed:** `reason` shows the armed-rung line (`reconnecting in 8s (3/10)`) — it is the band's input and the sidebar's rollup is derived from it — so the family lives in its own field, `retry.reason`, for exactly as long as that rung is armed ([#399](https://github.com/charliek/roost/issues/399)). Before writing an assertion against it: **read it when it is present, and do not gate on the attempt number.** Absence is ordinary — the drop that starts an outage is usually the live connection dying, a bare bridge EOF with nothing to classify, and the classified copy arrives with the next dial's failure — but it is not tied to the rung's position: a suspend/wake resets the ladder to attempt 1 and deliberately carries the family across, because it is still the same outage. A lane that waited for `attempt >= 2` would throw away a family that is legitimately there.
-- **The wire itself doesn't know it crossed a network.** The bridge is a pure byte pump — the same ROOSTDP2 control/events/data protocol reaches a session over SSH byte-identical to a local socket dial (see [`ipc.md`](../reference/ipc.md#session-sockets)).
+- **The wire itself doesn't know it crossed a network.** The bridge is a pure byte pump — the same ROOSTDP3 control/events/data protocol reaches a session over SSH byte-identical to a local socket dial (see [`ipc.md`](../reference/ipc.md#session-sockets)).
 
 **Concurrency depends on the one-attach policy.** A connected host realistically holds on the order of 4-5 concurrent `ssh` channels over the shared master at once — the sequential connect prologue (control, then events) plus one attached tab's data connection, with headroom for an in-flight reconnect — comfortably under sshd's default `MaxSessions 10`. That estimate assumes this client's own [one-attached-tab-per-host policy](#known-limitations) — attach-on-focus, unchanged by R15 — rather than any server-side limit; a future multi-attach-from-one-client slice has to re-check it against `MaxSessions` before it can promise more than one live tab per host from here.
 

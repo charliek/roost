@@ -34,6 +34,10 @@ pub mod pty;
 pub mod reconcile;
 pub mod session;
 pub mod single_instance;
+// Which attachment sizes a session tab (plan 084 D4): decisions only, the
+// tab task applies them.
+#[cfg(feature = "server-vt")]
+pub mod size_owner;
 // Host sessions: the per-tab authoritative server Terminal and its task.
 // Feature-gated for AVAILABILITY; the pipeline itself is a runtime
 // opt-in (`PtySupervisor::enable_server_vt`) so a feature-unified UI
@@ -76,9 +80,9 @@ pub use facade::{
 pub use pty::{Geometry, PtyError, PtyOutputEvent, PtySupervisor, ShutdownReport, SupervisorEvent};
 #[cfg(feature = "server-vt")]
 pub use tab_task::{
-    ResumeAt, ServerVtConfig, ServerVtWorkspace, SnapshotAt, TabCmd, TabError,
-    MAX_CONCURRENT_SNAPSHOTS, REPLAY_RING_BYTES, REPLY_PENDING_MAX, SERVER_VT_CONTINUATION_MAX,
-    SERVER_VT_SCROLLBACK, TAB_CHANNEL_CHUNKS, TAB_CMD_CAPACITY,
+    AttachDecision, ResumeAt, ServerVtConfig, ServerVtWorkspace, SnapshotAt, TabCmd, TabError,
+    MAX_CONCURRENT_SNAPSHOTS, OWNER_GRACE, REPLAY_RING_BYTES, REPLY_PENDING_MAX,
+    SERVER_VT_CONTINUATION_MAX, SERVER_VT_SCROLLBACK, TAB_CHANNEL_CHUNKS, TAB_CMD_CAPACITY,
 };
 pub use workspace::{
     AttentionSource, PersistOutcome, ReplayBounds, RestoreLayout, RestoreProject, RestoreTab,

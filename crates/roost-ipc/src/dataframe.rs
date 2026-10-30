@@ -13,9 +13,11 @@
 //! a payload, and enforces exactly one rule — the [`MAX_DATA_FRAME_BYTES`]
 //! cap, which has to live here because it bounds the allocation made
 //! before any caller sees the frame. Per-type payload validation (`PTY`
-//! ≥ 9 bytes, `EXIT` == 12, `RESIZE` == 8, which types may be empty,
-//! which types may arrive in which direction) belongs to the endpoint
-//! that knows the protocol state, not to the framer.
+//! ≥ 9 bytes, `EXIT` == 12, `RESIZE` == 9, which types may be empty,
+//! which flag bits are reserved, which types may arrive in which
+//! direction) belongs to the endpoint that knows the protocol state, not
+//! to the framer. The type bytes and flag bits are named here so both
+//! endpoints spell them from one place.
 //!
 //! Shared by the server, the Rust integration client, and the tests, so
 //! there is exactly one implementation of the byte layout.
@@ -25,12 +27,13 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::Error;
 
 /// Written by the server once the handshake is accepted, immediately
-/// before the first frame. The trailing `2` is
-/// [`crate::messages::SESSION_PROTOCOL_VERSION`]'s generation of the
-/// data plane: a client that reads a different magic has negotiated
-/// with a host it cannot talk to and must not try to parse what
-/// follows.
-pub const PREAMBLE: [u8; 8] = *b"ROOSTDP2";
+/// before the first frame. The trailing digit is the data plane's own
+/// frame-layout generation — `3` since `GRID`, `TAKE`, `DETACH` and the
+/// flag bytes on `INPUT`/`RESIZE` — moved under one
+/// [`crate::messages::SESSION_PROTOCOL_VERSION`] when the layout below
+/// changes. A client that reads a different magic has negotiated with a
+/// host it cannot talk to and must not try to parse what follows.
+pub const PREAMBLE: [u8; 8] = *b"ROOSTDP3";
 
 /// Header bytes ahead of every payload: 4 for the length, 1 for the type.
 pub const FRAME_HEADER_LEN: usize = 5;
@@ -49,13 +52,130 @@ pub const FRAME_PTY: u8 = 0x02;
 /// Server → client: `u64-LE final_seq | i32-LE exit code`. Always the
 /// last frame on a connection that sees it.
 pub const FRAME_EXIT: u8 = 0x03;
+/// Server → client: JSON `{seq, cols, rows, owner}` — the tab's grid or
+/// size owner changed after PTY frame `seq` and before `seq + 1`. It
+/// consumes no seq of its own.
+pub const FRAME_GRID: u8 = 0x04;
 /// Server → client: a JSON `{code, message}` diagnostic. The connection
 /// closes after it.
 pub const FRAME_ERROR: u8 = 0x0F;
-/// Client → server: raw input bytes, ordered and unacknowledged.
+/// Client → server: `u8 flags | input bytes`, ordered and
+/// unacknowledged. The bytes are never empty.
 pub const FRAME_INPUT: u8 = 0x11;
-/// Client → server: `u16-LE cols | rows | cell_w_px | cell_h_px`.
+/// Client → server: `u16-LE cols | rows | cell_w_px | cell_h_px | u8
+/// flags`, exactly [`RESIZE_PAYLOAD_LEN`] bytes.
 pub const FRAME_RESIZE: u8 = 0x12;
+/// Client → server, empty: take the tab's size at this connection's
+/// grid.
+pub const FRAME_TAKE: u8 = 0x13;
+/// Client → server, empty and terminal: a deliberate detach. Nothing may
+/// follow it.
+pub const FRAME_DETACH: u8 = 0x14;
+
+/// `INPUT` flag: take the tab's size, then deliver the bytes.
+pub const INPUT_TAKE_BEFORE: u8 = 0x01;
+/// `INPUT` flag: deliver the bytes, then take the tab's size.
+pub const INPUT_TAKE_AFTER: u8 = 0x02;
+/// `RESIZE` flag: the client's window had focus when it resized.
+pub const RESIZE_FOCUSED: u8 = 0x01;
+/// The exact width of a `RESIZE` payload.
+pub const RESIZE_PAYLOAD_LEN: usize = 9;
+
+/// What an `INPUT` frame asks of the tab's size, beside its bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputTake {
+    /// Bytes only — a focus report, a button-less mouse move.
+    #[default]
+    None,
+    /// Keys and paste: the size is taken before the bytes reach the
+    /// child, so the program reads them at the layout the user saw.
+    Before,
+    /// Clicks and the wheel: delivered at the current size, then taken,
+    /// so the program reads the coordinates against the layout they
+    /// were aimed at.
+    After,
+}
+
+impl InputTake {
+    /// The flag byte this spells.
+    pub fn flags(self) -> u8 {
+        match self {
+            InputTake::None => 0,
+            InputTake::Before => INPUT_TAKE_BEFORE,
+            InputTake::After => INPUT_TAKE_AFTER,
+        }
+    }
+
+    /// Read a flag byte, refusing both take bits at once and any
+    /// reserved bit.
+    pub fn from_flags(flags: u8) -> Result<Self, String> {
+        match flags {
+            0 => Ok(InputTake::None),
+            INPUT_TAKE_BEFORE => Ok(InputTake::Before),
+            INPUT_TAKE_AFTER => Ok(InputTake::After),
+            both if both == INPUT_TAKE_BEFORE | INPUT_TAKE_AFTER => {
+                Err("an INPUT frame set both TAKE_BEFORE and TAKE_AFTER".into())
+            }
+            other => Err(format!(
+                "an INPUT frame set reserved flag bits {other:#04x}"
+            )),
+        }
+    }
+}
+
+/// A `RESIZE` payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizePayload {
+    pub cols: u16,
+    pub rows: u16,
+    pub cell_w_px: u16,
+    pub cell_h_px: u16,
+    /// [`RESIZE_FOCUSED`].
+    pub focused: bool,
+}
+
+impl ResizePayload {
+    pub fn encode(self) -> [u8; RESIZE_PAYLOAD_LEN] {
+        let mut payload = [0u8; RESIZE_PAYLOAD_LEN];
+        for (slot, value) in payload[..8].chunks_exact_mut(2).zip([
+            self.cols,
+            self.rows,
+            self.cell_w_px,
+            self.cell_h_px,
+        ]) {
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
+        payload[8] = if self.focused { RESIZE_FOCUSED } else { 0 };
+        payload
+    }
+
+    /// Read a payload, refusing any other width — fixed, so a short or
+    /// long one is a client bug rather than something to interpret
+    /// generously — and any reserved flag bit.
+    pub fn decode(payload: &[u8]) -> Result<Self, String> {
+        let Ok(fields) = <[u8; RESIZE_PAYLOAD_LEN]>::try_from(payload) else {
+            return Err(format!(
+                "a RESIZE frame must carry exactly {RESIZE_PAYLOAD_LEN} bytes, got {}",
+                payload.len()
+            ));
+        };
+        let flags = fields[8];
+        if flags & !RESIZE_FOCUSED != 0 {
+            return Err(format!(
+                "a RESIZE frame set reserved flag bits {:#04x}",
+                flags & !RESIZE_FOCUSED
+            ));
+        }
+        let read = |at: usize| u16::from_le_bytes([fields[at], fields[at + 1]]);
+        Ok(Self {
+            cols: read(0),
+            rows: read(2),
+            cell_w_px: read(4),
+            cell_h_px: read(6),
+            focused: flags & RESIZE_FOCUSED != 0,
+        })
+    }
+}
 
 /// One decoded frame. The type byte is deliberately not an enum: an
 /// unknown type is a protocol error the *endpoint* answers (with an
@@ -169,6 +289,12 @@ impl<R: AsyncRead + Unpin> DataFrameReader<R> {
         }))
     }
 
+    /// Whether bytes past the last frame handed out are already in hand
+    /// — a peer that wrote more after a frame it promised was its last.
+    pub fn has_buffered(&self) -> bool {
+        !self.buffered().is_empty()
+    }
+
     /// The underlying reader plus whatever is still buffered — the
     /// mirror of [`crate::framing::FrameReader::into_parts`], for a
     /// caller that hands the connection on again.
@@ -230,10 +356,10 @@ mod tests {
 
     #[tokio::test]
     async fn preamble_is_the_pinned_magic() {
-        assert_eq!(&PREAMBLE, b"ROOSTDP2");
+        assert_eq!(&PREAMBLE, b"ROOSTDP3");
         let mut buf = Vec::new();
         write_preamble(&mut buf).await.unwrap();
-        assert_eq!(buf, b"ROOSTDP2");
+        assert_eq!(buf, b"ROOSTDP3");
 
         let mut r = reader(&buf);
         r.read_preamble().await.expect("preamble");
@@ -242,7 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_wrong_preamble_is_rejected() {
-        let mut r = reader(b"ROOSTDP1");
+        let mut r = reader(b"ROOSTDP2");
         match r.read_preamble().await {
             Err(Error::BadPreamble) => {}
             other => panic!("expected BadPreamble, got {other:?}"),
@@ -276,14 +402,21 @@ mod tests {
                 FRAME_ERROR,
                 br#"{"code":"desync","message":"lagged"}"#.to_vec(),
             ),
-            (FRAME_INPUT, b"ls -la\r".to_vec()),
+            (
+                FRAME_GRID,
+                br#"{"seq":7,"cols":80,"rows":24,"owner":null}"#.to_vec(),
+            ),
+            (FRAME_INPUT, b"\x01ls -la\r".to_vec()),
             (FRAME_RESIZE, {
                 let mut p = Vec::new();
                 for v in [120u16, 40, 9, 18] {
                     p.extend_from_slice(&v.to_le_bytes());
                 }
+                p.push(RESIZE_FOCUSED);
                 p
             }),
+            (FRAME_TAKE, Vec::new()),
+            (FRAME_DETACH, Vec::new()),
             // Zero-length is legal at the framing layer; which types may
             // use it is the endpoint's rule.
             (FRAME_SNAP, Vec::new()),
@@ -297,6 +430,20 @@ mod tests {
             assert_eq!(&got.payload, payload);
         }
         assert!(r.next_frame().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn input_flags_round_trip_and_refuse_what_is_reserved() {
+        for take in [InputTake::None, InputTake::Before, InputTake::After] {
+            assert_eq!(InputTake::from_flags(take.flags()), Ok(take));
+        }
+        assert!(InputTake::from_flags(INPUT_TAKE_BEFORE | INPUT_TAKE_AFTER).is_err());
+        for reserved in [0x04u8, 0x80, 0x05] {
+            assert!(
+                InputTake::from_flags(reserved).is_err(),
+                "{reserved:#04x} carries a reserved bit"
+            );
+        }
     }
 
     #[tokio::test]

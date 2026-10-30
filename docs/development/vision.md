@@ -986,7 +986,9 @@ and
 [`development/host-sessions.md`'s lease/takeover lifecycle](host-sessions.md#the-leasetakeover-lifecycle)
 for the shipped mechanics.
 
-*Superseded by [DL-26](#dl-26-there-is-no-lease-2026-09-12) — the lease itself is retired at protocol 5; geometry stays last-interactor, unchanged.*
+*Superseded by [DL-26](#dl-26-there-is-no-lease-2026-09-12) — the lease itself is retired at protocol 5.*
+
+*Its geometry half ("Geometry follows the last client that interacted") is superseded by [DL-31](#dl-31-a-tab-has-one-size-owner-2026-10-30): a tab has one size owner, and typing, a focused resize or Take size takes it; merely attaching to an owned tab does not.*
 
 ### DL-26: there is no lease (2026-09-12)
 
@@ -1061,9 +1063,11 @@ every op, `session.driver_changed`, and the four retired refusal codes
 a hard,
 breaking bump with no compatibility shim in either direction, because
 nothing built on this wire had shipped past v0.0.19's protocol `2`
-(see CHANGELOG). Geometry stays last-interactor
+(see CHANGELOG). Geometry stayed last-interactor
 ([DL-25](#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)) —
-that rule never depended on the lease and needed no change. `roostctl`,
+that rule never depended on the lease and needed no change *(superseded
+by [DL-31](#dl-31-a-tab-has-one-size-owner-2026-10-30): a tab now has one
+size owner)*. `roostctl`,
 same-UID access, and the attach path are unchanged; only the
 authority layer on top of them is gone.
 
@@ -1237,6 +1241,70 @@ the divergent forms stay divergent); skipping the second reading at its
 consumers (the iced batch tail would need a sink lookup for a tab that
 may be gone); teaching `roost-osc` libghostty's grammar (a second
 grammar to keep in step).
+
+### DL-31: a tab has one size owner (2026-10-30)
+
+Plan 084 (protocol-7 release M3, G2) replaces two rules that had stopped
+fitting a session more than one machine attaches to.
+[DL-25](#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)
+(plan 057 R15) sized the PTY by the last geometry-bearing interaction,
+and the host-sessions roadmap's D7 said a detach never resizes back.
+With the iced client attaching to every tab it selected as "focused",
+*looking* at a tab on one machine resized it to that machine's window
+under another machine's feet, and the docs promised that a client that
+only watches never shrinks the one that is working — which no shipped
+client could do. This entry supersedes both.
+
+**The rule.** A session tab has at most one **size owner**: an
+attachment, named on the wire by client id and label. The owner's grid is
+the PTY's. Every attachment keeps an *advisory* grid of its own, owner or
+not, and a client's terminal is always the PTY's grid; a client whose
+window is another size draws it inside the window, with a "Sized by
+`<label>`" badge and a Take size action. **Deliberate interaction takes the
+tab; watching never does.** What takes it: an explicit tab switch, keys
+and paste (resized first, then delivered), clicks and the wheel
+(delivered first, then taken), a copy (after the text is captured), a
+settled scroll, a window resize while it has focus, and Take size. What
+does not: showing a tab, an automatic re-attach, an unfocused resize,
+focus reports, automatic replies, `tab.write`, and any attach to a tab
+someone else owns. A tab nobody owns is taken by any attach.
+
+**Leaving.** A deliberate detach, or a release, hands the size on at
+once — to another attachment of the same client, else to the most
+recently updated advisory grid. A disconnect keeps the tab owned for a
+5 s grace so a reconnecting owner (same client id) gets it back with no
+reflow. With nobody left the tab keeps its size and has no owner. A
+control-plane `tab.resize` (iced's background wave, `roostctl tab resize`)
+only sizes an unowned tab and is refused `owned` otherwise.
+
+**One serializer, ordered with output.** The ownership state machine
+(`size_owner.rs`) is pure, with an injected clock, and the tab task is
+the only thing that applies its decisions, so two attaches to one tab at
+the same moment resolve there. Every change of grid or owner is
+announced in band as a data-plane `GRID` frame, ordered with the PTY
+output it follows, and to every subscriber as the live-only
+`tab.resized`; a client resizes its mirror when it reaches the frame, so
+output for the old and the new grid is never mixed.
+
+**A reading Charlie accepted.** A `take: true` attach has to resize
+before the snapshot and be seen doing so, so one that then fails or is
+cancelled may have been announced as owner for a moment. It never ends up
+owning: its take is rolled back, at the cost of a possible second reflow.
+
+**Identity.** Ownership needs to tell clients apart: `client.hello`
+carries a client id and label on the session socket, and a bridge writes
+a preamble so the session knows a connection came over ssh (used by M4's
+environment-by-opener).
+
+**Rejected:** smallest-wins and a `session-geometry` setting (still
+possible later, now that the pieces exist); "announce the geometry but not
+the owner until commit", which leaves the previous owner told it owns a
+tab whose PTY is at another grid.
+
+Protocol 7 is amended in place, with no generation bump. See
+[`reference/ipc.md`](../reference/ipc.md#size-ownership) for the wire,
+[`development/host-sessions.md`](host-sessions.md#who-sizes-a-tab) for
+the mechanics, and the [user guide](../guides/host-sessions.md#who-sizes-a-tab).
 
 ## Direction (under evaluation)
 

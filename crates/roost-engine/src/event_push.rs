@@ -34,7 +34,8 @@ use roost_ipc::messages::{
     EventBatch, EventEnvelope, HookActiveChangedEvent, NotificationFiredEvent, ProjectCreatedEvent,
     ProjectDeletedEvent, ProjectRenamedEvent, ProjectsReorderedEvent, TabClosedEvent,
     TabCwdChangedEvent, TabEffect, TabEffectEvent, TabNotificationEvent, TabOpenedEvent,
-    TabPasswordInputEvent, TabStateChangedEvent, TabTitleChangedEvent, TabsReorderedEvent,
+    TabPasswordInputEvent, TabResizedEvent, TabStateChangedEvent, TabTitleChangedEvent,
+    TabsReorderedEvent,
 };
 use roost_ipc::PushSource;
 use tokio::sync::broadcast::error::RecvError;
@@ -251,6 +252,20 @@ pub fn envelope(event: &WorkspaceEvent) -> Option<EventEnvelope> {
                     data: Some(bytes_base64::encode(text.as_bytes())),
                     target: Some(*target),
                 },
+            }),
+        ),
+        WorkspaceEvent::TabResized {
+            tab_id,
+            cols,
+            rows,
+            owner,
+        } => (
+            ops::EVENT_TAB_RESIZED,
+            to_value(TabResizedEvent {
+                tab_id: *tab_id,
+                cols: *cols,
+                rows: *rows,
+                owner: owner.clone(),
             }),
         ),
         // #481. A session has no view, so what it owes a client is the

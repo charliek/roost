@@ -33,6 +33,7 @@ roostctl [--socket <PATH>] [--target <mac|linux|iced|session>] [--json] <COMMAND
 | `events` | Print the event stream, one JSON line per event |
 | `tab open` / `close` / `send` / `resize` / `reorder` | Tab lifecycle + I/O |
 | `tab memory` | Print how much memory a tab's terminal holds |
+| `tab take-size` | Make this window the size owner of a host tab |
 | `tab report` | Report an agent-hook event straight to `tab.agent_report` |
 | `tab prompt` | Submit a prompt to a tab's agent and wait for the turn it starts |
 | `project list` / `create` / `ensure` / `rename` / `delete` / `reorder` | Project lifecycle |
@@ -126,7 +127,7 @@ never written to stdout either way — see [Exit codes](#exit-codes).
 
 A command that **changes** a tab — `notify`, `set-title`, `tab set-state`,
 `tab clear-notification`, `tab close`, `tab send`, `tab resize`,
-`tab focus`, `tab report`, `tab prompt` — acts on `--tab`, or else on
+`tab focus`, `tab report`, `tab prompt`, `tab take-size` — acts on `--tab`, or else on
 `$ROOST_TAB_ID`. With neither it refuses, before it dials anything, and
 exits 2:
 
@@ -146,7 +147,7 @@ tab when `ROOST_TAB_ID` is unset too. `tab send-file` has always required `--tab
 flag every event prints.
 A `ROOST_TAB_ID` that is not a tab id is refused the same way (exit 2).
 
-Only `tab focus`, `tab dump`, `tab memory` and `tab send-file` take a host tab's
+Only `tab focus`, `tab take-size`, `tab dump`, `tab memory` and `tab send-file` take a host tab's
 `h<host>.<id>`. Every other `--tab` names a local tab and refuses a host
 ref, canonical or not, before it dials anything (exit 2):
 
@@ -433,6 +434,19 @@ These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab 
 Omitting the flag sends the identical request bytes roostctl always sent, so nothing changes against an older Roost. **Using** it against one does not degrade quietly, though: `tab.dump`'s params are strict, so a UI or session that predates the field answers `unknown-field` and the whole request fails rather than returning a viewport-only result you might mistake for an empty history. Against a host session there is no capability list to consult: protocol 5 deleted `session.identify.features`, and the session integer now carries the whole contract — a session this Roost will talk to at all serves the field.
 
 `--tab` on `dump` (and the `tab.dump_resolved` op, plus the test-only `tab.capture_pty_input`) accepts the same host-qualified `h<host>.<id>` spelling `tab focus` does, reading an attached host tab's **client-side** terminal — the UI's own copy, distinct from the session's own `tab dump` served over its socket. See [Host Sessions](../guides/host-sessions.md).
+
+## `tab take-size`
+
+```bash
+roostctl tab take-size --tab h2.7
+```
+
+Make this window the size owner of a host tab, as the tab band's **Take
+size** button does: the tab's session resizes it to the window's grid and
+the command prints the grid it now has (`120x40`). Asked of the UI, which
+takes the size for its own client — see
+[ipc.md](ipc.md#tabtake_size). An in-process tab prints its own grid: it
+always follows the window.
 
 ## `tab memory`
 

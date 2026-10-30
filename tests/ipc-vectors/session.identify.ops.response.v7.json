@@ -39,7 +39,10 @@
       "session.stop",
       "session.set_theme",
       "session.set_agent_hooks",
-      "session.put_file"
+      "session.put_file",
+      "client.hello",
+      "tab.take_size",
+      "tab.release_size"
     ]
   }
 }

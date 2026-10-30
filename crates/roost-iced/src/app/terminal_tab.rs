@@ -1,5 +1,6 @@
 use super::*;
 use crate::terminal_widget::next_press_seq;
+use roost_ipc::dataframe::InputTake;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct NativePointerOutcome {
@@ -50,6 +51,28 @@ struct SelectionAutoscroll {
 pub(super) fn autoscroll_history_rows(overshoot: i16) -> isize {
     let rows = overshoot.unsigned_abs().clamp(1, 5) as isize;
     -isize::from(overshoot.signum()) * rows
+}
+
+/// The rows of a mirror drawn above the view (plan 084 D7): none while its
+/// grid fits, else the fewest that keep the cursor's row on screen. The
+/// row is counted from the live bottom (`scrolled_back` rows of history
+/// below the viewport), so a local scroll moves the drawn rows with the
+/// history instead of re-anchoring them, and a viewport the cursor has
+/// left keeps `last`.
+pub(super) fn grid_offset_rows(
+    cursor_row: Option<u32>,
+    scrolled_back: u32,
+    grid_rows: u16,
+    view_rows: u16,
+    last: u32,
+) -> u32 {
+    let max = u32::from(grid_rows.saturating_sub(view_rows));
+    match cursor_row {
+        Some(row) => (row.saturating_sub(scrolled_back) + 1)
+            .saturating_sub(u32::from(view_rows))
+            .min(max),
+        None => last.min(max),
+    }
 }
 
 /// The auto-scroll tick over every tab (#342). Only the tab on screen, in
@@ -222,6 +245,10 @@ pub(super) fn clear_preedit_or_warn(tab_id: i64, tab: &mut TerminalTab) -> bool 
 pub(super) struct TerminalGeometry {
     pub(super) cols: u16,
     pub(super) rows: u16,
+    /// The grid the window has room for. A host tab's terminal keeps its
+    /// session's grid and is drawn in this view (plan 084 D7); an
+    /// in-process tab's grid is its view.
+    pub(super) view: (u16, u16),
     pub(super) metrics: TerminalMetrics,
     pub(super) metric_generation: u64,
 }
@@ -518,6 +545,16 @@ pub(super) struct TerminalTab {
     theme_generation: u64,
     cols: u16,
     rows: u16,
+    /// See [`TerminalGeometry::view`].
+    view: (u16, u16),
+    /// [`grid_offset_rows`] as of the last snapshot.
+    grid_offset: u32,
+    /// A local scroll toward history reached the oldest row the viewport
+    /// can show, so the grid is drawn from its own top: the rows above
+    /// the offset would be out of reach otherwise. Any scroll back down or
+    /// a keystroke lets the cursor anchor it again; a new grid keeps it,
+    /// with the line at the top of the view.
+    top_pinned: bool,
     pub(super) applied_metrics: Option<TerminalMetrics>,
     pub(super) metric_generation: u64,
     pub(super) render_stats: crate::perf::TabRenderStats,
@@ -622,6 +659,9 @@ impl TerminalTab {
             theme_generation: 0,
             cols,
             rows,
+            view: (cols, rows),
+            grid_offset: 0,
+            top_pinned: false,
             applied_metrics: None,
             metric_generation: 0,
             render_stats: crate::perf::TabRenderStats::default(),
@@ -701,6 +741,7 @@ impl TerminalTab {
         self.rows = rows;
         self.selection = TerminalSelection::new();
         self.scroll = TerminalScroll::new();
+        self.top_pinned = false;
         self.end_selection_drag();
         self.grid = Vec::new();
         self.cached_grid_size = None;
@@ -710,10 +751,14 @@ impl TerminalTab {
     }
 
     /// Resize a host tab's client terminal directly — the attach
-    /// machine's mirror of a RESIZE frame it just queued. Bypasses the
+    /// machine applying a `GRID` its session sent. Bypasses the
     /// `apply_geometry` transaction on purpose: there is no PTY to
-    /// report to (the server owns it), replies are discarded under the
-    /// host handle's policy, and the machine already owns latest-wins.
+    /// report to (the server owns it) and replies are discarded under
+    /// the host handle's policy.
+    ///
+    /// A viewport scrolled back into history keeps the line drawn at its
+    /// top there (plan 084 D6): the reflow would otherwise move the
+    /// reader somewhere else in the history they were reading.
     pub(super) fn resize_for_host(
         &mut self,
         cols: u16,
@@ -721,11 +766,43 @@ impl TerminalTab {
         cell_w: u32,
         cell_h: u32,
     ) -> Result<()> {
+        let anchor = if self.scroll.is_scrolled_back() || self.top_pinned {
+            self.terminal
+                .track(roost_vt::Point::viewport(0, self.grid_offset))
+                .ok()
+        } else {
+            None
+        };
         self.terminal
             .resize(cols, rows, cell_w.max(1), cell_h.max(1))?;
         let _ = self.take_terminal_replies();
         self.adopt_grid(cols, rows);
+        if let Some(anchor) = anchor {
+            self.restore_top_line(&anchor);
+        }
         Ok(())
+    }
+
+    /// Scroll the viewport so `anchor`'s line is the one drawn at the
+    /// view's top again, at the offset the grid now allows.
+    fn restore_top_line(&mut self, anchor: &roost_vt::TrackedRef) {
+        let Some(line) = anchor.point(roost_vt::PointTag::Screen) else {
+            return;
+        };
+        let Ok(scrollbar) = self.terminal.scrollbar() else {
+            return;
+        };
+        let offset = u64::from(grid_offset_rows(
+            None,
+            0,
+            self.rows,
+            self.view.1,
+            self.grid_offset,
+        ));
+        let wanted_top = i64::from(line.y) - offset as i64;
+        let moved_down = wanted_top - scrollbar.offset as i64;
+        let history_rows = isize::try_from(-moved_down).unwrap_or(0);
+        let _ = self.scroll.scroll_local(&mut self.terminal, history_rows);
     }
 
     fn adopt_grid(&mut self, cols: u16, rows: u16) {
@@ -789,6 +866,9 @@ impl TerminalTab {
         (self.cols, self.rows)
     }
 
+    /// Lay the tab out in a `cols`×`rows` view with `metrics`. A host
+    /// tab's grid stays ([`TerminalGeometry::view`]): the window's grid
+    /// reaches its session through the attach and comes back as `GRID`.
     pub(super) fn apply_geometry(
         &mut self,
         cols: u16,
@@ -797,33 +877,46 @@ impl TerminalTab {
         metric_generation: u64,
     ) -> Result<Option<GeometryChange>> {
         let previous_grid = self.grid();
+        let view = (cols, rows);
+        let grid = if self.session.is_host() {
+            previous_grid
+        } else {
+            view
+        };
         let metrics_changed = self.applied_metrics != Some(metrics);
-        if previous_grid == (cols, rows) && !metrics_changed {
+        if previous_grid == grid && self.view == view && !metrics_changed {
             return Ok(None);
         }
         let previous = self.applied_metrics.map(|metrics| TerminalGeometry {
             cols: self.cols,
             rows: self.rows,
+            view: self.view,
             metrics,
             metric_generation: self.metric_generation,
         });
-        let resize = self.terminal.resize(
-            cols,
-            rows,
-            metrics.cell_width.round().max(1.0) as u32,
-            metrics.cell_height.round().max(1.0) as u32,
-        );
+        let resize = if previous_grid != grid || metrics_changed {
+            self.terminal.resize(
+                grid.0,
+                grid.1,
+                metrics.cell_width.round().max(1.0) as u32,
+                metrics.cell_height.round().max(1.0) as u32,
+            )
+        } else {
+            Ok(())
+        };
         let deferred_replies = self.take_terminal_replies();
         resize?;
-        self.adopt_grid(cols, rows);
+        self.adopt_grid(grid.0, grid.1);
+        self.view = view;
         self.applied_metrics = Some(metrics);
         self.metric_generation = metric_generation;
         Ok(Some(GeometryChange {
             previous,
             previous_grid,
             current: TerminalGeometry {
-                cols,
-                rows,
+                cols: grid.0,
+                rows: grid.1,
+                view,
                 metrics,
                 metric_generation,
             },
@@ -845,9 +938,25 @@ impl TerminalTab {
         let _ = self.take_terminal_replies();
         resize?;
         self.adopt_grid(previous.cols, previous.rows);
+        self.view = previous.view;
         self.applied_metrics = Some(previous.metrics);
         self.metric_generation = previous.metric_generation;
         Ok(())
+    }
+
+    /// The view this tab is drawn in — see [`TerminalGeometry::view`].
+    pub(super) fn view(&self) -> (u16, u16) {
+        self.view
+    }
+
+    /// See [`grid_offset_rows`].
+    pub(super) fn grid_offset(&self) -> u32 {
+        self.grid_offset
+    }
+
+    /// [`crate::terminal_widget::drawn_rows`], never none.
+    fn visible_rows(&self) -> u16 {
+        crate::terminal_widget::drawn_rows(self.rows, self.grid_offset, self.view.1).max(1)
     }
 
     pub(super) fn commit_geometry(&self, change: GeometryChange) {
@@ -879,7 +988,7 @@ impl TerminalTab {
     /// state to let go of.
     pub(super) fn commit_pointer_cancel(&mut self, release: Vec<u8>) -> bool {
         if !release.is_empty() {
-            self.session.send_input(release);
+            self.session.send_input(release, InputTake::None);
         }
         self.cancelled_through = self.cancelled_through.max(self.last_press_seq);
         self.drag_gate.reset();
@@ -918,12 +1027,14 @@ impl TerminalTab {
         if bytes.is_empty() {
             return Ok(());
         }
-        if motion_without_button {
+        let take = if motion_without_button {
             self.motion_emitter.commit(col, row, now);
+            InputTake::None
         } else {
             self.drag_gate.commit_dispatched(action, button, (col, row));
-        }
-        self.session.send_input(bytes);
+            InputTake::After
+        };
+        self.session.send_input(bytes, take);
         Ok(())
     }
 
@@ -969,13 +1080,15 @@ impl TerminalTab {
             .context("encode terminal mouse event")
     }
 
+    /// Route one wheel event. Reports whether it moved the local
+    /// viewport rather than reaching the program.
     pub(super) fn handle_wheel(
         &mut self,
         history_rows: f64,
         col: u32,
         row: u32,
         mods: u16,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let route = self.scroll.route(&mut self.terminal, history_rows);
         match route {
             Some(ScrollRoute::MouseReport { direction, rows }) => {
@@ -1005,29 +1118,41 @@ impl TerminalTab {
                             .context("encode alternate-screen wheel key")?,
                     );
                 }
-                self.session.send_input(bytes);
+                self.session.send_input(bytes, InputTake::After);
             }
-            Some(ScrollRoute::LocalViewport { .. }) | None => {}
+            Some(ScrollRoute::LocalViewport { .. }) => {
+                self.scrolled_locally(history_rows > 0.0);
+                return Ok(true);
+            }
+            None => {}
         }
-        Ok(())
+        Ok(false)
+    }
+
+    /// The viewport moved locally, toward history or not: see
+    /// [`Self::top_pinned`].
+    fn scrolled_locally(&mut self, toward_history: bool) {
+        self.top_pinned =
+            toward_history && self.terminal.scrollbar().is_ok_and(|bar| bar.offset == 0);
     }
 
     /// Route a Page Up / Page Down press through the shared scroll policy.
     /// A local page repaints here and reports `LocalViewport` so the caller
     /// consumes the key; `Forward` leaves the key to the normal encode path.
     pub(super) fn handle_page(&mut self, direction: PageDirection) -> Result<PageRoute> {
-        let route = self
-            .scroll
-            .route_page(&mut self.terminal, direction, usize::from(self.rows));
+        let rows = usize::from(self.visible_rows());
+        let route = self.scroll.route_page(&mut self.terminal, direction, rows);
         if matches!(route, PageRoute::LocalViewport { .. }) {
+            self.scrolled_locally(direction == PageDirection::Up);
             self.refresh_snapshot()?;
         }
         Ok(route)
     }
 
     pub(super) fn snap_to_bottom_for_input(&mut self) -> Result<bool> {
+        let unpinned = std::mem::take(&mut self.top_pinned);
         let snapped = self.scroll.snap_to_bottom(&mut self.terminal);
-        if snapped {
+        if snapped || unpinned {
             self.refresh_snapshot()?;
         }
         Ok(snapped)
@@ -1065,7 +1190,7 @@ impl TerminalTab {
         let cleared = self.clear_preedit();
         let snapped = self.snap_to_bottom_for_input();
         let bytes = input::encode_ime_commit(&mut self.encoder, &self.terminal, text);
-        self.session.send_input(bytes);
+        self.session.send_input(bytes, InputTake::Before);
         cleared?;
         snapped?;
         Ok(())
@@ -1280,10 +1405,19 @@ impl TerminalTab {
             self.autoscroll = None;
             return Ok(());
         };
+        let was_pinned = self.top_pinned;
+        self.scrolled_locally(history_rows > 0);
+        if self.top_pinned != was_pinned {
+            // The edge row below is read off the offset the pin moves.
+            self.refresh_snapshot()?;
+        }
+        // The edge the view draws, which a mirror taller than the view
+        // has below its offset (plan 084 D7).
+        let top = u16::try_from(self.grid_offset).unwrap_or(u16::MAX);
         let edge_row = if armed.overshoot < 0 {
-            0
+            top
         } else {
-            self.rows.saturating_sub(1)
+            top.saturating_add(self.visible_rows() - 1)
         };
         let unscrolled_spans = (!scrolled).then(|| {
             self.selection
@@ -1437,7 +1571,7 @@ impl TerminalTab {
     pub(super) fn paste(&self, text: Option<&str>) {
         let bytes = paste_bytes(&self.terminal, text);
         if !bytes.is_empty() {
-            self.session.send_input(bytes);
+            self.session.send_input(bytes, InputTake::Before);
         }
     }
 
@@ -1487,7 +1621,7 @@ impl TerminalTab {
     pub(super) fn set_window_focus(&self, focused: bool) {
         let bytes = self.terminal.encode_focus(focused);
         if !bytes.is_empty() {
-            self.session.send_input(bytes);
+            self.session.send_input(bytes, InputTake::None);
         }
     }
 
@@ -1559,6 +1693,22 @@ impl TerminalTab {
         self.render_state.update(&self.terminal)?;
         let colors = self.render_state.colors()?;
         let cursor = self.render_state.cursor();
+        self.grid_offset = if self.rows <= self.view.1 || self.top_pinned {
+            0
+        } else {
+            let scrolled_back = self
+                .terminal
+                .scrollbar()
+                .map(|bar| bar.total.saturating_sub(bar.offset).saturating_sub(bar.len))
+                .unwrap_or(0);
+            grid_offset_rows(
+                cursor.map(|cursor| cursor.row),
+                u32::try_from(scrolled_back).unwrap_or(u32::MAX),
+                self.rows,
+                self.view.1,
+                self.grid_offset,
+            )
+        };
 
         // Each guard raises the dirty state BEFORE recording its new key,
         // so a failed `mark_full` leaves the key stale and the next
@@ -1737,6 +1887,346 @@ mod tests {
         let hydrated = tab.hydration_terminal(80, 24).expect("hydration terminal");
         tab.swap_terminal(hydrated, 80, 24).expect("swap");
         assert!(tab.write_vt(WORKING).is_empty());
+    }
+
+    /// A hydrated terminal starts at its live bottom, so a pin to the old
+    /// terminal's top does not carry over to it.
+    #[test]
+    fn a_swapped_in_terminal_is_anchored_on_its_cursor_not_a_stale_pin() {
+        let metrics = TerminalMetrics::measure(13.0).expect("metrics");
+        let mut tab = laid_out_host_terminal(80, 30, metrics);
+        let view = tab
+            .apply_geometry(80, 10, metrics, 2)
+            .expect("view")
+            .expect("a new view");
+        tab.commit_geometry(view);
+        for line in 0..25 {
+            tab.write_vt(format!("line {line:03}\r\n").as_bytes());
+        }
+        tab.refresh_snapshot().expect("refresh");
+        assert!(matches!(
+            tab.handle_page(PageDirection::Up),
+            Ok(PageRoute::LocalViewport { .. })
+        ));
+        assert_eq!(tab.grid_offset(), 0, "pinned to the grid's top");
+
+        let mut hydrated = tab.hydration_terminal(80, 30).expect("hydration terminal");
+        for line in 0..25 {
+            hydrated.vt_write(format!("line {line:03}\r\n").as_bytes());
+        }
+        tab.swap_terminal(hydrated, 80, 30).expect("swap");
+        tab.refresh_snapshot().expect("refresh");
+        assert_eq!(tab.grid_offset(), 16, "anchored on the new cursor");
+    }
+
+    /// Plan 084 D7's offset: none while the grid fits the view, else the
+    /// fewest rows that keep the cursor's row on screen, counted from the
+    /// live bottom so a scroll back moves the drawn rows with the history,
+    /// and the last offset while the cursor is out of the viewport.
+    #[test]
+    fn the_offset_keeps_the_cursor_row_in_view_with_the_smallest_scroll() {
+        assert_eq!(grid_offset_rows(Some(40), 0, 50, 30, 0), 11);
+        assert_eq!(
+            grid_offset_rows(Some(49), 0, 50, 30, 0),
+            20,
+            "the bottom row"
+        );
+        assert_eq!(grid_offset_rows(Some(5), 0, 50, 30, 9), 0, "top-aligned");
+        assert_eq!(grid_offset_rows(Some(40), 0, 24, 30, 0), 0, "the grid fits");
+        assert_eq!(grid_offset_rows(Some(40), 0, 30, 30, 0), 0, "exactly");
+        assert_eq!(
+            grid_offset_rows(Some(43), 3, 50, 30, 0),
+            11,
+            "scrolled back 3 rows: the same rows, three history rows lower"
+        );
+        assert_eq!(
+            grid_offset_rows(None, 9, 50, 30, 11),
+            11,
+            "kept while scrolled away"
+        );
+        assert_eq!(
+            grid_offset_rows(None, 9, 50, 45, 11),
+            5,
+            "clamped to what the grid allows"
+        );
+    }
+
+    /// Plan 084 D6: a host tab's grid is its session's. A window re-grid
+    /// installs the cell metrics and moves the view the grid is drawn in,
+    /// and reports no grid change, so nothing downstream sends a resize
+    /// or forgets a resume point. An in-process tab's grid is its view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_tab_takes_the_windows_cells_and_view_but_keeps_its_grid() {
+        let metrics = TerminalMetrics::measure(13.0).expect("metrics");
+        let bigger = TerminalMetrics::measure(15.0).expect("bigger metrics");
+        let mut host = laid_out_host_terminal(80, 24, metrics);
+        let change = host
+            .apply_geometry(120, 30, bigger, 2)
+            .expect("apply")
+            .expect("a change");
+        assert!(!change.grid_changed());
+        assert_eq!(host.grid(), (80, 24));
+        assert_eq!(host.view(), (120, 30));
+        assert_eq!(host.applied_metrics, Some(bigger));
+        assert!(
+            host.apply_geometry(120, 30, bigger, 2)
+                .expect("apply")
+                .is_none(),
+            "nothing moved"
+        );
+        host.rollback_geometry(change.previous.expect("a previous layout"))
+            .expect("roll back");
+        assert_eq!((host.grid(), host.view()), ((80, 24), (80, 24)));
+
+        let (feed_tx, _feed_rx) = engine_feed::channel();
+        let (mut local, supervisor) = attach_test_terminal(42, feed_tx);
+        let change = local
+            .apply_geometry(100, 30, metrics, 2)
+            .expect("apply")
+            .expect("a change");
+        assert!(change.grid_changed());
+        assert_eq!((local.grid(), local.view()), ((100, 30), (100, 30)));
+        supervisor.close(42);
+    }
+
+    fn queued_takes(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<super::super::tab_backend::HostDataMsg>,
+    ) -> Vec<InputTake> {
+        let mut takes = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let super::super::tab_backend::HostDataMsg::Input { take, .. } = msg {
+                takes.push(take);
+            }
+        }
+        takes
+    }
+
+    /// Plan 084 D6's marking of what a host tab's input asks of its size:
+    /// keys, IME and paste take before their bytes; a click and the wheel
+    /// after; a pointer with no button held, a focus report and a pointer
+    /// cancel never.
+    #[test]
+    fn a_host_tabs_input_says_what_it_asks_of_the_size() {
+        let metrics = TerminalMetrics::measure(13.0).expect("metrics");
+        let (input, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut tab, _capture) = attach_test_host_terminal(80, 24, input);
+        let installed = tab
+            .apply_geometry(80, 24, metrics, 1)
+            .expect("metrics")
+            .expect("installed");
+        tab.commit_geometry(installed);
+
+        tab.paste(Some("pasted"));
+        tab.commit_ime("日本").expect("ime");
+        assert_eq!(queued_takes(&mut rx), vec![InputTake::Before; 2]);
+
+        // Mouse tracking, any-event (1003), so a hover reports too.
+        tab.write_vt(b"\x1b[?1003h\x1b[?1006h");
+        tab.dispatch_pointer(PointerAction::Press, Some(PointerButton::Left), 3, 2, 0)
+            .expect("press");
+        tab.dispatch_pointer(PointerAction::Motion, Some(PointerButton::Left), 4, 2, 0)
+            .expect("drag");
+        tab.dispatch_pointer(PointerAction::Release, Some(PointerButton::Left), 4, 2, 0)
+            .expect("release");
+        tab.handle_wheel(3.0, 4, 2, 0).expect("wheel");
+        assert!(queued_takes(&mut rx)
+            .iter()
+            .all(|take| *take == InputTake::After));
+
+        tab.dispatch_pointer(PointerAction::Motion, None, 9, 9, 0)
+            .expect("hover");
+        tab.write_vt(b"\x1b[?1004h");
+        tab.set_window_focus(false);
+        tab.tracking_pointer = Some(PointerButton::Left);
+        let release = tab.prepare_pointer_cancel().expect("release");
+        tab.commit_pointer_cancel(release);
+        let takes = queued_takes(&mut rx);
+        assert_eq!(
+            takes.len(),
+            3,
+            "a hover, a focus report and a cancel: {takes:?}"
+        );
+        assert!(
+            takes.iter().all(|take| *take == InputTake::None),
+            "{takes:?}"
+        );
+
+        // Off mouse tracking, on the alternate screen, the wheel is arrow
+        // keys — still the wheel.
+        tab.write_vt(b"\x1b[?1003l\x1b[?1049h");
+        tab.handle_wheel(3.0, 4, 2, 0).expect("wheel as keys");
+        assert_eq!(queued_takes(&mut rx), vec![InputTake::After]);
+    }
+
+    /// Plan 084 D6: when a `GRID` reflows a mirror whose viewport is
+    /// scrolled back into history, the line drawn at the top of the view
+    /// stays there. The mirror here is taller than the view, so the view
+    /// draws it from a row offset; the `GRID` brings it to the view's
+    /// grid, where nothing is offset, and libghostty's own viewport pin
+    /// alone would put a different line on top.
+    #[test]
+    fn a_grid_keeps_the_line_at_the_top_of_a_scrolled_back_view() {
+        let metrics = TerminalMetrics::measure(13.0).expect("metrics");
+        let mut tab = laid_out_host_terminal(80, 30, metrics);
+        let view = tab
+            .apply_geometry(80, 10, metrics, 2)
+            .expect("view")
+            .expect("a new view");
+        tab.commit_geometry(view);
+        for line in 0..120 {
+            tab.write_vt(format!("line {line:03}\r\n").as_bytes());
+        }
+        tab.refresh_snapshot().expect("refresh");
+        assert_eq!(tab.grid_offset(), 20, "the cursor's row in view");
+        assert_eq!(tab.scroll.scroll_local(&mut tab.terminal, 25), Some(true));
+        tab.refresh_snapshot().expect("refresh");
+        let top = |tab: &mut TerminalTab| {
+            let offset = tab.grid_offset() as usize;
+            tab.dump(0).expect("dump").rows_text[offset].clone()
+        };
+        let before = top(&mut tab);
+        assert!(before.starts_with("line"), "{before:?}");
+
+        tab.resize_for_host(80, 10, 9, 18).expect("GRID");
+        tab.refresh_snapshot().expect("refresh");
+        assert_eq!(tab.grid_offset(), 0);
+        assert_eq!(top(&mut tab), before);
+    }
+
+    /// Plan 084 D7: the rows above the offset stay reachable. With no
+    /// history to scroll, or at the oldest row history keeps, a Page Up
+    /// draws the grid from its own top; short of that row the cursor
+    /// keeps anchoring it, and a keystroke anchors it on the cursor again.
+    #[test]
+    fn a_page_up_at_the_oldest_row_draws_the_grid_from_its_top() {
+        let metrics = TerminalMetrics::measure(13.0).expect("metrics");
+        let mut tab = laid_out_host_terminal(80, 30, metrics);
+        let view = tab
+            .apply_geometry(80, 10, metrics, 2)
+            .expect("view")
+            .expect("a new view");
+        tab.commit_geometry(view);
+        for line in 0..25 {
+            tab.write_vt(format!("line {line:03}\r\n").as_bytes());
+        }
+        tab.refresh_snapshot().expect("refresh");
+        assert_eq!(tab.grid_offset(), 16, "the cursor's row in view");
+        let top = |tab: &mut TerminalTab| {
+            let offset = tab.grid_offset() as usize;
+            tab.dump(0).expect("dump").rows_text[offset].clone()
+        };
+        let page = |tab: &mut TerminalTab, direction| {
+            assert!(matches!(
+                tab.handle_page(direction),
+                Ok(PageRoute::LocalViewport { .. })
+            ));
+        };
+
+        page(&mut tab, PageDirection::Up);
+        assert_eq!(tab.grid_offset(), 0, "no history: the grid's own top");
+        assert!(top(&mut tab).starts_with("line 000"));
+        tab.snap_to_bottom_for_input().expect("a keystroke");
+        assert_eq!(tab.grid_offset(), 16, "anchored on the cursor again");
+
+        for line in 25..100 {
+            tab.write_vt(format!("line {line:03}\r\n").as_bytes());
+        }
+        tab.refresh_snapshot().expect("refresh");
+        assert_eq!(tab.grid_offset(), 20);
+        page(&mut tab, PageDirection::Up);
+        assert_eq!(tab.grid_offset(), 20, "history left above: still anchored");
+        for _ in 0..10 {
+            page(&mut tab, PageDirection::Up);
+        }
+        assert_eq!(tab.grid_offset(), 0, "the oldest row: the grid's own top");
+        assert!(top(&mut tab).starts_with("line 000"), "{:?}", top(&mut tab));
+        tab.snap_to_bottom_for_input().expect("a keystroke");
+        assert_eq!(tab.grid_offset(), 20, "anchored on the cursor again");
+    }
+
+    /// The grid of the page-up case above: 30 rows in a 10-row view, 25
+    /// lines and no history, the cursor anchoring the offset at 16.
+    fn pinnable_tab() -> TerminalTab {
+        let metrics = TerminalMetrics::measure(13.0).expect("metrics");
+        let mut tab = laid_out_host_terminal(80, 30, metrics);
+        let view = tab
+            .apply_geometry(80, 10, metrics, 2)
+            .expect("view")
+            .expect("a new view");
+        tab.commit_geometry(view);
+        for line in 0..25 {
+            tab.write_vt(format!("line {line:03}\r\n").as_bytes());
+        }
+        tab.refresh_snapshot().expect("refresh");
+        assert_eq!(tab.grid_offset(), 16);
+        tab
+    }
+
+    fn drawn_top(tab: &mut TerminalTab) -> String {
+        let offset = tab.grid_offset() as usize;
+        tab.dump(0).expect("dump").rows_text[offset].clone()
+    }
+
+    /// A selection drag held above the view scrolls toward history like a
+    /// Page Up, and at the oldest row draws the grid from its own top, so
+    /// the drag reaches rows the offset hid.
+    #[test]
+    fn a_selection_drag_held_above_the_view_reaches_the_grids_top() {
+        let mut tab = pinnable_tab();
+        let dispatch = |tab: &mut TerminalTab, action, row, overshoot| {
+            let button = Some(PointerButton::Left);
+            let press_seq = tab.synthetic_press_seq(action, button);
+            tab.handle_native_pointer(NativePointerDispatch {
+                action,
+                button,
+                col: 0,
+                row,
+                mods: 0,
+                click_count: 1,
+                inside: overshoot == 0,
+                link_modifier_held: false,
+                press_seq,
+                overshoot,
+            })
+            .expect("pointer");
+        };
+        dispatch(&mut tab, PointerAction::Press, 20, 0);
+        dispatch(&mut tab, PointerAction::Motion, 16, -3);
+        assert!(tab.autoscroll_armed());
+        tab.autoscroll_selection().expect("tick");
+        assert_eq!(tab.grid_offset(), 0, "the oldest row: the grid's own top");
+        assert!(drawn_top(&mut tab).starts_with("line 000"));
+        assert!(
+            tab.selected_text()
+                .expect("selection")
+                .is_some_and(|text| text.starts_with("line 000")),
+            "the drag reached the grid's top row"
+        );
+    }
+
+    /// Plan 084 D6: a `GRID` keeps the line drawn at the top of a pinned
+    /// view there, as it does a scrolled-back one's — the take that a
+    /// settled Page Up sends included — and one that moves nothing but
+    /// the owner leaves the pin alone.
+    #[test]
+    fn a_grid_keeps_the_top_line_of_a_view_pinned_to_the_grids_top() {
+        let mut tab = pinnable_tab();
+        assert!(matches!(
+            tab.handle_page(PageDirection::Up),
+            Ok(PageRoute::LocalViewport { .. })
+        ));
+        assert!(drawn_top(&mut tab).starts_with("line 000"));
+
+        tab.resize_for_host(80, 30, 9, 18)
+            .expect("an owner-only GRID");
+        tab.refresh_snapshot().expect("refresh");
+        assert_eq!(tab.grid_offset(), 0, "still pinned");
+        assert!(drawn_top(&mut tab).starts_with("line 000"));
+
+        tab.resize_for_host(80, 10, 9, 18).expect("the take's GRID");
+        tab.refresh_snapshot().expect("refresh");
+        let top = drawn_top(&mut tab);
+        assert!(top.starts_with("line 000"), "{top:?}");
     }
 
     /// D9 (#545): a session tab's first frame — before the host's

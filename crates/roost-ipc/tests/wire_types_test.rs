@@ -25,11 +25,12 @@ use roost_ipc::messages::{
     ResponseError, RetrySchedule, SentFile, SessionBinaryIdentity, SessionIdentify,
     SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
     SessionSetThemeParams, SessionSetThemeResult, SessionStopParams, SessionStopResult,
-    SessionStoppingEvent, SkippedFile, StreamEndedEvent, TabClearNotificationParams,
+    SessionStoppingEvent, SizeOwner, SkippedFile, StreamEndedEvent, TabClearNotificationParams,
     TabClearNotificationResult, TabDumpCursor, TabDumpParams, TabDumpResult, TabEffect,
-    TabEffectEvent, TabListResult, TabPasswordInputEvent, TabReorderParams, TabSendFileParams,
-    TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES,
-    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
+    TabEffectEvent, TabListResult, TabPasswordInputEvent, TabReleaseSizeParams, TabReorderParams,
+    TabResizedEvent, TabSendFileParams, TabSendFileResult, TabTakeSizeParams, TabTakeSizeResult,
+    TabWriteParams, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
+    SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -576,13 +577,15 @@ fn an_attach_handshake_matches_its_golden_json() {
         r#"{"attach":"7","protocol_version":7,"#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","kinds":["ghostty-snapshot","vt"],"#,
         r#""cols":100,"rows":30,"cell_w_px":8,"cell_h_px":16,"#,
-        r#""libghostty_build":"ghostty-1a2b3c4d5e6f7a8b+snapshot.v1","focus":true}"#,
+        r#""libghostty_build":"ghostty-1a2b3c4d5e6f7a8b+snapshot.v1","take":true,"#,
+        r#""client_id":"5d0c7e21a9f3b846"}"#,
     );
     const RESUME: &str = concat!(
         r#"{"attach":"7","protocol_version":7,"#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","kinds":["ghostty-snapshot","vt"],"#,
         r#""cols":100,"rows":30,"cell_w_px":8,"cell_h_px":16,"#,
-        r#""libghostty_build":"ghostty-1a2b3c4d5e6f7a8b+snapshot.v1","focus":true,"#,
+        r#""libghostty_build":"ghostty-1a2b3c4d5e6f7a8b+snapshot.v1","take":true,"#,
+        r#""client_id":"5d0c7e21a9f3b846","#,
         r#""resume_from_seq":901,"server_epoch":6032428321756423947,"tab_generation":3}"#,
     );
 
@@ -615,7 +618,8 @@ fn sample_handshake_terms() -> AttachHandshakeTerms {
         cell_w_px: 8,
         cell_h_px: 16,
         libghostty_build: "ghostty-1a2b3c4d5e6f7a8b+snapshot.v1".into(),
-        focus: true,
+        take: true,
+        client_id: "5d0c7e21a9f3b846".into(),
     }
 }
 
@@ -635,7 +639,8 @@ fn a_handshake_missing_a_required_term_names_it() {
         "cols",
         "rows",
         "libghostty_build",
-        "focus",
+        "take",
+        "client_id",
     ] {
         let mut line = serde_json::json!({
             "attach": "7",
@@ -645,7 +650,8 @@ fn a_handshake_missing_a_required_term_names_it() {
             "cols": 80,
             "rows": 24,
             "libghostty_build": "b",
-            "focus": false,
+            "take": false,
+            "client_id": "c",
         });
         line.as_object_mut().unwrap().remove(missing);
         let error = serde_json::from_value::<AttachHandshake>(line)
@@ -662,7 +668,7 @@ fn a_handshake_missing_a_required_term_names_it() {
 fn a_handshake_may_omit_its_cell_metrics() {
     let decoded: AttachHandshake = serde_json::from_str(concat!(
         r#"{"attach":"7","protocol_version":6,"session_id":"s","kinds":["vt"],"#,
-        r#""cols":80,"rows":24,"libghostty_build":"b","focus":true}"#,
+        r#""cols":80,"rows":24,"libghostty_build":"b","take":true,"client_id":"c"}"#,
     ))
     .expect("a headless client reports no cell metrics");
     assert_eq!((decoded.terms.cell_w_px, decoded.terms.cell_h_px), (0, 0));
@@ -675,7 +681,7 @@ fn a_handshake_may_omit_its_cell_metrics() {
 fn attach_handshake_tolerates_unknown_fields() {
     let decoded: AttachHandshake = serde_json::from_str(
         r#"{"attach":"7","protocol_version":2,"session_id":"s","kinds":["vt"],
-            "cols":80,"rows":24,"libghostty_build":"b","focus":true,
+            "cols":80,"rows":24,"libghostty_build":"b","take":true,"client_id":"c",
             "resume_from_seq":5,"viewport_hint":{"top":0},"future_field":true}"#,
     )
     .unwrap();
@@ -689,7 +695,8 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
     const ACCEPTED: &str = concat!(
         r#"{"ok":true,"kind":"ghostty-snapshot","mode":"snapshot","seq":900,"#,
         r#""server_epoch":6032428321756423947,"tab_generation":3,"#,
-        r#""snapshot_cols":100,"snapshot_rows":30}"#,
+        r#""snapshot_cols":100,"snapshot_rows":30,"#,
+        r#""owner":{"client_id":"5d0c7e21a9f3b846","label":"charlie-laptop"}}"#,
     );
     const REJECTED: &str = concat!(
         r#"{"ok":false,"error":{"code":"session-mismatch","#,
@@ -704,6 +711,10 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
         tab_generation: 3,
         snapshot_cols: 100,
         snapshot_rows: 30,
+        owner: Some(SizeOwner {
+            client_id: "5d0c7e21a9f3b846".into(),
+            label: "charlie-laptop".into(),
+        }),
     });
     round_trip(&accepted);
     assert_eq!(serde_json::to_string(&accepted).unwrap(), ACCEPTED);
@@ -731,15 +742,16 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
     );
 }
 
-/// The snapshot geometry rides **every** accepted arm: under protocol
-/// equality there is no session that leaves it out, so a reply without
-/// it is a truncated reply and not an older peer.
+/// The snapshot geometry and the size owner ride **every** accepted
+/// arm: under protocol equality there is no session that leaves either
+/// out, so a reply without one is a truncated reply and not an older
+/// peer. An unowned tab says so with a present `null`.
 #[test]
 fn an_accepted_handshake_reply_without_the_snapshot_geometry_is_refused() {
     const WITH: &str = concat!(
         r#"{"ok":true,"kind":"vt","mode":"snapshot","seq":900,"#,
         r#""server_epoch":6032428321756423947,"tab_generation":3,"#,
-        r#""snapshot_cols":100,"snapshot_rows":30}"#,
+        r#""snapshot_cols":100,"snapshot_rows":30,"owner":null}"#,
     );
 
     let sized = AttachHandshakeReply::Accepted(AttachAccepted {
@@ -750,6 +762,7 @@ fn an_accepted_handshake_reply_without_the_snapshot_geometry_is_refused() {
         tab_generation: 3,
         snapshot_cols: 100,
         snapshot_rows: 30,
+        owner: None,
     });
     round_trip(&sized);
     assert_eq!(serde_json::to_string(&sized).unwrap(), WITH);
@@ -766,6 +779,60 @@ fn an_accepted_handshake_reply_without_the_snapshot_geometry_is_refused() {
     assert!(
         error.to_string().contains("snapshot_cols"),
         "the error names the missing field: {error}"
+    );
+
+    let error = serde_json::from_str::<AttachHandshakeReply>(concat!(
+        r#"{"ok":true,"kind":"vt","mode":"snapshot","seq":900,"#,
+        r#""server_epoch":6032428321756423947,"tab_generation":3,"#,
+        r#""snapshot_cols":100,"snapshot_rows":30}"#,
+    ))
+    .expect_err("an accepted reply that does not say who sizes the tab is truncated");
+    assert!(
+        error.to_string().contains("owner"),
+        "the error names the missing field: {error}"
+    );
+}
+
+/// The size-ownership ops and event decode from their vectors into the
+/// shapes the session answers with, and `tab.resized` always carries its
+/// `owner` key — `null` for an unowned tab.
+#[test]
+fn size_ownership_vectors_decode_into_their_typed_shapes() {
+    let vector = |name: &str| -> serde_json::Value {
+        serde_json::from_str(&read_vector(name)).expect("a vector is JSON")
+    };
+    let take: TabTakeSizeParams =
+        serde_json::from_value(vector("tab.take_size.request.json")["params"].clone()).unwrap();
+    assert_eq!(take.tab_id, WireTabRef::Local(5));
+    let taken: TabTakeSizeResult =
+        serde_json::from_value(vector("tab.take_size.response.json")["result"].clone()).unwrap();
+    assert_eq!((taken.cols, taken.rows), (120, 40));
+    let release: TabReleaseSizeParams =
+        serde_json::from_value(vector("tab.release_size.request.json")["params"].clone()).unwrap();
+    assert_eq!(release.tab_id, 5);
+
+    let resized: TabResizedEvent =
+        serde_json::from_value(vector("tab.resized.event.json")["data"].clone()).unwrap();
+    assert_eq!(
+        resized,
+        TabResizedEvent {
+            tab_id: 5,
+            cols: 120,
+            rows: 40,
+            owner: Some(SizeOwner {
+                client_id: "5d0c7e21a9f3b846".into(),
+                label: "charlie-laptop".into(),
+            }),
+        }
+    );
+    let unowned = TabResizedEvent {
+        owner: None,
+        ..resized
+    };
+    assert_eq!(
+        serde_json::to_value(&unowned).unwrap()["owner"],
+        serde_json::Value::Null,
+        "an unowned tab says so with a present null"
     );
 }
 
@@ -897,7 +964,7 @@ fn dispatch_mouse_event_vectors_decode_into_their_typed_shapes() {
         (
             "tab.dispatch_mouse_event.request.json",
             TabDispatchMouseEventParams {
-                tab_id: 5,
+                tab_id: WireTabRef::Local(5),
                 kind: "press".into(),
                 button: "left".into(),
                 cell_x: 10,
@@ -909,7 +976,7 @@ fn dispatch_mouse_event_vectors_decode_into_their_typed_shapes() {
         (
             "tab.dispatch_mouse_event.overshoot.request.json",
             TabDispatchMouseEventParams {
-                tab_id: 5,
+                tab_id: WireTabRef::Local(5),
                 kind: "motion".into(),
                 button: "left".into(),
                 cell_x: 0,
@@ -941,7 +1008,7 @@ fn dispatch_mouse_event_params_omit_a_zero_overshoot() {
     use roost_ipc::messages::TabDispatchMouseEventParams;
 
     let params = TabDispatchMouseEventParams {
-        tab_id: 5,
+        tab_id: WireTabRef::Local(5),
         kind: "motion".into(),
         button: "left".into(),
         cell_x: 0,
