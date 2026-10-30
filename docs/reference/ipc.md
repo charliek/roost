@@ -110,7 +110,7 @@ terminal from. It shares the socket path but not the framing; see
   `unknown-op`, `unknown-field`, `missing-param`, `invalid-param`,
   `parse-error`, `frame-too-large`, `duplicate-id`, `not-found`,
   `not-implemented`, `internal`, `too-large`, `store-full`,
-  `shutting-down`, `host-unavailable`, `not-enabled`, `busy`.
+  `shutting-down`, `host-unavailable`, `not-enabled`, `busy`, `owned`.
   Clients should treat unknown codes as fatal for the request and
   surface `message` to the user. `too-large` and `store-full` arrived
   with [`session.put_file`](#sessionput_file) and are both about **one
@@ -140,6 +140,12 @@ terminal from. It shares the socket path but not the framing; see
   `host-unavailable` re-read `identify` too: a present
   `local_backend_switch` is that older spelling of `busy`, and an absent
   one means the session really is down.
+  `owned` (protocol 7) is a session's refusal of a background
+  [`tab.resize`](#tabresize) on a tab another client sizes; the
+  `message` names the owner's label (`tab <id> is sized by <label>`).
+  It is not a retry: the tab is resized again once its owner goes. A UI
+  socket under `local-backend = session` forwards a bare-id `tab.resize`
+  to the session, and the refusal crosses verbatim.
   `shutting-down` is **session-socket only**: once
   [`session.stop`](#sessionstop) latches, every mutating op answers it
   (reads still answer normally), and a second `session.stop` on the
@@ -786,42 +792,42 @@ Headless resize of a tab's PTY (issues `TIOCSWINSZ`, which fires
 Request: `{"params": {"tab_id": "3", "cols": 100, "rows": 24}}`.
 Response: `{}`.
 
-**A tab is sized by the last geometry-bearing interaction with it**
-(plan 057, R15) — the rule that lets two clients at different sizes
-share one tab without either permanently shrinking the other. Four
-things carry geometry, and each one sizes the tab:
+On a UI socket's own in-process tab this is the whole story. **On a host
+session a tab has a size owner** (plan 084, protocol 7): at most one
+attachment whose grid is the PTY's, and this op is a *background* resize
+— the one iced's resize wave and `roostctl tab resize` send:
 
-* this op;
-* an [attach handshake](#the-handshake) with `focus: true`, which
-  resizes during negotiation;
-* a data-plane `INPUT` frame, which applies its connection's declared
-  geometry ahead of the bytes when it differs — typing is how a client
-  says which viewport it is looking at;
-* a data-plane `RESIZE` frame, which applies and becomes that
-  connection's declared geometry.
+* a tab nobody owns takes it;
+* a tab somebody owns — live, still attaching, or holding its grace
+  after a drop — refuses it with **`owned`**, message
+  `tab <id> is sized by <label>`, and nothing changes. An `owned` answer
+  is final, not a retry: the tab is resized again once its owner goes
+  (a [`tab.resized`](#events) with `owner: null` says so).
 
-Nothing else does. [`tab.dump`](#tabdump), an
-[`events.subscribe`](#eventssubscribe) stream, a
-[`tab.write`](#tabwrite) (a control-plane write has no viewport behind
-it) and an idle client that attached with `focus: false` all leave the
-size exactly where it was.
+The reply comes after the session has decided **and** resized its own
+terminal; the child's `TIOCSWINSZ` is queued ahead of any later input
+but not waited for, so a wave of these never stalls behind a child that
+has stopped reading. A resize the terminal refuses answers `internal`
+and changes nothing.
+
+What takes a session tab's size, and what never does, is the data
+plane's to say — see [Size ownership](#size-ownership). In short: an
+attach with `take: true` (an explicit switch), a key or paste, a click
+or the wheel, a focused `RESIZE`, a `TAKE` frame and
+[`tab.take_size`](#tabtake_size) take it; watching (`take: false` on an
+owned tab), unflagged input (focus reports, button-less motion), the
+session's own answers to device queries, a [`tab.write`](#tabwrite)
+(a control-plane write has no viewport behind it),
+[`tab.dump`](#tabdump) and an [`events.subscribe`](#eventssubscribe)
+stream never do.
 
 Geometry is the four numbers `(cols, rows, cell_w_px, cell_h_px)`
 compared together, not just the grid: libghostty's mode-2048 in-band
 size reports quote the pixel dimensions, so the same grid at different
 cell metrics is a different viewport. Unchanged geometry is not
-re-applied, so two clients typing at the same size cost nothing. This
-op states the grid only and leaves the cell metrics where the last
-geometry-bearing client left them; before any client has declared them
+re-applied. This op states the grid only and leaves the cell metrics
+where the last owner left them; before any client has declared them
 they are unset, and the size report quotes `0x0` pixels.
-
-Simultaneous interactions **linearize in the order the tab receives
-them**, not in wall-clock order: every one of them is a command on the
-tab's single channel. The consequence is the rule working as intended —
-two clients alternating keystrokes at different sizes flip the PTY's
-size each time. The tab tells nobody it was resized under them (see
-[Data plane](#data-plane)); a client at another size sees wrapping
-until it interacts again.
 
 ### `tab.dump`
 
@@ -3955,8 +3961,12 @@ does — and such a connection simply has no client. An op that acts for
 said hello with `invalid-param` (`send client.hello first`).
 
 The session keeps one label per client id, the last hello's, and
-forgets it once no connection of that id is open. It is not in the
-mutating set: a stop that has latched still answers it.
+forgets it once no connection of that id is open — control or data —
+and no tab holds a [grace record](#size-ownership) for it. Each data
+connection copies its client's label when it attaches, so what one
+attachment is called never changes under it; an attach whose client id
+said no hello is labelled `client <first 8 characters of the id>`. It
+is not in the mutating set: a stop that has latched still answers it.
 
 Roost's client sends it first on its control connection, before
 `session.identify`, and ignores any refusal: a session from before the
@@ -3968,6 +3978,52 @@ connection instead, since a late reply would be read as the identify's:
 the client dials again and identifies with no hello. Only the control
 connection says hello. A **UI socket answers `unknown-op`**,
 like every other session op.
+
+### `tab.take_size`
+
+Session-only (protocol 7). Makes the client this connection said
+[`client.hello`](#clienthello) as the tab's size owner, at its newest
+attachment's own grid — the explicit transfer without typing (the "sized
+by" marker's **Take size**). Request:
+
+```json
+{"id": "4", "op": "tab.take_size", "params": {"tab_id": "5"}}
+```
+
+Response: the tab's grid afterwards, `{"cols": 120, "rows": 40}`.
+
+A connection that said no hello is `invalid-param` (`send client.hello
+first`). A client with no attachment to the tab is `not-found`
+(`client X has no attachment to tab N`). A grid the tab's terminal
+refuses is `internal`, and nothing changes. The tab id is bare; the
+`h<host>.<id>` spelling is a UI socket's. Mutating: refused once a stop
+has latched.
+
+### `tab.release_size`
+
+Session-only (protocol 7). If the client this connection said hello as
+owns the tab — live, still attaching, or holding its grace — the size is
+handed on at once, exactly as a deliberate detach hands it on, except
+that **none of that client's attachments is a candidate** until it takes
+a tab's size again. Otherwise a no-op. What a phone sends when it goes to
+the background; a desktop losing focus does not. Request
+`{"tab_id": "5"}`, response `{}`. Needs a hello, like
+[`tab.take_size`](#tabtake_size).
+
+### `tab.fail_next_resize` *(test-only — gated)*
+
+Session-only, `ROOST_TEST_MODE=1`. The tab's next resize of its own
+terminal fails before it changes anything — the failed-apply case of the
+size rules, which a real terminal reaches only with a grid it cannot
+take. Request `{"tab_id": "5"}`, response `{}`.
+
+### `tab.drop_data_conns` *(test-only — gated)*
+
+Session-only, `ROOST_TEST_MODE=1`. Closes the tab's data connections
+from the session's side with **no** label and no `DETACH` semantics: an
+EOF, exactly what a network drop looks like to the client, and a
+disconnect to the size rules (an owner's grace begins). Request
+`{"tab_id": "5"}`, response `{}`.
 
 ### `session.stop`
 
@@ -4038,7 +4094,7 @@ mid-flight by a payload that happens to look like a handshake.
  "kinds": ["ghostty-snapshot", "vt"], "cols": 100, "rows": 30,
  "cell_w_px": 8, "cell_h_px": 16,
  "libghostty_build": "ghostty-1a2b3c4d5e6f7a8b+snapshot.v1",
- "focus": true,
+ "take": true, "client_id": "5d0c7e21a9f3b846",
  "resume_from_seq": 8814, "server_epoch": 6032428321756423947,
  "tab_generation": 3}
 ```
@@ -4102,36 +4158,49 @@ advertise `vt`.
 
 Zero `cell_w_px` / `cell_h_px` are legal — a headless client has no
 cell metrics to report — but a zero-sized grid is not a grid. That
-holds for an unfocused attach too: `cols`/`rows` are this connection's
-**declared geometry** either way, and its first `INPUT` or `RESIZE`
-frame applies them.
+holds for a watching attach too: `cols`/`rows` are this attachment's
+**advisory grid** either way — what a take sizes the tab to, and what a
+handoff hands it.
 
-**`focus` says whether this attach claims the tab's geometry.** A
-focused attach is when the server resizes: once the connection is
-admitted and before anything is encoded, the session resizes the tab
-(server terminal *and* `TIOCSWINSZ`) to the requested geometry and
-waits for that to land, so the snapshot about to be encoded is already
-at client size and needs no post-READY resize. A geometry either half
-refuses comes back as `invalid-param`. Detach never resizes back — the
-PTY keeps the last attached size, so a TUI agent does not get a
-`SIGWINCH` because somebody closed a laptop. This does not contradict
-that rule: attach is exactly when an in-process Roost resizes too.
+**`take` says whether this attach takes the tab's size** (protocol 7;
+it replaces `focus`). An explicit tab switch says `true`: once the
+connection is admitted and before anything is encoded, the session
+makes this attachment the tab's owner — provisionally, until its
+accepted reply is written — and resizes the tab (server terminal *and*
+`TIOCSWINSZ`) to the requested geometry, waiting for both halves to
+land, so the snapshot about to be encoded is already at client size. A
+grid the terminal refuses takes nothing and the attach goes ahead as a
+watcher; a child that does not take the winsize within the budget is
+`internal`.
 
-`focus: false` resizes **nothing** — the point of it is a client that
-wants to watch a tab without shrinking the one that is typing (a phone
-glancing at a desktop's session). Its geometry still counts the moment
-it interacts; see the sizing rule beside [`tab.resize`](#tabresize).
+`take: false` is an **automatic** attach — a restore at launch, a
+re-attach after a reconnect or a lag. It takes a tab nobody owns, and
+otherwise resizes **nothing**: the point of it is a client that wants to
+watch a tab without shrinking the one that is typing (a phone glancing
+at a desktop's session). Two exceptions, both the attaching client's
+own: a tab its own client holds a grace record for is reclaimed (a
+reconnecting owner, no reflow), and a tab its own client owns through
+another attachment moves to this one (a reconnect whose attach beat the
+old connection's EOF). See [Size ownership](#size-ownership) for
+everything after the attach.
 
-**`focus` is required and always spelled out on the wire** — no
-default, no omit-when-true shim. An attach that leaves it out is a
-malformed request, not an unfocused one.
+**`client_id` names the client** this attachment belongs to — the id it
+said [`client.hello`](#clienthello) with, in the same format (1–64 bytes
+of `[A-Za-z0-9._-]`; anything else is `invalid-param`). Ownership,
+reclaim and handoff are decided per client, so a phone and a desktop
+that share a hostname are still two clients.
+
+**`take` and `client_id` are required and always spelled out on the
+wire** — no default. A handshake that leaves either out is a
+`parse-error` naming it; one that still says `focus` and not `take` is
+missing `take`.
 
 **Refusal order is part of the contract**, because each failure tells
 the client to fix a different thing and an earlier one must not be
 masked by a later one: protocol, then the typed decode, then
 `session_id`, then the stop latch, then the tab, then a servable kind,
-then an eligible one, then the grid, then the session's connection
-bound, and only then the focused resize.
+then an eligible one, then the grid, then `client_id`, then the
+session's connection bound, and only then the size decision.
 
 **Scope:** this sniff exists on Rust-served sockets only. The Mac UI's
 Swift IPC server has no data plane and is untouched — a handshake line
@@ -4144,7 +4213,8 @@ The reply is one JSON line. Accepted:
 ```json
 {"ok": true, "kind": "ghostty-snapshot", "mode": "snapshot",
  "seq": 8813, "server_epoch": 6032428321756423947, "tab_generation": 3,
- "snapshot_cols": 100, "snapshot_rows": 30}
+ "snapshot_cols": 100, "snapshot_rows": 30,
+ "owner": {"client_id": "5d0c7e21a9f3b846", "label": "charlie-laptop"}}
 ```
 
 Rejected — then the connection closes, and **nothing binary is ever
@@ -4162,7 +4232,8 @@ the bytes after it are frames:
 | `not-found` | the tab has no live terminal, or was respawned around the hand-off this attach was admitted for — the tab task reports which generation actually served it, so a stream from a replaced terminal is refused rather than painted under the old tab's identity. |
 | `unsupported-kind` | no `kinds` entry is one this session advertises. |
 | `build-mismatch` | the only servable kind needs the same libghostty on both ends. |
-| `invalid-param` | `attach` is not a tab id, the grid is zero-sized, or a focused attach asked for a geometry the tab refused. |
+| `invalid-param` | `attach` is not a tab id, the grid is zero-sized, or `client_id` is not in `client.hello`'s format. |
+| `internal` | the child did not take a taking attach's winsize within the budget. |
 | `too-many-attaches` | this session already serves `MAX_DATA_CONNS_PER_SESSION` (32) data connections. One buggy same-UID client can hold all of them; that is accepted under the same-UID boundary this socket already draws. |
 | `snapshot-failed` | the terminal could not be encoded right now. Re-attach is the recovery — it is about this instant, not about the client. For `vt` this also covers a terminal whose VT parser sits mid-sequence with no retained continuation for the whole attach budget: the encode is parked and retried after each further chunk rather than emitting a payload that would desync the client, and the budget is what bounds that wait. |
 | `shutting-down` | `session.stop` has latched. Read before the tab is looked up, so a stop that already reaped the tab still answers this and not `not-found`: what went away is the session, not one tab, and a client that removed the tab from its UI over a `not-found` would be acting on the wrong news. |
@@ -4195,22 +4266,31 @@ match.
 `snapshot_cols` and `snapshot_rows` name **the size the bytes that
 follow were written for** — the snapshot's own encode geometry in
 `"snapshot"` mode, the tab's grid at the handoff in `"resume"` mode —
-and are present on **every** accepted reply, `focus: true` included,
-because raw input is open and any other client may resize the tab
-between this connection's own resize and the encode. A `vt` client
-builds its terminal at that size before replaying, then resizes it to
-its own; a resuming client replays the ring into the terminal it kept,
-and an unfocused one may not be at the tab's grid (a served resume
-never straddles a grid change — see [Resume](#resume)). An accepted
-reply that states no geometry is a truncated reply, and a client
+and are present on **every** accepted reply, `take: true` included,
+because another client may take the tab between this connection's own
+resize and the encode. A `vt` client builds its terminal at that size
+and keeps it there — **a client's terminal is always the PTY's grid**,
+and it follows `GRID` frames from then on; a resuming client replays the
+ring into the terminal it kept, and a watching one may not be at the
+tab's grid (a served resume never straddles a grid change — see
+[Resume](#resume)).
+
+`owner` is the tab's size owner **in the same instant** — read in the
+session's turn that encoded the snapshot or cut the resume, so grid and
+owner describe one moment: `{client_id, label}`, or `null` for a tab
+nobody owns. A taking attach is its own owner here. Anything that changes
+either afterwards reaches this connection as a `GRID` frame. An accepted
+reply missing the geometry or `owner` is a truncated reply, and a client
 refuses it.
 
 #### Preamble and frames
 
 After an accepted reply the server writes the 8-byte magic
-`ROOSTDP2` — a client that reads anything else has negotiated with a
-host it cannot talk to and must not try to parse what follows — and
-then frames flow both ways:
+`ROOSTDP3` — a client that reads anything else has negotiated with a
+host it cannot talk to and must not try to parse what follows. The
+digit is the data plane's own frame-layout generation (`3` since
+protocol 7's `GRID`, `TAKE`, `DETACH` and the flag bytes). Then frames
+flow both ways:
 
 ```text
 frame := u32-LE payload length | u8 type | payload
@@ -4221,9 +4301,12 @@ frame := u32-LE payload length | u8 type | payload
 | `0x01` `SNAP` | S→C | the next bytes of the encoded snapshot stream |
 | `0x02` `PTY` | S→C | `u64-LE seq` \| raw PTY bytes |
 | `0x03` `EXIT` | S→C | `u64-LE final_seq` \| `i32-LE` exit code |
+| `0x04` `GRID` | S→C | JSON `{"seq": u64, "cols": u16, "rows": u16, "owner": {"client_id", "label"} \| null}` |
 | `0x0F` `ERROR` | S→C | JSON `{code, message}`; the connection closes after it |
-| `0x11` `INPUT` | C→S | raw encoded key/paste bytes, ordered and unacknowledged |
-| `0x12` `RESIZE` | C→S | `u16-LE cols` \| `rows` \| `cell_w_px` \| `cell_h_px` |
+| `0x11` `INPUT` | C→S | `u8 flags` \| raw encoded key/paste/mouse bytes (at least one), ordered and unacknowledged. bit 0 `TAKE_BEFORE`, bit 1 `TAKE_AFTER` |
+| `0x12` `RESIZE` | C→S | `u16-LE cols` \| `rows` \| `cell_w_px` \| `cell_h_px` \| `u8 flags`. bit 0 `FOCUSED` |
+| `0x13` `TAKE` | C→S | empty |
+| `0x14` `DETACH` | C→S | empty; terminal |
 
 Rules, all fatal (best-effort `ERROR`, then close). Only the first is
 the framer's — it has to be, because it bounds the allocation made
@@ -4240,10 +4323,15 @@ what the server sends and vice versa:
   fix rather than a wire-limit change — see [Payload
   kinds](#payload-kinds).
 * Fixed-width payloads are exactly that width: `PTY` ≥ 9 bytes,
-  `EXIT` == 12, `RESIZE` == 8.
-* A zero-length payload is meaningful only for `SNAP`, where it is the
-  `vt` payload's terminator (below). An empty `INPUT` is a
-  `protocol-error`.
+  `EXIT` == 12, `RESIZE` == 9, `TAKE` and `DETACH` == 0, and `INPUT` is
+  at least 2 (its flag byte and one byte of input).
+* A zero-length payload is the whole of a `TAKE` or a `DETACH`, and on
+  `SNAP` it is the `vt` payload's terminator (below). On any other type
+  it breaks that type's width.
+* An `INPUT` with both take bits set, or a reserved bit set on `INPUT`
+  or `RESIZE`, is a `protocol-error`.
+* Nothing may follow `DETACH`: a frame behind it is a `protocol-error`
+  (the detach itself still counts).
 * An unknown type byte is a `protocol-error` naming the byte. The
   framer hands it up rather than failing the decode, precisely so the
   endpoint can name it.
@@ -4260,12 +4348,87 @@ the [handshake](#the-handshake) refuses a zero-sized grid and the two
 state the same client's geometry, so they have to agree about what a
 grid is.
 
-Both `INPUT` and `RESIZE` size the tab: a `RESIZE` applies and becomes
-the connection's declared geometry, and an `INPUT` applies that
-geometry ahead of its bytes when the tab is at another one. Neither is
-answered, and the server never tells an attached client that somebody
-else resized the tab under it — a client at another size sees wrapping
-until it next interacts.
+**`GRID` consumes no seq.** Its `seq` is the last `PTY` seq written
+before the change (`0` if none), so several may share one; a client
+applies a `GRID` after `PTY` frame `seq` and before `seq + 1`, in
+arrival order. It sits outside the contiguity rule `PTY` is under, it is
+held with `PTY` frames until the ready prefix is out (rule 1 below), it
+counts against the same 8 MiB queue, and none is ever sent after `EXIT`.
+A `GRID` describing a state the accepted reply already carried is never
+sent. Before it resizes, the session takes in every chunk of output it
+had already read, so output read before a resize reaches the client
+before its `GRID`; bytes still in the kernel's PTY buffer at that instant
+can follow it, as on any terminal.
+
+#### Size ownership
+
+Protocol 7. A session tab has **at most one size owner** — an
+attachment — and the owner's grid is the PTY's. Every attachment keeps
+an **advisory grid** of its own (its handshake's, then its last
+`RESIZE`'s), owner or not. A client's terminal is always the PTY's
+grid; a client whose window is another size draws that grid inside it.
+
+What takes the tab (rule 3's "deliberate interaction"):
+
+* an attach with `take: true`, or any attach to a tab nobody owns;
+* `INPUT` with `TAKE_BEFORE` — keys, paste: the tab is resized to this
+  attachment's grid, then the bytes are delivered (the winsize is ahead
+  of them in the child's queue);
+* `INPUT` with `TAKE_AFTER` — clicks, the wheel: the bytes are delivered
+  at the current size, encoded against the grid the user saw, then the
+  tab is taken;
+* `RESIZE` with `FOCUSED` — a window resized while it had focus;
+* `TAKE` — after a copy, or once a local scroll has settled;
+* [`tab.take_size`](#tabtake_size).
+
+What never does: an `INPUT` with no flag (focus reports, a button-less
+mouse move), the session's own answers to device queries, an unfocused
+`RESIZE` (it only updates the advisory grid), a `RESIZE` from the owner
+(it just applies), a `take: false` attach to an owned tab,
+[`tab.write`](#tabwrite), [`tab.dump`](#tabdump), a subscription.
+Bytes are always delivered, at whatever size the tab has; a take whose
+resize the terminal refuses changes nothing but a log line.
+
+When the owner leaves:
+
+* **`DETACH`** — a deliberate detach (switching tabs, closing a
+  window): the size is handed on **at once**, however the connection
+  ends once the session has read it.
+* **A connection that ends without `DETACH`** — a disconnect: when the
+  owner's client has another attachment to the tab, the size is handed
+  on at once, as for `DETACH`. Otherwise the tab stays owned under the
+  owner's label for a **5 s grace**, and nothing resizes. The same
+  client attaching again in that time reclaims it (with no reflow when
+  its grid is the same); anybody else taking it ends the grace at once.
+* [`tab.release_size`](#tabrelease_size) — handed on at once, never
+  back to the releasing client until it takes again — not to any of its
+  attachments, including ones it opens after the release.
+
+Handing on picks, first, another attachment of the leaving owner's own
+client (its newest); otherwise the attachment whose advisory grid was
+updated most recently (the attach and every `RESIZE` stamp it, in
+milliseconds), ties going to the earliest attachment. Its grid applies;
+a candidate whose grid the terminal refuses is passed over, and each is
+tried once. With nobody left, the tab keeps its size and has no owner.
+
+An attach that took the tab is its owner provisionally until its
+accepted reply is written. If it fails or is cancelled first — a
+refusal, an EOF or a `DETACH` read while it was being decided, fenced or
+held — it never ends up owning: ownership returns to what it replaced
+when that is still there (a live attachment, or a grace that has not run
+out), at that grid; otherwise the size is handed on. It may have been
+announced as owner meanwhile. An EOF or a `DETACH` the session has read
+before it writes the accepted reply always cancels, whatever frames came
+first. Frames a client sends before its accepted reply are handled after
+it, in order — at most 64 of them: one more is a `protocol-error`,
+answered with a rejection line, and cancels the attach. A frame already
+sent behind a `DETACH` gets the same answer before the reply as after
+it.
+
+Every change of the tab's grid or owner is announced twice: in band, as
+a `GRID` on every attachment, and to every subscriber, as
+[`tab.resized`](#events). A background [`tab.resize`](#tabresize) of an
+owned tab is refused `owned`.
 
 Ordering, once the stream is running:
 
@@ -4402,7 +4565,7 @@ Resume is honored only when **all** of these hold:
   is inclusive: `last_assigned + 1` is a valid **empty-slice** resume —
   the client missed nothing and simply carries on.
 * The tab's grid has not changed since `resume_from_seq` (#564) —
-  whoever changed it, this attach's own `focus: true` resize included.
+  whoever changed it, this attach's own `take: true` resize included.
   The ring holds records written for the grid the tab had, and replayed
   into a terminal the client kept at another width they land in the
   wrong cells. The rule is conservative: a resize with no output after
@@ -4432,10 +4595,10 @@ of them may send `INPUT`. There is no supersede: a second attach never
 closes the first, and connecting from anywhere else never closes
 anything that was already open.
 
-**The tab is sized by whichever of them interacted last**, per the rule
-beside [`tab.resize`](#tabresize): a client that only watches (attached
-with `focus: false`, never typing) never changes the size out from
-under the one that is working.
+**The tab is sized by its owner**, per [Size ownership](#size-ownership):
+a client that only watches (attached with `take: false`, its input
+unflagged) never changes the size out from under the one that is
+working, and is told in band when the size changes.
 
 What bounds the count is not a per-tab limit: it is
 `MAX_DATA_CONNS_PER_SESSION` (32 live data connections session-wide,
@@ -4446,8 +4609,9 @@ what keeps that affordable.
 
 Client disconnect at any point simply aborts that one forwarder; the
 tab keeps running, the other connections keep streaming, and no partial
-state survives. That is the difference between detaching and stopping:
-dropping the socket leaves the session exactly as it was.
+state survives beyond an owner's grace. That is the difference between
+detaching and stopping: dropping the socket leaves the session as it
+was, and a `DETACH` first says so on purpose.
 
 #### Budgets
 
@@ -4557,6 +4721,17 @@ discipline, the last frame before the stream closes. See
   exactly these two effects — every other client-local OSC effect
   (pointer shape, today) stays dropped + debug-logged in the tab task
   rather than added to this envelope.
+* `tab.resized` — `{"tab_id": "<id>", "cols": <int>, "rows": <int>, "owner": {"client_id": "<id>", "label": "<string>"} | null}`.
+  A session tab's grid or [size owner](#size-ownership) changed —
+  emitted with every `GRID` frame its attachments get, to **every**
+  subscriber, attached or not; `owner` is always present, `null` for a
+  tab nobody owns. For sidebar and UI state (a "sized by" marker, a
+  resize wave that waits for a tab's owner to go): a client attached to
+  the tab follows the `GRID` frame, which is ordered with the output.
+  **Live-only** — never replayed into a resume, because a window drag
+  would otherwise fill the replay ring; a client recovers the standing
+  owner from its attach's reply and `GRID`. Session-only: a UI socket
+  never sends it. Protocol 7.
 * `workspace.durability_changed` — `{"error": "<string>" | null}`.
   The session stopped — or started — writing `state.json`. `error` is
   the write's message while it is failing and `null` the moment one
@@ -4591,7 +4766,13 @@ intra-generation capability channel today — the integer is the whole
 negotiation. The generation-by-generation history of what each bump
 changed, including the lease's own retirement at `5`, is in CHANGELOG,
 not here: this page describes the current contract, and a bump's
-rationale belongs with the change that made it, once.
+rationale belongs with the change that made it, once. Protocol 7 was
+amended in place before its first release — program status, then
+`client.hello` and the bridge preamble, then tab size ownership (`take`
+and `client_id` on the handshake, `owner` on its reply, `ROOSTDP3` with
+`GRID`/`TAKE`/`DETACH` and the flag bytes, `tab.take_size`,
+`tab.release_size`, `tab.resized`, `owned`) — so no released peer
+speaks an earlier 7.
 
 **The consumption and compatibility policy lives in
 [`ipc-compatibility.md`](ipc-compatibility.md)** — what is additive in

@@ -63,6 +63,22 @@ pub const IDENTITY_SIDECAR_SUFFIX: &str = ".test-identity";
 /// makes the outside-the-window case a handful of commits.
 pub const REPLAY_WINDOW_ENV: &str = "ROOST_SESSION_REPLAY_WINDOW";
 
+/// Test-mode overrides for tab size ownership (plan 084 D4 step 14), each
+/// read **only** when `ROOST_TEST_MODE=1` and once, at start.
+///
+/// The grace a dropped owner keeps its tab for, in milliseconds,
+/// overriding `roost_engine::OWNER_GRACE`: a few seconds is too long for
+/// a test to sit out and too short to stand inside reliably, so the
+/// expiry and the reclaim cases each take a daemon with their own.
+pub const OWNER_GRACE_MS_ENV: &str = "ROOST_TEST_OWNER_GRACE_MS";
+/// A pause, in milliseconds, between an attach's size decision and its
+/// accepted reply — where two attaches race and a cancel lands.
+pub const ATTACH_HOLD_MS_ENV: &str = "ROOST_TEST_ATTACH_HOLD_MS";
+/// `frozen`: every attachment's advisory grid is stamped with the same
+/// instant, so a handoff is decided by the tie rule (earliest
+/// attachment) end to end.
+pub const OWNER_CLOCK_ENV: &str = "ROOST_TEST_OWNER_CLOCK";
+
 /// `umask` the daemon installs before it creates anything. Everything
 /// downstream — state dir, log dir, `state.json`, crash reports, the
 /// socket — inherits this posture rather than restating it.

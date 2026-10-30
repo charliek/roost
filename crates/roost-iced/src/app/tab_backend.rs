@@ -152,6 +152,8 @@ pub(super) enum HostDataMsg {
         cell_w: u32,
         cell_h: u32,
     },
+    /// This window is done with the tab: the session hands its size on.
+    Detach,
 }
 
 /// A host tab's attachment: the queue the per-attempt writer task

@@ -12760,6 +12760,7 @@ mod tests {
                     Ok(Ok(PtyOutputEvent::Bytes { data, .. })) => {
                         said.push_str(&String::from_utf8_lossy(&data));
                     }
+                    Ok(Ok(PtyOutputEvent::Grid { .. })) => {}
                     _ => break,
                 }
             }

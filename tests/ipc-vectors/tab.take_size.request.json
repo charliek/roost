@@ -1,0 +1,7 @@
+{
+  "id": "4",
+  "op": "tab.take_size",
+  "params": {
+    "tab_id": "5"
+  }
+}

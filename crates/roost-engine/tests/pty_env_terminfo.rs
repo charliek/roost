@@ -33,6 +33,7 @@ async fn inherited_terminfo_is_stripped_from_child_env() {
     while Instant::now() < deadline && exit_status.is_none() {
         match output.try_recv() {
             Ok(PtyOutputEvent::Bytes { data, .. }) => collected.extend_from_slice(&data),
+            Ok(PtyOutputEvent::Grid { .. }) => {}
             Ok(PtyOutputEvent::Exit { code, .. }) => exit_status = Some(code),
             Err(TryRecvError::Closed) => break,
             Err(TryRecvError::Empty) => sleep(Duration::from_millis(50)).await,

@@ -38,14 +38,16 @@ use tokio::net::UnixStream;
 
 use crate::codes;
 use crate::dataframe::{
-    write_data_frame, DataFrame, DataFrameReader, FRAME_ERROR, FRAME_EXIT, FRAME_INPUT, FRAME_PTY,
-    FRAME_RESIZE, FRAME_SNAP, MAX_DATA_FRAME_BYTES,
+    write_data_frame, DataFrame, DataFrameReader, InputTake, ResizePayload, FRAME_DETACH,
+    FRAME_ERROR, FRAME_EXIT, FRAME_GRID, FRAME_INPUT, FRAME_PTY, FRAME_RESIZE, FRAME_SNAP,
+    FRAME_TAKE, MAX_DATA_FRAME_BYTES,
 };
 use crate::framing::{write_frame, FrameReader};
 use crate::messages::{
     ops, AttachAccepted, AttachHandshake, AttachHandshakeReply, EventBatch, EventsSubscribeParams,
-    EventsSubscribeResult, IdentifyParams, IdentifyResult, RawRequest, Response, ResponseError,
-    SessionStoppingEvent, StreamEndedEvent, SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
+    EventsSubscribeResult, GridFrame, IdentifyParams, IdentifyResult, RawRequest, Response,
+    ResponseError, SessionStoppingEvent, StreamEndedEvent, SESSION_STOPPING_EVENT,
+    STREAM_ENDED_EVENT,
 };
 use crate::Error;
 
@@ -407,6 +409,10 @@ pub enum ServerFrame {
     /// `final_seq` is one past the last `PTY` seq — the exit consumes
     /// an ordinal of its own.
     Exit { final_seq: u64, code: i32 },
+    /// The tab's grid or size owner changed, after `PTY` frame
+    /// `grid.seq` and before the one after it. Consumes no seq: it is
+    /// outside the contiguity rule `Pty` is under.
+    Grid(GridFrame),
     /// A stable diagnostic code; the connection closes after it. Map it
     /// with [`ServerCode`].
     Error(ResponseError),
@@ -448,6 +454,11 @@ impl ServerFrame {
                 let error: ResponseError =
                     serde_json::from_slice(&frame.payload).map_err(Error::from)?;
                 Ok(ServerFrame::Error(error))
+            }
+            FRAME_GRID => {
+                let grid: GridFrame =
+                    serde_json::from_slice(&frame.payload).map_err(Error::from)?;
+                Ok(ServerFrame::Grid(grid))
             }
             other => Err(Error::DataProtocol(format!(
                 "unexpected data frame type {other:#04x} from the server"
@@ -537,8 +548,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> DataConnection<R, W> {
     }
 
     /// See [`DataWriter::send_input`].
-    pub async fn send_input(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.writer.send_input(bytes).await
+    pub async fn send_input(&mut self, bytes: &[u8], take: InputTake) -> Result<(), Error> {
+        self.writer.send_input(bytes, take).await
     }
 
     /// See [`DataWriter::send_resize`].
@@ -548,10 +559,21 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> DataConnection<R, W> {
         rows: u16,
         cell_w_px: u16,
         cell_h_px: u16,
+        focused: bool,
     ) -> Result<(), Error> {
         self.writer
-            .send_resize(cols, rows, cell_w_px, cell_h_px)
+            .send_resize(cols, rows, cell_w_px, cell_h_px, focused)
             .await
+    }
+
+    /// See [`DataWriter::send_take`].
+    pub async fn send_take(&mut self) -> Result<(), Error> {
+        self.writer.send_take().await
+    }
+
+    /// See [`DataWriter::send_detach`].
+    pub async fn send_detach(&mut self) -> Result<(), Error> {
+        self.writer.send_detach().await
     }
 
     /// Split the halves apart: the reader drives a decode loop on its
@@ -582,34 +604,66 @@ pub struct DataWriter<W = OwnedWriteHalf> {
 
 impl<W: AsyncWrite + Unpin> DataWriter<W> {
     /// Client → server keystrokes and pastes, **split at the 1 MiB
-    /// frame cap** — that split is the client's job, not something the
-    /// server does for it. An empty slice writes nothing: an empty
-    /// `INPUT` frame is a protocol error.
-    pub async fn send_input(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        for chunk in bytes.chunks(MAX_DATA_FRAME_BYTES) {
-            write_data_frame(&mut self.writer, FRAME_INPUT, chunk).await?;
+    /// frame cap** (less the flag byte) — that split is the client's
+    /// job, not something the server does for it. An empty slice writes
+    /// nothing: an `INPUT` frame with no bytes is a protocol error.
+    ///
+    /// `take` is what the whole input asks of the tab's size, so a split
+    /// paste carries [`InputTake::Before`] on its first frame only and
+    /// [`InputTake::After`] on its last: the take happens once, on the
+    /// side of the bytes it was asked for.
+    pub async fn send_input(&mut self, bytes: &[u8], take: InputTake) -> Result<(), Error> {
+        let chunks = bytes.chunks(MAX_DATA_FRAME_BYTES - 1);
+        let last = chunks.len().saturating_sub(1);
+        let mut payload = Vec::new();
+        for (at, chunk) in chunks.enumerate() {
+            let flags = match take {
+                InputTake::Before if at == 0 => take.flags(),
+                InputTake::After if at == last => take.flags(),
+                _ => InputTake::None.flags(),
+            };
+            payload.clear();
+            payload.push(flags);
+            payload.extend_from_slice(chunk);
+            write_data_frame(&mut self.writer, FRAME_INPUT, &payload).await?;
         }
         Ok(())
     }
 
     /// Client → server geometry. The pixel dimensions are load-bearing,
     /// not decoration: the server terminal's resize and its mode-2048
-    /// size reports both need them.
+    /// size reports both need them. `focused` is whether the client's
+    /// window had focus when it resized — a focused resize takes the
+    /// tab's size, an unfocused one only records this client's grid.
     pub async fn send_resize(
         &mut self,
         cols: u16,
         rows: u16,
         cell_w_px: u16,
         cell_h_px: u16,
+        focused: bool,
     ) -> Result<(), Error> {
-        let mut payload = [0u8; 8];
-        for (slot, value) in payload
-            .chunks_exact_mut(2)
-            .zip([cols, rows, cell_w_px, cell_h_px])
-        {
-            slot.copy_from_slice(&value.to_le_bytes());
+        let payload = ResizePayload {
+            cols,
+            rows,
+            cell_w_px,
+            cell_h_px,
+            focused,
         }
+        .encode();
         write_data_frame(&mut self.writer, FRAME_RESIZE, &payload).await
+    }
+
+    /// Client → server: take the tab's size at this connection's grid —
+    /// after a copy, or once a local scroll has settled.
+    pub async fn send_take(&mut self) -> Result<(), Error> {
+        write_data_frame(&mut self.writer, FRAME_TAKE, &[]).await
+    }
+
+    /// Client → server: a deliberate detach. The server hands the size
+    /// on at once and closes; nothing may be sent after it.
+    pub async fn send_detach(&mut self) -> Result<(), Error> {
+        write_data_frame(&mut self.writer, FRAME_DETACH, &[]).await
     }
 
     /// Write one raw frame. Prefer [`Self::send_input`] /
@@ -698,6 +752,10 @@ pub enum ServerCode {
     /// A local-backend switch is in flight. Poll `identify` until
     /// `local_backend_switch` is absent, then re-read ids.
     Busy,
+    // -- size ownership --------------------------------------------------
+    /// A background `tab.resize` met a tab another client sizes. Not a
+    /// retry: the tab is resized again only once it has no owner.
+    Owned,
     // -- generic ----------------------------------------------------------
     /// A test seam called without `ROOST_TEST_MODE=1` at launch.
     NotEnabled,
@@ -736,6 +794,7 @@ impl ServerCode {
             codes::PROTOCOL_ERROR => ServerCode::ProtocolError,
             codes::HOST_UNAVAILABLE => ServerCode::HostUnavailable,
             codes::BUSY => ServerCode::Busy,
+            codes::OWNED => ServerCode::Owned,
             codes::NOT_ENABLED => ServerCode::NotEnabled,
             codes::UNKNOWN_OP => ServerCode::UnknownOp,
             codes::UNKNOWN_FIELD => ServerCode::UnknownField,
@@ -771,6 +830,7 @@ impl ServerCode {
             ServerCode::ProtocolError => codes::PROTOCOL_ERROR,
             ServerCode::HostUnavailable => codes::HOST_UNAVAILABLE,
             ServerCode::Busy => codes::BUSY,
+            ServerCode::Owned => codes::OWNED,
             ServerCode::NotEnabled => codes::NOT_ENABLED,
             ServerCode::UnknownOp => codes::UNKNOWN_OP,
             ServerCode::UnknownField => codes::UNKNOWN_FIELD,
@@ -948,6 +1008,34 @@ mod tests {
     }
 
     #[test]
+    fn a_grid_frame_decodes_its_owner_or_its_absence() {
+        let owned = DataFrame {
+            frame_type: FRAME_GRID,
+            payload: br#"{"seq":9,"cols":100,"rows":30,"owner":{"client_id":"a1","label":"desk"}}"#
+                .to_vec(),
+        };
+        match ServerFrame::decode(owned).unwrap() {
+            ServerFrame::Grid(grid) => {
+                assert_eq!((grid.seq, grid.cols, grid.rows), (9, 100, 30));
+                let owner = grid.owner.expect("an owner");
+                assert_eq!(
+                    (owner.client_id.as_str(), owner.label.as_str()),
+                    ("a1", "desk")
+                );
+            }
+            other => panic!("expected a GRID frame, got {other:?}"),
+        }
+        let unowned = DataFrame {
+            frame_type: FRAME_GRID,
+            payload: br#"{"seq":0,"cols":80,"rows":24,"owner":null}"#.to_vec(),
+        };
+        assert!(matches!(
+            ServerFrame::decode(unowned).unwrap(),
+            ServerFrame::Grid(GridFrame { owner: None, .. })
+        ));
+    }
+
+    #[test]
     fn a_zero_length_snap_is_legal() {
         assert_eq!(
             ServerFrame::decode(DataFrame {
@@ -963,7 +1051,7 @@ mod tests {
     /// and neither does a byte nobody defined.
     #[test]
     fn a_type_the_server_may_not_send_is_named_in_the_error() {
-        for frame_type in [FRAME_INPUT, FRAME_RESIZE, 0x7E] {
+        for frame_type in [FRAME_INPUT, FRAME_RESIZE, FRAME_TAKE, FRAME_DETACH, 0x7E] {
             match ServerFrame::decode(DataFrame {
                 frame_type,
                 payload: Vec::new(),

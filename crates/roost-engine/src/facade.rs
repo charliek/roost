@@ -136,6 +136,8 @@ impl EngineError {
             Self::Pty(PtyError::Cancelled(_)) => "cancelled",
             Self::Pty(PtyError::DuplicateTab(_)) => "duplicate_tab",
             Self::Pty(PtyError::ShuttingDown(_)) => "shutting_down",
+            Self::Pty(PtyError::Owned { .. }) => "size_owned",
+            Self::Pty(PtyError::Resize { .. }) => "operation_failed",
             Self::Operation(_) => "operation_failed",
             Self::InvalidArgument(_) => "invalid_argument",
         }

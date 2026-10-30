@@ -14,6 +14,7 @@
 //! would need a cooperative child is injected with `TabCmd::FeedBytes`,
 //! which takes the identical per-chunk path.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -21,14 +22,17 @@ use roost_engine::ipc::{DumpData, ResolvedCellData, ResolvedCellsData};
 use roost_engine::osc::{OscColorSnapshot, OscRgb};
 use roost_engine::program_status::RawOscAuthority;
 use roost_engine::tab_task::{
-    ServerVtConfig, ServerVtWorkspace, TabCmd, TabError, SERVER_VT_CONTINUATION_MAX,
+    AttachDecision, AttachPause, ServerVtConfig, ServerVtWorkspace, TabCmd, TabError,
+    SERVER_VT_CONTINUATION_MAX,
 };
 use roost_engine::{
     Geometry, PtyOutputEvent, PtySupervisor, TabEffectKind, Workspace, WorkspaceEvent,
 };
 use roost_ipc::agent::{AgentLifecycle, OwnershipAction, ShellState, TabAgentReportParams};
+use roost_ipc::dataframe::InputTake;
 use roost_ipc::messages::{
-    bytes_base64, AttachPayloadKind, ClipboardEffectTarget, Tab, CLIPBOARD_EFFECT_MAX_BYTES,
+    bytes_base64, AttachPayloadKind, ClipboardEffectTarget, SizeOwner, Tab,
+    CLIPBOARD_EFFECT_MAX_BYTES,
 };
 use roost_ipc::program_status::{
     DecidedBy, ProgramStatusKind, ProgramStatusReport, ProgramStatusState, PromptMark, StatusEvent,
@@ -52,6 +56,10 @@ struct TestWorkspace {
     order: Mutex<Vec<Seam>>,
     closed: Mutex<Vec<i64>>,
     effects: Mutex<Vec<(i64, TabEffectKind)>>,
+    resized: Mutex<Vec<Resized>>,
+    /// The newest pipeline registered per tab: a resize from an older one
+    /// is not published — `Workspace`'s rule, under one lock as there.
+    pipelines: Mutex<HashMap<i64, u64>>,
     gate: Mutex<bool>,
     released: Condvar,
 }
@@ -81,7 +89,14 @@ impl TestWorkspace {
     fn order(&self) -> Vec<Seam> {
         self.order.lock().unwrap().clone()
     }
+
+    fn resized(&self) -> Vec<Resized> {
+        self.resized.lock().unwrap().clone()
+    }
 }
+
+/// One `tab.resized` the task published: tab, cols, rows, owner.
+type Resized = (i64, u16, u16, Option<SizeOwner>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Seam {
@@ -127,6 +142,30 @@ impl ServerVtWorkspace for TestWorkspace {
     ) -> RawOscAuthority {
         self.order.lock().unwrap().push(Seam::Status(events));
         RawOscAuthority::default()
+    }
+
+    fn tab_pipeline(&self, tab_id: i64, generation: u64) {
+        let mut pipelines = self.pipelines.lock().unwrap();
+        let newest = pipelines.entry(tab_id).or_default();
+        *newest = (*newest).max(generation);
+    }
+
+    fn tab_resized(
+        &self,
+        tab_id: i64,
+        generation: u64,
+        cols: u16,
+        rows: u16,
+        owner: Option<SizeOwner>,
+    ) {
+        let pipelines = self.pipelines.lock().unwrap();
+        if generation < pipelines.get(&tab_id).copied().unwrap_or(0) {
+            return;
+        }
+        self.resized
+            .lock()
+            .unwrap()
+            .push((tab_id, cols, rows, owner));
     }
 }
 
@@ -604,7 +643,8 @@ async fn a_resume_after_the_exit_replays_the_stored_exit() {
     commands
         .send(TabCmd::Input {
             data: b"\n".to_vec(),
-            geometry: None,
+            from: None,
+            take: InputTake::None,
         })
         .await
         .expect("tab task is alive");
@@ -921,6 +961,66 @@ async fn a_parked_vt_encode_is_failed_by_the_tab_s_exit() {
     );
 }
 
+/// Attach `id` as `client` and commit it, waiting out the child half of
+/// any take — an attachment whose accepted reply is on the wire. `true`
+/// when it took the tab.
+async fn attached(
+    commands: &mpsc::Sender<TabCmd>,
+    tab_id: i64,
+    id: u64,
+    client: &str,
+    take: bool,
+    geometry: Geometry,
+) -> bool {
+    let decision = decide(commands, id, client, take, geometry).await;
+    let took = decision
+        .settled(tab_id)
+        .await
+        .expect("the child took the size");
+    commands
+        .send(TabCmd::AttachCommitted { id })
+        .await
+        .expect("tab task is alive");
+    took
+}
+
+/// The attach decision alone, its child half still in flight.
+async fn decide(
+    commands: &mpsc::Sender<TabCmd>,
+    id: u64,
+    client: &str,
+    take: bool,
+    geometry: Geometry,
+) -> AttachDecision {
+    ask(commands, |reply| TabCmd::Attach {
+        id,
+        client_id: client.into(),
+        label: format!("{client}-label"),
+        take,
+        geometry,
+        reply,
+    })
+    .await
+}
+
+/// A background `tab.resize`, answered after the decision.
+async fn resize_grid(
+    commands: &mpsc::Sender<TabCmd>,
+    cols: u16,
+    rows: u16,
+) -> Result<(), TabError> {
+    ask(commands, |reply| TabCmd::ResizeGrid { cols, rows, reply }).await
+}
+
+fn geometry(cols: u16, rows: u16, cell_w: u32, cell_h: u32) -> Geometry {
+    Geometry {
+        cols,
+        rows,
+        cell_w,
+        cell_h,
+    }
+}
+
 /// A resize orders the server terminal ahead of TIOCSWINSZ and drains
 /// the mode-2048 report the resize itself produces — a report that fires
 /// outside any `vt_write`, so a drain that only followed writes would
@@ -938,18 +1038,7 @@ async fn a_resize_drains_the_in_band_size_report() {
     quiesce(&commands).await;
     let _ = capture(&commands, true).await;
 
-    commands
-        .send(TabCmd::Resize {
-            geometry: Geometry {
-                cols: 40,
-                rows: 12,
-                cell_w: 8,
-                cell_h: 16,
-            },
-            ack: None,
-        })
-        .await
-        .expect("tab task is alive");
+    attached(&commands, 921, 1, "a", true, geometry(40, 12, 8, 16)).await;
     let dump = quiesce(&commands).await;
     assert_eq!((dump.cols, dump.rows), (40, 12), "the server VT resized");
 
@@ -964,62 +1053,38 @@ async fn a_resize_drains_the_in_band_size_report() {
     sup.close(921);
 }
 
-/// An acked resize that finds the geometry already applied is still
+/// An attach whose take finds the geometry already applied is still
 /// answered, and answered successfully.
 ///
-/// That path now queues a redundant winsize so the ack fences on the
-/// writer's FIFO: a grid-only resize queues its own winsize with no ack,
-/// so a waiter arriving at the same tuple would otherwise be told the
-/// child was sized while that `ioctl` was still queued, and a focused
-/// attach is exactly such a waiter. **What this pins is that the extra
-/// write cannot strand the waiter** — the ordering it buys is not
-/// observable from here, because forcing the writer to lag needs a child
-/// that has stopped reading and an assertion on an ack that does *not*
-/// fire. Stated rather than tested, deliberately.
+/// That path queues a redundant winsize so the decision's child half
+/// fences on the writer's FIFO: a background resize queues its own
+/// winsize with no ack, so a waiter arriving at the same tuple would
+/// otherwise be told the child was sized while that `ioctl` was still
+/// queued, and an attach that takes is exactly such a waiter. **What this
+/// pins is that the extra write cannot strand the waiter** — the ordering
+/// it buys is not observable from here, because forcing the writer to lag
+/// needs a child that has stopped reading and an assertion on an ack that
+/// does *not* fire. Stated rather than tested, deliberately.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_acked_resize_at_the_grid_already_applied_is_still_answered() {
+async fn a_take_at_the_grid_already_applied_is_still_answered() {
     let (sup, _workspace) = enabled_supervisor(true);
     let _output = sup
         .spawn(931, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("fence"))
         .expect("spawn");
     let commands = sup.tab_commands(931).expect("server-vt tab task");
 
-    // A client declares the metrics, then a grid-only resize moves the
-    // grid under them without waiting for the child.
-    commands
-        .send(TabCmd::Resize {
-            geometry: Geometry {
-                cols: 100,
-                rows: 30,
-                cell_w: 9,
-                cell_h: 18,
-            },
-            ack: None,
-        })
+    // A background resize moves the grid without waiting for the child.
+    resize_grid(&commands, 80, 24)
         .await
-        .expect("tab task is alive");
-    commands
-        .send(TabCmd::ResizeGrid { cols: 80, rows: 24 })
-        .await
-        .expect("tab task is alive");
+        .expect("an unowned tab takes a background resize");
 
-    // The same tuple the grid-only resize just recorded. The task must
+    // The same tuple the background resize just recorded. The task must
     // not answer off the record alone.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    commands
-        .send(TabCmd::Resize {
-            geometry: Geometry {
-                cols: 80,
-                rows: 24,
-                cell_w: 9,
-                cell_h: 18,
-            },
-            ack: Some(tx),
-        })
+    let decision = decide(&commands, 1, "a", true, geometry(80, 24, 0, 0)).await;
+    assert!(decision.provisional, "an unowned tab is taken");
+    timeout(BUDGET, decision.settled(931))
         .await
-        .expect("tab task is alive");
-    rx.await
-        .expect("the ack is answered")
+        .expect("the child half is answered")
         .expect("the child was sized");
 
     let dump = quiesce(&commands).await;
@@ -1031,7 +1096,7 @@ async fn an_acked_resize_at_the_grid_already_applied_is_still_answered() {
 
 /// `TabCmd::ResizeGrid` states the grid and lets the task fill the cell
 /// metrics in from the ones the tab already holds, so the report the
-/// resize drains quotes the pixels the last client declared.
+/// resize drains quotes the pixels the last owner declared.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grid_resize_keeps_the_cell_metrics_the_tab_holds() {
     let (sup, _workspace) = enabled_supervisor(true);
@@ -1047,27 +1112,24 @@ async fn a_grid_resize_keeps_the_cell_metrics_the_tab_holds() {
         .expect("spawn");
     let commands = sup.tab_commands(922).expect("server-vt tab task");
 
-    // One client states all four numbers; only the grid moves after it.
-    ask(&commands, |ack| TabCmd::Resize {
-        geometry: Geometry {
-            cols: 100,
-            rows: 30,
-            cell_w: 9,
-            cell_h: 18,
-        },
-        ack: Some(ack),
-    })
-    .await
-    .expect("the client's geometry applies");
+    // One client states all four numbers and leaves, so the tab is
+    // nobody's again; only the grid moves after it.
+    attached(&commands, 922, 1, "a", true, geometry(100, 30, 9, 18)).await;
+    commands
+        .send(TabCmd::Detach {
+            id: 1,
+            deliberate: true,
+        })
+        .await
+        .expect("tab task is alive");
 
     feed(&commands, b"\x1b[?2048h").await;
     quiesce(&commands).await;
     let _ = capture(&commands, true).await;
 
-    commands
-        .send(TabCmd::ResizeGrid { cols: 80, rows: 24 })
+    resize_grid(&commands, 80, 24)
         .await
-        .expect("tab task is alive");
+        .expect("an unowned tab takes a background resize");
     let dump = quiesce(&commands).await;
     assert_eq!((dump.cols, dump.rows), (80, 24), "the server VT resized");
 
@@ -1089,10 +1151,7 @@ async fn a_grid_resize_keeps_the_cell_metrics_the_tab_holds() {
 /// keystrokes at one size must not pay for a terminal resize per frame —
 /// and that is precisely why the recording has to come *after* the
 /// apply. Stored first, a refused resize would make every retry of that
-/// size a silent no-op: the attach would be refused `invalid-param`, the
-/// client would retry the same attach, the second one would succeed, and
-/// the snapshot would be encoded at the old grid while `tab.dump` and
-/// `SnapshotAt` reported the size that was never taken.
+/// size a silent no-op, and the tab would report a size it never took.
 ///
 /// A zero-column grid is the resize libghostty refuses (`cols` and
 /// `rows` must both be greater than zero); the control ops reject one
@@ -1112,18 +1171,8 @@ async fn a_refused_resize_leaves_the_geometry_retryable() {
         .expect("spawn");
     let commands = sup.tab_commands(931).expect("server-vt tab task");
 
-    let refused = Geometry {
-        cols: 0,
-        rows: 6,
-        cell_w: 8,
-        cell_h: 16,
-    };
     for attempt in 1..=2 {
-        let outcome = ask(&commands, |ack| TabCmd::Resize {
-            geometry: refused,
-            ack: Some(ack),
-        })
-        .await;
+        let outcome = resize_grid(&commands, 0, 6).await;
         assert!(
             outcome.is_err(),
             "attempt {attempt} must be refused, not short-circuited: {outcome:?}"
@@ -1136,19 +1185,10 @@ async fn a_refused_resize_leaves_the_geometry_retryable() {
         "the tab reports the size it actually has"
     );
 
-    // And the tab is not wedged: a legal geometry still applies, both
-    // halves, and answers.
-    ask(&commands, |ack| TabCmd::Resize {
-        geometry: Geometry {
-            cols: 40,
-            rows: 12,
-            cell_w: 8,
-            cell_h: 16,
-        },
-        ack: Some(ack),
-    })
-    .await
-    .expect("a legal resize still lands");
+    // And the tab is not wedged: a legal geometry still applies.
+    resize_grid(&commands, 40, 12)
+        .await
+        .expect("a legal resize still lands");
     let dump = quiesce(&commands).await;
     assert_eq!((dump.cols, dump.rows), (40, 12));
 
@@ -1156,22 +1196,19 @@ async fn a_refused_resize_leaves_the_geometry_retryable() {
     sup.close(931);
 }
 
-/// The acked resize means **both** halves (review F9).
+/// A take's child half means **both** halves (review F9) — and is waited
+/// out by the attach, never by the tab task.
 ///
-/// `TabCmd::Resize`'s reply exists so an attach cannot snapshot a tab
-/// whose child has not been told, and the child's `TIOCSWINSZ` happens
-/// on the PTY writer's own task — one FIFO shared with client input, so
-/// the winsize can only land once everything queued ahead of it has
-/// (#80). The ack has to wait for that, which it did not: the writer
-/// logged a failed resize and moved on while the ack resolved `Ok`.
-///
-/// Both halves of the promise here. First that the child really is told
-/// — it reads its own winsize back. Then that the ack is genuinely
-/// behind the FIFO: the child stops reading, the writer blocks on a
-/// large write, and the reply must not arrive until that clears. A
-/// fire-and-forget queue answers instantly instead.
+/// The child's `TIOCSWINSZ` happens on the PTY writer's own task — one
+/// FIFO shared with client input, so the winsize can only land once
+/// everything queued ahead of it has (#80). First that the child really
+/// is told: it reads its own winsize back. Then that the wait is
+/// genuinely behind the FIFO: the child stops reading, the writer blocks
+/// on a large write, and the decision's child half must not settle until
+/// that clears — while the decision itself, and the next command, are
+/// answered at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_acked_resize_waits_for_the_childs_winsize() {
+async fn a_take_waits_for_the_childs_winsize_outside_the_tab_task() {
     let (sup, _workspace) = enabled_supervisor(false);
     // Reports its winsize on demand and nothing else, so what comes back
     // is what the child saw at the moment it was asked.
@@ -1187,22 +1224,13 @@ async fn an_acked_resize_waits_for_the_childs_winsize() {
         .expect("spawn");
     let commands = sup.tab_commands(932).expect("server-vt tab task");
 
-    ask(&commands, |ack| TabCmd::Resize {
-        geometry: Geometry {
-            cols: 40,
-            rows: 12,
-            cell_w: 8,
-            cell_h: 16,
-        },
-        ack: Some(ack),
-    })
-    .await
-    .expect("the resize is applied");
+    attached(&commands, 932, 1, "a", true, geometry(40, 12, 8, 16)).await;
 
     commands
         .send(TabCmd::Input {
             data: b"\n".to_vec(),
-            geometry: None,
+            from: None,
+            take: InputTake::None,
         })
         .await
         .expect("tab task is alive");
@@ -1243,27 +1271,19 @@ async fn an_acked_resize_waits_for_the_childs_winsize() {
     commands
         .send(TabCmd::Input {
             data: stalling,
-            geometry: None,
+            from: None,
+            take: InputTake::None,
         })
         .await
         .expect("tab task is alive");
 
-    let (tx, rx) = oneshot::channel();
-    commands
-        .send(TabCmd::Resize {
-            geometry: Geometry {
-                cols: 40,
-                rows: 12,
-                cell_w: 8,
-                cell_h: 16,
-            },
-            ack: Some(tx),
-        })
-        .await
-        .expect("tab task is alive");
+    let decision = decide(&commands, 1, "a", true, geometry(40, 12, 8, 16)).await;
+    assert!(decision.provisional);
     assert!(
-        timeout(Duration::from_millis(300), rx).await.is_err(),
-        "the ack must not resolve while the child's winsize is still queued"
+        timeout(Duration::from_millis(300), decision.settled(933))
+            .await
+            .is_err(),
+        "the take's child half must not settle while the child's winsize is still queued"
     );
     // And the task itself is not blocked behind that wait: it answers
     // the very next command.
@@ -1278,27 +1298,17 @@ async fn an_acked_resize_waits_for_the_childs_winsize() {
     sup.close(933);
 }
 
-/// A resize acked after the PTY writer is gone answers at once, and
-/// answers success (review F3).
+/// Once the tab has exited its size is frozen: an attach that asks to
+/// take answers at once, and nothing about the tab moves (plan 084 D3:
+/// "no GRID after EXIT").
 ///
-/// `await_winsize` states the contract: a dropped ack is **not** a
-/// failure, because there is no child left to tell — the state an
-/// exited tab sits in while it still serves attaches. The queue broke
-/// that promise exactly when it was needed. `flush_writer` returns
-/// early once `writer_gone` is set and `pending` is cleared only at
-/// that instant, so a `WriterCmd::Resize` queued afterwards parked
-/// there forever with its `oneshot::Sender` inside it — neither sent
-/// nor dropped, the one shape the wait cannot resolve. It spent the
-/// whole `WINSIZE_ACK_BUDGET` and then reported the opposite of the
-/// truth, which a focused attach turns into a refused attach five
-/// seconds late.
-///
-/// The *first* resize after the writer's death was never the bug: its
-/// own `try_send` is what discovers the closed channel, and clearing
-/// the queue drops the sender. Every one after it is, which is why this
-/// asks more than once.
+/// It also keeps review F3's promise. An attach to an exited tab that
+/// waited on a writer that no longer exists would sit out the whole
+/// `WINSIZE_ACK_BUDGET` and then report the opposite of the truth, which
+/// turns into a refused attach five seconds late; the freeze answers
+/// before any winsize is queued at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_resize_acked_after_the_writer_is_gone_answers_at_once() {
+async fn a_take_after_the_tab_exited_answers_at_once_and_changes_nothing() {
     let (sup, _workspace) = enabled_supervisor(false);
     let mut output = sup
         .spawn(934, "/tmp", &sh("exit 0"), 20, 6, &socket("writer-gone"))
@@ -1313,53 +1323,453 @@ async fn a_resize_acked_after_the_writer_is_gone_answers_at_once() {
         }
     }
     // The child took the slave with it, so this write to the master
-    // fails and the writer task ends — the only way a tab reaches
-    // `writer_gone` at all.
+    // fails and the writer task ends.
     commands
         .send(TabCmd::Input {
             data: b"x\n".to_vec(),
-            geometry: None,
+            from: None,
+            take: InputTake::None,
         })
         .await
         .expect("the tab task outlives its child");
 
-    // Each geometry differs from the last, because an unchanged one
-    // short-circuits before the queue is reached and would prove
-    // nothing. A second below the ack budget: what is being asserted is
-    // that nothing here waits on it.
     for (attempt, rows) in (7..=12u16).enumerate() {
-        let (tx, rx) = oneshot::channel();
-        commands
-            .send(TabCmd::Resize {
-                geometry: Geometry {
-                    cols: 40,
-                    rows,
-                    cell_w: 8,
-                    cell_h: 16,
-                },
-                ack: Some(tx),
-            })
+        let decision = decide(
+            &commands,
+            attempt as u64,
+            "a",
+            true,
+            geometry(40, rows, 8, 16),
+        )
+        .await;
+        assert!(!decision.provisional, "an exited tab is taken by nobody");
+        timeout(Duration::from_secs(1), decision.settled(934))
             .await
-            .expect("the tab task outlives its child");
-        timeout(Duration::from_secs(1), rx)
-            .await
-            .unwrap_or_else(|_| {
-                panic!("resize {attempt} sat out the winsize budget with no writer to wait for")
-            })
-            .expect("the task answers rather than dropping the ack")
-            .unwrap_or_else(|error| {
-                panic!("resize {attempt} must succeed with no child left to tell: {error}")
-            });
+            .unwrap_or_else(|_| panic!("attach {attempt} sat out the winsize budget"))
+            .unwrap_or_else(|error| panic!("attach {attempt} must settle: {error}"));
     }
+    assert!(resize_grid(&commands, 40, 12).await.is_ok());
     let dump = quiesce(&commands).await;
     assert_eq!(
         (dump.cols, dump.rows),
-        (40, 12),
-        "and the server terminal half applied every one of them"
+        (20, 6),
+        "the exited tab's size is frozen"
+    );
+    assert!(
+        matches!(
+            output.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed)
+        ),
+        "nothing is teed after EXIT"
     );
 
     drop(commands);
     sup.close(934);
+}
+
+/// A background resize of a tab somebody owns is refused with the
+/// owner's label and changes nothing (rule 8); an unowned tab takes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_background_resize_of_an_owned_tab_is_refused_with_its_owners_label() {
+    let (sup, _workspace) = enabled_supervisor(false);
+    let _output = sup
+        .spawn(935, "/tmp", &sh("exec cat"), 20, 6, &socket("owned"))
+        .expect("spawn");
+    let commands = sup.tab_commands(935).expect("server-vt tab task");
+
+    attached(&commands, 935, 1, "desk", true, geometry(100, 30, 8, 16)).await;
+    match resize_grid(&commands, 60, 20).await {
+        Err(TabError::Owned(label)) => assert_eq!(label, "desk-label"),
+        other => panic!("expected owned, got {other:?}"),
+    }
+    let dump = quiesce(&commands).await;
+    assert_eq!((dump.cols, dump.rows), (100, 30));
+
+    commands
+        .send(TabCmd::ReleaseSize {
+            client_id: "desk".into(),
+            reply: oneshot::channel().0,
+        })
+        .await
+        .expect("tab task is alive");
+    resize_grid(&commands, 60, 20)
+        .await
+        .expect("a released tab is nobody's");
+    let dump = quiesce(&commands).await;
+    assert_eq!((dump.cols, dump.rows), (60, 20));
+
+    drop(commands);
+    sup.close(935);
+}
+
+/// `tab.fail_next_resize`: the take it fails changes nothing, the input
+/// that asked for it is still delivered, and a background resize it
+/// fails reports the failure (rule 3's failed apply).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_apply_keeps_the_owner_and_still_delivers_the_input() {
+    let (sup, workspace) = enabled_supervisor(true);
+    let mut tee = sup
+        .spawn(936, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("failed"))
+        .expect("spawn");
+    let commands = sup.tab_commands(936).expect("server-vt tab task");
+
+    attached(&commands, 936, 1, "a", true, geometry(80, 24, 8, 16)).await;
+    attached(&commands, 936, 2, "b", false, geometry(100, 30, 8, 16)).await;
+    let _ = capture(&commands, true).await;
+    let announced = workspace.resized().len();
+
+    commands
+        .send(TabCmd::FailNextResize)
+        .await
+        .expect("tab task is alive");
+    commands
+        .send(TabCmd::Input {
+            data: b"typed".to_vec(),
+            from: Some(2),
+            take: InputTake::Before,
+        })
+        .await
+        .expect("tab task is alive");
+    let dump = quiesce(&commands).await;
+    assert_eq!((dump.cols, dump.rows), (80, 24), "the size did not move");
+    assert_eq!(
+        capture(&commands, true).await,
+        b"typed",
+        "the bytes went anyway"
+    );
+    assert_eq!(
+        workspace.resized().len(),
+        announced,
+        "nothing changed, so nothing is announced"
+    );
+
+    // The next take is a real one.
+    commands
+        .send(TabCmd::TakeFrom { id: 2 })
+        .await
+        .expect("tab task is alive");
+    let dump = quiesce(&commands).await;
+    assert_eq!((dump.cols, dump.rows), (100, 30));
+    let (_, cols, rows, owner) = workspace.resized().last().cloned().expect("announced");
+    assert_eq!((cols, rows), (100, 30));
+    assert_eq!(owner.map(|o| o.client_id).as_deref(), Some("b"));
+    let grids: Vec<_> = std::iter::from_fn(|| tee.try_recv().ok())
+        .filter_map(|event| match event {
+            PtyOutputEvent::Grid { cols, rows, .. } => Some((cols, rows)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(grids.last(), Some(&(100, 30)), "and teed in band beside it");
+
+    commands
+        .send(TabCmd::ReleaseSize {
+            client_id: "b".into(),
+            reply: oneshot::channel().0,
+        })
+        .await
+        .expect("tab task is alive");
+    commands
+        .send(TabCmd::ReleaseSize {
+            client_id: "a".into(),
+            reply: oneshot::channel().0,
+        })
+        .await
+        .expect("tab task is alive");
+    commands
+        .send(TabCmd::FailNextResize)
+        .await
+        .expect("tab task is alive");
+    let dump = quiesce(&commands).await;
+    let before = (dump.cols, dump.rows);
+    assert!(
+        matches!(
+            resize_grid(&commands, 60, 20).await,
+            Err(TabError::ResizeFailed(_))
+        ),
+        "the failure is reported"
+    );
+    let dump = quiesce(&commands).await;
+    assert_eq!((dump.cols, dump.rows), before, "and changed nothing");
+
+    drop(commands);
+    sup.close(936);
+}
+
+/// A dropped owner keeps the tab through its grace, and the task's own
+/// timer hands it on when the grace runs out (rule 7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_grace_timer_hands_a_dropped_owners_tab_on() {
+    let workspace = Arc::new(TestWorkspace::default());
+    let sup = PtySupervisor::new();
+    sup.enable_server_vt(
+        ServerVtConfig::new(workspace.clone()).with_owner_grace(Duration::from_millis(200)),
+    )
+    .expect("server-vt enables once");
+    let _output = sup
+        .spawn(937, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("grace"))
+        .expect("spawn");
+    let commands = sup.tab_commands(937).expect("server-vt tab task");
+
+    attached(&commands, 937, 1, "a", true, geometry(80, 24, 8, 16)).await;
+    attached(&commands, 937, 2, "b", false, geometry(100, 30, 8, 16)).await;
+    commands
+        .send(TabCmd::Detach {
+            id: 1,
+            deliberate: false,
+        })
+        .await
+        .expect("tab task is alive");
+    let dump = quiesce(&commands).await;
+    assert_eq!((dump.cols, dump.rows), (80, 24), "nothing resizes in grace");
+    assert!(
+        sup.holds_grace("a"),
+        "the grace record keeps a's label in the registry"
+    );
+
+    let deadline = std::time::Instant::now() + BUDGET;
+    loop {
+        let dump = quiesce(&commands).await;
+        if (dump.cols, dump.rows) == (100, 30) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the grace never ran out"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (_, _, _, owner) = workspace.resized().last().cloned().expect("announced");
+    assert_eq!(owner.map(|o| o.client_id).as_deref(), Some("b"));
+    assert!(!sup.holds_grace("a"), "and the hold went with it");
+
+    drop(commands);
+    sup.close(937);
+}
+
+/// `tab.resized` names only the tab id, so a generation still deciding
+/// after a respawn took its id must keep its announcements to its own
+/// stream, or it would describe the replacement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaced_generation_never_announces_for_its_successor() {
+    let (sup, workspace) = enabled_supervisor(false);
+    // Ignores the hangup and keeps the slave open past the SIGKILL, so the
+    // old generation goes on deciding for a while after its close — once
+    // the trap is in place, which is what the marker says.
+    let mut old_output = sup
+        .spawn(
+            939,
+            "/tmp",
+            &sh("trap '' HUP; sleep 5 & printf 'TRAPPED\\n'; exec sleep 5"),
+            80,
+            24,
+            &socket("replaced-old"),
+        )
+        .expect("spawn");
+    let old = sup.tab_commands(939).expect("server-vt tab task");
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("TRAPPED") {
+        match timeout(BUDGET, old_output.recv()).await {
+            Ok(Ok(PtyOutputEvent::Bytes { data, .. })) => seen.extend_from_slice(&data),
+            Ok(Ok(_)) => {}
+            other => panic!("expected the trap's marker, got {other:?}"),
+        }
+    }
+    sup.close(939);
+    let _new_output = sup
+        .spawn(
+            939,
+            "/tmp",
+            &sh("exec cat"),
+            80,
+            24,
+            &socket("replaced-new"),
+        )
+        .expect("respawn");
+    let new = sup.tab_commands(939).expect("the replacement's tab task");
+
+    let decision = decide(&old, 1, "a", true, geometry(100, 30, 8, 16)).await;
+    assert!(
+        decision.provisional,
+        "the old generation must still be deciding for this to test anything"
+    );
+    quiesce(&old).await;
+    attached(&new, 939, 1, "b", true, geometry(90, 25, 8, 16)).await;
+    quiesce(&new).await;
+
+    let resized: Vec<_> = workspace
+        .resized()
+        .into_iter()
+        .map(|(_, cols, rows, owner)| (cols, rows, owner.map(|o| o.client_id)))
+        .collect();
+    assert_eq!(
+        resized,
+        [(90, 25, Some("b".to_string()))],
+        "only the replacement speaks for tab 939"
+    );
+
+    drop((old, new));
+    sup.close(939);
+}
+
+/// Every worker's busy time so far. Only a task that never stops being
+/// ready keeps a worker from parking, so on an otherwise quiet runtime
+/// this barely moves.
+fn runtime_busy() -> Duration {
+    let metrics = tokio::runtime::Handle::current().metrics();
+    (0..metrics.num_workers())
+        .map(|worker| metrics.worker_total_busy_duration(worker))
+        .sum()
+}
+
+/// A child that exits inside its owner's grace leaves the grace record
+/// armed but undecidable — nothing is decided once the wire has closed —
+/// so the deadline passing must not wake the task again and again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grace_outlived_by_its_tab_leaves_the_task_idle() {
+    const GRACE: Duration = Duration::from_millis(600);
+    const WINDOW: Duration = Duration::from_millis(500);
+    let workspace = Arc::new(TestWorkspace::default());
+    let sup = PtySupervisor::new();
+    sup.enable_server_vt(ServerVtConfig::new(workspace).with_owner_grace(GRACE))
+        .expect("server-vt enables once");
+    let mut output = sup
+        .spawn(
+            938,
+            "/tmp",
+            &sh("read line; exit 0"),
+            20,
+            6,
+            &socket("outlived"),
+        )
+        .expect("spawn");
+    let commands = sup.tab_commands(938).expect("server-vt tab task");
+
+    attached(&commands, 938, 1, "a", true, geometry(80, 24, 8, 16)).await;
+    let dropped = std::time::Instant::now();
+    commands
+        .send(TabCmd::Detach {
+            id: 1,
+            deliberate: false,
+        })
+        .await
+        .expect("tab task is alive");
+    commands
+        .send(TabCmd::Input {
+            data: b"\n".to_vec(),
+            from: None,
+            take: InputTake::None,
+        })
+        .await
+        .expect("tab task is alive");
+    loop {
+        match timeout(BUDGET, output.recv()).await {
+            Ok(Ok(PtyOutputEvent::Exit { .. })) => break,
+            Ok(Ok(_)) => continue,
+            other => panic!("expected an Exit event, got {other:?}"),
+        }
+    }
+    assert!(
+        dropped.elapsed() < GRACE,
+        "the child must exit inside the grace for this to test anything"
+    );
+    assert!(sup.holds_grace("a"), "the grace is still armed at the exit");
+
+    tokio::time::sleep_until((dropped + GRACE + Duration::from_millis(100)).into()).await;
+    let before = runtime_busy();
+    tokio::time::sleep(WINDOW).await;
+    let busy = runtime_busy() - before;
+    assert!(
+        busy < WINDOW / 2,
+        "the tab task kept a worker busy for {busy:?} of {WINDOW:?} after its grace ran out"
+    );
+
+    drop(commands);
+    sup.close(938);
+}
+
+/// Output the reader had already queued when a resize lands reaches the
+/// tee before the resize's `GRID` (plan 084 D3), so a client never
+/// applies a grid change ahead of bytes written for the old one.
+///
+/// The task is parked inside a snapshot hand-off while the child writes
+/// and while the take is queued behind it, so on release the queued
+/// chunks and the take are both waiting — and an unbiased loop would
+/// pick between them at random without the drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn output_already_queued_reaches_the_tee_before_the_grid() {
+    for round in 0..4 {
+        let workspace = Arc::new(TestWorkspace::default());
+        let sup = PtySupervisor::new();
+        let (pause, mut releases) = AttachPause::new();
+        sup.enable_server_vt(ServerVtConfig::new(workspace.clone()).with_handoff_pause(pause))
+            .expect("server-vt enables once");
+        let mut tee = sup
+            .spawn(
+                938,
+                "/tmp",
+                &sh("read _; head -c 40000 /dev/zero | tr '\\000' x; printf 'ROOST_QUEUED_END'; exec sleep 30"),
+                80,
+                24,
+                &socket("queued"),
+            )
+            .expect("spawn");
+        let commands = sup.tab_commands(938).expect("server-vt tab task");
+        attached(&commands, 938, 1, "a", true, geometry(80, 24, 8, 16)).await;
+        attached(&commands, 938, 2, "b", false, geometry(100, 30, 8, 16)).await;
+        commands
+            .send(TabCmd::Input {
+                data: b"\n".to_vec(),
+                from: None,
+                take: InputTake::None,
+            })
+            .await
+            .expect("tab task is alive");
+
+        let (snapshot_tx, _snapshot) = oneshot::channel();
+        commands
+            .send(TabCmd::Snapshot {
+                kind: AttachPayloadKind::from(AttachPayloadKind::VT),
+                reply: snapshot_tx,
+            })
+            .await
+            .expect("tab task is alive");
+        let release = timeout(BUDGET, releases.recv())
+            .await
+            .expect("the task parks")
+            .expect("the seam is alive");
+        // Parked: the child's output piles up in the reader's channel.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        commands
+            .send(TabCmd::TakeFrom { id: 2 })
+            .await
+            .expect("tab task is alive");
+        let _ = release.send(());
+        drop(releases);
+        quiesce(&commands).await;
+
+        let mut text = String::new();
+        let mut grid_after = None;
+        while let Ok(event) = tee.try_recv() {
+            match event {
+                PtyOutputEvent::Bytes { data, .. } => {
+                    text.push_str(&String::from_utf8_lossy(&data));
+                }
+                PtyOutputEvent::Grid { cols: 100, .. } => grid_after = Some(text.len()),
+                _ => {}
+            }
+        }
+        let at = grid_after.expect("the take was announced");
+        assert!(
+            text[..at].contains("ROOST_QUEUED_END"),
+            "round {round}: the GRID overtook output the reader had already queued \
+             ({at} of {} bytes before it)",
+            text.len()
+        );
+
+        drop(commands);
+        sup.close(938);
+    }
 }
 
 /// OSC that carries workspace facts still reaches the workspace — the

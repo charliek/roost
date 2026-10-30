@@ -2542,6 +2542,17 @@ def with_cwds(projects: list[dict]) -> list[tuple]:
     ]
 
 
+def has_a_live_pty(client: Roost, tab_id: int) -> None:
+    """`tab.resize` reaches a tab only through a live PTY. On a session, a
+    tab this window is attached to is the window's to size, and the session
+    refuses a background resize of it `owned` (plan 084) — which a row with
+    no shell behind it never answers."""
+    try:
+        client.resize(tab_id, 100, 30)
+    except RoostError as refused:
+        assert refused.code == "owned", refused
+
+
 def migrated(lane: Lane, roost: Roost, timeout: float = 240.0) -> None:
     """Wait for §D5's launch migration to finish."""
     wait_until(
@@ -2584,7 +2595,7 @@ def test_a_hand_edited_key_moves_the_layout_at_launch(lane: Lane):
     with lane.session() as c:
         for project in c.list():
             for tab in project["tabs"]:
-                c.resize(int(tab["id"]), 100, 30)
+                has_a_live_pty(c, int(tab["id"]))
 
     # The band is the slot's, and the tab the migration selected is the
     # one that was active in the source — asserted through the

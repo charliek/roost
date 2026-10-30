@@ -226,6 +226,9 @@ impl TabSession {
                     // afterwards are dropped by the `break` below.
                     // That is the deliberate trade: a tab that never
                     // reports its exit would never auto-close.
+                    // A UI's in-process tab is its own client: it sizes
+                    // itself, and has no size announcements to follow.
+                    Ok(PtyOutputEvent::Grid { .. }) => {}
                     Ok(PtyOutputEvent::Exit { code: status, .. }) => {
                         let _ = output_tx.send(TabOutput::Exit {
                             status,

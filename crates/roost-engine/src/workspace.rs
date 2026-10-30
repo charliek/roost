@@ -157,6 +157,10 @@ struct TabRow {
     position: i32,
     created_at: i64,
     last_active: i64,
+    /// The newest server-VT pipeline registered for this tab
+    /// ([`Workspace::register_tab_pipeline`]); a `tab.resized` from an
+    /// older one is dropped. Not persisted.
+    pipeline_generation: u64,
 }
 
 struct Inner {
@@ -477,6 +481,18 @@ pub enum WorkspaceEvent {
         tab_id: i64,
         effect: TabEffectKind,
     },
+    /// A server-VT tab's grid or size owner changed (plan 084 D3) — the
+    /// control-plane twin of the `GRID` frame its attachments get in
+    /// band. Minted only by `tab_task`. Live-only: a window drag would
+    /// fill the replay ring, and the state it leaves behind is recovered
+    /// from an attach's own reply and `GRID`.
+    TabResized {
+        #[serde(with = "roost_ipc::messages::string_int64")]
+        tab_id: i64,
+        cols: u16,
+        rows: u16,
+        owner: Option<roost_ipc::messages::SizeOwner>,
+    },
     /// The workspace's ability to write `state.json` changed (#481):
     /// `Some(error)` when the newest write failed, `None` when the next
     /// one landed. Emitted on a *change of value* only, so a session
@@ -524,6 +540,7 @@ impl WorkspaceEvent {
         matches!(
             self,
             Self::TabEffect { .. }
+                | Self::TabResized { .. }
                 | Self::DurabilityChanged { .. }
                 | Self::NotificationFired { .. }
         )
@@ -1674,6 +1691,7 @@ impl Workspace {
             position,
             created_at: now,
             last_active: now,
+            pipeline_generation: 0,
         };
         inner.tabs.insert(id, row.clone());
         if activate {
@@ -1956,23 +1974,70 @@ impl Workspace {
     /// `-D warnings` lint of a featureless `roost-engine` catches.
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     pub(crate) fn publish_tab_effect(&self, tab_id: i64, effect: TabEffectKind) {
+        self.publish_for_live_tab(tab_id, WorkspaceEvent::TabEffect { tab_id, effect });
+    }
+
+    /// A server-VT pipeline of `generation` now serves `tab_id`. Called
+    /// before that pipeline can decide anything, so from here on nothing
+    /// an older one decides is published for the tab.
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
+    pub(crate) fn register_tab_pipeline(&self, tab_id: i64, generation: u64) {
+        if let Some(row) = self.inner.lock().unwrap().tabs.get_mut(&tab_id) {
+            row.pipeline_generation = row.pipeline_generation.max(generation);
+        }
+    }
+
+    /// Publish one `tab.resized` (plan 084 D3) as the pipeline of
+    /// `generation` decided it: a commit like [`Self::publish_tab_effect`],
+    /// for the same reasons, dropped the same way for a tab whose row is
+    /// already gone — and dropped when a newer pipeline has registered
+    /// for the tab, checked under the lock the commit holds, since the
+    /// event names only the tab id.
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
+    pub(crate) fn publish_tab_resized(
+        &self,
+        tab_id: i64,
+        generation: u64,
+        cols: u16,
+        rows: u16,
+        owner: Option<roost_ipc::messages::SizeOwner>,
+    ) {
+        let inner = self.inner.lock().unwrap();
+        match inner.tabs.get(&tab_id) {
+            Some(row) if generation >= row.pipeline_generation => {}
+            Some(_) => {
+                tracing::debug!(tab_id, generation, "dropping a replaced pipeline's resize");
+                return;
+            }
+            None => {
+                tracing::debug!(tab_id, "dropping an event for a closed tab");
+                return;
+            }
+        }
+        let event = WorkspaceEvent::TabResized {
+            tab_id,
+            cols,
+            rows,
+            owner,
+        };
+        self.commit(inner, vec![event], Persist::Skip);
+    }
+
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
+    fn publish_for_live_tab(&self, tab_id: i64, event: WorkspaceEvent) {
         let inner = self.inner.lock().unwrap();
         // The tab task outlives its workspace row on purpose (it keeps
         // ingesting descendant output past the exit deadline), so a late
-        // BEL or OSC 52 can arrive here after `tab.closed` committed. An
-        // effect for a tab a subscriber has already watched close is
-        // noise at best and a mis-attribution at worst — checked under
-        // the same lock as the commit, so close-then-effect cannot
-        // interleave the other way around.
+        // event can arrive here after `tab.closed` committed. An event
+        // for a tab a subscriber has already watched close is noise at
+        // best and a mis-attribution at worst — checked under the same
+        // lock as the commit, so close-then-event cannot interleave the
+        // other way around.
         if !inner.tabs.contains_key(&tab_id) {
-            tracing::debug!(tab_id, "dropping a tab effect for a closed tab");
+            tracing::debug!(tab_id, "dropping an event for a closed tab");
             return;
         }
-        self.commit(
-            inner,
-            vec![WorkspaceEvent::TabEffect { tab_id, effect }],
-            Persist::Skip,
-        );
+        self.commit(inner, vec![event], Persist::Skip);
     }
 
     /// `tab.agent_report` — the one op every agent adapter writes
@@ -4943,6 +5008,36 @@ mod tests {
 
         assert_eq!(ws.active().1, tab, "the new tab took the selection");
         assert!(raises(&ws, tab));
+    }
+
+    /// A pipeline replaced under a tab id never speaks for it again: the
+    /// generation check and the publish are one critical section, so no
+    /// registration can land between them (plan 084 D3).
+    #[test]
+    fn a_replaced_pipeline_never_announces_for_the_tab() {
+        let ws = Workspace::new();
+        let project = ws.create_project("p", "/tmp").unwrap();
+        let tab = ws.open_tab(project.id, "/tmp", "", false).unwrap().id;
+        let mut rx = ws.subscribe();
+        let resized = |rx: &mut broadcast::Receiver<WorkspaceEvent>| -> Vec<(u16, u16)> {
+            drain(rx)
+                .into_iter()
+                .filter_map(|event| match event {
+                    WorkspaceEvent::TabResized { cols, rows, .. } => Some((cols, rows)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        ws.register_tab_pipeline(tab, 1);
+        ws.publish_tab_resized(tab, 1, 100, 30, None);
+        assert_eq!(resized(&mut rx), [(100, 30)]);
+
+        ws.register_tab_pipeline(tab, 2);
+        ws.publish_tab_resized(tab, 1, 120, 40, None);
+        assert_eq!(resized(&mut rx), [], "the replaced pipeline is dropped");
+        ws.publish_tab_resized(tab, 2, 90, 25, None);
+        assert_eq!(resized(&mut rx), [(90, 25)]);
     }
 
     /// Every raise that reaches a client carries the next generation, so

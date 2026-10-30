@@ -503,6 +503,7 @@ def test_a_fake_build_is_reported_and_enforced_at_attach(env):
                     build,
                     cols=COLS,
                     rows=ROWS,
+                    take=True,
                 )
 
         mismatch = attach("ghostty-1111111111111111+snapshot.v1")

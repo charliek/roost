@@ -144,6 +144,7 @@ async fn a_payload_past_the_pty_buffer_arrives_intact() {
         let left = deadline.saturating_duration_since(Instant::now());
         match timeout(left, rx.recv()).await {
             Ok(Ok(PtyOutputEvent::Bytes { data, .. })) => got.extend_from_slice(&data),
+            Ok(Ok(PtyOutputEvent::Grid { .. })) => {}
             Ok(Ok(PtyOutputEvent::Exit { .. })) => {
                 panic!(
                     "cat exited with {} of {} bytes echoed",

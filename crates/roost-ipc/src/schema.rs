@@ -123,6 +123,7 @@ const ALWAYS_PRESENT: &[(&str, &str)] = &[
     ("/$defs/AppLastActivationResult", "activation_global"),
     ("/$defs/TabExpandSelectionAtResult", "text"),
     ("/$defs/DurabilityChangedEvent", "error"),
+    ("/$defs/TabResizedEvent", "owner"),
 ];
 
 fn mark_always_present(bundle: &mut Value) {
@@ -262,6 +263,10 @@ const OP_TYPES: &[Row] = &[
     op::<SessionSetAgentHooksParams, AgentHooksOutcome>(ops::SESSION_SET_AGENT_HOOKS),
     op::<SessionPutFileParams, SessionPutFileResult>(ops::SESSION_PUT_FILE),
     op::<ClientHelloParams, ClientHelloResult>(ops::CLIENT_HELLO),
+    op::<TabTakeSizeParams, TabTakeSizeResult>(ops::TAB_TAKE_SIZE),
+    op::<TabReleaseSizeParams, EmptyResult>(ops::TAB_RELEASE_SIZE),
+    op::<TabFailNextResizeParams, EmptyResult>(ops::TAB_FAIL_NEXT_RESIZE),
+    op::<TabDropDataConnsParams, EmptyResult>(ops::TAB_DROP_DATA_CONNS),
     op::<AppActivateParams, EmptyResult>(ops::APP_ACTIVATE),
     op::<ScreenshotParams, ScreenshotResult>(ops::SCREENSHOT),
     op::<WindowMetricsParams, WindowMetricsResult>(ops::WINDOW_METRICS),
@@ -339,6 +344,7 @@ const OP_TYPES: &[Row] = &[
     event::<TabsReorderedEvent>(ops::EVENT_TABS_REORDERED),
     event::<ProjectsReorderedEvent>(ops::EVENT_PROJECTS_REORDERED),
     event::<TabEffectEvent>(ops::EVENT_TAB_EFFECT),
+    event::<TabResizedEvent>(ops::EVENT_TAB_RESIZED),
     event::<DurabilityChangedEvent>(ops::EVENT_WORKSPACE_DURABILITY_CHANGED),
 ];
 
@@ -697,6 +703,9 @@ mod tests {
     ///   is asserted directly by `attach_handshake_requires_what_try_
     ///   from_requires` and `attach_handshake_reply_arms_require_their_
     ///   own_fields` above.
+    /// - `AttachAccepted`: the accepted arm of [`AttachHandshakeReply`],
+    ///   whose schema is the hand-written one above — the struct itself
+    ///   is never registered.
     /// - `AgentTabState`: derives `JsonSchema` but nothing in `OP_TYPES`
     ///   ever reaches it — `Tab::agent_state()` computes one for
     ///   server-internal use; it never rides the wire as a field of any
@@ -713,7 +722,8 @@ mod tests {
         ("RawAttachHandshake", "cell_w_px"),
         ("RawAttachHandshake", "cell_h_px"),
         ("RawAttachHandshake", "libghostty_build"),
-        ("RawAttachHandshake", "focus"),
+        ("RawAttachHandshake", "take"),
+        ("RawAttachHandshake", "client_id"),
         ("RawAttachHandshake", "resume_from_seq"),
         ("RawAttachHandshake", "server_epoch"),
         ("RawAttachHandshake", "tab_generation"),
@@ -724,7 +734,9 @@ mod tests {
         ("RawAttachHandshakeReply", "tab_generation"),
         ("RawAttachHandshakeReply", "snapshot_cols"),
         ("RawAttachHandshakeReply", "snapshot_rows"),
+        ("RawAttachHandshakeReply", "owner"),
         ("RawAttachHandshakeReply", "error"),
+        ("AttachAccepted", "owner"),
         ("AgentTabState", "ownership"),
         ("SessionBinaryIdentity", "git_sha"),
     ];
@@ -850,10 +862,28 @@ mod tests {
             "a minimal handshake with none of the terms must not validate"
         );
 
+        let request = read_vector("attach.handshake.request.json");
+        for required in [
+            "session_id",
+            "kinds",
+            "cols",
+            "rows",
+            "libghostty_build",
+            "take",
+            "client_id",
+        ] {
+            let mut nulled = request.clone();
+            nulled[required] = serde_json::Value::Null;
+            assert!(
+                !validator.is_valid(&nulled),
+                "a null `{required}` is refused like a missing one, so it must not validate"
+            );
+        }
+
         let vectors = [
             "attach.handshake.request.json",
             "attach.handshake.resume.request.json",
-            "attach.handshake.unfocused.request.json",
+            "attach.handshake.watch.request.json",
             "attach.handshake.vt.request.json",
         ];
         for name in vectors {
@@ -923,6 +953,8 @@ mod tests {
             (ops::PALETTE_ACTIVATE, PALETTE_REPLY),
             (ops::PALETTE_DISMISS, PALETTE_REPLY),
             (ops::SELECTION_SET, TEST_SEAM),
+            (ops::TAB_FAIL_NEXT_RESIZE, TEST_SEAM),
+            (ops::TAB_DROP_DATA_CONNS, TEST_SEAM),
             (ops::SELECTION_CLEAR, TEST_SEAM),
             (ops::SELECTION_DUMP, TEST_SEAM),
             (ops::CLIPBOARD_DUMP, TEST_SEAM),

@@ -101,15 +101,30 @@ pub enum PtyOutputEvent {
     /// that never reaches EOF gets `Exit` published out from under it
     /// on a deadline, and `Bytes` with higher seqs can still follow.
     Exit { seq: u64, code: i32 },
+    /// A server-VT tab's grid or size owner changed (plan 084 D3), after
+    /// the `Bytes` record `seq` and before the next one. It consumes no
+    /// seq of its own, so `seq` repeats the last record's and is outside
+    /// the contiguity rule the other two are under. `gen` orders it
+    /// against a snapshot's or resume's own `grid_gen`. Never published
+    /// after `Exit`.
+    Grid {
+        seq: u64,
+        gen: u64,
+        cols: u16,
+        rows: u16,
+        owner: Option<roost_ipc::messages::SizeOwner>,
+    },
 }
 
 impl PtyOutputEvent {
     /// This event's ordinal within its spawn, whichever variant it is.
     /// A consumer watching for a `Lagged` gap cares about the number,
-    /// not the variant, so it should not have to match on one.
+    /// not the variant, so it should not have to match on one — except
+    /// that a `Grid` repeats the record before it, so a gap check skips
+    /// it.
     pub fn seq(&self) -> u64 {
         match self {
-            Self::Bytes { seq, .. } | Self::Exit { seq, .. } => *seq,
+            Self::Bytes { seq, .. } | Self::Exit { seq, .. } | Self::Grid { seq, .. } => *seq,
         }
     }
 }
@@ -946,6 +961,31 @@ impl PtySupervisor {
         }
     }
 
+    /// Whether any tab holds a grace record for this client (plan 084
+    /// D1's label hold). `false` when server-VT is off.
+    #[cfg(feature = "server-vt")]
+    pub fn holds_grace(&self, client_id: &str) -> bool {
+        self.server_vt
+            .get()
+            .is_some_and(|state| state.holds_grace(client_id))
+    }
+
+    /// The label a tab's grace record keeps for this client, if any does:
+    /// what a returning attach is named by before its client says hello.
+    #[cfg(feature = "server-vt")]
+    pub(crate) fn grace_label(&self, client_id: &str) -> Option<String> {
+        self.server_vt
+            .get()
+            .and_then(|state| state.grace_label(client_id))
+    }
+
+    /// The test-mode hold between an attach's size decision and its
+    /// accepted reply, if one was configured.
+    #[cfg(feature = "server-vt")]
+    pub(crate) fn attach_hold(&self) -> Option<std::time::Duration> {
+        self.server_vt.get().and_then(|state| state.attach_hold())
+    }
+
     /// Which pipeline this tab id names **right now**, or `None` when it
     /// names none — a tab that exited, or one this supervisor never had.
     ///
@@ -1560,7 +1600,8 @@ impl PtySupervisor {
             return tx
                 .send(crate::tab_task::TabCmd::Input {
                     data,
-                    geometry: None,
+                    from: None,
+                    take: roost_ipc::dataframe::InputTake::None,
                 })
                 .await
                 .map_err(|_| PtyError::Closed(tab_id));
@@ -1585,6 +1626,9 @@ impl PtySupervisor {
     /// It sends [`TabCmd::ResizeGrid`](crate::tab_task::TabCmd::ResizeGrid)
     /// rather than a full geometry: `tab.resize` states two numbers, and
     /// there is no viewport at this layer to take the cell metrics from.
+    /// It waits for the task's decision and its server-terminal apply —
+    /// a tab another client sizes refuses ([`PtyError::Owned`]) — but not
+    /// for the child's winsize, which is queued ahead of any later input.
     pub async fn resize(&self, tab_id: i64, cols: u16, rows: u16) -> Result<(), PtyError> {
         #[cfg(feature = "server-vt")]
         let task_tx = {
@@ -1594,10 +1638,20 @@ impl PtySupervisor {
         };
         #[cfg(feature = "server-vt")]
         if let Some(tx) = task_tx {
-            return tx
-                .send(crate::tab_task::TabCmd::ResizeGrid { cols, rows })
+            let (reply, decided) = oneshot::channel();
+            tx.send(crate::tab_task::TabCmd::ResizeGrid { cols, rows, reply })
                 .await
-                .map_err(|_| PtyError::Closed(tab_id));
+                .map_err(|_| PtyError::Closed(tab_id))?;
+            return match decided.await.map_err(|_| PtyError::Closed(tab_id))? {
+                Ok(()) => Ok(()),
+                Err(crate::tab_task::TabError::Owned(label)) => {
+                    Err(PtyError::Owned { tab_id, label })
+                }
+                Err(error) => Err(PtyError::Resize {
+                    tab_id,
+                    message: error.to_string(),
+                }),
+            };
         }
         let tx = {
             let sessions = self.sessions.lock().unwrap();
@@ -2693,6 +2747,13 @@ pub enum PtyError {
     Cancelled(i64),
     #[error("supervisor is shutting down; refused to spawn tab {0}")]
     ShuttingDown(i64),
+    /// A background resize of a session tab another client sizes
+    /// (plan 084 rule 8).
+    #[error("tab {tab_id} is sized by {label}")]
+    Owned { tab_id: i64, label: String },
+    /// The tab's terminal refused the grid; nothing changed.
+    #[error("tab {tab_id} could not be resized: {message}")]
+    Resize { tab_id: i64, message: String },
 }
 
 // A PATH lookup only — never executes `bin`, so an inherited BASH_ENV or
@@ -2796,7 +2857,7 @@ async fn wait_for_output(
                         return true;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) | Ok(PtyOutputEvent::Grid { .. }) => {}
                 Ok(PtyOutputEvent::Exit { .. }) | Err(_) => return false,
             }
         }

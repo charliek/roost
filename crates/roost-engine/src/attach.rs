@@ -65,28 +65,49 @@
 //! a tab task that went away all fall back to a full snapshot **in the
 //! same reply**. A client is told which it got by `mode`, and never has
 //! to handle a resume failure.
+//!
+//! # Size ownership (plan 084 D4)
+//!
+//! Every attachment is a [`TabCmd::Attach`] decision on the tab task —
+//! sent on the admitted generation's channel, after a [`DetachGuard`] is
+//! armed and after the client's reader has started — and ends in exactly
+//! one [`TabCmd::Detach`], whatever ends it. Until its accepted reply is
+//! written (`AttachCommitted`) an attachment is a cancel waiting to
+//! happen: an EOF or a `DETACH` read during the decision, the fence or
+//! the hold rolls back whatever it took, and the frames it sent meanwhile
+//! wait for the commit.
+//!
+//! `GRID` rides the tee beside the PTY records but outside their seq
+//! rule: it is held with them until READY, counted against the same
+//! queue, and dropped when the snapshot or resume already reported it.
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use roost_ipc::dataframe::{
-    write_data_frame, write_preamble, DataFrame, DataFrameReader, FRAME_ERROR, FRAME_EXIT,
-    FRAME_INPUT, FRAME_PTY, FRAME_RESIZE, FRAME_SNAP, MAX_DATA_FRAME_BYTES,
+    write_data_frame, write_preamble, DataFrame, DataFrameReader, InputTake, ResizePayload,
+    FRAME_DETACH, FRAME_ERROR, FRAME_EXIT, FRAME_GRID, FRAME_INPUT, FRAME_PTY, FRAME_RESIZE,
+    FRAME_SNAP, FRAME_TAKE, MAX_DATA_FRAME_BYTES,
 };
 use roost_ipc::framing::write_frame;
 use roost_ipc::messages::{
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
-    ResponseError,
+    GridFrame, ResponseError, SizeOwner,
 };
 use roost_ipc::{codes, CloseReason, ConnCloseWatch, ConnCtx, DataConn, CLOSE_LABEL_DEADLINE};
 use tokio::io::AsyncWriteExt;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, warn};
 
-use crate::ipc::{await_attach_resize, AdmittedAttach, IpcHandler};
+use crate::ipc::{attach_resize_refusal, AdmittedAttach, IpcHandler};
 use crate::pty::{Geometry, PtyOutputEvent};
-use crate::tab_task::{SnapshotAt, TabCmd, TabError};
+use crate::size_owner::AttachmentId;
+use crate::tab_task::{AttachDecision, SnapshotAt, TabCmd, TabError};
 
 /// PTY payload that may go out between two SNAP frames before the
 /// snapshot is guaranteed a turn.
@@ -142,8 +163,8 @@ pub(crate) async fn refuse(conn: DataConn, code: &str, message: &str) {
     reject(&mut writer, code, message).await;
 }
 
-/// Serve one data connection: admit it, fence it, and stream its tab
-/// until something ends it.
+/// Serve one data connection: admit it, decide its size, fence it, and
+/// stream its tab until something ends it.
 pub(crate) async fn serve_attach(
     h: &IpcHandler,
     ctx: &ConnCtx,
@@ -171,28 +192,55 @@ pub(crate) async fn serve_attach(
         }
     };
 
-    let tab_id = admitted.tab_id;
+    // Set by the reader the moment it reads `DETACH`, so however this
+    // attachment ends after that, it ends as a deliberate detach.
+    let detached = Arc::new(AtomicBool::new(false));
+    // Read from the start, so a client that leaves or detaches while its
+    // attach is still being decided cancels it instead of committing it.
+    let (mut client, reading) = ClientFrames::start(reader, Arc::clone(&detached));
+    // Armed before anything reaches the tab task, so every way out of
+    // here from now on — a rejection, a cancel, a fault, an unwind —
+    // tells the tab this attachment is gone, exactly once.
+    let mut guard = DetachGuard {
+        h,
+        detach: Some(Detach {
+            tab_id: admitted.tab_id,
+            id: ctx.conn_id,
+            commands: admitted.commands.clone(),
+            detached,
+            reader: Some(reading),
+        }),
+    };
+
     // Test seam only (`AttachPause`), and a no-op without one: the
     // window between the admission that captured this tab's identity
     // and the first thing done with it, which a test stands inside to
     // respawn the tab there.
     h.supervisor.pause_attach_admission().await;
-    let outcome = attach_tab(h, &admitted, &handshake, reader, writer, close);
-    // Registered by the admission; deregistered here however the
-    // forwarder ended, so a tab that is attached and detached repeatedly
-    // does not accumulate entries.
-    outcome.await;
-    h.release_data_conn(tab_id, ctx.conn_id);
+    attach_tab(
+        h,
+        &admitted,
+        &handshake,
+        &mut client,
+        writer,
+        close,
+        ctx.conn_id,
+    )
+    .await;
+    // The ordinary end waits the reader out here, so its `Detach` goes
+    // out at once, ahead of the registry release.
+    guard.reader_stopped().await;
 }
 
-/// Fence the tab, answer the handshake, and pump until the end.
+/// Decide, fence, answer the handshake, commit, and pump until the end.
 async fn attach_tab(
     h: &IpcHandler,
     admitted: &AdmittedAttach,
     handshake: &AttachHandshake,
-    reader: DataFrameReader<OwnedReadHalf>,
+    client: &mut ClientFrames,
     mut writer: OwnedWriteHalf,
     close: ConnCloseWatch,
+    id: AttachmentId,
 ) {
     let tab_id = admitted.tab_id;
     let tab_generation = admitted.tab_generation;
@@ -202,31 +250,72 @@ async fn attach_tab(
     // the part of an attach the time budget exists to bound.
     let started = Instant::now();
 
-    // A focused attach is a geometry-bearing interaction, so the tab
-    // takes this client's size before anything is encoded from it. It
-    // runs here, on the forwarder's own task and under no session-state
-    // lock, because a tab parked behind `MAX_CONCURRENT_SNAPSHOTS` must
-    // not stall every other session op. Detach never resizes back
-    // (roadmap D7).
-    if let Some(commands) = admitted.resize_first.as_ref() {
-        if let Err(error) = await_attach_resize(commands, tab_id, admitted.geometry).await {
-            reject(&mut writer, &error.code, &error.message).await;
+    // The size decision (rule 2): a take resizes the tab before anything
+    // is encoded from it. It runs on the forwarder's own task and under
+    // no session-state lock, because a tab parked behind
+    // `MAX_CONCURRENT_SNAPSHOTS` must not stall every other session op.
+    let decision = match client.during(decide_attach(admitted, id)).await {
+        Ok(Some(decision)) => decision,
+        Ok(None) => {
+            reject(
+                &mut writer,
+                codes::NOT_FOUND,
+                &format!("tab {tab_id} is gone"),
+            )
+            .await;
             return;
         }
+        Err(cancel) => return cancel.answer(&mut writer).await,
+    };
+    // The child half of a take, waited out here and never in the tab
+    // task: the snapshot below must not be encoded before the child was
+    // told, and a wave of attaches must not stall the tab behind it.
+    match client.during(decision.settled(tab_id)).await {
+        Ok(Ok(_provisional)) => {}
+        Ok(Err(error)) => {
+            let refused = attach_resize_refusal(
+                tab_id,
+                admitted.geometry.cols,
+                admitted.geometry.rows,
+                &error,
+            );
+            reject(&mut writer, &refused.code, &refused.message).await;
+            return;
+        }
+        Err(cancel) => return cancel.answer(&mut writer).await,
     }
+
     // Resume first, and only ever as an optimization: everything it
     // cannot honor comes back `None` and is served as a full attach
     // under the same reply (D6).
-    let attached = match resume_tab(h, tab_generation, tab_id, handshake).await {
+    let resumed = match client
+        .during(resume_tab(h, tab_generation, tab_id, handshake))
+        .await
+    {
+        Ok(resumed) => resumed,
+        Err(cancel) => return cancel.answer(&mut writer).await,
+    };
+    let attached = match resumed {
         Some(attached) => attached,
-        None => match fence_tab(h, tab_generation, tab_id, kind).await {
-            Ok(fenced) => fenced,
-            Err((code, message)) => {
+        None => match client
+            .during(fence_tab(h, tab_generation, tab_id, kind))
+            .await
+        {
+            Ok(Ok(fenced)) => fenced,
+            Ok(Err((code, message))) => {
                 reject(&mut writer, code, &message).await;
                 return;
             }
+            Err(cancel) => return cancel.answer(&mut writer).await,
         },
     };
+
+    if let Some(hold) = h.supervisor.attach_hold() {
+        if let Err(cancel) = client.during(tokio::time::sleep(hold)).await {
+            return cancel.answer(&mut writer).await;
+        }
+    }
+
     let Attached {
         tee,
         commands,
@@ -236,6 +325,8 @@ async fn attach_tab(
         tab_generation: live_generation,
         snapshot,
         reported_size,
+        owner,
+        grid_gen,
         ready_end,
         terminator,
         snap_frame_bytes,
@@ -255,14 +346,11 @@ async fn attach_tab(
         return;
     }
 
-    // Reported on every accepted reply, snapshot or resume, focused or
-    // not. A focused attach did resize the tab to its own geometry — but
-    // raw input is open and a `vt` encode can defer and retry inside the
-    // attach budget, so any other client's geometry-bearing INPUT
-    // landing in that window resizes the tab again, and this is the only
-    // place that says what the bytes to follow were actually written
-    // for. Sending it costs a client that already agrees nothing: it
-    // hydrates at a size it is already at.
+    // Reported on every accepted reply, snapshot or resume, taking or
+    // not: another client may take the tab between this attach's own
+    // decision and the encode, and this is the only place that says what
+    // the bytes to follow were actually written for — and by whose size.
+    // Sending it costs a client that already agrees nothing.
     let accepted = AttachHandshakeReply::Accepted(AttachAccepted {
         // Restated rather than assumed: the handshake states a
         // preference order, so the reply is the one place the client
@@ -274,24 +362,36 @@ async fn attach_tab(
         tab_generation: live_generation,
         snapshot_cols: reported_size.0,
         snapshot_rows: reported_size.1,
+        owner,
     });
     let Ok(body) = serde_json::to_vec(&accepted) else {
         return;
     };
+    // The last look before the reply goes out: whatever the client has
+    // already sent that ends this attach ends it uncommitted.
+    if let Err(cancel) = client.drain().await {
+        return cancel.answer(&mut writer).await;
+    }
     if write_frame(&mut writer, &body).await.is_err() {
         return;
     }
     if write_preamble(&mut writer).await.is_err() {
         return;
     }
+    // Committed only now: a client that is still deciding whether to
+    // believe this reply is not yet a candidate for anything.
+    if commands.send(TabCmd::AttachCommitted { id }).await.is_err() {
+        debug!(tab_id, "the tab task went away before the attach committed");
+    }
 
     let ending = Pump {
         tab_id,
+        id,
         commands,
-        geometry: admitted.geometry,
         tee,
         writer,
         close,
+        dropped: admitted.dropped.clone(),
         snapshot,
         ready_end,
         terminator,
@@ -299,11 +399,144 @@ async fn attach_tab(
         replay,
         stored_exit,
         fence,
+        grid_gen,
         started,
     }
-    .run(reader)
+    .run(client)
     .await;
     debug!(tab_id, ?mode, ?ending, "attach data connection ended");
+}
+
+/// Put this attachment to the tab task and wait for its decision.
+/// `None` when the task is gone.
+async fn decide_attach(admitted: &AdmittedAttach, id: AttachmentId) -> Option<AttachDecision> {
+    let (reply, decided) = oneshot::channel();
+    admitted
+        .commands
+        .send(TabCmd::Attach {
+            id,
+            client_id: admitted.client_id.clone(),
+            label: admitted.label.clone(),
+            take: admitted.take,
+            geometry: admitted.geometry,
+            reply,
+        })
+        .await
+        .ok()?;
+    decided.await.ok()
+}
+
+/// The one `Detach` every attachment ends in, and the registry entry it
+/// gives back.
+///
+/// Sent from `Drop`, so a rejection, a cancel, a fault, the pump's end and
+/// an unwind all reach it. A `Detach` the tab task has no attachment for
+/// is a no-op, so one that outruns an `Attach` that was never sent is
+/// harmless — and one cannot outrun an `Attach` that was, because that
+/// send is awaited before anything can drop this.
+struct DetachGuard<'a> {
+    h: &'a IpcHandler,
+    detach: Option<Detach>,
+}
+
+impl DetachGuard<'_> {
+    async fn reader_stopped(&mut self) {
+        if let Some(detach) = self.detach.as_mut() {
+            detach.stop_reader().await;
+        }
+    }
+}
+
+impl Drop for DetachGuard<'_> {
+    fn drop(&mut self) {
+        let Some(detach) = self.detach.take() else {
+            return;
+        };
+        let (tab_id, id) = (detach.tab_id, detach.id);
+        detach.send();
+        // Registered by the admission; given back here however the
+        // attachment ended, so a tab that is attached and detached
+        // repeatedly does not accumulate entries.
+        self.h.release_data_conn(tab_id, id);
+    }
+}
+
+/// The `Detach` itself. Whether it is deliberate is settled only once the
+/// client's reader has stopped — a reader that has decoded a `DETACH` may
+/// not have recorded it yet, and an abort cannot reach it there — so one
+/// sent while the reader still runs waits for it on a task of its own.
+struct Detach {
+    tab_id: i64,
+    id: AttachmentId,
+    commands: mpsc::Sender<TabCmd>,
+    /// The client sent `DETACH` — before its commit or after.
+    detached: Arc<AtomicBool>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Detach {
+    /// Awaited through the handle in place, so a caller cancelled
+    /// mid-wait leaves it for [`Self::send`] to wait out.
+    async fn stop_reader(&mut self) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.abort();
+            let _ = reader.await;
+            self.reader = None;
+        }
+    }
+
+    fn send(mut self) {
+        let running = self.reader.take().and_then(|reader| {
+            reader.abort();
+            (!reader.is_finished()).then_some(reader)
+        });
+        let Some(reader) = running else {
+            return self.send_now();
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _ = reader.await;
+                    let detach = self.command();
+                    let _ = self.commands.send(detach).await;
+                });
+            }
+            Err(_) => {
+                warn!(
+                    tab_id = self.tab_id,
+                    "a detach could not wait for its reader with no runtime to wait on"
+                );
+                self.send_now();
+            }
+        }
+    }
+
+    /// `try_send` first; a full channel gets a task of its own rather than
+    /// a dropped detach, which would leave the tab owned by a connection
+    /// that no longer exists.
+    fn send_now(self) {
+        match self.commands.try_send(self.command()) {
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Full(detach)) => match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(async move {
+                        let _ = self.commands.send(detach).await;
+                    });
+                }
+                Err(_) => warn!(
+                    tab_id = self.tab_id,
+                    "a detach found the tab's channel full with no runtime to wait on it"
+                ),
+            },
+        }
+    }
+
+    fn command(&self) -> TabCmd {
+        TabCmd::Detach {
+            id: self.id,
+            deliberate: self.detached.load(Ordering::Acquire),
+        }
+    }
 }
 
 /// A tab pinned for one attach: the live tee, the fence every byte that
@@ -327,6 +560,10 @@ struct Attached {
     /// `Option` the way the wire fields are — those are absent only from
     /// a session that predates them.
     reported_size: (u16, u16),
+    /// The size owner in that same turn, and the generation every `GRID`
+    /// at or below which the reply already covers.
+    owner: Option<SizeOwner>,
+    grid_gen: u64,
     ready_end: usize,
     /// Whether a zero-length `SNAP` frame ends the snapshot half.
     ///
@@ -431,6 +668,8 @@ async fn fence_tab(
         server_epoch: snapshot.server_epoch,
         tab_generation: snapshot.tab_generation,
         reported_size: (snapshot.cols, snapshot.rows),
+        owner: snapshot.owner,
+        grid_gen: snapshot.grid_gen,
         snapshot: snapshot.bytes,
         ready_end,
         terminator: is_vt,
@@ -551,6 +790,8 @@ async fn resume_tab(
         // a resize landing in between would describe records this reply
         // does not carry.
         reported_size: (resumed.cols, resumed.rows),
+        owner: resumed.owner,
+        grid_gen: resumed.grid_gen,
         ready_end: 0,
         terminator: false,
         snap_frame_bytes: MAX_DATA_FRAME_BYTES,
@@ -590,14 +831,14 @@ async fn take_snapshot(
 /// Everything one live attach owns.
 struct Pump {
     tab_id: i64,
+    /// This attachment, as every size command it sends names it.
+    id: AttachmentId,
     commands: mpsc::Sender<TabCmd>,
-    /// What this connection says its viewport is: the handshake's
-    /// geometry until a `RESIZE` frame moves it. Every `INPUT` frame
-    /// carries it, which is how the PTY follows whoever typed last.
-    geometry: Geometry,
     tee: broadcast::Receiver<PtyOutputEvent>,
     writer: OwnedWriteHalf,
     close: ConnCloseWatch,
+    /// `tab.drop_data_conns`: end as a disconnect, with no label.
+    dropped: watch::Receiver<bool>,
     /// Empty on a resume, which is what makes the whole SNAP half of the
     /// pump inert: no frames, no budgets, no scheduling floors.
     snapshot: Vec<u8>,
@@ -610,6 +851,8 @@ struct Pump {
     replay: Vec<(u64, Vec<u8>)>,
     stored_exit: Option<(u64, i32)>,
     fence: u64,
+    /// See [`Attached::grid_gen`].
+    grid_gen: u64,
     /// When the attach's snapshot half began — at the fence, not at the
     /// first frame. [`ATTACH_TIME_BUDGET`] is measured from here.
     started: Instant,
@@ -623,6 +866,14 @@ enum Ending {
     /// EXIT was written, or the peer went away.
     Complete,
     ClientGone,
+    /// The client sent `DETACH`. `trailing` names the frame that broke
+    /// the rule that nothing follows it, which still gets its
+    /// `protocol-error`.
+    Detached {
+        trailing: Option<String>,
+    },
+    /// `tab.drop_data_conns`: a disconnect nobody is told about.
+    Dropped,
     /// A protocol or stream failure the peer is told about.
     Fault {
         code: &'static str,
@@ -634,21 +885,216 @@ enum Ending {
 
 /// One frame's worth of news from the client's half of the socket.
 enum ClientEvent {
-    Frame(DataFrame),
-    /// The framing itself failed — an oversized frame, a bogus length.
+    Frame(ClientFrame),
+    /// The client broke the protocol: an oversized frame, a bogus
+    /// length, a malformed payload, a frame after `DETACH`.
     Fatal(String),
     Eof,
 }
 
-impl Pump {
-    #[allow(clippy::too_many_lines)] // One state machine; splitting it would hide the ordering.
-    async fn run(mut self, reader: DataFrameReader<OwnedReadHalf>) -> Ending {
+/// A client frame, decoded and validated (`ipc.md`'s data plane).
+#[derive(Debug)]
+enum ClientFrame {
+    Input { data: Vec<u8>, take: InputTake },
+    Resize { geometry: Geometry, focused: bool },
+    Take,
+    Detach,
+}
+
+impl ClientFrame {
+    /// `Ok(None)` is a frame the protocol says to ignore: a `RESIZE` to
+    /// a zero-sized grid.
+    fn decode(frame: DataFrame) -> Result<Option<ClientFrame>, String> {
+        match frame.frame_type {
+            FRAME_INPUT => {
+                if frame.payload.len() < 2 {
+                    return Err(format!(
+                        "an INPUT frame carries a flag byte and at least one byte, got {}",
+                        frame.payload.len()
+                    ));
+                }
+                let take = InputTake::from_flags(frame.payload[0])?;
+                let mut data = frame.payload;
+                data.drain(..1);
+                Ok(Some(ClientFrame::Input { data, take }))
+            }
+            FRAME_RESIZE => {
+                let resize = ResizePayload::decode(&frame.payload)?;
+                let geometry = Geometry {
+                    cols: resize.cols,
+                    rows: resize.rows,
+                    cell_w: u32::from(resize.cell_w_px),
+                    cell_h: u32::from(resize.cell_h_px),
+                };
+                // Dropped rather than applied or fatal: the handshake
+                // refuses a zero-sized grid, and the two paths state one
+                // client's geometry, so they have to agree about what a
+                // grid is.
+                if geometry.cols == 0 || geometry.rows == 0 {
+                    debug!(
+                        cols = geometry.cols,
+                        rows = geometry.rows,
+                        "ignored a RESIZE frame with a zero-sized grid"
+                    );
+                    return Ok(None);
+                }
+                Ok(Some(ClientFrame::Resize {
+                    geometry,
+                    focused: resize.focused,
+                }))
+            }
+            FRAME_TAKE | FRAME_DETACH if !frame.payload.is_empty() => Err(format!(
+                "a {} frame is empty, got {} bytes",
+                if frame.frame_type == FRAME_TAKE {
+                    "TAKE"
+                } else {
+                    "DETACH"
+                },
+                frame.payload.len()
+            )),
+            FRAME_TAKE => Ok(Some(ClientFrame::Take)),
+            FRAME_DETACH => Ok(Some(ClientFrame::Detach)),
+            other => Err(format!("unknown client frame type {other:#04x}")),
+        }
+    }
+}
+
+/// How many frames an attachment that is not yet committed may send
+/// ahead of its commit — the same depth as the channel behind it. One
+/// more is a protocol error: a reader that stopped at the cap would no
+/// longer see the EOF or `DETACH` that has to cancel the attach.
+const EARLY_FRAMES: usize = CLIENT_FRAME_CAPACITY;
+
+/// Why an attach that was still being decided is not going ahead.
+enum Cancel {
+    /// EOF, or a socket that died.
+    Gone,
+    /// The client sent `DETACH`.
+    Detached,
+    /// The client broke the protocol; it is still reading JSON, so it is
+    /// told with a rejection line.
+    Fault(String),
+}
+
+impl Cancel {
+    async fn answer(self, writer: &mut OwnedWriteHalf) {
+        if let Cancel::Fault(message) = self {
+            reject(writer, codes::PROTOCOL_ERROR, &message).await;
+        }
+    }
+}
+
+/// The client's half of the socket, read on its own task from the moment
+/// the attach is admitted.
+struct ClientFrames {
+    rx: mpsc::Receiver<ClientEvent>,
+    /// Frames that arrived before the commit, handled after it, in order.
+    early: VecDeque<ClientFrame>,
+    /// The reader's `DETACH` flag, set before the frame is handed over.
+    detached: Arc<AtomicBool>,
+}
+
+impl ClientFrames {
+    /// Start the reader, handing back its task: stopping it is the
+    /// [`Detach`]'s business, which has to know when it has stopped.
+    fn start(
+        reader: DataFrameReader<OwnedReadHalf>,
+        detached: Arc<AtomicBool>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         // The client's frames are read on their own task: a long
         // snapshot burst runs without awaiting the socket's read half,
         // and INPUT typed during it must not queue behind FINISH.
-        let (client_tx, mut client_rx) = mpsc::channel(CLIENT_FRAME_CAPACITY);
-        let client_task = tokio::spawn(read_client(reader, client_tx));
+        let (tx, rx) = mpsc::channel(CLIENT_FRAME_CAPACITY);
+        let reading = tokio::spawn(read_client(reader, tx, Arc::clone(&detached)));
+        let frames = Self {
+            rx,
+            early: VecDeque::new(),
+            detached,
+        };
+        (frames, reading)
+    }
 
+    /// Run one step of an attach that is not yet committed, watching the
+    /// client while it runs: an EOF, a `DETACH` or a broken frame ends
+    /// it before the step does — and still wins when it was ready beside
+    /// the step's result. Other frames wait in [`Self::early`].
+    async fn during<T>(&mut self, step: impl std::future::Future<Output = T>) -> Result<T, Cancel> {
+        tokio::pin!(step);
+        loop {
+            tokio::select! {
+                biased;
+                out = &mut step => {
+                    self.drain().await?;
+                    return Ok(out);
+                }
+                event = self.rx.recv() => self.early_event(event).await?,
+            }
+        }
+    }
+
+    /// Everything the reader has already read, without waiting for the
+    /// client to send more — including a `DETACH` read off the socket but
+    /// not yet handed over.
+    async fn drain(&mut self) -> Result<(), Cancel> {
+        loop {
+            let event = match self.rx.try_recv() {
+                Ok(event) => Some(event),
+                Err(mpsc::error::TryRecvError::Empty) if self.detached.load(Ordering::Acquire) => {
+                    self.rx.recv().await
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
+                Err(mpsc::error::TryRecvError::Disconnected) => None,
+            };
+            self.early_event(event).await?;
+        }
+    }
+
+    /// One event before the commit: a frame waits, anything else cancels.
+    async fn early_event(&mut self, event: Option<ClientEvent>) -> Result<(), Cancel> {
+        match event {
+            Some(ClientEvent::Frame(ClientFrame::Detach)) => Err(self.after_detach().await),
+            Some(ClientEvent::Frame(_)) if self.early.len() == EARLY_FRAMES => Err(Cancel::Fault(
+                format!("more than {EARLY_FRAMES} frames before the accepted reply"),
+            )),
+            Some(ClientEvent::Frame(frame)) => {
+                self.early.push_back(frame);
+                Ok(())
+            }
+            Some(ClientEvent::Fatal(message)) => Err(Cancel::Fault(message)),
+            Some(ClientEvent::Eof) | None => Err(Cancel::Gone),
+        }
+    }
+
+    /// A `DETACH` cancels; a frame the client had already written behind
+    /// it still gets its `protocol-error`. The reader ends right after
+    /// either, so this does not wait on the client.
+    async fn after_detach(&mut self) -> Cancel {
+        match self.rx.recv().await {
+            Some(ClientEvent::Fatal(message)) => Cancel::Fault(message),
+            _ => Cancel::Detached,
+        }
+    }
+
+    /// The next frame without waiting: an early one first.
+    fn try_next(&mut self) -> Option<ClientEvent> {
+        if let Some(frame) = self.early.pop_front() {
+            return Some(ClientEvent::Frame(frame));
+        }
+        self.rx.try_recv().ok()
+    }
+
+    /// The next frame. `None` once the reader has finished.
+    async fn next(&mut self) -> Option<ClientEvent> {
+        if let Some(frame) = self.early.pop_front() {
+            return Some(ClientEvent::Frame(frame));
+        }
+        self.rx.recv().await
+    }
+}
+
+impl Pump {
+    #[allow(clippy::too_many_lines)] // One state machine; splitting it would hide the ordering.
+    async fn run(mut self, client: &mut ClientFrames) -> Ending {
         let mut sent = 0usize;
         // The end-of-snapshot marker `vt` owes its client, still unsent.
         // Always false for GHOSTSNP, which is what makes every branch
@@ -662,13 +1108,12 @@ impl Pump {
         // live ones.
         let mut pty_before_snap = 0usize;
         let mut last_snap = Instant::now();
-        let mut tee = TeeState::new(self.fence);
+        let mut tee = TeeState::new(self.fence, self.grid_gen);
         // Reused for every SNAP frame: a megabyte-chunked snapshot would
         // otherwise allocate once per frame for the whole catch-up.
         let mut snap = Vec::new();
 
         if self.snapshot.len() > ATTACH_BYTE_BUDGET {
-            client_task.abort();
             let message = format!(
                 "the snapshot is {} bytes, past the {ATTACH_BYTE_BUDGET}-byte attach budget",
                 self.snapshot.len()
@@ -688,7 +1133,6 @@ impl Pump {
         // never tell. Nothing to do in snapshot mode — the replay is
         // empty and the loop below starts at the tee.
         if let Some(ending) = self.preload(&mut tee).await {
-            client_task.abort();
             return self.finish(ending).await;
         }
 
@@ -702,6 +1146,9 @@ impl Pump {
             if let Some(reason) = self.close.reason() {
                 break Ending::Closed(reason);
             }
+            if *self.dropped.borrow() {
+                break Ending::Dropped;
+            }
 
             // 1. Client frames already in hand, so input keeps flowing
             //    while the snapshot is being pumped. Bounded by the
@@ -709,10 +1156,10 @@ impl Pump {
             //    not be able to hold the pass open indefinitely, which
             //    would starve the tee and defer the close check above.
             for _ in 0..CLIENT_FRAME_CAPACITY {
-                let Ok(event) = client_rx.try_recv() else {
+                let Some(event) = client.try_next() else {
                     break;
                 };
-                if let Some(ending) = self.handle_client(event).await {
+                if let Some(ending) = self.handle_client(event, client).await {
                     break 'pump ending;
                 }
             }
@@ -889,8 +1336,9 @@ impl Pump {
             tokio::select! {
                 biased;
                 reason = self.close.closed() => break Ending::Closed(reason),
-                event = client_rx.recv() => match event {
-                    Some(event) => if let Some(ending) = self.handle_client(event).await {
+                Ok(()) = self.dropped.changed() => break Ending::Dropped,
+                event = client.next() => match event {
+                    Some(event) => if let Some(ending) = self.handle_client(event, client).await {
                         break ending;
                     },
                     // The reader task only ends after sending Eof or
@@ -909,7 +1357,6 @@ impl Pump {
             }
         };
 
-        client_task.abort();
         self.finish(ending).await
     }
 
@@ -935,7 +1382,11 @@ impl Pump {
     }
 
     /// Route one client frame. `Some` ends the connection.
-    async fn handle_client(&mut self, event: ClientEvent) -> Option<Ending> {
+    async fn handle_client(
+        &mut self,
+        event: ClientEvent,
+        client: &mut ClientFrames,
+    ) -> Option<Ending> {
         let frame = match event {
             ClientEvent::Frame(frame) => frame,
             ClientEvent::Fatal(message) => {
@@ -946,69 +1397,36 @@ impl Pump {
             }
             ClientEvent::Eof => return Some(Ending::ClientGone),
         };
-        match frame.frame_type {
-            FRAME_INPUT => {
-                if frame.payload.is_empty() {
-                    return Some(Ending::Fault {
-                        code: codes::PROTOCOL_ERROR,
-                        message: "an INPUT frame carried no bytes".into(),
-                    });
-                }
-                // Geometry rides the same command as the bytes, on the
-                // tab task's one channel: the resize it may cause is
-                // applied ahead of the keys it precedes without a fence.
+        // Every size question rides the tab task's one channel beside
+        // the bytes, so a take is ordered against the input it goes
+        // with without a fence. None is acknowledged on the wire.
+        let id = self.id;
+        match frame {
+            ClientFrame::Input { data, take } => {
                 self.send(TabCmd::Input {
-                    data: frame.payload,
-                    geometry: Some(self.geometry),
+                    data,
+                    from: Some(id),
+                    take,
                 })
                 .await;
             }
-            FRAME_RESIZE => {
-                // Fixed width, so a short or long payload is a client
-                // bug rather than something to interpret generously.
-                let Ok(fields) = <[u8; 8]>::try_from(frame.payload.as_slice()) else {
-                    return Some(Ending::Fault {
-                        code: codes::PROTOCOL_ERROR,
-                        message: format!(
-                            "a RESIZE frame must carry exactly 8 bytes, got {}",
-                            frame.payload.len()
-                        ),
-                    });
-                };
-                let read = |at: usize| u16::from_le_bytes([fields[at], fields[at + 1]]);
-                let geometry = Geometry {
-                    cols: read(0),
-                    rows: read(2),
-                    cell_w: u32::from(read(4)),
-                    cell_h: u32::from(read(6)),
-                };
-                // Dropped rather than applied or fatal: the handshake
-                // refuses a zero-sized grid, and the two paths state one
-                // client's geometry, so they have to agree about what a
-                // grid is.
-                if geometry.cols == 0 || geometry.rows == 0 {
-                    debug!(
-                        tab_id = self.tab_id,
-                        cols = geometry.cols,
-                        rows = geometry.rows,
-                        "ignored a RESIZE frame with a zero-sized grid"
-                    );
-                    return None;
-                }
-                self.geometry = geometry;
-                // No ack: a RESIZE frame is unacknowledged on the wire,
-                // so there is nobody to tell when it lands.
+            ClientFrame::Resize { geometry, focused } => {
                 self.send(TabCmd::Resize {
+                    id,
                     geometry,
-                    ack: None,
+                    focused,
                 })
                 .await;
             }
-            other => {
-                return Some(Ending::Fault {
-                    code: codes::PROTOCOL_ERROR,
-                    message: format!("unknown client frame type {other:#04x}"),
-                })
+            ClientFrame::Take => self.send(TabCmd::TakeFrom { id }).await,
+            // Terminal. The reader stops at it, so the one event left
+            // to read is whether anything was already sent behind it.
+            ClientFrame::Detach => {
+                let trailing = match client.next().await {
+                    Some(ClientEvent::Fatal(message)) => Some(message),
+                    _ => None,
+                };
+                return Some(Ending::Detached { trailing });
             }
         }
         None
@@ -1052,7 +1470,16 @@ impl Pump {
     /// the only signal it gets.
     async fn finish(mut self, ending: Ending) -> Ending {
         let error = match &ending {
-            Ending::Complete | Ending::ClientGone => return ending,
+            Ending::Complete
+            | Ending::ClientGone
+            | Ending::Dropped
+            | Ending::Detached { trailing: None } => return ending,
+            Ending::Detached {
+                trailing: Some(message),
+            } => ResponseError {
+                code: codes::PROTOCOL_ERROR.to_string(),
+                message: message.clone(),
+            },
             Ending::Fault { code, message } => ResponseError {
                 code: (*code).to_string(),
                 message: message.clone(),
@@ -1115,9 +1542,12 @@ impl Pump {
 }
 
 /// The tee side of one attach: how far the fence walk has got, and the
-/// PTY frames it has framed but not yet written.
+/// PTY and GRID frames it has framed but not yet written.
 struct TeeState {
     fence: u64,
+    /// `GRID`s at or below this generation describe a state the accepted
+    /// reply already carried.
+    grid_gen: u64,
     next_seq: u64,
     open: bool,
     exit: Option<(u64, i32)>,
@@ -1125,8 +1555,8 @@ struct TeeState {
     /// per drain rather than one per record. Kept across flushes so a
     /// busy tab reframes into the same allocation.
     batch: Vec<u8>,
-    /// Payload bytes sitting in `batch`, which is what both the queue
-    /// cap and the snapshot's byte floor are counted in.
+    /// Payload bytes sitting in `batch`, GRID included, which is what
+    /// both the queue cap and the snapshot's byte floor are counted in.
     payload_bytes: usize,
     /// `u64-LE seq | raw PTY bytes` for the record being framed, reused
     /// for the same reason `batch` is.
@@ -1134,9 +1564,10 @@ struct TeeState {
 }
 
 impl TeeState {
-    fn new(fence: u64) -> Self {
+    fn new(fence: u64, grid_gen: u64) -> Self {
         Self {
             fence,
+            grid_gen,
             next_seq: fence + 1,
             open: true,
             exit: None,
@@ -1153,22 +1584,47 @@ impl TeeState {
     }
 
     /// Apply the fence and the contiguity rule to one tee event, framing
-    /// what survives into [`TeeState::batch`].
+    /// what survives into [`TeeState::batch`]. A `GRID` is outside both:
+    /// it repeats the seq of the record before it, so it is filtered by
+    /// its generation instead and framed in its place in the stream.
     async fn absorb(&mut self, event: PtyOutputEvent) -> Result<(), Ending> {
-        let seq = event.seq();
-        // Already inside the snapshot.
-        if seq <= self.fence {
-            return Ok(());
-        }
-        if seq != self.next_seq {
-            return Err(Ending::Fault {
-                code: codes::DESYNC,
-                message: format!("expected seq {} on this tab, got {seq}", self.next_seq),
-            });
-        }
-        self.next_seq += 1;
         match event {
+            PtyOutputEvent::Grid {
+                seq,
+                gen,
+                cols,
+                rows,
+                owner,
+            } => {
+                if gen <= self.grid_gen {
+                    return Ok(());
+                }
+                self.grid_gen = gen;
+                let payload = serde_json::to_vec(&GridFrame {
+                    seq,
+                    cols,
+                    rows,
+                    owner,
+                })
+                .map_err(|error| Ending::Fault {
+                    code: codes::INTERNAL,
+                    message: format!("a GRID frame could not be encoded: {error}"),
+                })?;
+                if write_data_frame(&mut self.batch, FRAME_GRID, &payload)
+                    .await
+                    .is_err()
+                {
+                    return Err(Ending::Fault {
+                        code: codes::INTERNAL,
+                        message: "a GRID frame exceeded the frame cap".into(),
+                    });
+                }
+                self.payload_bytes += payload.len();
+            }
             PtyOutputEvent::Bytes { seq, data } => {
+                if !self.admit(seq)? {
+                    return Ok(());
+                }
                 self.scratch.clear();
                 self.scratch.extend_from_slice(&seq.to_le_bytes());
                 self.scratch.extend_from_slice(&data);
@@ -1184,11 +1640,30 @@ impl TeeState {
                 self.payload_bytes += self.scratch.len();
             }
             PtyOutputEvent::Exit { seq, code } => {
+                if !self.admit(seq)? {
+                    return Ok(());
+                }
                 self.exit = Some((seq, code));
                 self.open = false;
             }
         }
         Ok(())
+    }
+
+    /// The fence and the contiguity rule for one record: `false` for one
+    /// already inside the snapshot, a fault for a gap or a duplicate.
+    fn admit(&mut self, seq: u64) -> Result<bool, Ending> {
+        if seq <= self.fence {
+            return Ok(false);
+        }
+        if seq != self.next_seq {
+            return Err(Ending::Fault {
+                code: codes::DESYNC,
+                message: format!("expected seq {} on this tab, got {seq}", self.next_seq),
+            });
+        }
+        self.next_seq += 1;
+        Ok(true)
     }
 }
 
@@ -1201,11 +1676,23 @@ fn lagged(missed: u64) -> Ending {
     }
 }
 
-/// Read the client's half until it ends, forwarding frames to the pump.
-async fn read_client(mut reader: DataFrameReader<OwnedReadHalf>, tx: mpsc::Sender<ClientEvent>) {
+/// Read the client's half until it ends, forwarding decoded frames.
+///
+/// It stops at `DETACH`, which nothing may follow: whatever the client
+/// had already written behind it is reported as one `Fatal`, and nothing
+/// further is read.
+async fn read_client(
+    mut reader: DataFrameReader<OwnedReadHalf>,
+    tx: mpsc::Sender<ClientEvent>,
+    detached: Arc<AtomicBool>,
+) {
     loop {
         let event = match reader.next_frame().await {
-            Ok(Some(frame)) => ClientEvent::Frame(frame),
+            Ok(Some(frame)) => match ClientFrame::decode(frame) {
+                Ok(Some(frame)) => ClientEvent::Frame(frame),
+                Ok(None) => continue,
+                Err(message) => ClientEvent::Fatal(message),
+            },
             Ok(None) => ClientEvent::Eof,
             // An oversized or bogus length is the client breaking the
             // protocol and is named as such; anything else is a socket
@@ -1215,8 +1702,20 @@ async fn read_client(mut reader: DataFrameReader<OwnedReadHalf>, tx: mpsc::Sende
             )),
             Err(_) => ClientEvent::Eof,
         };
+        let detach = matches!(event, ClientEvent::Frame(ClientFrame::Detach));
+        if detach {
+            detached.store(true, Ordering::Release);
+        }
         let done = matches!(event, ClientEvent::Eof | ClientEvent::Fatal(_));
         if tx.send(event).await.is_err() || done {
+            return;
+        }
+        if detach {
+            if reader.has_buffered() {
+                let _ = tx
+                    .send(ClientEvent::Fatal("a frame followed DETACH".into()))
+                    .await;
+            }
             return;
         }
     }
@@ -1230,5 +1729,191 @@ async fn reject(writer: &mut OwnedWriteHalf, code: &str, message: &str) {
     };
     if let Err(error) = write_frame(writer, &body).await {
         debug!(%error, "attach rejection could not be written");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roost_ipc::dataframe::FRAME_HEADER_LEN;
+
+    /// The forwarder's half of a connection, and the client's write half.
+    fn client_frames() -> (ClientFrames, Arc<AtomicBool>, OwnedWriteHalf) {
+        let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+        let (read, _) = server.into_split();
+        let (_, write) = client.into_split();
+        let detached = Arc::new(AtomicBool::new(false));
+        let (frames, _reading) = ClientFrames::start(
+            DataFrameReader::new(read, Vec::new()),
+            Arc::clone(&detached),
+        );
+        (frames, detached, write)
+    }
+
+    async fn send(write: &mut OwnedWriteHalf, frames: &[(u8, &[u8])]) {
+        let mut bytes = Vec::new();
+        for (frame_type, payload) in frames {
+            write_data_frame(&mut bytes, *frame_type, payload)
+                .await
+                .expect("frame");
+        }
+        write.write_all(&bytes).await.expect("write");
+    }
+
+    async fn read_by_the_reader(detached: &AtomicBool) {
+        while !detached.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A reader still between decoding a `DETACH` and recording it — where
+    /// no abort reaches — is waited out before the `Detach` says whether
+    /// it was deliberate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_detach_waits_for_its_reader_to_finish_recording() {
+        let (commands, mut tab) = mpsc::channel(4);
+        let detached = Arc::new(AtomicBool::new(false));
+        let decoding = Arc::new(std::sync::Barrier::new(2));
+        let reader = tokio::spawn({
+            let (detached, decoding) = (Arc::clone(&detached), Arc::clone(&decoding));
+            async move {
+                decoding.wait();
+                std::thread::sleep(Duration::from_millis(200));
+                detached.store(true, Ordering::Release);
+            }
+        });
+        decoding.wait();
+        Detach {
+            tab_id: 1,
+            id: 7,
+            commands,
+            detached,
+            reader: Some(reader),
+        }
+        .send();
+        let sent = tokio::time::timeout(Duration::from_secs(5), tab.recv())
+            .await
+            .expect("a detach in time");
+        assert!(
+            matches!(
+                sent,
+                Some(TabCmd::Detach {
+                    id: 7,
+                    deliberate: true
+                })
+            ),
+            "the DETACH the reader was recording counts"
+        );
+    }
+
+    /// A forwarder cancelled while it waits for its reader to stop still
+    /// leaves the guard a reader to wait out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_wait_cut_short_is_waited_out_by_the_detach() {
+        let (commands, mut tab) = mpsc::channel(4);
+        let detached = Arc::new(AtomicBool::new(false));
+        let decoding = Arc::new(std::sync::Barrier::new(2));
+        let reader = tokio::spawn({
+            let (detached, decoding) = (Arc::clone(&detached), Arc::clone(&decoding));
+            async move {
+                decoding.wait();
+                std::thread::sleep(Duration::from_millis(200));
+                detached.store(true, Ordering::Release);
+            }
+        });
+        decoding.wait();
+        let mut detach = Detach {
+            tab_id: 1,
+            id: 7,
+            commands,
+            detached,
+            reader: Some(reader),
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), detach.stop_reader())
+                .await
+                .is_err(),
+            "the reader is still recording"
+        );
+        detach.send();
+        let sent = tokio::time::timeout(Duration::from_secs(5), tab.recv())
+            .await
+            .expect("a detach in time");
+        assert!(
+            matches!(
+                sent,
+                Some(TabCmd::Detach {
+                    id: 7,
+                    deliberate: true
+                })
+            ),
+            "the DETACH the reader was recording counts"
+        );
+    }
+
+    /// A `DETACH` already handed over when a step finishes cancels the
+    /// attach, though the step's result was ready first.
+    #[tokio::test]
+    async fn a_waiting_detach_beats_a_finished_step() {
+        let (mut frames, detached, mut write) = client_frames();
+        send(&mut write, &[(FRAME_DETACH, &[])]).await;
+        read_by_the_reader(&detached).await;
+        assert!(matches!(
+            frames.during(std::future::ready(())).await,
+            Err(Cancel::Detached)
+        ));
+    }
+
+    /// One the reader has read but could not yet hand over — its channel
+    /// full of early frames — cancels too.
+    #[tokio::test]
+    async fn a_detach_read_but_not_yet_handed_over_cancels() {
+        let (mut frames, detached, mut write) = client_frames();
+        let mut sent: Vec<(u8, &[u8])> = vec![(FRAME_INPUT, b"\0x"); CLIENT_FRAME_CAPACITY];
+        sent.push((FRAME_DETACH, &[]));
+        send(&mut write, &sent).await;
+        read_by_the_reader(&detached).await;
+        assert!(matches!(frames.drain().await, Err(Cancel::Detached)));
+    }
+
+    fn grid(seq: u64, gen: u64) -> PtyOutputEvent {
+        PtyOutputEvent::Grid {
+            seq,
+            gen,
+            cols: 100,
+            rows: 30,
+            owner: None,
+        }
+    }
+
+    /// A `GRID` at or below the reply's generation describes a state the
+    /// reply already carried, so it is dropped; a newer one is framed in
+    /// its place, outside the seq rule the records beside it are under.
+    #[tokio::test]
+    async fn a_grid_the_reply_already_carried_is_dropped() {
+        let mut tee = TeeState::new(5, 3);
+        assert!(tee.absorb(grid(4, 2)).await.is_ok());
+        assert!(tee.absorb(grid(5, 3)).await.is_ok());
+        assert!(tee.batch.is_empty(), "both are inside the reply");
+
+        assert!(tee.absorb(grid(5, 4)).await.is_ok());
+        assert_eq!(tee.batch[4], FRAME_GRID, "a newer GRID is framed");
+        let framed = tee.batch.len();
+        assert!(
+            tee.absorb(PtyOutputEvent::Bytes {
+                seq: 6,
+                data: b"x".to_vec(),
+            })
+            .await
+            .is_ok(),
+            "the GRID consumed no seq"
+        );
+        assert_eq!(tee.batch[framed + 4], FRAME_PTY);
+        assert!(tee.absorb(grid(6, 4)).await.is_ok());
+        assert_eq!(
+            tee.batch.len(),
+            framed + FRAME_HEADER_LEN + 9,
+            "a generation is framed once"
+        );
     }
 }

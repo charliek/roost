@@ -1256,8 +1256,8 @@ impl InProcessStreams {
 /// control connection, one per live event subscriber, and up to
 /// [`MAX_DATA_CONNS_PER_SESSION`] live data connections, keyed by tab.
 ///
-/// A tab admits as many data connections as clients dial (plan 057,
-/// R15); what bounds them is [`MAX_DATA_CONNS_PER_SESSION`] live ones
+/// A tab admits as many data connections as clients dial (plan 057
+/// R15, kept by plan 084); what bounds them is [`MAX_DATA_CONNS_PER_SESSION`] live ones
 /// session-wide, and the tab task's `MAX_CONCURRENT_SNAPSHOTS`
 /// simultaneous fences (named rather than linked: that module is
 /// `server-vt`-gated and this one is not). Over time the count is open.
@@ -1275,7 +1275,7 @@ struct Connections {
     /// them and so a forwarder unwinding can drop its own entry — no
     /// supersede, no bound: a tab serves as many attaches as clients
     /// dial.
-    data_conns: std::collections::HashMap<i64, Vec<(u64, ConnCloser)>>,
+    data_conns: std::collections::HashMap<i64, Vec<DataConnEntry>>,
     /// Every live event subscriber. `None` once a stop has swept them: a
     /// subscribe that raced the sweep is refused rather than registered
     /// into a list nobody will read again.
@@ -1300,12 +1300,22 @@ impl Default for Connections {
     }
 }
 
+/// One live data connection: who it is, how to close it with a label (a
+/// stop), and how to drop it without one (`tab.drop_data_conns`).
+struct DataConnEntry {
+    conn_id: u64,
+    closer: ConnCloser,
+    dropper: tokio::sync::watch::Sender<bool>,
+}
+
 /// The session's view of its clients (plan 084 D1): the identity each
-/// control connection announced with `client.hello`, and one label per
-/// client id — the last hello's.
+/// control connection announced with `client.hello`, the client id each
+/// data connection attached as, and one label per client id — the last
+/// hello's.
 #[derive(Default)]
 struct ClientRegistry {
     by_conn: std::collections::HashMap<u64, ClientHelloParams>,
+    by_data_conn: std::collections::HashMap<u64, String>,
     labels: std::collections::HashMap<String, String>,
 }
 
@@ -1320,26 +1330,36 @@ impl ClientRegistry {
         self.by_conn.get(&conn_id)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn label(&self, client_id: &str) -> Option<&str> {
         self.labels.get(client_id).map(String::as_str)
     }
 
-    /// A label outlives the connection that set it only while something
-    /// still holds its client id.
-    fn forget(&mut self, conn_id: u64) {
-        let Some(gone) = self.by_conn.remove(&conn_id) else {
-            return;
-        };
-        if !self.holds(&gone.client_id) {
-            self.labels.remove(&gone.client_id);
-        }
+    fn attached(&mut self, conn_id: u64, client_id: &str) {
+        self.by_data_conn.insert(conn_id, client_id.to_string());
     }
 
-    fn holds(&self, client_id: &str) -> bool {
-        self.by_conn
+    /// A label outlives the connection that set it only while something
+    /// still holds its client id: a connection, or a tab's grace record
+    /// (`graced`), so a dropped owner that reconnects its data plane
+    /// before it says hello again comes back under its own name.
+    fn forget(&mut self, conn_id: u64, graced: &dyn Fn(&str) -> bool) {
+        self.by_conn.remove(&conn_id);
+        self.by_data_conn.remove(&conn_id);
+        self.sweep(graced);
+    }
+
+    /// Drop every label nothing holds any more. Run on each read as well
+    /// as on each close, because a grace ends on a tab's own task — by
+    /// expiry, a take or a release — where no connection closes.
+    fn sweep(&mut self, graced: &dyn Fn(&str) -> bool) {
+        let held: std::collections::HashSet<&str> = self
+            .by_conn
             .values()
-            .any(|client| client.client_id == client_id)
+            .map(|client| client.client_id.as_str())
+            .chain(self.by_data_conn.values().map(String::as_str))
+            .collect();
+        self.labels
+            .retain(|client_id, _| held.contains(client_id.as_str()) || graced(client_id));
     }
 }
 
@@ -1352,20 +1372,28 @@ pub(crate) struct AdmittedAttach {
     /// The negotiated payload kind — the encode and the handshake reply
     /// both have to name it.
     pub(crate) kind: AttachPayloadKind,
-    /// The client's declared geometry: what the tab is resized to on a
-    /// focused attach, and what every `INPUT` frame from this connection
-    /// claims (plan 057, R15). A `RESIZE` frame moves it.
+    /// The client's declared geometry: the attachment's advisory grid,
+    /// and what a take sizes the tab to. A `RESIZE` frame moves it.
     pub(crate) geometry: Geometry,
-    /// The tab task the forwarder still owes the focused resize, or
-    /// `None` when it owes none.
+    /// The tab task every size command of this attachment goes to — the
+    /// `Attach`, the guard's `Detach`, everything in between.
     ///
     /// The channel is the one the admission read `tab_generation` off,
     /// under the same lock, and never a fresh lookup: a respawn between
-    /// the two would send the geometry to the **replacement** tab — and
-    /// the generation check that follows then refuses the attach, having
-    /// resized somebody else's terminal on the way out. A rejected
-    /// operation leaves no side effect.
-    pub(crate) resize_first: Option<tokio::sync::mpsc::Sender<crate::tab_task::TabCmd>>,
+    /// the two would send the attach to the **replacement** tab — and the
+    /// generation check that follows then refuses it, having resized
+    /// somebody else's terminal on the way out. A rejected operation
+    /// leaves no side effect.
+    pub(crate) commands: tokio::sync::mpsc::Sender<crate::tab_task::TabCmd>,
+    pub(crate) client_id: String,
+    /// The client's label as of this attach — copied, so the attachment's
+    /// `GRID`, `owned` and `tab.resized` never disagree about it.
+    pub(crate) label: String,
+    /// The handshake's `take`.
+    pub(crate) take: bool,
+    /// Fires when `tab.drop_data_conns` closes this connection with no
+    /// label and no `DETACH`.
+    pub(crate) dropped: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Connections {
@@ -1410,13 +1438,13 @@ impl Connections {
     ///
     /// Closed peers are pruned on the way through: a client that dropped
     /// two connections at once must not leave the second one standing.
-    fn forget_connection(&mut self, conn_id: u64) {
+    fn forget_connection(&mut self, conn_id: u64, graced: &dyn Fn(&str) -> bool) {
         if let Some(subscribers) = self.subscribers.as_mut() {
             subscribers.retain(|subscriber| subscriber.conn_id != conn_id && subscriber.is_live());
         }
         self.controls.remove(&conn_id);
         self.controls.retain(|_, closer| !closer.is_closed());
-        self.clients.forget(conn_id);
+        self.clients.forget(conn_id, graced);
     }
 
     /// Close every registered connection, and stop tracking them.
@@ -1427,8 +1455,8 @@ impl Connections {
         // Walked in its own right: a data connection never appears in
         // `controls`, so each list is owed the same labeled close.
         for (_, conns) in self.data_conns.drain() {
-            for (_, closer) in conns {
-                closer.close(reason);
+            for conn in conns {
+                conn.closer.close(reason);
             }
         }
         // The records stay — [`Self::abort_subscribers`] takes them, after
@@ -1453,8 +1481,9 @@ impl Connections {
         &mut self,
         tab_id: i64,
         ctx: &ConnCtx,
+        client_id: &str,
         stopping: bool,
-    ) -> Result<(), HandlerError> {
+    ) -> Result<tokio::sync::watch::Receiver<bool>, HandlerError> {
         if stopping {
             return Err(shutting_down());
         }
@@ -1462,7 +1491,7 @@ impl Connections {
         // a peer that dropped without unwinding its forwarder must not
         // hold a slot against the next client.
         self.data_conns.retain(|_, conns| {
-            conns.retain(|(_, closer)| !closer.is_closed());
+            conns.retain(|conn| !conn.closer.is_closed());
             !conns.is_empty()
         });
         if self.data_conn_count() >= MAX_DATA_CONNS_PER_SESSION {
@@ -1475,9 +1504,27 @@ impl Connections {
             ));
         }
         let conns = self.data_conns.entry(tab_id).or_default();
-        conns.retain(|(id, _)| *id != ctx.conn_id);
-        conns.push((ctx.conn_id, ctx.closer.clone()));
-        Ok(())
+        conns.retain(|conn| conn.conn_id != ctx.conn_id);
+        let (dropper, dropped) = tokio::sync::watch::channel(false);
+        conns.push(DataConnEntry {
+            conn_id: ctx.conn_id,
+            closer: ctx.closer.clone(),
+            dropper,
+        });
+        self.clients.attached(ctx.conn_id, client_id);
+        Ok(dropped)
+    }
+
+    /// `tab.drop_data_conns`: every data connection on the tab ends as a
+    /// disconnect would. How many there were.
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
+    fn drop_data_conns(&self, tab_id: i64) -> usize {
+        self.data_conns.get(&tab_id).map_or(0, |conns| {
+            for conn in conns {
+                conn.dropper.send_replace(true);
+            }
+            conns.len()
+        })
     }
 
     /// How many data connections are registered right now, across every
@@ -1497,7 +1544,7 @@ impl Connections {
         else {
             return;
         };
-        entry.get_mut().retain(|(id, _)| *id != conn_id);
+        entry.get_mut().retain(|conn| conn.conn_id != conn_id);
         if entry.get().is_empty() {
             entry.remove();
         }
@@ -1544,9 +1591,10 @@ impl SessionState {
         lock(&self.conns).register_control(ctx);
     }
 
-    /// One connection has ended.
-    fn forget_connection(&self, conn_id: u64) {
-        lock(&self.conns).forget_connection(conn_id);
+    /// One connection has ended. `graced` says whether a tab still holds
+    /// a grace record for a client id.
+    fn forget_connection(&self, conn_id: u64, graced: &dyn Fn(&str) -> bool) {
+        lock(&self.conns).forget_connection(conn_id, graced);
     }
 
     /// `client.hello`: only as the connection's first request, so every
@@ -1573,7 +1621,7 @@ impl SessionState {
     /// The client this connection said hello as — what an op that acts
     /// for "the caller's client" (`tab.take_size`, `tab.release_size`)
     /// is addressed by.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn hello_client(&self, ctx: &ConnCtx) -> Result<ClientHelloParams, HandlerError> {
         lock(&self.conns)
             .clients
@@ -1592,15 +1640,36 @@ impl SessionState {
     /// connection registered after that sweep is one no closer can
     /// reach, which is why the three are one step.
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
-    fn register_data_conn(&self, tab_id: i64, ctx: &ConnCtx) -> Result<(), HandlerError> {
+    fn register_data_conn(
+        &self,
+        tab_id: i64,
+        ctx: &ConnCtx,
+        client_id: &str,
+    ) -> Result<tokio::sync::watch::Receiver<bool>, HandlerError> {
         let mut guard = lock(&self.conns);
         let stopping = self.stopping.load(Ordering::Acquire);
-        guard.register_data_conn(tab_id, ctx, stopping)
+        guard.register_data_conn(tab_id, ctx, client_id, stopping)
+    }
+
+    /// The label the client's last hello registered, while a connection
+    /// or a grace record (`graced`) still holds that client.
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
+    fn registered_label(&self, client_id: &str, graced: &dyn Fn(&str) -> bool) -> Option<String> {
+        let mut guard = lock(&self.conns);
+        guard.clients.sweep(graced);
+        guard.clients.label(client_id).map(str::to_string)
     }
 
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
-    fn release_data_conn(&self, tab_id: i64, conn_id: u64) {
-        lock(&self.conns).release_data_conn(tab_id, conn_id);
+    fn release_data_conn(&self, tab_id: i64, conn_id: u64, graced: &dyn Fn(&str) -> bool) {
+        let mut guard = lock(&self.conns);
+        guard.release_data_conn(tab_id, conn_id);
+        guard.clients.forget(conn_id, graced);
+    }
+
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
+    fn drop_data_conns(&self, tab_id: i64) -> usize {
+        lock(&self.conns).drop_data_conns(tab_id)
     }
 
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
@@ -1673,6 +1742,9 @@ pub fn is_mutating_op(op: &str) -> bool {
             // store would leave the client holding a path to nothing.
             | ops::SESSION_PUT_FILE
             | ops::TAB_FEED_PTY_BYTES
+            // Size ownership resizes the tab, like `tab.resize`.
+            | ops::TAB_TAKE_SIZE
+            | ops::TAB_RELEASE_SIZE
             | ops::HOST_ADD
             | ops::HOST_REMOVE
     )
@@ -1913,6 +1985,19 @@ impl IpcHandler {
         Ok(())
     }
 
+    /// Whether any tab still holds a grace record for this client — what
+    /// keeps its label in the session's registry with no connection
+    /// open.
+    fn graced(&self, client_id: &str) -> bool {
+        #[cfg(feature = "server-vt")]
+        return self.supervisor.holds_grace(client_id);
+        #[cfg(not(feature = "server-vt"))]
+        {
+            let _ = client_id;
+            false
+        }
+    }
+
     /// Whether a UI adapter is driving this handler.
     ///
     /// Only the `host.*` registry ops ask: they have a working headless
@@ -1996,7 +2081,7 @@ impl Handler for IpcHandler {
     /// entry and subscriber slot, or a UI socket's in-process stream.
     fn connection_ended(&self, conn_id: u64) {
         match self.session.as_ref() {
-            Some(session) => session.forget_connection(conn_id),
+            Some(session) => session.forget_connection(conn_id, &|client| self.graced(client)),
             None => self.in_process_streams.forget(conn_id),
         }
     }
@@ -2097,23 +2182,43 @@ impl IpcHandler {
         // 5 + 6. Servable, then eligible.
         let kind = negotiate_kind(&session.info, &terms.kinds, &terms.libghostty_build)?;
 
-        // 7. The grid.
+        // 7. The grid, then whose attachment this is.
         let geometry = attach_geometry(terms.cols, terms.rows, terms.cell_w_px, terms.cell_h_px)?;
+        roost_ipc::messages::validate_client_id(&terms.client_id)
+            .map_err(HandlerError::invalid_param)?;
+
+        // The client's last hello, else the label a tab's grace record
+        // kept for it (a data connection that came back before its control
+        // connection said hello again), else its id. Read before this
+        // connection is registered, which would hold the label itself.
+        let label = session
+            .registered_label(&terms.client_id, &|id| self.graced(id))
+            .or_else(|| self.supervisor.grace_label(&terms.client_id))
+            .unwrap_or_else(|| {
+                format!(
+                    "client {}",
+                    &terms.client_id[..terms.client_id.len().min(8)]
+                )
+            });
 
         // 8. The latch, the bound and the registration together.
-        session.register_data_conn(tab_id, ctx)?;
+        let dropped = session.register_data_conn(tab_id, ctx, &terms.client_id)?;
         Ok(AdmittedAttach {
             tab_id,
             tab_generation,
             kind,
             geometry,
-            resize_first: terms.focus.then_some(commands),
+            commands,
+            label,
+            client_id: terms.client_id.clone(),
+            take: terms.take,
+            dropped,
         })
     }
 
     pub(crate) fn release_data_conn(&self, tab_id: i64, conn_id: u64) {
         if let Some(session) = self.session.as_ref() {
-            session.release_data_conn(tab_id, conn_id);
+            session.release_data_conn(tab_id, conn_id, &|client| self.graced(client));
         }
     }
 
@@ -2158,6 +2263,24 @@ fn no_server_vt() -> HandlerError {
 
 /// Round-trip one command through a tab task.
 #[cfg(feature = "server-vt")]
+async fn tab_round_trip<R>(
+    h: &IpcHandler,
+    tab_id: i64,
+    make: impl FnOnce(tokio::sync::oneshot::Sender<R>) -> crate::tab_task::TabCmd,
+) -> Result<R, HandlerError> {
+    let commands = tab_commands(h, tab_id)?;
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    commands
+        .send(make(reply_tx))
+        .await
+        .map_err(|_| tab_gone(tab_id))?;
+    reply_rx.await.map_err(|_| tab_gone(tab_id))
+}
+
+/// [`tab_round_trip`] for a command that answers with a [`TabError`].
+///
+/// [`TabError`]: crate::tab_task::TabError
+#[cfg(feature = "server-vt")]
 async fn tab_ask<T>(
     h: &IpcHandler,
     tab_id: i64,
@@ -2165,16 +2288,7 @@ async fn tab_ask<T>(
         tokio::sync::oneshot::Sender<Result<T, crate::tab_task::TabError>>,
     ) -> crate::tab_task::TabCmd,
 ) -> Result<T, HandlerError> {
-    let commands = tab_commands(h, tab_id)?;
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    commands
-        .send(make(reply_tx))
-        .await
-        .map_err(|_| tab_gone(tab_id))?;
-    reply_rx
-        .await
-        .map_err(|_| tab_gone(tab_id))?
-        .map_err(tab_err)
+    tab_round_trip(h, tab_id, make).await?.map_err(tab_err)
 }
 
 /// Map a tab-task failure onto the wire. `Gone` and a missing tab are
@@ -2188,13 +2302,15 @@ fn tab_err(e: crate::tab_task::TabError) -> HandlerError {
         TabError::Gone | TabError::RingMiss { .. } | TabError::Regridded { .. } => {
             HandlerError::not_found(e.to_string())
         }
-        TabError::SnapshotFailed(_) | TabError::Render(_) | TabError::WinsizeFailed(_) => {
-            HandlerError::new(codes::INTERNAL, e.to_string())
-        }
+        TabError::Owned(_) => HandlerError::new(codes::OWNED, e.to_string()),
+        TabError::SnapshotFailed(_)
+        | TabError::Render(_)
+        | TabError::WinsizeFailed(_)
+        | TabError::ResizeFailed(_) => HandlerError::new(codes::INTERNAL, e.to_string()),
     }
 }
 
-/// Why a focused [`tab_attach`] could not size the tab, told apart by
+/// Why an attach that took the tab could not size it, told apart by
 /// whose problem it is.
 ///
 /// A grid the server terminal refused is the caller's `cols`/`rows` to
@@ -2392,11 +2508,80 @@ fn project_reorder_route(
 #[cfg(feature = "server-vt")]
 mod served {
     use super::{
-        bare_tab as bare, session_test_mode, tab_ask, tab_commands, tab_gone, DumpData,
-        HandlerError, IpcHandler, ResolvedCellsData, WireTabRef,
+        bare_tab as bare, session_test_mode, tab_ask, tab_commands, tab_gone, tab_round_trip,
+        ConnCtx, DumpData, HandlerError, IpcHandler, ResolvedCellsData, SessionState, WireTabRef,
     };
+    use crate::size_owner::TakeRefusal;
     use crate::tab_task::TabCmd;
-    use roost_ipc::messages::MemoryUsage;
+    use roost_ipc::messages::{
+        MemoryUsage, TabDropDataConnsParams, TabFailNextResizeParams, TabReleaseSizeParams,
+        TabTakeSizeParams, TabTakeSizeResult,
+    };
+
+    /// `tab.take_size` (plan 084 rule 5), for the client this connection
+    /// said hello as.
+    pub(super) async fn take_size(
+        h: &IpcHandler,
+        session: &SessionState,
+        ctx: &ConnCtx,
+        p: TabTakeSizeParams,
+    ) -> Result<TabTakeSizeResult, HandlerError> {
+        let client = session.hello_client(ctx)?;
+        let tab_id = bare(p.tab_id)?;
+        let answer = tab_round_trip(h, tab_id, |reply| TabCmd::TakeSize {
+            client_id: client.client_id.clone(),
+            reply,
+        })
+        .await?;
+        match answer {
+            Ok((cols, rows)) => Ok(TabTakeSizeResult { cols, rows }),
+            Err(TakeRefusal::NoAttachment) => Err(HandlerError::not_found(format!(
+                "client {} has no attachment to tab {tab_id}",
+                client.client_id
+            ))),
+            Err(TakeRefusal::ApplyFailed) => Err(HandlerError::new(
+                roost_ipc::codes::INTERNAL,
+                format!("tab {tab_id} could not be resized to this client's grid"),
+            )),
+        }
+    }
+
+    /// `tab.release_size` (rule 6).
+    pub(super) async fn release_size(
+        h: &IpcHandler,
+        session: &SessionState,
+        ctx: &ConnCtx,
+        p: TabReleaseSizeParams,
+    ) -> Result<(), HandlerError> {
+        let client = session.hello_client(ctx)?;
+        tab_round_trip(h, p.tab_id, |reply| TabCmd::ReleaseSize {
+            client_id: client.client_id,
+            reply,
+        })
+        .await
+    }
+
+    pub(super) async fn fail_next_resize(
+        h: &IpcHandler,
+        p: TabFailNextResizeParams,
+    ) -> Result<(), HandlerError> {
+        session_test_mode(h)?;
+        tab_commands(h, p.tab_id)?
+            .send(TabCmd::FailNextResize)
+            .await
+            .map_err(|_| tab_gone(p.tab_id))
+    }
+
+    pub(super) fn drop_data_conns(
+        h: &IpcHandler,
+        session: &SessionState,
+        p: &TabDropDataConnsParams,
+    ) -> Result<(), HandlerError> {
+        session_test_mode(h)?;
+        tab_commands(h, p.tab_id)?;
+        session.drop_data_conns(p.tab_id);
+        Ok(())
+    }
 
     pub(super) async fn dump(
         h: &IpcHandler,
@@ -2477,16 +2662,7 @@ mod served {
 
     async fn capture(h: &IpcHandler, tab_id: i64, drain: bool) -> Result<Vec<u8>, HandlerError> {
         session_test_mode(h)?;
-        let commands = tab_commands(h, tab_id)?;
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        commands
-            .send(TabCmd::CaptureInput {
-                drain,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| tab_gone(tab_id))?;
-        reply_rx.await.map_err(|_| tab_gone(tab_id))
+        tab_round_trip(h, tab_id, |reply| TabCmd::CaptureInput { drain, reply }).await
     }
 }
 
@@ -2499,7 +2675,47 @@ mod served {
     // every one is an `async fn` that never awaits.
     #![allow(clippy::unused_async)]
 
-    use super::{DumpData, HandlerError, IpcHandler, ResolvedCellsData, WireTabRef};
+    use super::{
+        no_server_vt, ConnCtx, DumpData, HandlerError, IpcHandler, ResolvedCellsData, SessionState,
+        WireTabRef,
+    };
+    use roost_ipc::messages::{
+        TabDropDataConnsParams, TabFailNextResizeParams, TabReleaseSizeParams, TabTakeSizeParams,
+        TabTakeSizeResult,
+    };
+
+    pub(super) async fn take_size(
+        _: &IpcHandler,
+        _: &SessionState,
+        _: &ConnCtx,
+        _: TabTakeSizeParams,
+    ) -> Result<TabTakeSizeResult, HandlerError> {
+        Err(no_server_vt())
+    }
+
+    pub(super) async fn release_size(
+        _: &IpcHandler,
+        _: &SessionState,
+        _: &ConnCtx,
+        _: TabReleaseSizeParams,
+    ) -> Result<(), HandlerError> {
+        Err(no_server_vt())
+    }
+
+    pub(super) async fn fail_next_resize(
+        _: &IpcHandler,
+        _: TabFailNextResizeParams,
+    ) -> Result<(), HandlerError> {
+        Err(no_server_vt())
+    }
+
+    pub(super) fn drop_data_conns(
+        _: &IpcHandler,
+        _: &SessionState,
+        _: &TabDropDataConnsParams,
+    ) -> Result<(), HandlerError> {
+        Err(no_server_vt())
+    }
 
     pub(super) async fn dump(
         _: &IpcHandler,
@@ -2586,6 +2802,14 @@ async fn dispatch_outcome(
         ops::CLIENT_HELLO => {
             return encode(&session.client_hello(ctx, params)?).map(HandlerOutcome::Reply);
         }
+        ops::TAB_FAIL_NEXT_RESIZE => {
+            served::fail_next_resize(h, decode(params)?).await?;
+            return Ok(HandlerOutcome::Reply(serde_json::json!({})));
+        }
+        ops::TAB_DROP_DATA_CONNS => {
+            served::drop_data_conns(h, session, &decode(params)?)?;
+            return Ok(HandlerOutcome::Reply(serde_json::json!({})));
+        }
         // The host registry is client-side state (D8): a UI socket's op
         // family. Letting it fall through would grow a shadow registry in
         // the daemon's own state.json that nothing ever reads.
@@ -2632,6 +2856,16 @@ async fn dispatch_outcome(
         return session_set_theme(h, p).await.map(HandlerOutcome::Reply);
     }
 
+    if op == ops::TAB_TAKE_SIZE {
+        let taken = served::take_size(h, session, ctx, decode(params)?).await?;
+        return encode(&taken).map(HandlerOutcome::Reply);
+    }
+
+    if op == ops::TAB_RELEASE_SIZE {
+        served::release_size(h, session, ctx, decode(params)?).await?;
+        return Ok(HandlerOutcome::Reply(serde_json::json!({})));
+    }
+
     if op == ops::SESSION_SET_AGENT_HOOKS {
         let p: SessionSetAgentHooksParams = decode(params)?;
         return session_set_agent_hooks(h, p)
@@ -2673,36 +2907,6 @@ fn attach_geometry(
         cell_w: u32::from(cell_w_px),
         cell_h: u32::from(cell_h_px),
     })
-}
-
-/// Give a tab the geometry an attaching client claimed, and wait for
-/// both halves — the server terminal and the child — to take it.
-///
-/// Awaited, never fired and forgotten: the ack is what reports a
-/// geometry either half refused, and everything the attach does next is
-/// encoded from the grid this settles. A `Resize` still sitting on the
-/// command channel would let that encode run at exactly the geometry
-/// the attach exists to replace.
-#[cfg(feature = "server-vt")]
-pub(crate) async fn await_attach_resize(
-    commands: &tokio::sync::mpsc::Sender<crate::tab_task::TabCmd>,
-    tab_id: i64,
-    geometry: Geometry,
-) -> Result<(), HandlerError> {
-    let (resized_tx, resized_rx) = tokio::sync::oneshot::channel();
-    commands
-        .send(crate::tab_task::TabCmd::Resize {
-            geometry,
-            ack: Some(resized_tx),
-        })
-        .await
-        .map_err(|_| tab_gone(tab_id))?;
-    resized_rx
-        .await
-        // The task dropped the ack without answering, which only
-        // happens when the task itself is going away.
-        .map_err(|_| tab_gone(tab_id))?
-        .map_err(|error| attach_resize_refusal(tab_id, geometry.cols, geometry.rows, &error))
 }
 
 /// The payload kind a client's preference order settles on.
@@ -4750,6 +4954,13 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
         (ops::SESSION_SET_AGENT_HOOKS, &[SessionOnly]),
         (ops::SESSION_PUT_FILE, &[SessionOnly]),
         (ops::CLIENT_HELLO, &[SessionOnly]),
+        (ops::TAB_TAKE_SIZE, &[SessionOnly, ServerVt]),
+        (ops::TAB_RELEASE_SIZE, &[SessionOnly, ServerVt]),
+        (
+            ops::TAB_FAIL_NEXT_RESIZE,
+            &[SessionOnly, ServerVt, TestMode],
+        ),
+        (ops::TAB_DROP_DATA_CONNS, &[SessionOnly, ServerVt, TestMode]),
     ]
 };
 
@@ -4938,6 +5149,8 @@ fn pty_err(e: &PtyError) -> HandlerError {
         }
         PtyError::DuplicateTab(_) => HandlerError::invalid_param(e.to_string()),
         PtyError::ShuttingDown(_) => HandlerError::new(codes::SHUTTING_DOWN, e.to_string()),
+        PtyError::Owned { .. } => HandlerError::new(codes::OWNED, e.to_string()),
+        PtyError::Resize { .. } => HandlerError::new(codes::INTERNAL, e.to_string()),
     }
 }
 
@@ -5079,7 +5292,7 @@ mod tests {
         let parked = tokio::spawn(std::future::pending::<()>());
         assert!(register(&state, 7, parked.abort_handle()));
 
-        state.forget_connection(7);
+        state.forget_connection(7, &|_| false);
         assert_eq!(live_subscribers(&state), 0);
         parked.abort();
     }
@@ -6050,6 +6263,8 @@ mod tests {
         "tab.dump",
         "tab.dump_resolved",
         "tab.memory_usage",
+        "tab.release_size",
+        "tab.take_size",
     ];
 
     fn on_this_platform(seams: &'static [&'static str]) -> &'static [&'static str] {
@@ -6559,7 +6774,12 @@ mod tests {
             .with_agent_hooks(AgentHooksHandle::new(|_| async {
                 Ok(AgentHooksOutcome::default())
             }));
-        let seams: &[&str] = &["tab.capture_pty_input", "tab.feed_pty_bytes"];
+        let seams: &[&str] = &[
+            "tab.capture_pty_input",
+            "tab.drop_data_conns",
+            "tab.fail_next_resize",
+            "tab.feed_pty_bytes",
+        ];
         assert_eq!(
             ops_in(&reply_of(&h, ops::SESSION_IDENTIFY).await),
             sorted(&[

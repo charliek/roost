@@ -24,8 +24,9 @@ use roost_ipc::client::{
     ClientError, DataConnection, EventFrame, EventStream, ServerCode, ServerFrame,
 };
 use roost_ipc::dataframe::{
-    write_data_frame, write_preamble, DataFrame, FRAME_INPUT, FRAME_RESIZE, MAX_DATA_FRAME_BYTES,
-    PREAMBLE,
+    write_data_frame, write_preamble, DataFrame, InputTake, FRAME_DETACH, FRAME_INPUT,
+    FRAME_RESIZE, FRAME_TAKE, INPUT_TAKE_AFTER, INPUT_TAKE_BEFORE, MAX_DATA_FRAME_BYTES, PREAMBLE,
+    RESIZE_FOCUSED,
 };
 use roost_ipc::framing::write_frame;
 use roost_ipc::messages::{
@@ -74,7 +75,8 @@ fn terms() -> roost_ipc::messages::AttachHandshakeTerms {
         cell_w_px: 0,
         cell_h_px: 0,
         libghostty_build: "ghostty-1a2b3c4d5e6f7a8b+snapshot.v1".into(),
-        focus: true,
+        take: true,
+        client_id: "5d0c7e21a9f3b846".into(),
     }
 }
 
@@ -562,6 +564,7 @@ async fn the_line_reader_residue_carries_into_the_frame_reader() {
         tab_generation: 3,
         snapshot_cols: 80,
         snapshot_rows: 24,
+        owner: None,
     });
     write_frame(&mut wire, &serde_json::to_vec(&reply).unwrap())
         .await
@@ -637,6 +640,7 @@ async fn a_mismatched_resume_identity_is_visible_on_both_sides() {
         tab_generation: 9,
         snapshot_cols: 80,
         snapshot_rows: 24,
+        owner: None,
     };
     let stub = Stub::start(Plan::new().handshake(Handshake::Accept(wrong.clone()))).await;
 
@@ -745,32 +749,74 @@ async fn a_malformed_payload_is_rejected_by_the_endpoint() {
 
 /// Splitting an oversized paste is the client's job, not something the
 /// server will do for it — so the split has to live in the library
-/// every client shares.
+/// every client shares. The flag byte counts against the cap, and a take
+/// is stated once, on the side of the paste it was asked for: before
+/// the first frame, after the last.
 #[tokio::test]
 async fn a_paste_past_the_cap_is_split_across_input_frames() {
     let stub = Stub::start(Plan::new().after_serve(End::Hold)).await;
     let mut data = dial(&stub).await;
 
     let paste = vec![b'p'; MAX_DATA_FRAME_BYTES + 17];
-    data.send_input(&paste).await.expect("send the paste");
-    data.send_resize(120, 40, 9, 18).await.expect("send resize");
-    // Nothing is written for an empty paste: an empty INPUT frame is a
-    // protocol error on this wire.
-    data.send_input(b"").await.expect("send nothing");
+    data.send_input(&paste, InputTake::Before)
+        .await
+        .expect("send the paste");
+    data.send_resize(120, 40, 9, 18, true)
+        .await
+        .expect("send resize");
+    // Nothing is written for an empty paste: an INPUT frame with no
+    // bytes is a protocol error on this wire.
+    data.send_input(b"", InputTake::Before)
+        .await
+        .expect("send nothing");
+    data.send_input(&paste, InputTake::After)
+        .await
+        .expect("send a click-sized paste");
+    data.send_resize(80, 24, 0, 0, false)
+        .await
+        .expect("send an unfocused resize");
+    data.send_take().await.expect("send a take");
+    data.send_detach().await.expect("send a detach");
 
-    let frames = within("the frames to arrive", stub.frames_at_least(3)).await;
-    assert_eq!(frames.len(), 3, "two INPUT frames and one RESIZE");
+    let frames = within("the frames to arrive", stub.frames_at_least(8)).await;
+    assert_eq!(
+        frames.len(),
+        8,
+        "two INPUT, a RESIZE, two INPUT, RESIZE, TAKE, DETACH"
+    );
     assert_eq!(frames[0].frame_type, FRAME_INPUT);
     assert_eq!(frames[0].payload.len(), MAX_DATA_FRAME_BYTES);
+    assert_eq!(
+        frames[0].payload[0], INPUT_TAKE_BEFORE,
+        "the take leads the paste"
+    );
     assert_eq!(frames[1].frame_type, FRAME_INPUT);
-    assert_eq!(frames[1].payload.len(), 17);
+    assert_eq!(frames[1].payload.len(), 1 + 18);
+    assert_eq!(frames[1].payload[0], 0, "and is not repeated");
     assert_eq!(
         frames[2],
         DataFrame {
             frame_type: FRAME_RESIZE,
-            payload: vec![120, 0, 40, 0, 9, 0, 18, 0],
+            payload: vec![120, 0, 40, 0, 9, 0, 18, 0, RESIZE_FOCUSED],
         },
-        "cols | rows | cell_w_px | cell_h_px, u16 little-endian"
+        "cols | rows | cell_w_px | cell_h_px, u16 little-endian, then the flags"
+    );
+    assert_eq!(
+        frames[3].payload[0], 0,
+        "a take after the paste is not on its head"
+    );
+    assert_eq!(
+        frames[4].payload[0], INPUT_TAKE_AFTER,
+        "but on its last frame"
+    );
+    assert_eq!(frames[5].payload, vec![80, 0, 24, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        (frames[6].frame_type, frames[6].payload.len()),
+        (FRAME_TAKE, 0)
+    );
+    assert_eq!(
+        (frames[7].frame_type, frames[7].payload.len()),
+        (FRAME_DETACH, 0)
     );
 }
 
@@ -788,7 +834,10 @@ async fn a_split_connection_reads_and_writes_independently() {
     let (mut reader, mut writer) = data.into_split();
 
     let pump = tokio::spawn(async move { reader.next_frame().await });
-    writer.send_input(b"typed").await.expect("send");
+    writer
+        .send_input(b"typed", InputTake::None)
+        .await
+        .expect("send");
 
     let frame = within("the read half", pump)
         .await
@@ -801,7 +850,7 @@ async fn a_split_connection_reads_and_writes_independently() {
     ));
 
     let sent = within("the write half", stub.frames_at_least(1)).await;
-    assert_eq!(sent[0].payload, b"typed");
+    assert_eq!(sent[0].payload, b"\0typed");
 }
 
 /// A peer that is not speaking this protocol at all must be refused

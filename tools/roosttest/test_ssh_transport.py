@@ -392,7 +392,7 @@ def test_a_full_attach_streams_and_echoes_through_the_bridge(env, bridge):
             conn.read_until_finish()
             conn.snap.assert_ready_leads(expect_history=False)
 
-            conn.send_input(f"{line}\n".encode())
+            conn.send_input(f"{line}\n".encode(), take=dataplane.TAKE_BEFORE)
             ending = conn.drain_to_close(timeout=30.0)
             assert ending.kind == "exit", ending
             assert ending.exit_code == 0, ending

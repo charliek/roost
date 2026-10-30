@@ -3,14 +3,14 @@
 A data connection is the one place in the protocol where the wire stops
 being newline JSON. It opens with a handshake line, gets one JSON line
 back, and — if that line said `ok` — turns binary for the rest of its
-life: the 8-byte `ROOSTDP2` preamble, then length-prefixed frames in
+life: the 8-byte `ROOSTDP3` preamble, then length-prefixed frames in
 both directions (`crates/roost-ipc/src/dataframe.rs`,
 `docs/reference/ipc.md`'s data-plane section).
 
 ```text
 frame := u32-LE payload length | u8 type | payload
-server → client:  SNAP 0x01 | PTY 0x02 | EXIT 0x03 | ERROR 0x0F
-client → server:  INPUT 0x11 | RESIZE 0x12
+server → client:  SNAP 0x01 | PTY 0x02 | EXIT 0x03 | GRID 0x04 | ERROR 0x0F
+client → server:  INPUT 0x11 | RESIZE 0x12 | TAKE 0x13 | DETACH 0x14
 ```
 
 `client.Roost` cannot do this — its whole shape is one request, one
@@ -51,13 +51,16 @@ boundary markers here, never semantics.
   [`VtPayload.plain_rows`] is a row *count and position* cross-check
   against `tab.dump`, not a replay — see the class docstring.
 * [`DataPlane`] — the connection: handshake, preamble, framed reads with
-  cross-read reassembly, `INPUT`/`RESIZE` writes.
+  cross-read reassembly, `INPUT`/`RESIZE`/`TAKE`/`DETACH` writes, and
+  every `GRID` it reads, in order ([`DataPlane.grids`]).
 * The invariants that hold on every connection, checked as frames
   arrive rather than restated in each test — so a violation fails at the
   frame that broke it, with the frame in hand:
   - **seq contiguity**: the fence `S` from the handshake reply means the
     first `PTY` frame is `S+1` and every one after it is exactly one
-    more. A gap is the one thing the protocol promises can never happen;
+    more. A gap is the one thing the protocol promises can never happen.
+    A `GRID` consumes no seq — it names the last PTY seq before it, and
+    is held, like a PTY frame, until the payload's readiness boundary;
   - **terminal frames**: `ERROR` and `EXIT` both end the connection, so
     anything behind either is a protocol violation;
   - **nothing precedes readiness**: in snapshot mode the prefix goes out
@@ -78,6 +81,7 @@ per read.
 from __future__ import annotations
 
 import json
+import secrets
 import socket
 import struct
 import time
@@ -91,25 +95,41 @@ from client import RoostError, scaled_timeout
 # change to either fails here instead of being absorbed.
 # ---------------------------------------------------------------------------
 
-PREAMBLE = b"ROOSTDP2"
+PREAMBLE = b"ROOSTDP3"
 FRAME_HEADER_LEN = 5
 MAX_DATA_FRAME_BYTES = 1024 * 1024
 
 FRAME_SNAP = 0x01
 FRAME_PTY = 0x02
 FRAME_EXIT = 0x03
+FRAME_GRID = 0x04
 FRAME_ERROR = 0x0F
 FRAME_INPUT = 0x11
 FRAME_RESIZE = 0x12
+FRAME_TAKE = 0x13
+FRAME_DETACH = 0x14
 
 FRAME_NAMES = {
     FRAME_SNAP: "SNAP",
     FRAME_PTY: "PTY",
     FRAME_EXIT: "EXIT",
+    FRAME_GRID: "GRID",
     FRAME_ERROR: "ERROR",
     FRAME_INPUT: "INPUT",
     FRAME_RESIZE: "RESIZE",
+    FRAME_TAKE: "TAKE",
+    FRAME_DETACH: "DETACH",
 }
+
+#: What an `INPUT` frame asks of the tab's size — its flag byte. Every
+#: send names one: a helper that defaulted to "take" would let a test
+#: written against "the last typist sizes the tab" keep passing without
+#: ever exercising the distinction.
+TAKE_NONE = 0x00
+TAKE_BEFORE = 0x01
+TAKE_AFTER = 0x02
+#: The `RESIZE` flag byte's one bit.
+RESIZE_FOCUSED = 0x01
 
 SESSION_PROTOCOL_VERSION = 7
 GHOSTTY_SNAPSHOT = "ghostty-snapshot"
@@ -180,6 +200,14 @@ class Frame:
         one of these."""
         assert self.frame_type == FRAME_ERROR, f"not an ERROR frame: {self.name}"
         return json.loads(self.payload.decode())
+
+    def grid(self) -> dict:
+        """`{seq, cols, rows, owner}` — the tab's grid and size owner as
+        of PTY frame `seq`; `owner` is `{client_id, label}` or `None`."""
+        assert self.frame_type == FRAME_GRID, f"not a GRID frame: {self.name}"
+        grid = json.loads(self.payload.decode())
+        assert set(grid) >= {"seq", "cols", "rows", "owner"}, grid
+        return grid
 
 
 # ---------------------------------------------------------------------------
@@ -470,12 +498,14 @@ class Reply:
     server_epoch: int = 0
     tab_generation: int = 0
     #: The geometry the bytes that follow were written for. On every
-    #: accepted reply, either mode, focused or not: raw input is open,
-    #: so anything may resize the tab between the handshake's own resize
-    #: and the encode, and this is the only statement of what the bytes
-    #: say.
+    #: accepted reply, either mode, taking or not: another client may take
+    #: the tab between the handshake's own resize and the encode, and this
+    #: is the only statement of what the bytes say.
     snapshot_cols: int | None = None
     snapshot_rows: int | None = None
+    #: The tab's size owner in the same instant: `{client_id, label}`,
+    #: or `None` for a tab nobody owns.
+    owner: dict | None = None
     code: str = ""
     message: str = ""
 
@@ -554,6 +584,12 @@ class DataPlane:
         #: one of the two modes: a resume stream carries no payload and
         #: therefore no boundary to order anything against.
         self.snapshot_mode: bool | None = None
+        #: Every `GRID` read, decoded, in arrival order, each with
+        #: `"after_pty"`: how many PTY frames this connection had read when
+        #: it arrived — what a sequence-position assertion compares.
+        self.grids: list[dict] = []
+        #: The client id this connection's handshake named.
+        self.client_id: str | None = None
 
     # -- lifecycle --------------------------------------------------------
     def close(self) -> None:
@@ -580,7 +616,8 @@ class DataPlane:
         rows: int = 24,
         cell_w_px: int = 0,
         cell_h_px: int = 0,
-        focus: bool = True,
+        take: bool,
+        client_id: str | None = None,
         protocol_version: int = SESSION_PROTOCOL_VERSION,
         resume_from_seq: int | None = None,
         server_epoch: int | None = None,
@@ -595,7 +632,52 @@ class DataPlane:
         and is required — it is what stops a dial prepared for one
         session from landing on a replacement listening at the same
         socket path.
+
+        `take` has no default: an explicit switch takes the tab's size, an
+        automatic attach (`False`) takes only a tab nobody owns, and a test
+        has to say which it is. `client_id` defaults to one minted for this
+        connection; a test that reclaims across connections names one.
         """
+        return self.send_handshake(
+            self.handshake_request(
+                tab_id,
+                session_id,
+                libghostty_build,
+                kinds=kinds,
+                cols=cols,
+                rows=rows,
+                cell_w_px=cell_w_px,
+                cell_h_px=cell_h_px,
+                take=take,
+                client_id=client_id,
+                protocol_version=protocol_version,
+                resume_from_seq=resume_from_seq,
+                server_epoch=server_epoch,
+                tab_generation=tab_generation,
+            ),
+            timeout=timeout,
+        )
+
+    def handshake_request(
+        self,
+        tab_id: int,
+        session_id: str,
+        libghostty_build: str,
+        *,
+        kinds: list[str] | None = None,
+        cols: int = 80,
+        rows: int = 24,
+        cell_w_px: int = 0,
+        cell_h_px: int = 0,
+        take: bool,
+        client_id: str | None = None,
+        protocol_version: int = SESSION_PROTOCOL_VERSION,
+        resume_from_seq: int | None = None,
+        server_epoch: int | None = None,
+        tab_generation: int | None = None,
+    ) -> dict:
+        """The handshake line [`attach`] sends, as a dict."""
+        self.client_id = client_id or f"rt-{secrets.token_hex(6)}"
         request: dict = {
             "attach": str(tab_id),
             "protocol_version": protocol_version,
@@ -606,7 +688,8 @@ class DataPlane:
             "cell_w_px": cell_w_px,
             "cell_h_px": cell_h_px,
             "libghostty_build": libghostty_build,
-            "focus": focus,
+            "take": take,
+            "client_id": self.client_id,
         }
         if resume_from_seq is not None:
             request["resume_from_seq"] = resume_from_seq
@@ -614,7 +697,7 @@ class DataPlane:
             request["server_epoch"] = server_epoch
         if tab_generation is not None:
             request["tab_generation"] = tab_generation
-        return self.send_handshake(request, timeout=timeout)
+        return request
 
     def send_handshake(self, request: dict, *, timeout: float = 30.0) -> Reply:
         """Send a handshake line verbatim and read the answer.
@@ -638,8 +721,17 @@ class DataPlane:
         no constructor would produce — a malformed term, a missing one,
         a wrong generation.
         """
+        self.write_handshake(request)
+        return self.read_reply(timeout=timeout)
+
+    def write_handshake(self, request: dict) -> None:
+        """The handshake line alone — for a case that does something
+        between sending it and reading the answer (two attaches racing,
+        a client that leaves before its reply)."""
         self._sock.sendall((json.dumps(request) + "\n").encode())
 
+    def read_reply(self, *, timeout: float = 30.0) -> Reply:
+        """The second half of [`send_handshake`]."""
         deadline = time.monotonic() + scaled_timeout(timeout)
         raw = json.loads(self._readline(deadline))
         if raw.get("ok"):
@@ -653,6 +745,7 @@ class DataPlane:
                 tab_generation=int(raw["tab_generation"]),
                 snapshot_cols=_optional_int(raw, "snapshot_cols"),
                 snapshot_rows=_optional_int(raw, "snapshot_rows"),
+                owner=raw["owner"],
             )
             assert self.kind in (ANY_KIND, reply.kind), (
                 f"this connection was opened to read {self.kind!r} but the session "
@@ -812,17 +905,58 @@ class DataPlane:
         raise AssertionError(f"expected the connection to close; got a {frame.name} frame")
 
     # -- writing ----------------------------------------------------------
-    def send_input(self, data: bytes) -> None:
-        """An `INPUT` frame. Payloads over the frame cap are the client's
-        to split (the documented paste rule), so an oversized one fails
-        here rather than on the wire."""
-        assert len(data) <= MAX_DATA_FRAME_BYTES, (
-            f"INPUT payloads are capped at {MAX_DATA_FRAME_BYTES}; split larger pastes"
+    def send_input(self, data: bytes, *, take: int) -> None:
+        """An `INPUT` frame: its flag byte ([`TAKE_NONE`], [`TAKE_BEFORE`]
+        or [`TAKE_AFTER`]), then the bytes. Payloads over the frame cap,
+        less the flag byte, are the client's to split (the documented
+        paste rule), so an oversized one fails here rather than on the
+        wire."""
+        assert len(data) < MAX_DATA_FRAME_BYTES, (
+            f"INPUT payloads are capped at {MAX_DATA_FRAME_BYTES - 1}; split larger pastes"
         )
-        self._write_frame(FRAME_INPUT, data)
+        self._write_frame(FRAME_INPUT, bytes([take]) + data)
 
-    def send_resize(self, cols: int, rows: int, cell_w: int = 0, cell_h: int = 0) -> None:
-        self._write_frame(FRAME_RESIZE, struct.pack("<HHHH", cols, rows, cell_w, cell_h))
+    def send_resize(
+        self, cols: int, rows: int, cell_w: int = 0, cell_h: int = 0, *, focused: bool
+    ) -> None:
+        """A `RESIZE` frame. `focused` has no default: a focused resize
+        takes the tab, an unfocused one only records this client's grid."""
+        self._write_frame(
+            FRAME_RESIZE,
+            struct.pack(
+                "<HHHHB", cols, rows, cell_w, cell_h, RESIZE_FOCUSED if focused else 0
+            ),
+        )
+
+    def half_close(self) -> None:
+        """End this side's writes and keep reading: how a client that has
+        gone looks through a bridge, whose pump still delivers whatever
+        the session writes."""
+        self._sock.shutdown(socket.SHUT_WR)
+
+    def expect_no_reply(self, timeout: float = 15.0) -> None:
+        """The session closed this connection without answering its
+        handshake — a cancelled attach."""
+        deadline = time.monotonic() + scaled_timeout(timeout)
+        while b"\n" not in self._buf:
+            if not self._fill(deadline):
+                assert not self._buf, f"a partial reply before the close: {self._buf!r}"
+                return
+        raise AssertionError(f"a cancelled attach was answered: {self._buf!r}")
+
+    def send_take(self) -> None:
+        """`TAKE`: take the tab's size at this connection's grid."""
+        self._write_frame(FRAME_TAKE, b"")
+
+    def send_detach(self) -> None:
+        """`DETACH` alone, for a test that reads what follows itself."""
+        self._write_frame(FRAME_DETACH, b"")
+
+    def detach(self, timeout: float = 10.0) -> "Ending":
+        """A deliberate detach: `DETACH`, then everything the session still
+        writes until it closes. Nothing may be sent after it."""
+        self.send_detach()
+        return self.drain_to_close(timeout=timeout)
 
     def _write_frame(self, frame_type: int, payload: bytes) -> None:
         header = struct.pack("<IB", len(payload), frame_type)
@@ -900,6 +1034,19 @@ class DataPlane:
             self._reject_before_ready(frame)
             self.exit = frame.exit()
             self.terminal_frame = "EXIT"
+        elif frame.frame_type == FRAME_GRID:
+            self._reject_before_ready(frame)
+            grid = frame.grid()
+            # A GRID names the last PTY record the tab produced before the
+            # change, which is the last one read here — the reply's fence
+            # before any. Ahead of its record or behind the fence, it is
+            # out of place.
+            if self.next_seq is not None:
+                assert grid["seq"] == self.next_seq - 1, (
+                    f"a GRID named seq {grid['seq']} where the stream stood at "
+                    f"seq {self.next_seq - 1}"
+                )
+            self.grids.append({**grid, "after_pty": self.pty_frames})
         elif frame.frame_type == FRAME_ERROR:
             self.error = frame.error()
             self.terminal_frame = "ERROR"

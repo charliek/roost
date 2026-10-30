@@ -108,7 +108,7 @@ fn retryable(error: &HostOpError) -> bool {
         error,
         HostOpError::QueueFull
             | HostOpError::Rejected {
-                code: ServerCode::Busy,
+                code: ServerCode::Busy | ServerCode::Owned,
                 ..
             }
     )
@@ -557,6 +557,10 @@ mod tests {
     fn a_busy_session_is_retried_and_any_other_refusal_is_not() {
         assert!(retryable(&HostOpError::QueueFull));
         assert!(retryable(&rejected(ServerCode::Busy)));
+        assert!(
+            retryable(&rejected(ServerCode::Owned)),
+            "an owned tab is retried until the wave learns to park it"
+        );
         assert!(!retryable(&rejected(ServerCode::NotFound)));
         assert!(!retryable(&rejected(ServerCode::InvalidParam)));
         assert!(!retryable(&HostOpError::Disconnected));

@@ -2480,6 +2480,12 @@ impl HostConnSet {
         Some(self.facts(&host)?.session_id.as_str())
     }
 
+    /// This process's client id, which every attach handshake names
+    /// beside the hello its control connection said.
+    pub(crate) fn client_id(&self) -> &str {
+        &self.client.client_id
+    }
+
     /// The theme changed. The slot every task re-reads on reconnect is
     /// updated first, then every connected host is told — so a session
     /// that reconnects during the round trip still gets the new colors.

@@ -2518,8 +2518,9 @@ pub struct AgentReportChangedEvent {
 /// [`ops::EVENT_NOTIFICATION_FIRED`]: a session suppresses nothing,
 /// because only a client knows what its own window is showing, and the
 /// client already reading the tab answers for all of them with a
-/// generation-checked [`ops::TAB_CLEAR_NOTIFICATION`] (#474). The PTY is
-/// sized by whoever interacted with it last.
+/// generation-checked [`ops::TAB_CLEAR_NOTIFICATION`] (#474). At `6` the
+/// PTY is sized by whoever interacted with it last; `7` replaces that
+/// with size ownership, below.
 /// [`ops::SESSION_SET_AGENT_HOOKS`] is a **raise, never a lower**: a
 /// client widens the host's own `agent-hooks` key with its own
 /// allow-list and can only ever add to it (plan 064 §3.3).
@@ -2538,6 +2539,17 @@ pub struct AgentReportChangedEvent {
 /// `program_status` means the tab has no records: a mirror clears its
 /// copy. A Swift UI target keeps no records, so its `Tab.state` is never
 /// composed.
+///
+/// And **tab size ownership** in place of "the last interactor sizes the
+/// PTY": a tab has at most one owning attachment, whose grid is the
+/// PTY's. An attach takes it only when it says `take` (or nobody owns the
+/// tab); deliberate input, a focused `RESIZE` and `TAKE` take it;
+/// watching never does. The owner leaving hands it on. Every change is
+/// announced in band (`GRID`) and as [`ops::EVENT_TAB_RESIZED`], and a
+/// background [`ops::TAB_RESIZE`] on an owned tab is refused `owned`.
+/// Clients name themselves with [`ops::CLIENT_HELLO`] and on every
+/// attach handshake (`client_id`). The data plane's preamble is
+/// `ROOSTDP3`.
 ///
 /// # The versioning rule
 ///
@@ -2728,19 +2740,7 @@ impl ClientHelloParams {
     /// The params as the session records them, with the label trimmed,
     /// or why they are refused.
     pub fn validate(self) -> Result<Self, String> {
-        let id = &self.client_id;
-        if id.is_empty() || id.len() > MAX_CLIENT_FIELD {
-            return Err(format!(
-                "client_id must be 1-{MAX_CLIENT_FIELD} bytes, got {}",
-                id.len()
-            ));
-        }
-        if !id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-        {
-            return Err("client_id must be [A-Za-z0-9._-] only".to_string());
-        }
+        validate_client_id(&self.client_id)?;
         // On the label as sent: a trim would otherwise quietly drop a
         // leading tab or a trailing newline instead of refusing it.
         if self.label.chars().any(char::is_control) {
@@ -2760,12 +2760,87 @@ impl ClientHelloParams {
     }
 }
 
+/// The one `client_id` rule, for a hello and an attach handshake alike:
+/// 1–64 bytes of `[A-Za-z0-9._-]`.
+pub fn validate_client_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > MAX_CLIENT_FIELD {
+        return Err(format!(
+            "client_id must be 1-{MAX_CLIENT_FIELD} bytes, got {}",
+            id.len()
+        ));
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err("client_id must be [A-Za-z0-9._-] only".to_string());
+    }
+    Ok(())
+}
+
 /// [`ops::CLIENT_HELLO`] result.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientHelloResult {
     /// Whether this connection arrived through a `client-bridge` that
     /// announced itself with a [`BridgePreamble`].
     pub bridged: bool,
+}
+
+/// [`ops::TAB_TAKE_SIZE`] params. On a session the tab id is bare; the
+/// `h<host>.<id>` spelling is a UI socket's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TabTakeSizeParams {
+    pub tab_id: WireTabRef,
+}
+
+/// [`ops::TAB_TAKE_SIZE`] result: the tab's grid once the caller's
+/// client owns it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TabTakeSizeResult {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// [`ops::TAB_RELEASE_SIZE`] params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TabReleaseSizeParams {
+    #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
+    pub tab_id: i64,
+}
+
+/// [`ops::TAB_FAIL_NEXT_RESIZE`] params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TabFailNextResizeParams {
+    #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
+    pub tab_id: i64,
+}
+
+/// [`ops::TAB_DROP_DATA_CONNS`] params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TabDropDataConnsParams {
+    #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
+    pub tab_id: i64,
+}
+
+/// [`ops::EVENT_TAB_RESIZED`] data: a session tab's grid or size owner
+/// changed. The same fact a `GRID` frame carries in band, for clients
+/// with no attachment to the tab; `owner` is always present, `null` when
+/// nobody owns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TabResizedEvent {
+    #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
+    pub tab_id: i64,
+    pub cols: u16,
+    pub rows: u16,
+    pub owner: Option<SizeOwner>,
 }
 
 /// The one line a `client-bridge` writes toward a session before it
@@ -2865,11 +2940,16 @@ pub struct AttachHandshakeTerms {
     pub cell_w_px: u16,
     pub cell_h_px: u16,
     pub libghostty_build: String,
-    /// Whether this attach claims the tab's geometry. `true` resizes
-    /// the tab to `cols`/`rows` during the handshake; `false` attaches
-    /// at whatever size the tab already is, so a client that is only
-    /// watching cannot shrink the one that is typing.
-    pub focus: bool,
+    /// Whether this attach takes the tab's size: an explicit tab switch
+    /// says `true`, and the tab is resized to `cols`/`rows` before the
+    /// snapshot is encoded. `false` is an automatic attach (a restore, a
+    /// reconnect), which takes only a tab nobody owns — otherwise its
+    /// grid is advisory and the tab keeps its owner's size.
+    pub take: bool,
+    /// Which client this attachment belongs to: the id it said
+    /// [`ops::CLIENT_HELLO`] with, in [`ClientHelloParams::client_id`]'s
+    /// format. Ownership, reclaim and handoff are all decided per client.
+    pub client_id: String,
 }
 
 impl AttachHandshake {
@@ -2930,7 +3010,9 @@ struct RawAttachHandshake {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     libghostty_build: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    focus: Option<bool>,
+    take: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume_from_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2957,7 +3039,10 @@ impl TryFrom<RawAttachHandshake> for AttachHandshake {
             libghostty_build: raw
                 .libghostty_build
                 .ok_or("an attach handshake is missing `libghostty_build`")?,
-            focus: raw.focus.ok_or("an attach handshake is missing `focus`")?,
+            take: raw.take.ok_or("an attach handshake is missing `take`")?,
+            client_id: raw
+                .client_id
+                .ok_or("an attach handshake is missing `client_id`")?,
         };
         Ok(AttachHandshake {
             attach: raw.attach,
@@ -2981,22 +3066,38 @@ impl JsonSchema for AttachHandshake {
     /// that are never optional. `cell_w_px`/`cell_h_px` stay out —
     /// they default to 0 for a headless client — and so does the
     /// all-or-nothing resume triple, which falls back to snapshot mode
-    /// rather than erroring.
+    /// rather than erroring. A required field is also not nullable: the
+    /// conversion refuses a `null` exactly as it refuses a missing field.
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        const REQUIRED: [&str; 9] = [
+            "attach",
+            "protocol_version",
+            "session_id",
+            "kinds",
+            "cols",
+            "rows",
+            "libghostty_build",
+            "take",
+            "client_id",
+        ];
         let mut schema = RawAttachHandshake::json_schema(generator);
-        schema.insert(
-            "required".to_string(),
-            json!([
-                "attach",
-                "protocol_version",
-                "session_id",
-                "kinds",
-                "cols",
-                "rows",
-                "libghostty_build",
-                "focus",
-            ]),
-        );
+        if let Some(properties) = schema
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for name in REQUIRED {
+                let Some(ty) = properties.get_mut(name).and_then(|p| p.get_mut("type")) else {
+                    continue;
+                };
+                if let serde_json::Value::Array(types) = ty {
+                    types.retain(|t| t != "null");
+                    if let [only] = types.as_slice() {
+                        *ty = only.clone();
+                    }
+                }
+            }
+        }
+        schema.insert("required".to_string(), json!(REQUIRED));
         schema
     }
 }
@@ -3014,7 +3115,8 @@ impl From<AttachHandshake> for RawAttachHandshake {
             cell_w_px: Some(t.cell_w_px),
             cell_h_px: Some(t.cell_h_px),
             libghostty_build: Some(t.libghostty_build),
-            focus: Some(t.focus),
+            take: Some(t.take),
+            client_id: Some(t.client_id),
             resume_from_seq: h.resume_from_seq,
             server_epoch: h.server_epoch,
             tab_generation: h.tab_generation,
@@ -3050,14 +3152,19 @@ pub enum AttachMode {
 /// afterwards. A resuming client replays the ring into the terminal it
 /// kept, which has the same problem for the same reason.
 ///
-/// Sent on **every** accepted reply — both modes, focused or not. A
-/// focused attach did resize the tab to its own geometry, and a resuming
-/// client did leave one behind — but raw input is open (plan 057 R15):
-/// any other client's geometry-bearing frame can land in between and
-/// resize the tab again, so "the client asked for it" is not evidence
-/// of what the bytes say. When the two agree the fields are a no-op.
+/// Sent on **every** accepted reply — both modes, taking or not. An
+/// attach that took the tab did resize it to its own geometry, and a
+/// resuming client did leave one behind — but another client can take
+/// the tab in between, so "the client asked for it" is not evidence of
+/// what the bytes say. When the two agree the fields are a no-op.
 /// Never absent: under protocol equality every session that answers an
 /// accepted handshake states the geometry its bytes were written for.
+///
+/// `owner` is the tab's size owner at that same instant (`None`: nobody
+/// owns it), read in the tab task's turn that encoded the snapshot or
+/// cut the resume, so the grid and the owner describe one moment.
+/// Anything that changes either afterwards reaches the client as a
+/// `GRID` frame.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AttachAccepted {
     pub kind: AttachPayloadKind,
@@ -3067,6 +3174,38 @@ pub struct AttachAccepted {
     pub tab_generation: u64,
     pub snapshot_cols: u16,
     pub snapshot_rows: u16,
+    pub owner: Option<SizeOwner>,
+}
+
+/// Which client sizes a tab: the client id its owning attachment was
+/// made with, and the label that attachment carried. The label is
+/// display only — two windows on one host share it, the id tells them
+/// apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SizeOwner {
+    pub client_id: String,
+    pub label: String,
+}
+
+/// A `GRID` frame's JSON payload: the tab's grid and size owner as of
+/// PTY frame `seq`, applied after that frame and before `seq + 1`.
+/// Several may share one `seq`; they apply in arrival order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GridFrame {
+    pub seq: u64,
+    pub cols: u16,
+    pub rows: u16,
+    pub owner: Option<SizeOwner>,
+}
+
+/// A key that has to be on the wire even when its value is `null`:
+/// `Some(None)` is a present `null`, `None` an absent key.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// The one JSON line a data connection gets back before the wire turns
@@ -3117,6 +3256,12 @@ struct RawAttachHandshakeReply {
     snapshot_cols: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     snapshot_rows: Option<u16>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    owner: Option<Option<SizeOwner>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<ResponseError>,
 }
@@ -3146,6 +3291,9 @@ impl TryFrom<RawAttachHandshakeReply> for AttachHandshakeReply {
                 snapshot_rows: raw
                     .snapshot_rows
                     .ok_or("accepted handshake reply is missing `snapshot_rows`")?,
+                owner: raw
+                    .owner
+                    .ok_or("accepted handshake reply is missing `owner`")?,
             }))
         } else {
             Ok(AttachHandshakeReply::Rejected(
@@ -3189,6 +3337,7 @@ impl JsonSchema for AttachHandshakeReply {
                 "tab_generation",
                 "snapshot_cols",
                 "snapshot_rows",
+                "owner",
             ],
         });
 
@@ -3216,6 +3365,7 @@ impl From<AttachHandshakeReply> for RawAttachHandshakeReply {
                 tab_generation: Some(a.tab_generation),
                 snapshot_cols: Some(a.snapshot_cols),
                 snapshot_rows: Some(a.snapshot_rows),
+                owner: Some(a.owner),
                 error: None,
             },
             AttachHandshakeReply::Rejected(error) => RawAttachHandshakeReply {
@@ -4207,6 +4357,21 @@ pub mod ops {
     /// and learn whether the connection came through a bridge. Only as
     /// the connection's first request; session-only.
     pub const CLIENT_HELLO: &str = "client.hello";
+    /// Make the caller's client the size owner of a tab it is attached
+    /// to — its newest attachment's grid applies. Session-only; the
+    /// connection must have said [`CLIENT_HELLO`].
+    pub const TAB_TAKE_SIZE: &str = "tab.take_size";
+    /// Give up the caller's client's size ownership of a tab: it is
+    /// handed on at once, never back to that client. A no-op when the
+    /// client does not own it. Session-only; needs [`CLIENT_HELLO`].
+    pub const TAB_RELEASE_SIZE: &str = "tab.release_size";
+    /// Test-only (`ROOST_TEST_MODE=1`): the tab's next server-terminal
+    /// resize fails before it changes anything. Session-only.
+    pub const TAB_FAIL_NEXT_RESIZE: &str = "tab.fail_next_resize";
+    /// Test-only (`ROOST_TEST_MODE=1`): close the tab's data connections
+    /// from the server side with no `DETACH` — what a network drop looks
+    /// like. Session-only.
+    pub const TAB_DROP_DATA_CONNS: &str = "tab.drop_data_conns";
     /// Raise + focus the running UI window. Sent by a second launch
     /// that loses the single-instance flock; takes no params (#6).
     pub const APP_ACTIVATE: &str = "app.activate";
@@ -4453,6 +4618,11 @@ pub mod ops {
     /// these only mean anything to an attached client;
     /// [`crate::messages::TabEffectEvent`] is the payload.
     pub const EVENT_TAB_EFFECT: &str = "tab.effect";
+    /// A session tab's grid or size owner changed —
+    /// [`crate::messages::TabResizedEvent`]. Live-only: a window drag
+    /// would otherwise fill the replay ring, and an attached client
+    /// recovers the same state from its handshake reply and `GRID`.
+    pub const EVENT_TAB_RESIZED: &str = "tab.resized";
     /// The session could not write `state.json`, or can again (#481).
     /// Carried on the session event stream only — a UI socket serves no
     /// subscription, and the in-process UI reads the same change off its

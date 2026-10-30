@@ -124,6 +124,7 @@ pub fn accepted(mode: AttachMode, seq: u64) -> AttachAccepted {
         tab_generation: STUB_GENERATION,
         snapshot_cols: 80,
         snapshot_rows: 24,
+        owner: None,
     }
 }
 

@@ -10,5 +10,6 @@
   "cell_w_px": 9,
   "cell_h_px": 18,
   "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
-  "focus": true
+  "take": true,
+  "client_id": "5d0c7e21a9f3b846"
 }

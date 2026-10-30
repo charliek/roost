@@ -49,6 +49,9 @@ const PAGES_PER_PASS: usize = 8;
 /// forfeits the remaining history pages, so a withheld one is sent when
 /// the hydration completes — but never held longer than this).
 const WITHHOLD_DEADLINE: Duration = Duration::from_secs(2);
+/// How long a detach leaves the data connection's writer to put `DETACH`
+/// on the wire before the attempt is aborted (plan 084 §4.B).
+const DETACH_DRAIN: Duration = Duration::from_millis(200);
 
 /// Re-attach backoff: base doubling, capped. Deterministic (no jitter):
 /// one client re-attaching one focused tab is not a thundering herd.
@@ -405,6 +408,12 @@ pub(super) struct HostAttach {
     /// The current attempt's tasks (dial/reader/writer/timers), aborted
     /// wholesale on detach or re-attach.
     tasks: Vec<tokio::task::AbortHandle>,
+    /// The current attempt's data-connection task, kept apart from
+    /// `tasks`: the one a detach lets finish writing `DETACH`.
+    data_task: Option<tokio::task::AbortHandle>,
+    /// Set once this attach is detaching: the data task stops feeding the
+    /// frames it still reads, which nothing will apply.
+    detaching: Arc<std::sync::atomic::AtomicBool>,
     backoff_step: u32,
     /// Permits refused by a full queue since the stream was last Live —
     /// see [`FULL_QUEUE_RETRIES`].
@@ -427,6 +436,8 @@ impl HostAttach {
             input_tx,
             input_rx: Arc::new(tokio::sync::Mutex::new(input_rx)),
             tasks: Vec::new(),
+            data_task: None,
+            detaching: Arc::default(),
             backoff_step: 0,
             full_refusals: 0,
         }
@@ -494,12 +505,14 @@ impl HostAttach {
     /// publishing `Connected` and publishing its facts, which is a
     /// "not yet", not a refusal — the attempt fails retryably and the
     /// ordinary backoff picks it up.
+    #[allow(clippy::too_many_arguments)] // One attempt's whole context, as the app holds it.
     pub(super) fn begin(
         &mut self,
         ops: &HostOps,
         session_id: Option<&str>,
         socket: std::path::PathBuf,
         libghostty_build: &str,
+        client_id: &str,
         feed: &EngineFeedSender,
     ) {
         self.abort_tasks();
@@ -533,9 +546,10 @@ impl HostAttach {
             cell_w_px: cell_px(geometry.cell_w),
             cell_h_px: cell_px(geometry.cell_h),
             libghostty_build: libghostty_build.to_string(),
-            // Attach is on-focus in this client, so the claim is always
-            // true.
-            focus: true,
+            // Attach is on-focus in this client, so it always takes the
+            // tab's size.
+            take: true,
+            client_id: client_id.to_string(),
         };
         let dial = Dial {
             socket,
@@ -553,9 +567,10 @@ impl HostAttach {
             permit,
             dial,
             input_rx,
+            Arc::clone(&self.detaching),
             feed.clone(),
         ));
-        self.tasks.push(task.abort_handle());
+        self.data_task = Some(task.abort_handle());
     }
 
     /// Arm the re-attach backoff timer: one `ReattachDue` for the
@@ -832,7 +847,11 @@ impl HostAttach {
     /// sent no RESIZE, leaves the session writing for a grid the kept
     /// terminal has left.
     pub(super) fn detach(mut self, kept: Option<(u16, u16)>) -> Option<ResumePoint> {
-        self.abort_tasks();
+        if matches!(self.phase, Phase::Hydrating(_) | Phase::Live) {
+            self.detach_on_the_wire();
+        } else {
+            self.abort_tasks();
+        }
         if let Phase::Hydrating(hydration) = std::mem::replace(&mut self.phase, Phase::Ended) {
             hydration.hydrator.abandon();
         }
@@ -862,8 +881,38 @@ impl HostAttach {
     }
 
     fn abort_tasks(&mut self) {
+        if let Some(task) = self.data_task.take() {
+            task.abort();
+        }
         for task in self.tasks.drain(..) {
             task.abort();
+        }
+    }
+
+    /// Tell the session this is a deliberate detach, so it hands the
+    /// tab's size on at once instead of holding it for this client's
+    /// grace: `DETACH` is queued behind whatever input is waiting, the
+    /// data task gets [`DETACH_DRAIN`] to write it, and everything else
+    /// goes now. Outside a runtime there is nothing to wait on, and the
+    /// detach is the disconnect it always was.
+    fn detach_on_the_wire(&mut self) {
+        self.detaching
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.input_tx.send(HostDataMsg::Detach);
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        let Some(data_task) = self.data_task.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    tokio::time::sleep(DETACH_DRAIN).await;
+                    data_task.abort();
+                });
+            }
+            Err(_) => data_task.abort(),
         }
     }
 
@@ -1296,6 +1345,7 @@ async fn run_attempt(
     permit: impl std::future::Future<Output = Result<AttachPermit, HostOpError>>,
     dial: Dial,
     input_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<HostDataMsg>>>,
+    detaching: Arc<std::sync::atomic::AtomicBool>,
     feed: EngineFeedSender,
 ) {
     let Dial { socket, handshake } = dial;
@@ -1365,6 +1415,20 @@ async fn run_attempt(
             snapshot_size: Some((accepted.snapshot_cols, accepted.snapshot_rows)),
         },
     ));
+    let mut rx = input_rx.lock().await;
+    stream_attempt(key, attempt, conn, &mut rx, &detaching, &feed).await;
+}
+
+/// One accepted attempt's connection, until its reader ends it — or, once
+/// the attach is detaching, until `DETACH` is written.
+async fn stream_attempt(
+    key: TabKey,
+    attempt: u64,
+    conn: DataConnection,
+    rx: &mut mpsc::UnboundedReceiver<HostDataMsg>,
+    detaching: &std::sync::atomic::AtomicBool,
+    feed: &EngineFeedSender,
+) {
     let (mut reader, mut writer) = conn.into_split();
     // Both halves are futures of THIS task rather than spawned children,
     // so aborting the attempt takes the writer with it and releases the
@@ -1375,7 +1439,7 @@ async fn run_attempt(
     // The lock serializes attempts over the persistent queue: a
     // previous attempt's writer holds it until dropped, and this one
     // takes over draining the same keystrokes.
-    let mut rx = input_rx.lock().await;
+    //
     // ONE loop over both halves, and only the READER decides when the
     // attempt is over. A write error just parks the writer branch: the
     // server labels its closes (`superseded`, `ERROR`
@@ -1386,9 +1450,17 @@ async fn run_attempt(
     loop {
         tokio::select! {
             read = read_server_frame(&mut reader) => match read {
+                // Draining for its `DETACH` only: whatever it reads, its own
+                // end included, is no news for a tab whose next attach may
+                // already be on this attempt number.
+                Ok(Some(_)) if detaching.load(std::sync::atomic::Ordering::Acquire) => {}
+                _ if detaching.load(std::sync::atomic::Ordering::Acquire) => return,
                 Ok(Some(frame)) => {
                     let done = matches!(frame, ServerFrame::Exit { .. } | ServerFrame::Error(_));
-                    feed.send(EngineFeed::HostTab(key, lift_frame(attempt, frame)));
+                    let Some(frame) = lift_frame(attempt, frame) else {
+                        continue;
+                    };
+                    feed.send(EngineFeed::HostTab(key, frame));
                     if done {
                         return;
                     }
@@ -1410,8 +1482,14 @@ async fn run_attempt(
                     writer_dead = true;
                     continue;
                 };
+                // Every keystroke and every resize takes the tab, which
+                // is what this client's on-focus attach already did.
                 let outcome = match msg {
-                    HostDataMsg::Input(bytes) => writer.send_input(&bytes).await,
+                    HostDataMsg::Input(bytes) => {
+                        writer
+                            .send_input(&bytes, roost_ipc::dataframe::InputTake::Before)
+                            .await
+                    }
                     HostDataMsg::Resize {
                         cols,
                         rows,
@@ -1419,8 +1497,14 @@ async fn run_attempt(
                         cell_h,
                     } => {
                         writer
-                            .send_resize(cols, rows, cell_w as u16, cell_h as u16)
+                            .send_resize(cols, rows, cell_w as u16, cell_h as u16, true)
                             .await
+                    }
+                    // Terminal on the wire: nothing more is written, and
+                    // the attempt is over.
+                    HostDataMsg::Detach => {
+                        let _ = writer.send_detach().await;
+                        return;
                     }
                 };
                 if outcome.is_err() {
@@ -1440,8 +1524,8 @@ async fn read_server_frame(
     }
 }
 
-fn lift_frame(attempt: u64, frame: ServerFrame) -> HostTabFrame {
-    match frame {
+fn lift_frame(attempt: u64, frame: ServerFrame) -> Option<HostTabFrame> {
+    Some(match frame {
         ServerFrame::Snap(bytes) => HostTabFrame::Snap { attempt, bytes },
         ServerFrame::Pty { seq, bytes } => HostTabFrame::Pty {
             attempt,
@@ -1458,7 +1542,10 @@ fn lift_frame(attempt: u64, frame: ServerFrame) -> HostTabFrame {
             code: error.code,
             message: error.message,
         },
-    }
+        // Decoded so the stream stays readable; this client keeps sizing
+        // every tab it shows, so it has nothing to follow.
+        ServerFrame::Grid(_) => return None,
+    })
 }
 
 #[cfg(test)]
@@ -1493,7 +1580,8 @@ mod tests {
             cell_w_px: cell_px(GEOMETRY.cell_w),
             cell_h_px: cell_px(GEOMETRY.cell_h),
             libghostty_build: "gb".into(),
-            focus: true,
+            take: true,
+            client_id: "iced-test".into(),
         }
     }
 
@@ -1759,7 +1847,7 @@ mod tests {
                 attach.on_frame(HostTabFrame::Closed { attempt: 1 }, &mut tab, &feed_tx),
                 AttachStep::Reattach { .. }
             ));
-            attach.begin(&ops, None, nowhere.clone(), "gb", &feed_tx);
+            attach.begin(&ops, None, nowhere.clone(), "gb", "iced-test", &feed_tx);
             assert_eq!(attach.resume, expected, "a re-attach after resize={resize}");
         }
     }
@@ -1873,7 +1961,8 @@ mod tests {
             "in this client's preference order"
         );
         assert_eq!((stated.cols, stated.rows), (80, 24));
-        assert!(stated.focus, "this client only attaches what it shows");
+        assert!(stated.take, "this client only attaches what it shows");
+        assert_eq!(stated.client_id, "iced-test");
 
         let resumed = choose_handshake(
             7,
@@ -2208,7 +2297,7 @@ mod tests {
             .into_iter()
             .flat_map(|msg| match msg {
                 HostDataMsg::Input(bytes) => bytes,
-                HostDataMsg::Resize { .. } => Vec::new(),
+                HostDataMsg::Resize { .. } | HostDataMsg::Detach => Vec::new(),
             })
             .collect();
         assert_eq!(
@@ -2642,6 +2731,7 @@ mod tests {
             Some("sess-1"),
             stand_in.socket.clone(),
             "gb",
+            "iced-test",
             &feed_tx,
         );
 
@@ -2679,6 +2769,7 @@ mod tests {
             Some("sess-1"),
             stand_in.socket.clone(),
             "gb",
+            "iced-test",
             &feed_tx,
         );
 
@@ -2744,6 +2835,7 @@ mod tests {
             Some("sess-1"),
             stand_in.socket.clone(),
             "gb",
+            "iced-test",
             &feed_tx,
         );
         let refusal = next_permit_refusal(&mut feed_rx).await;
@@ -2769,6 +2861,7 @@ mod tests {
             Some("sess-1"),
             stand_in.socket.clone(),
             "gb",
+            "iced-test",
             &feed_tx,
         );
 
@@ -2797,6 +2890,7 @@ mod tests {
                 Some("sess-1"),
                 std::path::PathBuf::from("/nonexistent/roost-full-queue.sock"),
                 "gb",
+                "iced-test",
                 &feed_tx,
             );
             let refusal = next_permit_refusal(&mut feed_rx).await;
@@ -2858,6 +2952,7 @@ mod tests {
             Some("sess-1"),
             std::path::PathBuf::from("/nonexistent/roost-gone-worker.sock"),
             "gb",
+            "iced-test",
             &feed_tx,
         );
         let refusal = next_permit_refusal(&mut feed_rx).await;
@@ -2992,6 +3087,58 @@ mod tests {
                 return frame;
             }
         }
+    }
+
+    /// A detaching attempt's connection ends without a word: the attach
+    /// that replaced it may be on the same attempt number, and a `Closed`
+    /// from this one would abort that.
+    #[tokio::test]
+    async fn a_detaching_connection_ends_without_a_word() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+        let (read, write) = client.into_split();
+        let (server_read, mut server_write) = server.into_split();
+        let reply = roost_ipc::messages::AttachHandshakeReply::Accepted(
+            roost_ipc::messages::AttachAccepted {
+                kind: AttachPayloadKind::from("ghostty-snapshot"),
+                mode: roost_ipc::messages::AttachMode::Snapshot,
+                seq: 0,
+                server_epoch: 1,
+                tab_generation: 1,
+                snapshot_cols: GEOMETRY.cols,
+                snapshot_rows: GEOMETRY.rows,
+                owner: None,
+            },
+        );
+        let body = serde_json::to_vec(&reply).expect("encode the reply");
+        roost_ipc::framing::write_frame(&mut server_write, &body)
+            .await
+            .expect("reply");
+        server_write
+            .write_all(&roost_ipc::dataframe::PREAMBLE)
+            .await
+            .expect("preamble");
+        let handshake = choose_handshake(key().tab, terms(), None);
+        let (_, conn) = DataConnection::handshake(read, write, &handshake)
+            .await
+            .expect("accepted");
+        drop((server_read, server_write));
+
+        let (feed_tx, mut feed_rx) = engine_feed::channel();
+        let (_input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let detaching = std::sync::atomic::AtomicBool::new(true);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_attempt(key(), 1, conn, &mut input_rx, &detaching, &feed_tx),
+        )
+        .await
+        .expect("the attempt ends with its connection");
+        let mut batch = crate::engine_feed::EngineBatch::default();
+        assert!(
+            feed_rx.try_next(&mut batch).is_none(),
+            "a detaching attempt publishes nothing"
+        );
     }
 
     /// FINISH promotes the hydration's fence — the moment it becomes

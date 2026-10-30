@@ -1850,6 +1850,9 @@ impl App {
         if let Some(attach) = self.host_attach.remove(&key) {
             self.background_resize.detached(key, Instant::now());
             let kept = self.tabs.get(&key).map(TerminalTab::grid);
+            // The detach leaves its data task a moment to say so on the
+            // wire, which needs the app runtime ambient.
+            let _guard = self.runtime.enter();
             if let Some(resume) = attach.detach(kept) {
                 self.host_resume.insert(key, resume);
             }
@@ -1926,6 +1929,7 @@ impl App {
             session_id,
             socket,
             &roost_vt::libghostty_build(),
+            self.hosts.client_id(),
             &self.feed_tx,
         );
     }

@@ -1032,35 +1032,23 @@
             "null"
           ]
         },
+        "client_id": {
+          "type": "string"
+        },
         "cols": {
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "focus": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "integer"
         },
         "kinds": {
           "items": {
             "$ref": "#/$defs/AttachPayloadKind"
           },
-          "type": [
-            "array",
-            "null"
-          ]
+          "type": "array"
         },
         "libghostty_build": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "protocol_version": {
           "format": "uint32",
@@ -1079,10 +1067,7 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": "integer"
         },
         "server_epoch": {
           "format": "uint64",
@@ -1093,10 +1078,7 @@
           ]
         },
         "session_id": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "tab_generation": {
           "format": "uint64",
@@ -1105,6 +1087,9 @@
             "integer",
             "null"
           ]
+        },
+        "take": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -1115,7 +1100,8 @@
         "cols",
         "rows",
         "libghostty_build",
-        "focus"
+        "take",
+        "client_id"
       ],
       "type": "object"
     },
@@ -1155,6 +1141,16 @@
             },
             "ok": {
               "const": true
+            },
+            "owner": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SizeOwner"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "seq": {
               "format": "uint64",
@@ -1207,7 +1203,8 @@
             "server_epoch",
             "tab_generation",
             "snapshot_cols",
-            "snapshot_rows"
+            "snapshot_rows",
+            "owner"
           ],
           "type": "object"
         },
@@ -1245,6 +1242,16 @@
             },
             "ok": {
               "const": false
+            },
+            "owner": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SizeOwner"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "seq": {
               "format": "uint64",
@@ -3713,6 +3720,21 @@
       ],
       "type": "object"
     },
+    "SizeOwner": {
+      "properties": {
+        "client_id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "client_id",
+        "label"
+      ],
+      "type": "object"
+    },
     "SkippedFile": {
       "properties": {
         "path": {
@@ -4063,6 +4085,18 @@
       ],
       "type": "object"
     },
+    "TabDropDataConnsParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
     "TabDumpCursor": {
       "properties": {
         "col": {
@@ -4283,6 +4317,18 @@
         "col0",
         "col1",
         "text"
+      ],
+      "type": "object"
+    },
+    "TabFailNextResizeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id"
       ],
       "type": "object"
     },
@@ -4530,6 +4576,18 @@
       ],
       "type": "object"
     },
+    "TabReleaseSizeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
     "TabReorderParams": {
       "additionalProperties": false,
       "properties": {
@@ -4570,6 +4628,42 @@
         "tab_id",
         "cols",
         "rows"
+      ],
+      "type": "object"
+    },
+    "TabResizedEvent": {
+      "properties": {
+        "cols": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SizeOwner"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rows": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "cols",
+        "rows",
+        "owner"
       ],
       "type": "object"
     },
@@ -4686,6 +4780,39 @@
       "required": [
         "tab_id",
         "state"
+      ],
+      "type": "object"
+    },
+    "TabTakeSizeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "$ref": "#/$defs/WireTabRef"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "TabTakeSizeResult": {
+      "properties": {
+        "cols": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cols",
+        "rows"
       ],
       "type": "object"
     },
@@ -4986,6 +5113,9 @@
     },
     "tab.password_input": {
       "$ref": "#/$defs/TabPasswordInputEvent"
+    },
+    "tab.resized": {
+      "$ref": "#/$defs/TabResizedEvent"
     },
     "tab.state_changed": {
       "$ref": "#/$defs/TabStateChangedEvent"
@@ -5553,6 +5683,14 @@
         "$ref": "#/$defs/EmptyResult"
       }
     },
+    "tab.drop_data_conns": {
+      "params": {
+        "$ref": "#/$defs/TabDropDataConnsParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
     "tab.dump": {
       "params": {
         "$ref": "#/$defs/TabDumpParams"
@@ -5575,6 +5713,14 @@
       },
       "result": {
         "$ref": "#/$defs/TabExpandSelectionAtResult"
+      }
+    },
+    "tab.fail_next_resize": {
+      "params": {
+        "$ref": "#/$defs/TabFailNextResizeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
       }
     },
     "tab.feed_ime": {
@@ -5625,6 +5771,14 @@
         "$ref": "#/$defs/TabOpenResult"
       }
     },
+    "tab.release_size": {
+      "params": {
+        "$ref": "#/$defs/TabReleaseSizeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
     "tab.reorder": {
       "params": {
         "$ref": "#/$defs/TabReorderParams"
@@ -5671,6 +5825,14 @@
       },
       "result": {
         "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "tab.take_size": {
+      "params": {
+        "$ref": "#/$defs/TabTakeSizeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TabTakeSizeResult"
       }
     },
     "tab.write": {
