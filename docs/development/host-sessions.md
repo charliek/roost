@@ -197,11 +197,13 @@ cancelled reclaim restores it. iced drains its own `DETACH` for at most
 background wave.
 
 **`client.hello` and the bridge preamble.** Ownership names clients, so
-the first request on a session control connection is `client.hello
+iced's first request on a session control connection is `client.hello
 {client_id, label}`, and every data attach carries the same `client_id`.
 The session keeps a registry of id to label while any connection of that
-id is open, and refuses a later hello or any other first request with
-`invalid-param`. A `client-bridge` writes one preamble line toward the
+id is open. A hello is optional, but only as a connection's first
+request: a later one is refused `invalid-param`. Only the ops that act
+for the caller's client, `tab.take_size` and `tab.release_size`, need
+one, and refuse a connection that never said it with `invalid-param`. A `client-bridge` writes one preamble line toward the
 daemon, `{"bridge":{"ssh_connection":…,"ssh_client":…}}`, and waits for
 `{"bridge":"accepted"}`; anything else (a pre-M3 daemon's `parse-error`,
 silence for 2 s) makes it re-dial and relay with no preamble, so an old

@@ -1814,6 +1814,7 @@ mod tests {
     use roost_ui_model::keys::HostId;
     use roost_vt::{Terminal, TerminalOptions};
 
+    use super::super::Regrid;
     use super::*;
     use crate::app::terminal_tab::TerminalTab;
     use crate::engine_feed::{self, EngineFeedReceiver};
@@ -4076,6 +4077,101 @@ mod tests {
         drop(input_tx);
         let mut batch = crate::engine_feed::EngineBatch::default();
         assert!(feed_rx.try_next(&mut batch).is_none(), "nothing published");
+    }
+
+    /// Plan 084 D6's launch case: a window attaches another client's tab
+    /// on its own, and its first layout then reports the grid the
+    /// handshake already carried, with the window focused. That is the
+    /// window settling, and sends nothing; a resize once it is laid out
+    /// is one the user made, and takes.
+    #[tokio::test]
+    async fn a_windows_first_layout_takes_nothing_and_its_next_resize_does() {
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(
+            accepted_at(
+                PayloadKind::GhosttySnapshot,
+                false,
+                100,
+                GEOMETRY.grid(),
+                owner(DESK),
+            ),
+            &mut tab,
+            &feed_tx,
+        );
+        let mut layout = super::super::WindowLayout::default();
+        attach.note_resize(GEOMETRY, layout.focused(Regrid::Window, true));
+        hydrate_fully(
+            &mut attach,
+            &mut tab,
+            &feed_tx,
+            &mut feed_rx,
+            snapshot_with("x"),
+        );
+        assert!(
+            attach.test_drain_input().is_empty(),
+            "the first layout is no resize"
+        );
+        layout.resized();
+        attach.note_resize(GEOMETRY, layout.focused(Regrid::Window, true));
+        assert!(matches!(
+            attach.test_drain_input().as_slice(),
+            [HostDataMsg::Resize { focused: true, .. }]
+        ));
+    }
+
+    /// iced drops a subscription's events when its queue is full, so a
+    /// window's first native resize can go missing. A font or sidebar
+    /// change the user makes in a focused window then lays it out itself,
+    /// and takes; so does a re-grid of the window's own size after it. In
+    /// an unfocused window the same change only advises.
+    #[tokio::test]
+    async fn a_users_regrid_lays_out_a_window_whose_first_resize_never_came() {
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(
+            accepted_at(
+                PayloadKind::GhosttySnapshot,
+                false,
+                100,
+                GEOMETRY.grid(),
+                owner(DESK),
+            ),
+            &mut tab,
+            &feed_tx,
+        );
+        hydrate_fully(
+            &mut attach,
+            &mut tab,
+            &feed_tx,
+            &mut feed_rx,
+            snapshot_with("x"),
+        );
+        let wider = Geometry {
+            cols: 90,
+            ..GEOMETRY
+        };
+
+        let mut unfocused = super::super::WindowLayout::default();
+        assert!(!unfocused.focused(Regrid::User, false));
+
+        let mut layout = super::super::WindowLayout::default();
+        attach.note_resize(wider, layout.focused(Regrid::User, true));
+        assert!(matches!(
+            attach.test_drain_input().as_slice(),
+            [HostDataMsg::Resize {
+                cols: 90,
+                focused: true,
+                ..
+            }]
+        ));
+        attach.note_resize(GEOMETRY, layout.focused(Regrid::Window, true));
+        assert!(matches!(
+            attach.test_drain_input().as_slice(),
+            [HostDataMsg::Resize {
+                cols: 80,
+                focused: true,
+                ..
+            }]
+        ));
     }
 
     /// A focused resize of a tab this window does not size is a take even

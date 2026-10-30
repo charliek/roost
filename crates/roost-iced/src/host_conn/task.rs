@@ -842,13 +842,22 @@ async fn dial_control(
 /// before `client.hello` answers `unknown-op`, and an old-path proxy
 /// `not-supported`, so any refusal of it is left for the identify that
 /// follows to judge.
+///
+/// A hello that got no answer costs its connection ([`say_hello`]), and
+/// the replacement says hello too: a connection that never named this
+/// client is refused every op that needs its identity (Take size) for as
+/// long as it lasts. Only a second hello lost the same way goes on
+/// without one, on a third connection.
 async fn open_control(
     config: &ConnectionConfig,
     mode: ConnectMode,
 ) -> Result<(IpcClient, ConnectFacts), AttemptError> {
     ensure_socket(config, mode).await?;
     let mut control = dial_control(config, mode).await?;
-    if !say_hello(&mut control, config).await {
+    for _ in 0..2 {
+        if say_hello(&mut control, config).await {
+            break;
+        }
         control = dial_control(config, mode).await?;
     }
     let identity = session_identify(&mut control).await?;
@@ -3536,6 +3545,10 @@ mod tests {
             let (reader, mut writer) = stream.into_split();
             let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(reader));
             let mut subscribed = false;
+            // C2's identity rule: a hello counts only as the connection's
+            // first request, and the size ops need one.
+            let mut first = true;
+            let mut named = false;
             loop {
                 let line = tokio::select! {
                     () = self.cut.requested(),
@@ -3605,8 +3618,21 @@ mod tests {
                             "error": { "code": code, "message": "refused by the script" },
                         })
                     });
+                let was_first = std::mem::take(&mut first);
                 let response = match op.as_str() {
                     _ if refused.is_some() => refused.expect("just checked"),
+                    ops::CLIENT_HELLO => {
+                        named = was_first;
+                        serde_json::json!({"id": id, "ok": true, "result": {}})
+                    }
+                    ops::TAB_TAKE_SIZE | ops::TAB_RELEASE_SIZE if !named => serde_json::json!({
+                        "id": id,
+                        "ok": false,
+                        "error": {
+                            "code": roost_ipc::codes::INVALID_PARAM,
+                            "message": "send client.hello first",
+                        },
+                    }),
                     ops::SESSION_IDENTIFY => {
                         self.identifies.fetch_add(1, Ordering::AcqRel);
                         let mut result = identify_result(self.session_id);
@@ -4536,20 +4562,30 @@ mod tests {
     }
 
     /// Plan 084 D1 (review): a hello that never got an answer leaves the
-    /// connection out of step, so the identify goes on a fresh one —
-    /// with no second hello — and the connect still lands.
+    /// connection out of step, so the next request goes on a fresh one —
+    /// and that one says hello first too, or every op that needs this
+    /// client's identity is refused on it for as long as it lasts.
     #[tokio::test]
-    async fn a_hello_the_session_hung_up_on_is_retried_as_a_fresh_identify() {
+    async fn a_hello_the_session_hung_up_on_is_said_again_on_the_replacement() {
         let dir = tempfile::tempdir().expect("temp dir");
         let socket = dir.path().join("hello.sock");
         let fake = Fake::new(PutFile::Land).hanging_up_on(ops::CLIENT_HELLO, 1);
         fake.serve(&socket);
         let host = Connected::start(socket, HostTransport::UnixSocket).await;
+        let taken = tokio::time::timeout(
+            Duration::from_secs(10),
+            host.ops
+                .call(ops::TAB_TAKE_SIZE, serde_json::json!({"tab_id": 1})),
+        )
+        .await
+        .expect("answered");
+        assert!(taken.is_ok(), "{taken:?}");
         let seen = fake.seen();
         assert_eq!(
-            seen.get(..2),
+            seen.get(..3),
             Some(
                 &[
+                    ops::CLIENT_HELLO.to_string(),
                     ops::CLIENT_HELLO.to_string(),
                     ops::SESSION_IDENTIFY.to_string()
                 ][..]
@@ -4557,14 +4593,40 @@ mod tests {
             "{seen:?}"
         );
         assert_eq!(
-            seen.iter().filter(|op| *op == ops::CLIENT_HELLO).count(),
-            1,
+            fake.dials.load(Ordering::Acquire),
+            3,
+            "the hung-up control dial, its replacement and the event stream's"
+        );
+        let states = host.stop().await;
+        assert_eq!(states.connections(), 1);
+    }
+
+    /// Two hellos lost the same way: the third connection goes on
+    /// without one, never reading a reply on a connection whose hello
+    /// got none, and the connect still lands.
+    #[tokio::test]
+    async fn a_second_lost_hello_connects_without_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("hello.sock");
+        let fake = Fake::new(PutFile::Land).hanging_up_on(ops::CLIENT_HELLO, 2);
+        fake.serve(&socket);
+        let host = Connected::start(socket, HostTransport::UnixSocket).await;
+        let seen = fake.seen();
+        assert_eq!(
+            seen.get(..3),
+            Some(
+                &[
+                    ops::CLIENT_HELLO.to_string(),
+                    ops::CLIENT_HELLO.to_string(),
+                    ops::SESSION_IDENTIFY.to_string()
+                ][..]
+            ),
             "{seen:?}"
         );
         assert_eq!(
             fake.dials.load(Ordering::Acquire),
-            3,
-            "the hung-up control dial, its replacement and the event stream's"
+            4,
+            "two hung-up control dials, the third and the event stream's"
         );
         let states = host.stop().await;
         assert_eq!(states.connections(), 1);

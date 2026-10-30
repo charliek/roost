@@ -843,8 +843,14 @@ below is already corrected where an entry changes it:*
 - **iced ignores any `client.hello` error** (`unknown-op` from protocol 6,
   `not-supported` from M2's old-path proxy); `identify` still decides
   compatibility. A hello that gets no answer is not trusted to leave the
-  connection in step: iced dials a fresh control connection and goes
-  straight to identify.
+  connection in step: iced dials a fresh control connection and says
+  hello there too, because a connection that never said it is refused
+  `tab.take_size` for as long as it lasts. Only a second lost hello goes
+  on without one, on a third connection.
+- **Hello is optional, but only first.** A connection that never says it
+  is served everything except the ops that act for the caller's client
+  (`tab.take_size`, `tab.release_size`), which refuse it
+  `invalid-param`.
 - **`roostctl` sends no hello** (a non-goal). `tab.take_size` is
   addressed by tab and the connection's hello'd client id, so
   `roostctl tab take-size` asks the UI, which takes the size for its own
@@ -870,6 +876,14 @@ below is already corrected where an entry changes it:*
 - **`RESIZE` carries FOCUSED**, captured at resize time. A focused resize
   while this window is not the owner sends even at an unchanged grid
   (font change, palette preview); unfocused, an unchanged grid dedupes.
+  The window's first layout, and any regrid before it, goes out
+  unfocused whatever focus says. It is the window settling: it reports
+  the grid that an automatic attach made before it (a restore, or the
+  slot's tab at launch) already carried, and as a focused resize it
+  would take the owned tab that attach was told to leave alone. A later
+  slot re-arm sends no `RESIZE` at all. iced can drop that first resize
+  event (a full subscription queue), so a font or sidebar change the user
+  makes lays the window out too, and goes focused.
 - **The mirror is the PTY's grid.** The window's own grid is kept apart as
   `advisory`. A GRID applies live, to the decoder, or deferred during
   hydration; hydration finishes at the grid the payload ended at. The

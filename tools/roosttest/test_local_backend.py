@@ -110,7 +110,7 @@ from test_password_input import (  # noqa: E402
     prompt_argv,
     raised_on,
 )
-from test_session_ownership import attached as raw_attached, geometry  # noqa: E402
+from test_session_ownership import attached as raw_attached, geometry, no_grid_within  # noqa: E402
 
 pytestmark = pytest.mark.host_client
 
@@ -2047,6 +2047,57 @@ def test_a17_the_wave_parks_a_tab_another_client_sizes_until_nobody_does(lane: L
         )
     finally:
         roost.window_resize(before["window_width"], before["window_height"])
+        desk.close()
+
+
+def test_a1_a_window_launched_onto_a_tab_another_client_sizes_leaves_its_size(lane: Lane):
+    """Plan 084 A1's launch case (C5): a window that comes up re-attaches
+    the slot's tab on its own, and nothing it does while it settles is a
+    resize anyone made — the first layout included, which reports the
+    window's grid unchanged and focused. The desk keeps the size, and
+    the window shows the tab sized by it.
+
+    Only Wayland orders it this way: there the first layout lands after
+    the attach is under way, and under X11 before it, where this passes
+    either way. The rule itself is pinned by the host-tab unit test
+    `a_windows_first_layout_takes_nothing_and_its_next_resize_does`."""
+    roost = session_ui(lane)
+    tab = roost.identify()["active_tab_id"]
+    desk_grid = (52, 14)
+    with lane.session() as c:
+        desk = raw_attached(lane.env, c, tab, "desk-a1-launch", True, desk_grid)[0]
+        wait_until(
+            lambda: geometry(c, tab) == desk_grid,
+            scaled_timeout(30.0),
+            "the desk to size the tab",
+        )
+    try:
+        roost = lane.restart()
+        wait_until(
+            lambda: roost.identify()["active_tab_id"] == tab,
+            scaled_timeout(60.0),
+            "the relaunched window to re-attach the slot's tab",
+        )
+        key = wait_until(
+            lambda: slot_key(roost, tab), scaled_timeout(30.0), "the window to list the tab"
+        )
+
+        def trace() -> list[dict]:
+            return roost.call("host.size_trace", {"tab_id": key})["actions"]
+
+        wait_until(
+            lambda: any(entry["action"] == "attach-accepted" for entry in trace())
+            and roost.window_metrics().get("mirror_grid") == {"cols": 52, "rows": 14},
+            scaled_timeout(30.0),
+            "the window's attach to be accepted and its mirror live",
+        )
+        no_grid_within(desk, 1.0)
+        assert {"action": "resize-sent", "focused": True} not in trace(), trace()
+        owner = roost.window_metrics().get("size_owner") or {}
+        assert owner.get("client_id") == "desk-a1-launch", owner
+        with lane.session() as c:
+            assert geometry(c, tab) == desk_grid
+    finally:
         desk.close()
 
 

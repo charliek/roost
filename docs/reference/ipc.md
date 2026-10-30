@@ -3993,8 +3993,11 @@ on an old socket path `not-supported`, and in both cases the identify
 that follows is what decides whether the connection is usable. A hello
 that gets no answer at all — a timeout, a closed connection — costs the
 connection instead, since a late reply would be read as the identify's:
-the client dials again and identifies with no hello. Only the control
-connection says hello. A **UI socket answers `unknown-op`**,
+the client dials again and says hello on the new connection too, since
+one that never said it is refused `tab.take_size` for as long as it
+lasts. Only if that hello gets no answer either does it dial a third
+time and identify with no hello. Only the control connection says
+hello. A **UI socket answers `unknown-op`**,
 like every other session op.
 
 ### `tab.take_size`
@@ -4407,7 +4410,9 @@ What takes the tab (rule 3's "deliberate interaction"):
 * `INPUT` with `TAKE_AFTER` — clicks, the wheel: the bytes are delivered
   at the current size, encoded against the grid the user saw, then the
   tab is taken;
-* `RESIZE` with `FOCUSED` — a window resized while it had focus;
+* `RESIZE` with `FOCUSED` — a window resized while it had focus. A
+  window's first layout, and any regrid before it, is the window
+  settling, not a resize, and Roost's client sends it unfocused;
 * `TAKE` — after a copy, or once a local scroll has settled;
 * [`tab.take_size`](#tabtake_size).
 

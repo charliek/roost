@@ -2997,6 +2997,47 @@ struct WindowOpenResult {
     retained_resize_scheduled: bool,
 }
 
+/// What moved the window's grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Regrid {
+    /// The window's own size: a native resize, or one read back for a
+    /// resize the events missed.
+    Window,
+    /// A font or sidebar change the user made.
+    User,
+}
+
+/// Whether the window has been laid out, which a re-grid needs to be a
+/// resize somebody made — one a focused window's host tabs hear as a take
+/// (plan 084 D6). The window's first layout, and anything that moves its
+/// grid before it, is the window settling: the grid a tab it attached on
+/// its own was already told, reported again.
+///
+/// The first native resize lays it out once its own re-grid has gone. iced
+/// drops a subscription's events when its queue is full, so that resize
+/// can go missing; a font or sidebar change the user makes lays it out
+/// too, since nobody makes one in a window that is not on screen.
+#[derive(Debug, Default)]
+pub(super) struct WindowLayout {
+    laid_out: bool,
+}
+
+impl WindowLayout {
+    /// A native resize has been applied.
+    fn resized(&mut self) {
+        self.laid_out = true;
+    }
+
+    /// Whether the re-grid `regrid` brings goes out focused, for a window
+    /// `focused` or not.
+    pub(super) fn focused(&mut self, regrid: Regrid, focused: bool) -> bool {
+        if regrid == Regrid::User {
+            self.laid_out = true;
+        }
+        focused && self.laid_out
+    }
+}
+
 fn prepare_window_opened(
     window_id: &mut Option<window::Id>,
     pending_window_resize: &mut Option<Size>,
@@ -3236,6 +3277,7 @@ pub struct App {
     /// The Agents panel divider's drag, held off `state.json` the same way.
     agents_split_drag: AgentsSplitDrag,
     window_focused: bool,
+    window_layout: WindowLayout,
     /// Native focus losses only; `app.window_metrics` reports it.
     native_focus_losses: u64,
     /// App-identity name the window title falls back to, fixed at bootstrap
@@ -3850,6 +3892,7 @@ impl App {
             sidebar_drag_width: None,
             agents_split_drag: AgentsSplitDrag::default(),
             window_focused: true,
+            window_layout: WindowLayout::default(),
             native_focus_losses: 0,
             title_fallback: title_fallback(profile.kind),
             ime_discard: ImeDiscard::default(),
@@ -3997,7 +4040,7 @@ impl App {
         };
         app.publish_local_route();
         app.reconcile();
-        app.resize(app.window_size);
+        app.resize(app.window_size, Regrid::Window);
         app.reconnect_saved_hosts();
         tracing::info!(socket = %profile.socket_path.display(), "Iced walking skeleton ready");
         Ok(app)
@@ -4891,8 +4934,9 @@ impl App {
             id,
         );
         if !opened.retained_resize_scheduled {
-            self.resize(size);
+            self.resize(size, Regrid::Window);
         }
+        self.window_layout.resized();
         // A native resize event confirms that Iced has rebuilt the widget
         // viewport. The test IPC path may already have stored the same logical
         // size, so invalidate even when `resize` sees no numeric change.
@@ -4951,7 +4995,7 @@ impl App {
                 gridded = ?self.window_size,
                 "window frame: re-grid for a resize the events missed"
             );
-            self.resize(size);
+            self.resize(size, Regrid::Window);
         }
     }
 
@@ -5450,7 +5494,7 @@ impl App {
     }
 
     #[track_caller]
-    pub fn resize(&mut self, size: Size) {
+    pub fn resize(&mut self, size: Size, regrid: Regrid) {
         let changed = self.window_size != size;
         if self.tabs.values().any(TerminalTab::autoscroll_armed) {
             tracing::info!(
@@ -5462,7 +5506,7 @@ impl App {
         }
         self.window_size = size;
         let grid = self.current_grid();
-        self.note_host_grid(grid);
+        self.note_host_grid(grid, regrid);
         regrid_window(
             &mut self.tabs,
             &mut self.host_resume,
@@ -7393,7 +7437,7 @@ impl App {
             return;
         }
         self.sidebar_drag_width = Some(width);
-        self.resize(self.window_size);
+        self.resize(self.window_size, Regrid::User);
     }
 
     pub fn sidebar_resize_ended(&mut self) {
@@ -7416,7 +7460,7 @@ impl App {
         drop_drag_and_collapse(&mut self.sidebar_drag_width, &self.workspace);
         self.cancel_drags();
         self.cancel_editor_for_interaction();
-        self.resize(self.window_size);
+        self.resize(self.window_size, Regrid::User);
     }
 
     fn commit_sidebar_drag(&mut self) {
@@ -7444,7 +7488,7 @@ impl App {
         }
         self.workspace.set_sidebar_collapsed(collapsed);
         self.settle_agents_split_drag();
-        self.resize(self.window_size);
+        self.resize(self.window_size, Regrid::User);
     }
 
     fn toggle_sidebar_agents(&mut self) {

@@ -1863,12 +1863,13 @@ impl App {
     /// The attached host tabs' sessions hear the window's grid too, with
     /// whether the window has focus as it resizes: a focused resize takes
     /// the tab's size, an unfocused one only says what this window would
-    /// like (plan 084 D6). The machine decides when (immediately while
+    /// like (plan 084 D6). A window not yet laid out is never resizing
+    /// ([`super::WindowLayout`]). The machine decides when (immediately while
     /// live; withheld during hydration, where a mid-snapshot resize
     /// forfeits history).
-    pub(super) fn note_host_grid(&mut self, (cols, rows): (u16, u16)) {
+    pub(super) fn note_host_grid(&mut self, (cols, rows): (u16, u16), regrid: super::Regrid) {
         let geometry = self.host_geometry(cols, rows);
-        let focused = self.window_focused;
+        let focused = self.window_layout.focused(regrid, self.window_focused);
         for attach in self.host_attach.values_mut() {
             attach.note_resize(geometry, focused);
         }
@@ -4130,7 +4131,7 @@ impl App {
                     // the requested logical geometry immediately for the
                     // deterministic test port; a compositor Resized event
                     // remains authoritative if it sends one afterward.
-                    self.resize(size);
+                    self.resize(size, super::Regrid::Window);
                     if let Some(id) = self.window_id {
                         task = task.then(UiTask::Resize(id, size));
                     } else {
@@ -4152,7 +4153,7 @@ impl App {
                     // the one the layout and the next relaunch both see.
                     self.commit_sidebar_drag();
                     self.workspace.set_sidebar_width(width);
-                    self.resize(self.window_size);
+                    self.resize(self.window_size, super::Regrid::User);
                     Ok(())
                 };
                 let _ = reply.send(result);

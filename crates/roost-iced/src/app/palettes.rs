@@ -875,7 +875,7 @@ impl App {
             }
         }
         commit_typography_regrid(&mut self.tabs, &mut self.host_resume, applied, operation);
-        self.note_host_grid((cols, rows));
+        self.note_host_grid((cols, rows), super::Regrid::User);
         self.background_resize.trigger(Instant::now());
         Ok(())
     }
