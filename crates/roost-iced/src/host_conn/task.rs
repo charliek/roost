@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use roost_ipc::client::{ClientError, EventFrame, EventStream, IpcClient, ServerCode};
 use roost_ipc::messages::{
-    ops, EventBatch, OscColorsParams, SessionIdentify, SessionIdentifyParams,
+    ops, ClientHelloParams, EventBatch, OscColorsParams, SessionIdentify, SessionIdentifyParams,
     SessionSetThemeParams, TabListResult,
 };
 use roost_ipc::session_launch::{self, FirstProject};
@@ -206,6 +206,8 @@ pub(crate) struct ConnectionConfig {
     pub(crate) resume: Option<Resume>,
     /// This session's pinned libghostty identity, compared exactly.
     pub(crate) client_build: String,
+    /// What [`open_control`] says `client.hello` with.
+    pub(crate) client: ClientHelloParams,
     /// The client's terminal palette, re-read on every (re)connect so a
     /// theme changed while disconnected is the one the session gets.
     pub(crate) theme: Arc<Mutex<OscColorsParams>>,
@@ -831,17 +833,24 @@ async fn dial_control(
         .map_err(|error| dial_failure(mode, &config.socket, &error))
 }
 
-/// The prologue's opening: make sure a session is there, dial it, and
-/// gate on `session.identify` before anything else is said.
+/// The prologue's opening: make sure a session is there, dial it, name
+/// this client, and gate on `session.identify` before anything else is
+/// said.
 ///
 /// Nothing binary exists yet at this point, so every incompatibility is
-/// caught on stable JSON.
+/// caught on stable JSON. That includes the hello's: a session from
+/// before `client.hello` answers `unknown-op`, and an old-path proxy
+/// `not-supported`, so any refusal of it is left for the identify that
+/// follows to judge.
 async fn open_control(
     config: &ConnectionConfig,
     mode: ConnectMode,
 ) -> Result<(IpcClient, ConnectFacts), AttemptError> {
     ensure_socket(config, mode).await?;
     let mut control = dial_control(config, mode).await?;
+    if !say_hello(&mut control, config).await {
+        control = dial_control(config, mode).await?;
+    }
     let identity = session_identify(&mut control).await?;
     let compatibility = check_compatibility(
         &identity,
@@ -862,6 +871,30 @@ async fn open_control(
         );
     }
     Ok((control, facts))
+}
+
+/// Send `client.hello`, and say whether `control` is still fit for the
+/// identify: a refusal the session answered leaves it in step, while a
+/// hello that timed out, hung up or came back unreadable may leave a
+/// late reply on the wire to be mistaken for the identify's.
+async fn say_hello(control: &mut IpcClient, config: &ConnectionConfig) -> bool {
+    let sent =
+        tokio::time::timeout(leg(), control.call_raw(ops::CLIENT_HELLO, &config.client)).await;
+    match sent {
+        Ok(Ok(_)) => true,
+        Ok(Err(ClientError::Server { code, .. })) => {
+            tracing::debug!(host = %config.host, %code, "client.hello refused; identify decides");
+            true
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(host = %config.host, %error, "client.hello failed; dialing again");
+            false
+        }
+        Err(_) => {
+            tracing::debug!(host = %config.host, "client.hello timed out; dialing again");
+            false
+        }
+    }
 }
 
 /// A prologue's subscription, and the mirror handle its connection will
@@ -2482,6 +2515,10 @@ mod tests {
             mode,
             resume: None,
             client_build: "gb".into(),
+            client: ClientHelloParams {
+                client_id: "0123456789abcdef".into(),
+                label: "test".into(),
+            },
             theme: Arc::new(Mutex::new(super::super::blank_theme())),
             uploads: Uploads::default(),
             serving: queue::Serving::default(),
@@ -3318,6 +3355,10 @@ mod tests {
         /// between the gate and the subscription that would have carried
         /// the announcement.
         fails_after_identify: Arc<Mutex<Option<String>>>,
+        /// An op this session hangs up on instead of answering, the
+        /// first `hang_ups` times it is sent.
+        hang_up_on: Option<&'static str>,
+        hang_ups: Arc<AtomicUsize>,
     }
 
     impl Fake {
@@ -3348,6 +3389,8 @@ mod tests {
                 streams_ended: Arc::new(AtomicUsize::new(0)),
                 persist_error: Arc::new(Mutex::new(None)),
                 fails_after_identify: Arc::new(Mutex::new(None)),
+                hang_up_on: None,
+                hang_ups: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -3439,6 +3482,14 @@ mod tests {
             self
         }
 
+        /// Close the connection on `op`, unanswered, the first `times`
+        /// times it is sent.
+        fn hanging_up_on(mut self, op: &'static str, times: usize) -> Fake {
+            self.hang_up_on = Some(op);
+            self.hang_ups.store(times, Ordering::Release);
+            self
+        }
+
         /// Refuse one op by name, however often it is sent.
         fn refusing(mut self, op: &'static str, code: &'static str) -> Fake {
             self.refuse_op = Some((op, code));
@@ -3525,6 +3576,16 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push(op.clone());
+                if self.hang_up_on == Some(op.as_str())
+                    && self
+                        .hang_ups
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                            left.checked_sub(1)
+                        })
+                        .is_ok()
+                {
+                    return;
+                }
                 if self.stall == Some(op.as_str()) && armed(&self.stall_skips) {
                     self.stalled.request();
                     self.release.requested().await;
@@ -4427,6 +4488,81 @@ mod tests {
 
         let states = host.stop().await;
         assert_eq!(states.connections(), 1, "one incarnation throughout");
+    }
+
+    /// Plan 084 D1: the control connection says `client.hello` before
+    /// anything else, and a session that refuses it — one from before the
+    /// op, or an old-path proxy — still connects: the identify decides.
+    #[tokio::test]
+    async fn the_control_connection_says_hello_first_and_a_refusal_changes_nothing() {
+        for refusal in [
+            None,
+            Some(roost_ipc::codes::UNKNOWN_OP),
+            Some(roost_ipc::codes::NOT_SUPPORTED),
+        ] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let socket = dir.path().join("hello.sock");
+            let fake = match refusal {
+                Some(code) => Fake::new(PutFile::Land).refusing(ops::CLIENT_HELLO, code),
+                None => Fake::new(PutFile::Land),
+            };
+            fake.serve(&socket);
+            let host = Connected::start(socket, HostTransport::UnixSocket).await;
+            let seen = fake.seen();
+            assert_eq!(
+                seen.get(..2),
+                Some(
+                    &[
+                        ops::CLIENT_HELLO.to_string(),
+                        ops::SESSION_IDENTIFY.to_string()
+                    ][..]
+                ),
+                "{refusal:?}: {seen:?}"
+            );
+            assert_eq!(
+                fake.dials.load(Ordering::Acquire),
+                2,
+                "{refusal:?}: an answered hello keeps its connection — one \
+                 control dial and the event stream's"
+            );
+            let states = host.stop().await;
+            assert_eq!(states.connections(), 1, "{refusal:?}");
+        }
+    }
+
+    /// Plan 084 D1 (review): a hello that never got an answer leaves the
+    /// connection out of step, so the identify goes on a fresh one —
+    /// with no second hello — and the connect still lands.
+    #[tokio::test]
+    async fn a_hello_the_session_hung_up_on_is_retried_as_a_fresh_identify() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("hello.sock");
+        let fake = Fake::new(PutFile::Land).hanging_up_on(ops::CLIENT_HELLO, 1);
+        fake.serve(&socket);
+        let host = Connected::start(socket, HostTransport::UnixSocket).await;
+        let seen = fake.seen();
+        assert_eq!(
+            seen.get(..2),
+            Some(
+                &[
+                    ops::CLIENT_HELLO.to_string(),
+                    ops::SESSION_IDENTIFY.to_string()
+                ][..]
+            ),
+            "{seen:?}"
+        );
+        assert_eq!(
+            seen.iter().filter(|op| *op == ops::CLIENT_HELLO).count(),
+            1,
+            "{seen:?}"
+        );
+        assert_eq!(
+            fake.dials.load(Ordering::Acquire),
+            3,
+            "the hung-up control dial, its replacement and the event stream's"
+        );
+        let states = host.stop().await;
+        assert_eq!(states.connections(), 1);
     }
 
     /// **The permit's two halves, against the worker that grants it**

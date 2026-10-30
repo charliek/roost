@@ -27,8 +27,9 @@ use crate::codes;
 use crate::dataframe::DataFrameReader;
 use crate::framing::{write_frame, FrameReader};
 use crate::messages::{
-    AttachHandshake, AttachHandshakeReply, EventEnvelope, RawRequest, Response,
-    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
+    AttachHandshake, AttachHandshakeReply, BridgeOrigin, BridgePreamble, EventEnvelope, RawRequest,
+    Response, BRIDGE_ACCEPTED, MAX_BRIDGE_PREAMBLE, SESSION_PROTOCOL_VERSION,
+    SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
 };
 use crate::socket_state::{self, SocketState};
 use crate::Error;
@@ -165,6 +166,11 @@ pub const CLOSE_LABEL_DEADLINE: std::time::Duration = std::time::Duration::from_
 pub struct ConnCtx {
     pub conn_id: u64,
     pub closer: ConnCloser,
+    /// Where a bridged connection came from, when it opened with a
+    /// [`BridgePreamble`] on a server that accepts one. `None` is a
+    /// local connection.
+    pub bridge: Option<BridgeOrigin>,
+    handled: u64,
 }
 
 impl ConnCtx {
@@ -173,7 +179,29 @@ impl ConnCtx {
     /// [`Handler`] directly calls it to get a context to hand in.
     pub fn new(conn_id: u64) -> (Self, ConnCloseWatch) {
         let (closer, watch) = ConnCloser::new();
-        (Self { conn_id, closer }, watch)
+        (
+            Self {
+                conn_id,
+                closer,
+                bridge: None,
+                handled: 0,
+            },
+            watch,
+        )
+    }
+
+    /// How many requests this connection had handed to the handler
+    /// before the one being handled now. A line that never decoded as a
+    /// request does not count.
+    pub fn requests_before(&self) -> u64 {
+        self.handled
+    }
+
+    /// Count one request as handled. The accept loop calls this after
+    /// every [`Handler::handle`]; a test driving a handler directly
+    /// calls it to stand in for the loop.
+    pub fn note_handled(&mut self) {
+        self.handled += 1;
     }
 }
 
@@ -450,6 +478,8 @@ pub struct IpcServer<H: Handler> {
     /// effective UID differs. Unset by default — the UI sockets keep
     /// the behavior they have always had.
     required_uid: Option<u32>,
+    /// See [`Self::accept_bridge_preamble`].
+    bridge_preamble: bool,
 }
 
 impl<H: Handler> IpcServer<H> {
@@ -527,6 +557,7 @@ impl<H: Handler> IpcServer<H> {
             handler: Arc::new(handler),
             socket_path,
             required_uid: None,
+            bridge_preamble: false,
         })
     }
 
@@ -551,6 +582,20 @@ impl<H: Handler> IpcServer<H> {
     #[must_use]
     pub fn require_same_uid(self) -> Self {
         self.require_uid(crate::peer::current_euid())
+    }
+
+    /// Recognise a [`BridgePreamble`] as a connection's first line:
+    /// record its origin on the [`ConnCtx`], answer [`BRIDGE_ACCEPTED`],
+    /// and read the next line as the first one, so either plane can
+    /// follow it.
+    ///
+    /// Off by default: only a session's socket is ever reached through a
+    /// `client-bridge`, and a UI socket keeps answering such a line as
+    /// the malformed request it is there.
+    #[must_use]
+    pub fn accept_bridge_preamble(mut self) -> Self {
+        self.bridge_preamble = true;
+        self
     }
 
     /// Run the accept loop until the listener returns an error.
@@ -612,10 +657,11 @@ impl<H: Handler> IpcServer<H> {
             let mut cancel = cancel_rx.clone();
             let keep_sender_alive = cancel_tx.clone();
             let conn_id = next_conn_id();
+            let bridge_preamble = self.bridge_preamble;
             tokio::spawn(async move {
                 let _keep_sender_alive = keep_sender_alive;
                 tokio::select! {
-                    served = serve_connection(conn, Arc::clone(&handler), conn_id) => {
+                    served = serve_connection(conn, Arc::clone(&handler), conn_id, bridge_preamble) => {
                         if let Err(e) = served {
                             debug!(error = %e, "ipc connection ended");
                         }
@@ -687,14 +733,53 @@ fn is_data_handshake(line: &[u8]) -> bool {
     map.contains_key("attach") && !map.contains_key("op")
 }
 
+/// What a connection's first line is, on a server that accepts a bridge
+/// preamble.
+#[derive(Debug, PartialEq, Eq)]
+enum Preamble {
+    /// Not a preamble: the line is sniffed and served as it always was.
+    Absent,
+    Valid(BridgeOrigin),
+    /// A preamble the server refuses, closing the connection: why.
+    Invalid(String),
+}
+
+/// A JSON object whose only key is `bridge` is a preamble; whether it is
+/// one this server can take is the rest.
+fn classify_preamble(line: &[u8]) -> Preamble {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(line)
+    else {
+        return Preamble::Absent;
+    };
+    if map.len() != 1 || !map.contains_key("bridge") {
+        return Preamble::Absent;
+    }
+    // Checked before the decode: a derived struct deserializer also
+    // takes a positional array, which is not the object the wire names.
+    if !map["bridge"].is_object() {
+        return Preamble::Invalid("bridge preamble's `bridge` is not an object".to_string());
+    }
+    if line.len() > MAX_BRIDGE_PREAMBLE {
+        return Preamble::Invalid(format!(
+            "bridge preamble is {} bytes, over the {MAX_BRIDGE_PREAMBLE} byte limit",
+            line.len()
+        ));
+    }
+    match serde_json::from_value::<BridgePreamble>(serde_json::Value::Object(map)) {
+        Ok(preamble) => Preamble::Valid(preamble.bridge),
+        Err(e) => Preamble::Invalid(format!("bridge preamble decode failed: {e}")),
+    }
+}
+
 async fn serve_connection<H: Handler>(
     stream: UnixStream,
     handler: Arc<H>,
     conn_id: u64,
+    bridge_preamble: bool,
 ) -> Result<(), Error> {
     let (r, mut w) = stream.into_split();
     let mut reader = FrameReader::new(r);
-    let (ctx, mut close_watch) = ConnCtx::new(conn_id);
+    let (mut ctx, mut close_watch) = ConnCtx::new(conn_id);
     // The sniff is a property of the connection's *first* line only, so
     // a request stream can never be diverted mid-flight by a payload
     // that happens to look like a handshake.
@@ -730,6 +815,28 @@ async fn serve_connection<H: Handler>(
                 return Ok(());
             }
         };
+
+        // A connection that opened with a preamble keeps checking for one
+        // on every line, so a second is refused wherever it comes; one
+        // that did not leaves a preamble-shaped line after its first to
+        // the request path, as a malformed request.
+        if bridge_preamble && (first_line || ctx.bridge.is_some()) {
+            match classify_preamble(&line) {
+                Preamble::Absent => {}
+                Preamble::Valid(origin) if ctx.bridge.is_none() => {
+                    ctx.bridge = Some(origin);
+                    write_frame(&mut w, BRIDGE_ACCEPTED.as_bytes()).await?;
+                    continue;
+                }
+                Preamble::Valid(_) => {
+                    let message = "a second bridge preamble on one connection".to_string();
+                    return refuse_preamble(&mut w, conn_id, message).await;
+                }
+                Preamble::Invalid(message) => {
+                    return refuse_preamble(&mut w, conn_id, message).await;
+                }
+            }
+        }
 
         if std::mem::take(&mut first_line) && is_data_handshake(&line) {
             return serve_data(&ctx, handler.as_ref(), reader, w, close_watch, &line).await;
@@ -770,6 +877,7 @@ async fn serve_connection<H: Handler>(
         let id = request.id;
         let op = request.op.clone();
         let result = handler.handle(&ctx, &op, request.params).await;
+        ctx.note_handled();
         let (response, action) = match result {
             Ok(HandlerOutcome::Reply(value)) => (Response::ok(id, value), None),
             Ok(HandlerOutcome::ReplyThen { reply, then }) => (Response::ok(id, reply), Some(then)),
@@ -852,6 +960,19 @@ async fn serve_connection<H: Handler>(
             }
         }
     }
+}
+
+/// A refused bridge preamble ends the connection: the bridge reads
+/// anything but [`BRIDGE_ACCEPTED`] as "relay without one", and a
+/// connection whose origin is in doubt is not worth serving.
+async fn refuse_preamble(
+    w: &mut tokio::net::unix::OwnedWriteHalf,
+    conn_id: u64,
+    message: String,
+) -> Result<(), Error> {
+    debug!(conn_id, %message, "refusing a bridge preamble");
+    let body = serde_json::to_vec(&Response::err(0, codes::PARSE_ERROR, message))?;
+    write_frame(w, &body).await
 }
 
 /// A connection whose first line was an attach handshake. From here on
@@ -1157,5 +1278,323 @@ async fn remove_socket_if_present(path: &Path) -> anyhow::Result<()> {
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+    use tokio::net::unix::OwnedReadHalf;
+
+    #[test]
+    fn only_an_object_whose_sole_key_is_bridge_is_a_preamble() {
+        for line in [
+            &br#"{"id":"1","op":"session.identify","params":{}}"#[..],
+            br#"{"bridge":{},"op":"x"}"#,
+            br#"["bridge"]"#,
+            b"not json",
+            br#""bridge""#,
+        ] {
+            assert_eq!(
+                classify_preamble(line),
+                Preamble::Absent,
+                "{}",
+                String::from_utf8_lossy(line)
+            );
+        }
+        assert_eq!(
+            classify_preamble(br#"{"bridge":{"ssh_connection":null,"ssh_client":"1.2.3.4 5 22"}}"#),
+            Preamble::Valid(BridgeOrigin {
+                ssh_connection: None,
+                ssh_client: Some("1.2.3.4 5 22".into()),
+            })
+        );
+        // The inner object is permissive, so a later bridge can say more.
+        assert_eq!(
+            classify_preamble(br#"{"bridge":{"future":1}}"#),
+            Preamble::Valid(BridgeOrigin::default())
+        );
+        for line in [
+            &br#"{"bridge":"x"}"#[..],
+            br#"{"bridge":null}"#,
+            br#"{"bridge":[null,null]}"#,
+            br#"{"bridge":[]}"#,
+            br#"{"bridge":{"ssh_client":7}}"#,
+        ] {
+            assert!(
+                matches!(classify_preamble(line), Preamble::Invalid(_)),
+                "{}",
+                String::from_utf8_lossy(line)
+            );
+        }
+    }
+
+    #[test]
+    fn a_preamble_over_the_limit_is_refused() {
+        let line = |len: usize| {
+            let head = br#"{"bridge":{"ssh_client":""#.len() + br#""}}"#.len();
+            format!(
+                r#"{{"bridge":{{"ssh_client":"{}"}}}}"#,
+                "a".repeat(len - head)
+            )
+            .into_bytes()
+        };
+        assert_eq!(line(MAX_BRIDGE_PREAMBLE).len(), MAX_BRIDGE_PREAMBLE);
+        assert!(matches!(
+            classify_preamble(&line(MAX_BRIDGE_PREAMBLE)),
+            Preamble::Valid(_)
+        ));
+        assert!(matches!(
+            classify_preamble(&line(MAX_BRIDGE_PREAMBLE + 1)),
+            Preamble::Invalid(_)
+        ));
+    }
+
+    /// Answers every request with what its connection knows about itself,
+    /// and every data connection with one line saying the same.
+    struct Echo;
+
+    impl Handler for Echo {
+        fn handle<'a>(
+            &'a self,
+            ctx: &'a ConnCtx,
+            op: &'a str,
+            _params: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<HandlerOutcome, HandlerError>> + Send + 'a>>
+        {
+            let reply = serde_json::json!({
+                "op": op,
+                "bridge": serde_json::to_value(&ctx.bridge).unwrap(),
+                "requests_before": ctx.requests_before(),
+            });
+            Box::pin(async move { Ok(HandlerOutcome::Reply(reply)) })
+        }
+
+        fn handle_data<'a>(
+            &'a self,
+            ctx: &'a ConnCtx,
+            handshake: AttachHandshake,
+            conn: DataConn,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async move {
+                let (_reader, mut writer, _close) = conn.into_parts();
+                let line = serde_json::json!({
+                    "attach": handshake.attach,
+                    "bridge": serde_json::to_value(&ctx.bridge).unwrap(),
+                });
+                let _ = write_frame(&mut writer, &serde_json::to_vec(&line).unwrap()).await;
+            })
+        }
+    }
+
+    struct Peer {
+        _dir: tempfile::TempDir,
+        lines: Lines<BufReader<OwnedReadHalf>>,
+        write: tokio::net::unix::OwnedWriteHalf,
+    }
+
+    impl Peer {
+        async fn send(&mut self, line: &str) {
+            self.write
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write a line");
+        }
+
+        async fn recv(&mut self) -> serde_json::Value {
+            let line = self
+                .lines
+                .next_line()
+                .await
+                .expect("read a line")
+                .expect("a line before EOF");
+            serde_json::from_str(&line).expect("a JSON line")
+        }
+
+        async fn eof(&mut self) {
+            assert_eq!(self.lines.next_line().await.expect("read to EOF"), None);
+        }
+    }
+
+    async fn dial(preamble: bool) -> Peer {
+        let dir = tempfile::Builder::new()
+            .prefix("roost-pre-")
+            .tempdir_in("/tmp")
+            .expect("tempdir");
+        let path = dir.path().join("s.sock");
+        let server = IpcServer::bind(&path, Echo).await.expect("bind");
+        let server = if preamble {
+            server.accept_bridge_preamble()
+        } else {
+            server
+        };
+        tokio::spawn(server.run());
+        let (read, write) = UnixStream::connect(&path)
+            .await
+            .expect("connect")
+            .into_split();
+        Peer {
+            _dir: dir,
+            lines: BufReader::new(read).lines(),
+            write,
+        }
+    }
+
+    const PREAMBLE: &str =
+        r#"{"bridge":{"ssh_connection":"10.0.0.1 5000 10.0.0.2 22","ssh_client":null}}"#;
+    const REQUEST: &str = r#"{"id":"3","op":"session.identify","params":{}}"#;
+
+    fn handshake_line() -> String {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/ipc-vectors/attach.handshake.request.json"
+        ))
+        .unwrap();
+        vector.to_string()
+    }
+
+    /// Plan 084 D2: the preamble is acknowledged, recorded on the
+    /// connection, and the next line is served as a first line — a
+    /// request here.
+    #[tokio::test]
+    async fn a_request_after_the_preamble_is_served_as_bridged() {
+        let mut peer = dial(true).await;
+        peer.send(PREAMBLE).await;
+        assert_eq!(
+            peer.recv().await,
+            serde_json::from_str::<serde_json::Value>(BRIDGE_ACCEPTED).unwrap()
+        );
+        peer.send(REQUEST).await;
+        let reply = peer.recv().await;
+        assert_eq!(reply["id"], "3", "{reply}");
+        assert_eq!(
+            reply["result"]["bridge"]["ssh_connection"], "10.0.0.1 5000 10.0.0.2 22",
+            "{reply}"
+        );
+        assert_eq!(reply["result"]["requests_before"], 0, "{reply}");
+        peer.send(REQUEST).await;
+        assert_eq!(peer.recv().await["result"]["requests_before"], 1);
+    }
+
+    /// Plan 084 D2: the same on the data plane — the handshake after a
+    /// preamble still opens a data connection, and it knows its origin.
+    #[tokio::test]
+    async fn a_data_handshake_after_the_preamble_opens_a_bridged_data_connection() {
+        let mut peer = dial(true).await;
+        peer.send(PREAMBLE).await;
+        assert_eq!(peer.recv().await["bridge"], "accepted");
+        peer.send(&handshake_line()).await;
+        let reply = peer.recv().await;
+        assert_eq!(reply["attach"], "5", "{reply}");
+        assert_eq!(
+            reply["bridge"]["ssh_connection"], "10.0.0.1 5000 10.0.0.2 22",
+            "{reply}"
+        );
+    }
+
+    /// Without a preamble a connection is local, on either plane.
+    #[tokio::test]
+    async fn a_connection_without_a_preamble_is_local() {
+        let mut peer = dial(true).await;
+        peer.send(REQUEST).await;
+        assert_eq!(
+            peer.recv().await["result"]["bridge"],
+            serde_json::Value::Null
+        );
+
+        let mut peer = dial(true).await;
+        peer.send(&handshake_line()).await;
+        assert_eq!(peer.recv().await["bridge"], serde_json::Value::Null);
+    }
+
+    /// Plan 084 D2: a second preamble, a non-object `bridge`, and a line
+    /// over the limit are each a `parse-error`, and the connection ends.
+    #[tokio::test]
+    async fn a_refused_preamble_is_a_parse_error_and_closes() {
+        let mut peer = dial(true).await;
+        peer.send(PREAMBLE).await;
+        assert_eq!(peer.recv().await["bridge"], "accepted");
+        peer.send(PREAMBLE).await;
+        let reply = peer.recv().await;
+        assert_eq!(reply["error"]["code"], codes::PARSE_ERROR, "{reply}");
+        peer.eof().await;
+
+        let oversized = format!(
+            r#"{{"bridge":{{"ssh_client":"{}"}}}}"#,
+            "a".repeat(MAX_BRIDGE_PREAMBLE)
+        );
+        for line in [r#"{"bridge":"x"}"#.to_string(), oversized] {
+            let mut peer = dial(true).await;
+            peer.send(&line).await;
+            let reply = peer.recv().await;
+            assert_eq!(reply["ok"], false, "{reply}");
+            assert_eq!(reply["error"]["code"], codes::PARSE_ERROR, "{reply}");
+            peer.eof().await;
+        }
+    }
+
+    /// Plan 084 D2 (review): a positional array decodes into the origin
+    /// struct, so the object check is the server's own, and a second
+    /// preamble is terminal wherever on the connection it comes.
+    #[tokio::test]
+    async fn an_array_bridge_and_a_later_second_preamble_close_the_connection() {
+        let mut peer = dial(true).await;
+        peer.send(r#"{"bridge":[null,null]}"#).await;
+        let reply = peer.recv().await;
+        assert_eq!(reply["error"]["code"], codes::PARSE_ERROR, "{reply}");
+        peer.eof().await;
+
+        let mut peer = dial(true).await;
+        peer.send(PREAMBLE).await;
+        assert_eq!(peer.recv().await["bridge"], "accepted");
+        peer.send(REQUEST).await;
+        assert_eq!(peer.recv().await["id"], "3");
+        peer.send(PREAMBLE).await;
+        let reply = peer.recv().await;
+        assert_eq!(reply["error"]["code"], codes::PARSE_ERROR, "{reply}");
+        // A connection left open would answer this; a closed one EOFs
+        // (and may refuse the write).
+        let _ = peer
+            .write
+            .write_all(format!("{REQUEST}\n").as_bytes())
+            .await;
+        peer.eof().await;
+    }
+
+    /// Preserved: a server that does not accept the preamble — a UI
+    /// socket, or a session from before it — answers one as a malformed
+    /// request and keeps serving, which is what a bridge's fallback reads.
+    #[tokio::test]
+    async fn without_the_option_a_preamble_is_a_malformed_request() {
+        let mut peer = dial(false).await;
+        peer.send(PREAMBLE).await;
+        let reply = peer.recv().await;
+        assert_eq!(reply["id"], "0", "{reply}");
+        assert_eq!(reply["error"]["code"], codes::PARSE_ERROR, "{reply}");
+        peer.send(REQUEST).await;
+        assert_eq!(
+            peer.recv().await["result"]["bridge"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// The preamble is a first line only: after a request it is just a
+    /// malformed request.
+    #[tokio::test]
+    async fn a_preamble_after_a_request_is_a_malformed_request() {
+        let mut peer = dial(true).await;
+        peer.send(REQUEST).await;
+        peer.recv().await;
+        peer.send(PREAMBLE).await;
+        let reply = peer.recv().await;
+        assert_eq!(reply["error"]["code"], codes::PARSE_ERROR, "{reply}");
+        peer.send(REQUEST).await;
+        let reply = peer.recv().await;
+        assert_eq!(
+            reply["result"]["bridge"],
+            serde_json::Value::Null,
+            "{reply}"
+        );
+        assert_eq!(reply["result"]["requests_before"], 1, "{reply}");
     }
 }

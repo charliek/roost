@@ -261,6 +261,7 @@ const OP_TYPES: &[Row] = &[
     op::<SessionSetThemeParams, SessionSetThemeResult>(ops::SESSION_SET_THEME),
     op::<SessionSetAgentHooksParams, AgentHooksOutcome>(ops::SESSION_SET_AGENT_HOOKS),
     op::<SessionPutFileParams, SessionPutFileResult>(ops::SESSION_PUT_FILE),
+    op::<ClientHelloParams, ClientHelloResult>(ops::CLIENT_HELLO),
     op::<AppActivateParams, EmptyResult>(ops::APP_ACTIVATE),
     op::<ScreenshotParams, ScreenshotResult>(ops::SCREENSHOT),
     op::<WindowMetricsParams, WindowMetricsResult>(ops::WINDOW_METRICS),

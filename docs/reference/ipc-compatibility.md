@@ -380,9 +380,10 @@ derives the tab's state from `agent_lifecycle` + `shell_state` +
 a closed enum, gained `program_status` and `foreign_app`. A Swift UI
 target keeps no records, so its `Tab.state` is never composed. `7` is
 unreleased, so it may still be amended in place under the rule above,
-and it was once: the session socket's `tab.memory_usage` (plan 082 D6)
-rides the same generation rather than spending one of its own, and
-`session.identify.ops.response.v7.json` was re-cut to list it.
+and it has been: the session socket's `tab.memory_usage` (plan 082 D6)
+rides the same generation rather than spending one of its own, as do
+`client.hello` and the `client-bridge` preamble (plan 084), and
+`session.identify.ops.response.v7.json` was re-cut to list each new op.
 The identify vectors were re-cut at `7`
 (`session.identify{,.ops,.persist_error}.response.v7.json`) beside the
 frozen `v6` files, and the attach handshake vectors carry `7`.

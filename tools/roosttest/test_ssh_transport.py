@@ -498,7 +498,34 @@ def test_each_half_close_ends_the_chain_cleanly(env, bridge):
 
 
 # ---------------------------------------------------------------------------
-# 5. No session: the failure the client classifies on
+# 5. The bridge introduces itself, and nothing else can tell
+# ---------------------------------------------------------------------------
+
+
+def test_a_bridged_connection_is_told_so_and_a_local_one_is_not(env, bridge):
+    """Plan 084 D2: the bridge's preamble reaches the real session, which
+    is what `client.hello`'s `bridged` reads, and a direct dial carries
+    none.
+
+    The client end of the bridged connection sees nothing of it — the
+    hello is the first line it ever reads — and the preamble's own
+    acknowledgement stays inside the bridge, so its stderr stays empty.
+    """
+    started(env)
+    hello = {"client_id": f"roosttest-{uuid.uuid4().hex[:8]}", "label": "roosttest"}
+
+    with bridge.client() as through:
+        assert through.call("client.hello", hello) == {"bridged": True}
+        assert through.call("session.identify") == env.identify()
+
+    with env.client() as local:
+        assert local.call("client.hello", hello) == {"bridged": False}
+
+    assert bridge.stderr_text() == "", bridge.stderr_text()
+
+
+# ---------------------------------------------------------------------------
+# 6. No session: the failure the client classifies on
 # ---------------------------------------------------------------------------
 
 

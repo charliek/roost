@@ -2707,6 +2707,95 @@ pub struct SessionStopResult {
     pub abandoned: Vec<i64>,
 }
 
+/// [`ops::CLIENT_HELLO`] params: who is on the other end of this control
+/// connection.
+///
+/// `client_id` is opaque and stable for the client process's lifetime,
+/// across its reconnects: 1–64 bytes of `[A-Za-z0-9._-]`. `label` is for
+/// display only: 1–64 characters once trimmed, no control characters.
+/// [`Self::validate`] is the one place both rules live.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClientHelloParams {
+    pub client_id: String,
+    pub label: String,
+}
+
+/// The longest `client_id` and `label` [`ClientHelloParams`] admits.
+pub const MAX_CLIENT_FIELD: usize = 64;
+
+impl ClientHelloParams {
+    /// The params as the session records them, with the label trimmed,
+    /// or why they are refused.
+    pub fn validate(self) -> Result<Self, String> {
+        let id = &self.client_id;
+        if id.is_empty() || id.len() > MAX_CLIENT_FIELD {
+            return Err(format!(
+                "client_id must be 1-{MAX_CLIENT_FIELD} bytes, got {}",
+                id.len()
+            ));
+        }
+        if !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err("client_id must be [A-Za-z0-9._-] only".to_string());
+        }
+        // On the label as sent: a trim would otherwise quietly drop a
+        // leading tab or a trailing newline instead of refusing it.
+        if self.label.chars().any(char::is_control) {
+            return Err("label must not contain control characters".to_string());
+        }
+        let label = self.label.trim();
+        let chars = label.chars().count();
+        if chars == 0 || chars > MAX_CLIENT_FIELD {
+            return Err(format!(
+                "label must be 1-{MAX_CLIENT_FIELD} characters after trimming, got {chars}"
+            ));
+        }
+        Ok(Self {
+            label: label.to_string(),
+            client_id: self.client_id,
+        })
+    }
+}
+
+/// [`ops::CLIENT_HELLO`] result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientHelloResult {
+    /// Whether this connection arrived through a `client-bridge` that
+    /// announced itself with a [`BridgePreamble`].
+    pub bridged: bool,
+}
+
+/// The one line a `client-bridge` writes toward a session before it
+/// relays anything: where the bridged connection came from.
+///
+/// Recognised only by a session socket, and only as a connection's first
+/// line: a JSON object whose sole key is `bridge`. The session answers
+/// [`BRIDGE_ACCEPTED`] and then reads the next line as if it were the
+/// first. Advisory, not a credential: every peer of that socket is
+/// already the session's own uid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgePreamble {
+    pub bridge: BridgeOrigin,
+}
+
+/// The bridge's own `SSH_CONNECTION` / `SSH_CLIENT`, each `None` when
+/// unset. Unknown keys are ignored so a later bridge can say more.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeOrigin {
+    pub ssh_connection: Option<String>,
+    pub ssh_client: Option<String>,
+}
+
+/// The session's answer to a [`BridgePreamble`], newline excluded.
+pub const BRIDGE_ACCEPTED: &str = r#"{"bridge":"accepted"}"#;
+
+/// The longest [`BridgePreamble`] line a session accepts, newline
+/// excluded.
+pub const MAX_BRIDGE_PREAMBLE: usize = 4096;
+
 /// One atomic push on the events connection.
 ///
 /// A single workspace commit can publish several events under the same
@@ -4114,6 +4203,10 @@ pub mod ops {
     /// `not-supported`, and a UI socket `unknown-op` like every other
     /// session op. The leg underneath [`TAB_SEND_FILE`].
     pub const SESSION_PUT_FILE: &str = "session.put_file";
+    /// Name the client on this control connection (`client_id`, `label`)
+    /// and learn whether the connection came through a bridge. Only as
+    /// the connection's first request; session-only.
+    pub const CLIENT_HELLO: &str = "client.hello";
     /// Raise + focus the running UI window. Sent by a second launch
     /// that loses the single-instance flock; takes no params (#6).
     pub const APP_ACTIVATE: &str = "app.activate";
@@ -4717,6 +4810,49 @@ mod tests {
         let json = serde_json::to_string(value).expect("serialize");
         let back: T = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(value, &back, "round-trip mismatch via {}", json);
+    }
+
+    fn hello(client_id: &str, label: &str) -> Result<ClientHelloParams, String> {
+        ClientHelloParams {
+            client_id: client_id.into(),
+            label: label.into(),
+        }
+        .validate()
+    }
+
+    /// Plan 084 D1: `client_id` is 1-64 bytes of `[A-Za-z0-9._-]`; the
+    /// label is 1-64 characters once trimmed, with no control characters,
+    /// and is recorded trimmed.
+    #[test]
+    fn client_hello_validates_its_id_and_label() {
+        let ok = hello("Ab.9_-x", "  laptop  ").expect("a valid hello");
+        assert_eq!(ok.label, "laptop", "recorded trimmed");
+        hello(&"a".repeat(64), &"é".repeat(64)).expect("both at the limit");
+
+        for (client_id, label) in [
+            ("", "l"),
+            (&*"a".repeat(65), "l"),
+            ("a b", "l"),
+            ("a/b", "l"),
+            ("é", "l"),
+            ("a", ""),
+            ("a", "   "),
+            ("a", &*"é".repeat(65)),
+            ("a", "tab\there"),
+            ("a", "bell\u{7}"),
+            ("a", "del\u{7f}"),
+            ("a", "\tlaptop\n"),
+            ("a", "laptop\r"),
+        ] {
+            assert!(
+                hello(client_id, label).is_err(),
+                "{client_id:?} / {label:?} must be refused"
+            );
+        }
+        assert!(serde_json::from_value::<ClientHelloParams>(json!({
+            "client_id": "a", "label": "l", "extra": true
+        }))
+        .is_err());
     }
 
     /// The context-menu ops' documented spellings (plan 073 D9): a target

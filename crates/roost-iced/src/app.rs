@@ -3719,6 +3719,9 @@ struct StartedEngine {
     switch_gate: Arc<tokio::sync::RwLock<()>>,
     test_mode: bool,
     opening: window_frame::OpeningFrame,
+    /// The UI socket's `identify.instance_id`, minted once with its
+    /// handler: the client id every host connection says hello with.
+    instance_id: String,
 }
 
 impl App {
@@ -3785,6 +3788,7 @@ impl App {
             switch_gate,
             test_mode,
             opening,
+            instance_id,
         } = match Self::start_engine(profile, &config, &runtime, &supervisor, terminal_metrics) {
             Ok(engine) => engine,
             Err(error) => {
@@ -3922,6 +3926,7 @@ impl App {
                 runtime.handle().clone(),
                 feed_tx.clone(),
                 &host_theme,
+                instance_id,
             ),
             host_attach: HashMap::new(),
             host_resume: HashMap::new(),
@@ -4063,6 +4068,7 @@ impl App {
         .with_test_mode(test_mode);
         let in_process_streams = handler.in_process_streams();
         let switch_gate = handler.switch_gate();
+        let instance_id = handler.instance_id().to_string();
         let server = runtime
             .block_on(IpcServer::bind(&profile.socket_path, handler))
             .context("bind Iced IPC server")?;
@@ -4085,6 +4091,7 @@ impl App {
             switch_gate,
             test_mode,
             opening,
+            instance_id,
         })
     }
 

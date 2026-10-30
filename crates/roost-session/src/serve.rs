@@ -372,7 +372,8 @@ pub async fn serve(
         // A forwarded socket is opened as the forwarding user, so the
         // filesystem mode alone stops nobody once this session is
         // reachable over SSH. The kernel's answer is the one that counts.
-        .require_same_uid();
+        .require_same_uid()
+        .accept_bridge_preamble();
 
     // Recorded from the bound socket, not from the path we asked for:
     // the tail unlinks by identity so a successor that rebinds the same

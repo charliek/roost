@@ -16,7 +16,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use roost_ipc::messages::{BridgePreamble, BRIDGE_ACCEPTED};
 use roost_ipc::paths::{SESSION_SOCKET_DIR_ENV, TEST_OLD_SESSION_DIR_ENV, TEST_PASSWD_HOME_ENV};
+use roost_ipc::{ConnCtx, Handler, HandlerError, HandlerOutcome, IpcServer};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -94,8 +102,20 @@ impl Fixture {
         }
     }
 
+    /// The bridge's connection, past its preamble: what is left on it is
+    /// exactly what the client and the session say.
     async fn accept(&self) -> UnixStream {
-        let (stream, _) = self.listener.accept().await.expect("accept the bridge");
+        let (mut stream, _) = self.listener.accept().await.expect("accept the bridge");
+        let preamble = read_line(&mut stream).await;
+        assert!(
+            serde_json::from_slice::<BridgePreamble>(&preamble).is_ok(),
+            "the bridge opens with its preamble: {:?}",
+            String::from_utf8_lossy(&preamble)
+        );
+        stream
+            .write_all(format!("{BRIDGE_ACCEPTED}\n").as_bytes())
+            .await
+            .expect("ack the preamble");
         stream
     }
 
@@ -137,6 +157,20 @@ impl Fixture {
     async fn finish(mut self) -> (Vec<u8>, ExitStatus) {
         let trailing = self.drain().await.expect("the drain task");
         (trailing, self.wait().await)
+    }
+}
+
+/// One line, read a byte at a time so nothing behind it is consumed.
+async fn read_line(stream: &mut UnixStream) -> Vec<u8> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let read = stream.read(&mut byte).await.expect("read a line");
+        assert_ne!(read, 0, "EOF before a full line: {line:?}");
+        if byte[0] == b'\n' {
+            return line;
+        }
+        line.push(byte[0]);
     }
 }
 
@@ -351,6 +385,15 @@ async fn with_nothing_here_the_bridge_proxies_only_identify_and_stop_to_an_old_p
         .unwrap();
     assert_eq!(read_reply(&mut stdout).await["ok"], true);
 
+    // Plan 084 D2: the restricted proxy never introduces itself.
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .all(|line| serde_json::from_str::<BridgePreamble>(line).is_err()),
+        "no preamble reached the old session: {:?}",
+        seen.lock().unwrap()
+    );
     let ops: Vec<String> = seen
         .lock()
         .unwrap()
@@ -391,4 +434,203 @@ async fn with_no_session_anywhere_the_bridge_still_says_no_session() {
         stderr.starts_with("client-bridge: no session is listening at "),
         "{stderr:?}"
     );
+}
+
+/// A session that answers every request with the origin its connection
+/// arrived with, and counts its connections.
+struct OriginEcho {
+    conns: Arc<AtomicUsize>,
+}
+
+impl Handler for OriginEcho {
+    fn handle<'a>(
+        &'a self,
+        ctx: &'a ConnCtx,
+        op: &'a str,
+        _params: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<HandlerOutcome, HandlerError>> + Send + 'a>> {
+        let reply = serde_json::json!({
+            "op": op,
+            "bridge": serde_json::to_value(&ctx.bridge).unwrap(),
+        });
+        Box::pin(async move { Ok(HandlerOutcome::Reply(reply)) })
+    }
+
+    fn connection_ended(&self, _conn_id: u64) {
+        self.conns.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// An [`OriginEcho`] session at the bridge's socket under `root`, with or
+/// without the preamble — without it is a session from before the
+/// preamble existed. Returns the count of connections it has finished.
+async fn origin_echo(root: &Path, preamble: bool) -> Arc<AtomicUsize> {
+    let conns = Arc::new(AtomicUsize::new(0));
+    let server = IpcServer::bind(
+        session_socket_path(root),
+        OriginEcho {
+            conns: Arc::clone(&conns),
+        },
+    )
+    .await
+    .expect("bind the echo session");
+    let server = if preamble {
+        server.accept_bridge_preamble()
+    } else {
+        server
+    };
+    tokio::spawn(server.run());
+    conns
+}
+
+fn spawn_bridge_from(root: &Path, ssh_connection: &str) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_roost-session"));
+    command.arg("client-bridge");
+    root_env(&mut command, root);
+    command
+        .env("SSH_CONNECTION", ssh_connection)
+        .env_remove("SSH_CLIENT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command.spawn().expect("spawn the client bridge")
+}
+
+/// Long enough for the bridge's own 2 s preamble budget and a fresh
+/// dial; what it bounds is a bridge that never answers at all.
+fn bridge_budget() -> Duration {
+    support::scaled(Duration::from_secs(20))
+}
+
+/// One request through the bridge, and every line stdout carries until
+/// the bridge exits.
+async fn one_request(mut child: Child) -> (Vec<serde_json::Value>, ExitStatus) {
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(b"{\"id\":\"7\",\"op\":\"session.identify\",\"params\":{}}\n")
+        .await
+        .unwrap();
+    drop(stdin);
+    let output = tokio::time::timeout(bridge_budget(), child.wait_with_output())
+        .await
+        .expect("the bridge answers and exits")
+        .expect("reap the bridge");
+    let lines = output
+        .stdout
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice(line)
+                .unwrap_or_else(|_| panic!("a JSON line: {:?}", String::from_utf8_lossy(line)))
+        })
+        .collect();
+    (lines, output.status)
+}
+
+/// The session's count of finished connections, once it reaches `want`
+/// or the budget runs out. A connection is counted after its socket has
+/// closed, so a bridge can exit a moment before its own is.
+async fn finished(conns: &AtomicUsize, want: usize) -> usize {
+    let deadline = tokio::time::Instant::now() + bridge_budget();
+    while conns.load(Ordering::Acquire) < want && tokio::time::Instant::now() < deadline {
+        support::tick().await;
+    }
+    conns.load(Ordering::Acquire)
+}
+
+/// Plan 084 D2: a session that takes the preamble learns the bridge's
+/// origin, and the client sees only its own reply — the ack is the
+/// bridge's to read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_that_accepts_the_preamble_sees_the_bridged_origin() {
+    let root = root_dir();
+    let conns = origin_echo(root.path(), true).await;
+
+    let (lines, status) =
+        one_request(spawn_bridge_from(root.path(), "10.0.0.1 5000 10.0.0.2 22")).await;
+
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(lines.len(), 1, "only the reply reaches stdout: {lines:?}");
+    assert_eq!(lines[0]["id"], "7", "{lines:?}");
+    assert_eq!(lines[0]["ok"], true, "{lines:?}");
+    assert_eq!(
+        lines[0]["result"]["bridge"],
+        serde_json::json!({"ssh_connection": "10.0.0.1 5000 10.0.0.2 22", "ssh_client": null}),
+        "{lines:?}"
+    );
+    assert_eq!(finished(&conns, 1).await, 1, "one connection, relayed");
+}
+
+/// Plan 084 D2: a session from before the preamble answers it as a
+/// malformed request. The bridge dials again and relays with none, so
+/// the client's first request still gets its own reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_from_before_the_preamble_gets_a_fresh_connection_without_one() {
+    let root = root_dir();
+    let conns = origin_echo(root.path(), false).await;
+
+    let (lines, status) = one_request(spawn_bridge_from(root.path(), "10.0.0.1 5000")).await;
+
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(
+        lines.len(),
+        1,
+        "neither the refusal nor an ack reaches stdout: {lines:?}"
+    );
+    assert_eq!(lines[0]["id"], "7", "{lines:?}");
+    assert_eq!(lines[0]["ok"], true, "{lines:?}");
+    assert_eq!(
+        lines[0]["result"]["bridge"],
+        serde_json::Value::Null,
+        "the relayed connection carried no preamble: {lines:?}"
+    );
+    assert_eq!(
+        finished(&conns, 2).await,
+        2,
+        "the refused connection, then the relayed one"
+    );
+}
+
+/// Plan 084 D2: a session that never answers the preamble is given up
+/// on after the budget, and the client is relayed on a fresh connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_silent_after_the_preamble_gets_a_fresh_connection() {
+    let root = root_dir();
+    let listener =
+        UnixListener::bind(session_socket_path(root.path())).expect("bind the silent session");
+    let child = spawn_bridge_from(root.path(), "10.0.0.1 5000");
+
+    let (mut silent, _) = listener.accept().await.unwrap();
+    let preamble = tokio::time::timeout(bridge_budget(), read_line(&mut silent))
+        .await
+        .expect("the bridge writes its preamble");
+    assert!(serde_json::from_slice::<BridgePreamble>(&preamble).is_ok());
+
+    let serve = tokio::spawn(async move {
+        let (mut relayed, _) = listener.accept().await.unwrap();
+        let request = read_line(&mut relayed).await;
+        relayed
+            .write_all(b"{\"id\":\"7\",\"ok\":true,\"result\":{}}\n")
+            .await
+            .unwrap();
+        request
+    });
+    let (lines, status) = one_request(child).await;
+    let request = tokio::time::timeout(bridge_budget(), serve)
+        .await
+        .expect("the bridge dialed again")
+        .unwrap();
+
+    assert_eq!(status.code(), Some(0));
+    let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+    assert_eq!(
+        request["op"], "session.identify",
+        "no preamble on the retry"
+    );
+    assert_eq!(
+        lines,
+        vec![serde_json::json!({"id": "7", "ok": true, "result": {}})]
+    );
+    drop(silent);
 }

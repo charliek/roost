@@ -1340,6 +1340,33 @@
       ],
       "type": "object"
     },
+    "ClientHelloParams": {
+      "additionalProperties": false,
+      "properties": {
+        "client_id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "client_id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "ClientHelloResult": {
+      "properties": {
+        "bridged": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bridged"
+      ],
+      "type": "object"
+    },
     "ClipboardDumpParams": {
       "additionalProperties": false,
       "properties": {
@@ -5196,6 +5223,14 @@
       },
       "result": {
         "$ref": "#/$defs/WindowMetricsResult"
+      }
+    },
+    "client.hello": {
+      "params": {
+        "$ref": "#/$defs/ClientHelloParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ClientHelloResult"
       }
     },
     "clipboard.dump": {

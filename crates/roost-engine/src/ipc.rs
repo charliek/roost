@@ -61,6 +61,7 @@ use roost_ipc::messages::{
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{AttachHandshake, SessionSetThemeResult};
+use roost_ipc::messages::{ClientHelloParams, ClientHelloResult};
 use roost_ipc::{
     codes, CloseReason, ConnAction, ConnCloser, ConnCtx, Handler, HandlerError, HandlerOutcome,
     LocalBackendCell, LocalBackendMode, LocalRoute, StopFinalizer,
@@ -1284,6 +1285,8 @@ struct Connections {
     /// reach in, close it (which writes the terminal envelope) and only
     /// then abort its relay.
     subscribers: Option<Vec<Subscriber>>,
+    /// Who said `client.hello` on which connection.
+    clients: ClientRegistry,
 }
 
 impl Default for Connections {
@@ -1292,7 +1295,51 @@ impl Default for Connections {
             controls: std::collections::HashMap::new(),
             data_conns: std::collections::HashMap::new(),
             subscribers: Some(Vec::new()),
+            clients: ClientRegistry::default(),
         }
+    }
+}
+
+/// The session's view of its clients (plan 084 D1): the identity each
+/// control connection announced with `client.hello`, and one label per
+/// client id — the last hello's.
+#[derive(Default)]
+struct ClientRegistry {
+    by_conn: std::collections::HashMap<u64, ClientHelloParams>,
+    labels: std::collections::HashMap<String, String>,
+}
+
+impl ClientRegistry {
+    fn hello(&mut self, conn_id: u64, client: ClientHelloParams) {
+        self.labels
+            .insert(client.client_id.clone(), client.label.clone());
+        self.by_conn.insert(conn_id, client);
+    }
+
+    fn of_conn(&self, conn_id: u64) -> Option<&ClientHelloParams> {
+        self.by_conn.get(&conn_id)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn label(&self, client_id: &str) -> Option<&str> {
+        self.labels.get(client_id).map(String::as_str)
+    }
+
+    /// A label outlives the connection that set it only while something
+    /// still holds its client id.
+    fn forget(&mut self, conn_id: u64) {
+        let Some(gone) = self.by_conn.remove(&conn_id) else {
+            return;
+        };
+        if !self.holds(&gone.client_id) {
+            self.labels.remove(&gone.client_id);
+        }
+    }
+
+    fn holds(&self, client_id: &str) -> bool {
+        self.by_conn
+            .values()
+            .any(|client| client.client_id == client_id)
     }
 }
 
@@ -1369,6 +1416,7 @@ impl Connections {
         }
         self.controls.remove(&conn_id);
         self.controls.retain(|_, closer| !closer.is_closed());
+        self.clients.forget(conn_id);
     }
 
     /// Close every registered connection, and stop tracking them.
@@ -1499,6 +1547,39 @@ impl SessionState {
     /// One connection has ended.
     fn forget_connection(&self, conn_id: u64) {
         lock(&self.conns).forget_connection(conn_id);
+    }
+
+    /// `client.hello`: only as the connection's first request, so every
+    /// later request on it is known to come from one named client.
+    fn client_hello(
+        &self,
+        ctx: &ConnCtx,
+        params: serde_json::Value,
+    ) -> Result<ClientHelloResult, HandlerError> {
+        if ctx.requests_before() > 0 {
+            return Err(HandlerError::invalid_param(
+                "client.hello must be the first request on its connection",
+            ));
+        }
+        let client = decode::<ClientHelloParams>(params)?
+            .validate()
+            .map_err(HandlerError::invalid_param)?;
+        lock(&self.conns).clients.hello(ctx.conn_id, client);
+        Ok(ClientHelloResult {
+            bridged: ctx.bridge.is_some(),
+        })
+    }
+
+    /// The client this connection said hello as — what an op that acts
+    /// for "the caller's client" (`tab.take_size`, `tab.release_size`)
+    /// is addressed by.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn hello_client(&self, ctx: &ConnCtx) -> Result<ClientHelloParams, HandlerError> {
+        lock(&self.conns)
+            .clients
+            .of_conn(ctx.conn_id)
+            .cloned()
+            .ok_or_else(|| HandlerError::invalid_param("send client.hello first"))
     }
 
     /// Tell every registered connection why it is going away.
@@ -1789,6 +1870,12 @@ impl IpcHandler {
     pub fn with_push_limits(mut self, limits: PushLimits) -> Self {
         self.push_limits = limits;
         self
+    }
+
+    /// `identify.instance_id`: this UI process's id, which is also the
+    /// `client_id` it says `client.hello` with to every session.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     /// The in-process streams this UI socket has handed out, for the UI to
@@ -2495,6 +2582,9 @@ async fn dispatch_outcome(
         ops::SESSION_STOP => {
             let _p: SessionStopParams = decode(params)?;
             return session_stop(h, session).await;
+        }
+        ops::CLIENT_HELLO => {
+            return encode(&session.client_hello(ctx, params)?).map(HandlerOutcome::Reply);
         }
         // The host registry is client-side state (D8): a UI socket's op
         // family. Letting it fall through would grow a shadow registry in
@@ -4659,6 +4749,7 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
         (ops::SESSION_SET_THEME, &[SessionOnly, ServerVt]),
         (ops::SESSION_SET_AGENT_HOOKS, &[SessionOnly]),
         (ops::SESSION_PUT_FILE, &[SessionOnly]),
+        (ops::CLIENT_HELLO, &[SessionOnly]),
     ]
 };
 
@@ -5926,6 +6017,7 @@ mod tests {
 
     /// A headless session outside test mode.
     const SESSION: &[&str] = &[
+        "client.hello",
         "events.subscribe",
         "identify",
         "notification.create",
@@ -6225,6 +6317,197 @@ mod tests {
             assert!(!headless.iter().any(|served| served == op), "{op}");
             assert!(in_process.iter().any(|served| served == op), "{op}");
         }
+    }
+
+    fn hello_params(client_id: &str, label: &str) -> serde_json::Value {
+        serde_json::json!({"client_id": client_id, "label": label})
+    }
+
+    async fn call(
+        h: &IpcHandler,
+        ctx: &mut ConnCtx,
+        op: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, HandlerError> {
+        let outcome = h.handle(ctx, op, params).await;
+        ctx.note_handled();
+        match outcome? {
+            HandlerOutcome::Reply(value) => Ok(value),
+            HandlerOutcome::ReplyThen { .. } => panic!("{op} answered with an action"),
+        }
+    }
+
+    fn a_session(dir: &std::path::Path) -> IpcHandler {
+        identify_handler(dir).with_session(session_state().info, StopHandle::new(|| async {}))
+    }
+
+    /// Plan 084 D1: `client.hello` answers whether the connection came
+    /// through a bridge, records the client, and names it to the ops that
+    /// act for "this connection's client".
+    #[tokio::test]
+    async fn a_hello_names_the_connections_client_and_says_whether_it_was_bridged() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = a_session(dir.path());
+        let session = h.session.as_ref().unwrap();
+
+        let (mut local, _w) = ConnCtx::new(1);
+        let reply = call(
+            &h,
+            &mut local,
+            ops::CLIENT_HELLO,
+            hello_params("abc", " laptop "),
+        )
+        .await
+        .expect("a first hello");
+        assert_eq!(reply, serde_json::json!({"bridged": false}));
+        let client = session.hello_client(&local).expect("the hello'd client");
+        assert_eq!(
+            (client.client_id.as_str(), client.label.as_str()),
+            ("abc", "laptop")
+        );
+
+        let (mut bridged, _w) = ConnCtx::new(2);
+        bridged.bridge = Some(roost_ipc::messages::BridgeOrigin::default());
+        let reply = call(
+            &h,
+            &mut bridged,
+            ops::CLIENT_HELLO,
+            hello_params("def", "phone"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, serde_json::json!({"bridged": true}));
+    }
+
+    /// Plan 084 D1: only as the first request — after any other request,
+    /// or a second time, it is `invalid-param` and records nothing.
+    #[tokio::test]
+    async fn a_hello_after_any_other_request_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = a_session(dir.path());
+        let session = h.session.as_ref().unwrap();
+
+        let (mut late, _w) = ConnCtx::new(1);
+        call(&h, &mut late, ops::SESSION_IDENTIFY, serde_json::json!({}))
+            .await
+            .unwrap();
+        let error = call(&h, &mut late, ops::CLIENT_HELLO, hello_params("abc", "l"))
+            .await
+            .expect_err("a hello after identify");
+        assert_eq!(error.code, codes::INVALID_PARAM, "{error:?}");
+        assert!(session.hello_client(&late).is_err(), "nothing was recorded");
+
+        let (mut twice, _w) = ConnCtx::new(2);
+        call(
+            &h,
+            &mut twice,
+            ops::CLIENT_HELLO,
+            hello_params("abc", "first"),
+        )
+        .await
+        .unwrap();
+        let error = call(
+            &h,
+            &mut twice,
+            ops::CLIENT_HELLO,
+            hello_params("abc", "second"),
+        )
+        .await
+        .expect_err("a second hello");
+        assert_eq!(error.code, codes::INVALID_PARAM, "{error:?}");
+        assert_eq!(session.hello_client(&twice).unwrap().label, "first");
+    }
+
+    /// Plan 084 D1: a hello whose params do not validate is refused and
+    /// records nothing.
+    #[tokio::test]
+    async fn an_invalid_hello_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = a_session(dir.path());
+        let session = h.session.as_ref().unwrap();
+        for (params, code) in [
+            (hello_params("a b", "l"), codes::INVALID_PARAM),
+            (hello_params("a", ""), codes::INVALID_PARAM),
+            (hello_params("a", "bell\u{7}"), codes::INVALID_PARAM),
+            (serde_json::json!({"client_id": "a"}), codes::MISSING_PARAM),
+            (
+                serde_json::json!({"client_id": "a", "label": "l", "extra": 1}),
+                codes::UNKNOWN_FIELD,
+            ),
+        ] {
+            let (mut ctx, _w) = ConnCtx::new(1);
+            let error = call(&h, &mut ctx, ops::CLIENT_HELLO, params.clone())
+                .await
+                .expect_err("an invalid hello");
+            assert_eq!(error.code, code, "{params}: {error:?}");
+            assert!(session.hello_client(&ctx).is_err(), "{params}");
+        }
+    }
+
+    /// Plan 084 D1: an op that acts for the connection's client refuses a
+    /// connection that never said hello.
+    #[tokio::test]
+    async fn a_connection_without_a_hello_has_no_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = a_session(dir.path());
+        let (ctx, _w) = ConnCtx::new(1);
+        let error = h.session.as_ref().unwrap().hello_client(&ctx).unwrap_err();
+        assert_eq!(error.code, codes::INVALID_PARAM);
+        assert_eq!(error.message, "send client.hello first");
+    }
+
+    /// `client.hello` is a session's op: a UI socket answers it
+    /// `unknown-op` like every other session op.
+    #[tokio::test]
+    async fn a_ui_socket_does_not_know_hello() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let (mut ctx, _w) = ConnCtx::new(1);
+        let error = call(&h, &mut ctx, ops::CLIENT_HELLO, hello_params("a", "l"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, codes::UNKNOWN_OP);
+    }
+
+    /// Plan 084 D1: the label registry keeps the last hello's label per
+    /// client id, and drops it once no connection of that id is open.
+    #[tokio::test]
+    async fn the_label_registry_keeps_the_last_hello_until_the_last_connection_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = a_session(dir.path());
+        let session = h.session.as_ref().unwrap();
+        let label = |id: &str| lock(&session.conns).clients.label(id).map(str::to_string);
+
+        let (mut first, _w1) = ConnCtx::new(1);
+        let (mut second, _w2) = ConnCtx::new(2);
+        call(
+            &h,
+            &mut first,
+            ops::CLIENT_HELLO,
+            hello_params("abc", "old"),
+        )
+        .await
+        .unwrap();
+        call(
+            &h,
+            &mut second,
+            ops::CLIENT_HELLO,
+            hello_params("abc", "new"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(label("abc").as_deref(), Some("new"), "last hello wins");
+        assert_eq!(session.hello_client(&first).unwrap().label, "old");
+
+        h.connection_ended(2);
+        assert_eq!(
+            label("abc").as_deref(),
+            Some("new"),
+            "connection 1 still holds the id"
+        );
+        assert!(session.hello_client(&second).is_err());
+        h.connection_ended(1);
+        assert_eq!(label("abc"), None, "no connection of that id is open");
     }
 
     #[tokio::test]

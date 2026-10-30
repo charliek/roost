@@ -37,14 +37,28 @@
 //! refused, not adopted. Whether to fall back is decided by `connect()`
 //! alone, before a byte reaches stdout; nothing answering anywhere keeps
 //! the `client-bridge: no session` stderr prefix the client matches.
+//!
+//! # The preamble
+//!
+//! On the full pump (never the restricted proxy) the bridge first
+//! writes one line of its own toward the session — a
+//! [`BridgePreamble`] carrying its `SSH_CONNECTION` and `SSH_CLIENT` —
+//! and reads one line back itself, so the session can tell a bridged
+//! connection from a local one. Only [`BRIDGE_ACCEPTED`] lets that
+//! connection be relayed; anything else is a session that predates the
+//! preamble, and the bridge dials again and relays with none. Neither
+//! line ever reaches stdout.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use roost_ipc::codes;
 use roost_ipc::framing::FrameReader;
-use roost_ipc::messages::{ops, RawRequest};
+use roost_ipc::messages::{
+    ops, BridgeOrigin, BridgePreamble, RawRequest, BRIDGE_ACCEPTED, MAX_BRIDGE_PREAMBLE,
+};
 use roost_ipc::old_session::{self, OldSession};
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::socket_state::{classify_connect_error, SocketState};
@@ -57,6 +71,15 @@ use tokio::sync::Mutex;
 /// is not chopped into a syscall per frame, and a match for the default
 /// pipe buffer on the stdio side.
 const CHUNK: usize = 64 * 1024;
+
+/// How long a session has to answer the preamble before the bridge
+/// takes it for one that predates it.
+const PREAMBLE_ACK_BUDGET: Duration = Duration::from_secs(2);
+
+/// The most of each `SSH_*` value the preamble carries, so the line
+/// always fits the session's [`MAX_BRIDGE_PREAMBLE`] even when every
+/// byte has to be escaped.
+const MAX_ORIGIN_VALUE: usize = 256;
 
 /// Owns the reporting rather than returning an error, because the
 /// caller has no other channel: stdout belongs to the wire.
@@ -80,7 +103,7 @@ fn connect_and_pump() -> anyhow::Result<()> {
         .context("build the bridge runtime")?;
     let outcome = runtime.block_on(async {
         match connect(&profile.socket_path).await {
-            Ok(socket) => pump(socket).await,
+            Ok(socket) => pump(announce(socket, &profile.socket_path).await?).await,
             Err(Unreachable::Nothing(error)) => {
                 match old_path_session(&profile.socket_path).await {
                     Some((socket, old)) => restricted_pump(socket, &old).await,
@@ -122,6 +145,76 @@ async fn connect(socket_path: &Path) -> Result<UnixStream, Unreachable> {
             _ => Unreachable::Other(anyhow!("{hint} ({error})")),
         }
     })
+}
+
+/// Introduce `socket` with the preamble, and hand back the connection to
+/// relay: `socket` itself once the session accepts, otherwise a fresh
+/// one that carries no preamble — a session from before the preamble
+/// existed answers it as a malformed request, and the client must never
+/// see that answer.
+async fn announce(mut socket: UnixStream, socket_path: &Path) -> anyhow::Result<UnixStream> {
+    let line = preamble_line(
+        std::env::var("SSH_CONNECTION").ok(),
+        std::env::var("SSH_CLIENT").ok(),
+    );
+    if accepted(&mut socket, &line).await {
+        return Ok(socket);
+    }
+    drop(socket);
+    connect(socket_path)
+        .await
+        .map_err(|(Unreachable::Nothing(error) | Unreachable::Other(error))| error)
+}
+
+/// The preamble line, newline included.
+fn preamble_line(ssh_connection: Option<String>, ssh_client: Option<String>) -> Vec<u8> {
+    let preamble = BridgePreamble {
+        bridge: BridgeOrigin {
+            ssh_connection: ssh_connection.map(cut_origin_value),
+            ssh_client: ssh_client.map(cut_origin_value),
+        },
+    };
+    let mut line = serde_json::to_vec(&preamble).expect("a preamble serializes");
+    line.push(b'\n');
+    line
+}
+
+fn cut_origin_value(mut value: String) -> String {
+    if value.len() > MAX_ORIGIN_VALUE {
+        let mut end = MAX_ORIGIN_VALUE;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+    }
+    value
+}
+
+/// Write the preamble and read exactly one line back, within
+/// [`PREAMBLE_ACK_BUDGET`]. Byte by byte, because whatever follows that
+/// line belongs to the client.
+async fn accepted(socket: &mut UnixStream, line: &[u8]) -> bool {
+    let exchange = async {
+        socket.write_all(line).await.ok()?;
+        let mut reply = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            if socket.read(&mut byte).await.ok()? == 0 {
+                return None;
+            }
+            if byte[0] == b'\n' {
+                return Some(reply == BRIDGE_ACCEPTED.as_bytes());
+            }
+            if reply.len() >= MAX_BRIDGE_PREAMBLE {
+                return None;
+            }
+            reply.push(byte[0]);
+        }
+    };
+    matches!(
+        tokio::time::timeout(PREAMBLE_ACK_BUDGET, exchange).await,
+        Ok(Some(true))
+    )
 }
 
 /// The first session found on an old path, connected.
@@ -351,6 +444,36 @@ mod tests {
             assert_eq!(reply["ok"], false);
         }
         assert_eq!(refused(b"garbage")["error"]["code"], codes::PARSE_ERROR);
+    }
+
+    /// Plan 084 D2: the preamble is one line naming both values, null
+    /// when unset.
+    #[test]
+    fn the_preamble_is_one_line_with_both_origin_values() {
+        let line = preamble_line(Some("10.0.0.1 5000 10.0.0.2 22".into()), None);
+        assert_eq!(line.last(), Some(&b'\n'));
+        assert_eq!(line.iter().filter(|b| **b == b'\n').count(), 1);
+        let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"bridge": {
+                "ssh_connection": "10.0.0.1 5000 10.0.0.2 22",
+                "ssh_client": null,
+            }})
+        );
+    }
+
+    /// Each value is cut to 256 bytes on a char boundary, so the line
+    /// fits the session's limit even escaped.
+    #[test]
+    fn origin_values_are_cut_on_a_char_boundary() {
+        assert_eq!(cut_origin_value("a".repeat(256)).len(), 256);
+        assert_eq!(cut_origin_value("a".repeat(300)).len(), 256);
+        // 255 ASCII bytes then a 3-byte char straddling the limit.
+        let cut = cut_origin_value(format!("{}€tail", "a".repeat(255)));
+        assert_eq!(cut, "a".repeat(255));
+        let worst = preamble_line(Some("\u{1}".repeat(400)), Some("\u{1}".repeat(400)));
+        assert!(worst.len() - 1 <= MAX_BRIDGE_PREAMBLE, "{}", worst.len());
     }
 
     /// Plan 083 A2 review (R6): an envelope a session would refuse to

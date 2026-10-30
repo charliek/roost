@@ -3390,11 +3390,13 @@ Served **only by a host session** (`roost-session`), never by a UI
 socket. A UI socket answers `unknown-op` for every one of them, which
 is how a client tells the two kinds of socket apart.
 
-There is no connect step, and no order the server enforces: a client
-dials, calls `session.identify` to run the compatibility gate (below),
-and from there every other op is available immediately, to every
-same-UID connection, in any order. What Roost's own client actually
-sends is `session.identify` → `session.set_theme` →
+There is no connect step, and one order the server enforces:
+[`client.hello`](#clienthello), when a client sends it at all, is the
+first request on its connection. Otherwise a client dials, calls
+`session.identify` to run the compatibility gate (below), and from there
+every other op is available immediately, to every same-UID connection,
+in any order. What Roost's own client actually sends is
+`client.hello` → `session.identify` → `session.set_theme` →
 `events.subscribe`, dialing a [data connection](#data-plane) per tab it
 shows, with `session.set_agent_hooks` queued behind them — not because
 the wire requires that shape, but because each `set_*` op states
@@ -3459,7 +3461,51 @@ change to support it.
 one session (it changes across a restart) — it names a run, not a
 session.
 
-**The wire is byte-identical over SSH.** A host session reached over an SSH target (host-sessions HS-3) is not a distinct protocol — the client's local bridge socket and the far side's `roost-session client-bridge` are a pure byte pump between this socket and the client's control/events/data connections, so every op and frame on this page crosses SSH exactly as written here. See [Host sessions (development) → Transport: SSH hosts](../development/host-sessions.md#transport-ssh-hosts) for the transport itself (per-connection `ssh` exec over a shared `ControlMaster`, the classified-failure surface); the classifier deciding whether a saved host's `target` is an SSH destination, a socket path, or `localhost` is [`host.add`'s](#host-registry-host) concern, not this socket's.
+**The wire is byte-identical over SSH.** A host session reached over an SSH target (host-sessions HS-3) is not a distinct protocol — the client's local bridge socket and the far side's `roost-session client-bridge` are a pure byte pump between this socket and the client's control/events/data connections, so every op and frame on this page crosses SSH exactly as written here, after the one line of the bridge's own described [below](#the-bridge-preamble). See [Host sessions (development) → Transport: SSH hosts](../development/host-sessions.md#transport-ssh-hosts) for the transport itself (per-connection `ssh` exec over a shared `ControlMaster`, the classified-failure surface); the classifier deciding whether a saved host's `target` is an SSH destination, a socket path, or `localhost` is [`host.add`'s](#host-registry-host) concern, not this socket's.
+
+#### The bridge preamble
+
+Before relaying anything, `client-bridge` introduces the connection it
+is about to carry with one line of its own, written toward the session:
+
+```json
+{"bridge": {"ssh_connection": "203.0.113.7 51514 10.0.0.2 22", "ssh_client": null}}
+```
+
+The two values are the bridge's own `SSH_CONNECTION` and `SSH_CLIENT` —
+the SSH connection the client came in on — each `null` when unset and
+cut to 256 bytes on a character boundary. The bridge then reads exactly
+one line back **itself**: the session's acknowledgement,
+
+```json
+{"bridge": "accepted"}
+```
+
+and only then starts pumping. Neither line ever reaches the client,
+which sees the same byte stream it would see dialing the socket
+directly. Anything other than that acknowledgement within 2 s — the
+`parse-error` a session from before the preamble answers it with, a
+closed socket, silence — and the bridge closes that connection, dials
+the socket again and relays with **no** preamble, silently (stderr is
+reserved for failures a client matches). That connection is then local
+to the session, which is the honest reading of a session that cannot
+tell. The [restricted proxy](paths.md#upgrading-from-an-older-build)
+a bridge runs in front of a session on an old socket path never writes
+one.
+
+The session recognises the preamble only as a connection's **first**
+line, and only as a JSON object whose sole key is `bridge` (unknown keys
+inside it are ignored). It records the origin, writes the
+acknowledgement, and reads the next line as if it were the first: an
+[attach handshake](#data-plane) or a request, so both planes take it.
+A second preamble anywhere on a connection that opened with one, a
+`bridge` that is not an object, or a preamble line over 4 KiB is a
+`parse-error` (id `"0"`) and the connection closes. A
+connection that opens with anything else carries no preamble and is
+**local**. The origin is advisory, not a credential: every peer of this
+socket is already the session's own uid. A UI socket does not recognise
+the preamble at all — such a line is a malformed request there.
+[`client.hello`](#clienthello)'s `bridged` reports it.
 
 `roostctl session start|stop|status` address this socket directly; they
 are a pre-connect carve-out (`session start` has to work when nothing is
@@ -3871,6 +3917,57 @@ Served only by a session built with a file store. One that could not
 open its root answers `not-supported` rather than refusing to start —
 the session still serves everything else. A **UI socket answers
 `unknown-op`**, like every other `session.*` op.
+
+### `client.hello`
+
+Names the client on this control connection. Request:
+
+```json
+{"id": "1", "op": "client.hello", "params": {
+  "client_id": "5d0c7e21a9f3b846", "label": "charlie-laptop"
+}}
+```
+
+Response:
+
+```json
+{"bridged": true}
+```
+
+`client_id` is opaque to the session and stable for the client
+process's whole life, across its reconnects: 1–64 bytes of
+`[A-Za-z0-9._-]`. Roost's own UI uses its
+[`identify.instance_id`](#identify), so one window is one client to
+every session it connects to. `label` is for display only — a hostname
+is typical, and two windows on one machine share it, which is what the
+id is for: no control characters anywhere in it, and 1–64 characters
+once trimmed, recorded trimmed. Either one out of bounds is `invalid-param`, and the
+params refuse unknown fields like every other session op.
+
+`bridged` says whether this connection arrived through a
+[`client-bridge` preamble](#the-bridge-preamble).
+
+**Only as the first request.** After any other request on the same
+connection, or a second time, `client.hello` is `invalid-param` and
+records nothing. Sending none is allowed — a script or `roostctl` never
+does — and such a connection simply has no client. An op that acts for
+"the caller's client" needs one, and refuses a connection that never
+said hello with `invalid-param` (`send client.hello first`).
+
+The session keeps one label per client id, the last hello's, and
+forgets it once no connection of that id is open. It is not in the
+mutating set: a stop that has latched still answers it.
+
+Roost's client sends it first on its control connection, before
+`session.identify`, and ignores any refusal: a session from before the
+op answers `unknown-op`, and the restricted proxy in front of a session
+on an old socket path `not-supported`, and in both cases the identify
+that follows is what decides whether the connection is usable. A hello
+that gets no answer at all — a timeout, a closed connection — costs the
+connection instead, since a late reply would be read as the identify's:
+the client dials again and identifies with no hello. Only the control
+connection says hello. A **UI socket answers `unknown-op`**,
+like every other session op.
 
 ### `session.stop`
 
