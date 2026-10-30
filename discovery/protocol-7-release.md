@@ -732,7 +732,7 @@ green.
 
 ### M3. G2: tab size ownership
 
-**Status: shipped on the branch (plan 084); PR pending.**
+**Status: merged: #663** (plan 084).
 
 This overturns plan 057 R15, "last interactor sets geometry"
 (`tab_task.rs:406-411`), and roadmap D7, "detach never resizes back"
