@@ -175,7 +175,7 @@ this context doesn't look at."
 
 ### G2. Window size with several clients
 
-**Status: shipped in plan 084, on the branch (PR pending).** The
+**Status: merged: #663 (plan 084).** The
 [decision above](#decided-2026-10-28-protocol-7-release) and
 [DL-31](../docs/development/vision.md#dl-31-a-tab-has-one-size-owner-2026-10-30)
 are what shipped; how it came out is in
