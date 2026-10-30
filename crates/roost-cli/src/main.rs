@@ -178,7 +178,8 @@ const NO_TAB: &str = "no --tab and ROOST_TAB_ID is unset; refusing to guess the 
                   it on the socket named.\n\n\
                   A command that changes a tab (notify, set-title, tab \
                   set-state, tab clear-notification, tab close, tab send, \
-                  tab resize, tab focus, tab report, tab prompt) needs \
+                  tab resize, tab focus, tab report, tab prompt, tab \
+                  take-size) needs \
                   --tab or ROOST_TAB_ID, which every Roost tab sets; \
                   without either it exits 2.\n\n\
                   Exit codes: 0 ok, 1 failed, 2 usage, 3 `session status` \

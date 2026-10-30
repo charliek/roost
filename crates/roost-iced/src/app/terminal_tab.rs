@@ -741,6 +741,7 @@ impl TerminalTab {
         self.rows = rows;
         self.selection = TerminalSelection::new();
         self.scroll = TerminalScroll::new();
+        self.top_pinned = false;
         self.end_selection_drag();
         self.grid = Vec::new();
         self.cached_grid_size = None;
@@ -1886,6 +1887,36 @@ mod tests {
         let hydrated = tab.hydration_terminal(80, 24).expect("hydration terminal");
         tab.swap_terminal(hydrated, 80, 24).expect("swap");
         assert!(tab.write_vt(WORKING).is_empty());
+    }
+
+    /// A hydrated terminal starts at its live bottom, so a pin to the old
+    /// terminal's top does not carry over to it.
+    #[test]
+    fn a_swapped_in_terminal_is_anchored_on_its_cursor_not_a_stale_pin() {
+        let metrics = TerminalMetrics::measure(13.0).expect("metrics");
+        let mut tab = laid_out_host_terminal(80, 30, metrics);
+        let view = tab
+            .apply_geometry(80, 10, metrics, 2)
+            .expect("view")
+            .expect("a new view");
+        tab.commit_geometry(view);
+        for line in 0..25 {
+            tab.write_vt(format!("line {line:03}\r\n").as_bytes());
+        }
+        tab.refresh_snapshot().expect("refresh");
+        assert!(matches!(
+            tab.handle_page(PageDirection::Up),
+            Ok(PageRoute::LocalViewport { .. })
+        ));
+        assert_eq!(tab.grid_offset(), 0, "pinned to the grid's top");
+
+        let mut hydrated = tab.hydration_terminal(80, 30).expect("hydration terminal");
+        for line in 0..25 {
+            hydrated.vt_write(format!("line {line:03}\r\n").as_bytes());
+        }
+        tab.swap_terminal(hydrated, 80, 30).expect("swap");
+        tab.refresh_snapshot().expect("refresh");
+        assert_eq!(tab.grid_offset(), 16, "anchored on the new cursor");
     }
 
     /// Plan 084 D7's offset: none while the grid fits the view, else the
