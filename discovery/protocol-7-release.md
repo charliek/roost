@@ -732,20 +732,195 @@ green.
 
 ### M3. G2: tab size ownership
 
+**Status: shipped on the branch (plan 084); PR pending.**
+
 This overturns plan 057 R15, "last interactor sets geometry"
 (`tab_task.rs:406-411`), and roadmap D7, "detach never resizes back"
 (`attach.rs:209-210`). Both are pinned by tests that M3 rewrites,
 including `tools/roosttest/test_session_attach.py` and
-`crates/roost-engine/tests/attach_forwarder_test.rs`. A new
-decision-log entry in `docs/development/vision.md` names both.
+`crates/roost-engine/tests/attach_forwarder_test.rs`. The decision-log
+entry in `docs/development/vision.md` is
+[DL-31](../docs/development/vision.md#dl-31-a-tab-has-one-size-owner-2026-10-30);
+it names both.
+
+*How it shipped (plan 084 corrections to this section). The rule text
+below is already corrected where an entry changes it:*
+
+**Terms**
+- **The wire says `client_id`.** It is the doc's "instance id": opaque,
+  1-64 bytes of `[A-Za-z0-9._-]`, minted once per iced process. The
+  label is 1-64 characters, display only.
+- **An owner goes on the wire as `{client_id, label}`.** `ResponseError`
+  has no data field, so `owned` names the label in its message only.
+- **`tab.resized` is live-only.** No geometry or owner rides the wire
+  `Tab`, and a reconnecting client learns a tab's owner from the attach
+  reply and from `tab.resized`.
+- **The data plane is `ROOSTDP3`.** Protocol 7 is amended in place; there
+  is no generation bump.
+
+**The rules**
+- **A `take: true` attach takes provisionally (rule 10, accepted by
+  Charlie).** The resize must happen before the snapshot and other
+  clients must see it in band, so an attach that later fails or is
+  cancelled may have been announced as owner (GRID, `tab.resized`) for
+  that window. It never ends up owning: it is never committed, never a
+  handoff candidate, and its take is rolled back to what it replaced,
+  when that is still there, else handed on. The cost is a possible
+  second reflow.
+- **Rollback.** A predecessor that committed meanwhile comes back live;
+  one that is gone defers to its own predecessor; an unowned one runs
+  the handoff. A failed resize-back keeps the predecessor and logs.
+- **A taking attach whose terminal resize fails is accepted as a
+  watcher.** A child that never takes the winsize gets `internal`, and
+  the attach rolls back.
+- **Timings.** Grace 5 s, scroll settle 300 ms, iced's `DETACH` drain at
+  most 200 ms.
+- **`DETACH` is a data-plane frame.** Rules 6 and 7 need the difference
+  between a deliberate detach (an immediate handoff) and a disconnect
+  (grace), and the wire had none. Before the accepted line it cancels
+  the attach. It is terminal: the reader stops, and a frame already
+  buffered behind it is a `protocol-error`.
+- **Handoff.** Another attachment of the leaving owner's own client
+  comes first, so a reconnect whose new attach beats the old EOF keeps
+  ownership. Recency is the attach and every `RESIZE`, in milliseconds;
+  ties go to the earliest attachment. A candidate whose grid the
+  terminal refuses is passed over, each tried once in one sorted pass.
+- **Release is per client.** `tab.release_size` puts the client in a
+  `released` set that every attachment it has, or opens later,
+  inherits; only a successful take by that client clears it. Otherwise
+  a still-attached owner's release would hand the size straight back.
+- **Grace.** The record keeps the PTY's grid, for a cancelled reclaim to
+  restore, and the owner's label, for a returning data attach that
+  arrives before its client's next hello.
+- **GRID consumes no seq.** Its `seq` is the last PTY seq before it.
+  It is held with the tee records until READY and filtered by
+  `grid_gen` against both snapshot and resume. No GRID follows EXIT, and
+  queued PTY output is ingested before any geometry change.
+- **GRID and `tab.resized` fire only when (cols, rows, owner id+label)
+  change.** A metrics-only change, or ownership moving between two
+  attachments of one client at the same grid, is not announced. Owner-only
+  changes are.
+- **`tab.resized` is generation-checked.** Only the pipeline generation
+  the workspace row last registered may publish it, checked under the
+  workspace lock with the publish, so a replaced pipeline never announces
+  for its replacement.
+- **Frames before the accepted line.** The queue holds 64 and the reader
+  never stops (so EOF and `DETACH` always cancel). A 65th ordinary frame
+  is a `protocol-error` rejection. A malformed frame before commit gets
+  the same. The queue is drained after each pre-commit step and once
+  more right before the accepted line.
+- **After EXIT**, size and owner are frozen. An attach is
+  non-provisional and records nothing, `tab.resize` answers ok and
+  changes nothing, and `tab.take_size` answers the current grid.
+- **`tab.take_size` uses the client's newest committed attachment.** A
+  client whose only attachment is mid-attach gets `not-found`; a resize
+  failure is `internal`; the hello check runs before the tab lookup.
+- **`tab.resize` replies after the decision and the terminal apply**,
+  not the winsize ack. Button-less mouse motion never takes (rule 3
+  names clicks and the wheel).
+- **`owned` is session-scoped.** It reaches a UI socket only through a
+  verbatim forward. The facade's code name is `size_owned`.
+- **Test-mode knobs and ops:** `ROOST_TEST_OWNER_GRACE_MS`,
+  `ROOST_TEST_ATTACH_HOLD_MS`, `ROOST_TEST_OWNER_CLOCK=frozen` (which
+  stamps `updated_at` 0), `tab.fail_next_resize`, `tab.drop_data_conns`
+  (a bare EOF).
+
+**Client identity**
+- **`client.hello` is session-only and must come first.** After any
+  other request, or a second time, it is refused `invalid-param`. A
+  session-wide registry maps client id to label (last hello wins, dropped
+  when no connection of that id is open). It is not a mutating op, so a
+  stopping session still answers it. An unknown or missing field answers
+  `unknown-field` / `missing-param`, the engine's decode convention.
+- **The bridge preamble is acknowledged, not fire-and-forget.** The
+  bridge writes it, reads one line back, and on anything but
+  `{"bridge":"accepted"}` (a protocol-6 daemon's `parse-error`, a closed
+  socket, 2 s of silence) closes, re-dials and relays with no preamble,
+  silently. A pre-M3 daemon behind an M3 bridge therefore sees bridged
+  connections as local. The restricted old-path proxy never writes it.
+  Only `roost-session serve` accepts it; a second preamble, a non-object
+  `bridge` or a line over 4 KiB closes the connection.
+- **iced ignores any `client.hello` error** (`unknown-op` from protocol 6,
+  `not-supported` from M2's old-path proxy); `identify` still decides
+  compatibility. A hello that gets no answer is not trusted to leave the
+  connection in step: iced dials a fresh control connection and goes
+  straight to identify.
+- **`roostctl` sends no hello** (a non-goal). `tab.take_size` is
+  addressed by tab and the connection's hello'd client id, so
+  `roostctl tab take-size` asks the UI, which takes the size for its own
+  client.
+
+**The iced side**
+- **Attach intent.** A user switch, a pending creation and `roostctl`
+  activation take; a close fallback, restore and slot re-arm watch. The
+  intent is spent when the accepted JSON line is parsed, so a forced
+  re-attach never takes, and an explicit request upgrades an automatic
+  attach that is not yet accepted (a re-dial with `take`).
+- **`DETACH`** goes out in every live phase with a bounded 200 ms drain,
+  and a dial still waiting for its reply sends it right behind the
+  handshake line. Closing the window detaches too, waiting out the
+  drains from outside the runtime.
+- **Input marking.** Keys, IME and paste take before their bytes; clicks
+  and the wheel are delivered, then take; hover, focus reports and pointer
+  cancel never do. A copy takes after the text is captured, and only when
+  this window is not the owner; a copy-on-select that copies nothing does
+  not take. A settled scroll takes only if another client owns the tab,
+  and only the wheel's local scroll and Page Up/Down arm it, not selection
+  autoscroll.
+- **`RESIZE` carries FOCUSED**, captured at resize time. A focused resize
+  while this window is not the owner sends even at an unchanged grid
+  (font change, palette preview); unfocused, an unchanged grid dedupes.
+- **The mirror is the PTY's grid.** The window's own grid is kept apart as
+  `advisory`. A GRID applies live, to the decoder, or deferred during
+  hydration; hydration finishes at the grid the payload ended at. The
+  withhold deadline only sends the held `RESIZE` and re-arms; it never
+  resizes the decoder. The owner comes from the accepted line and every
+  GRID only. A GRID whose seq is not the last PTY seq re-attaches.
+- **Resume points.** Detach keeps the resume point when the kept grid
+  equals the PTY's or none was heard; the session's `Regridded` refusal
+  covers the rest. A resume at exactly a GRID's seq answers `Regridded`,
+  so detaching right after a take costs a snapshot.
+- **The offset view.** A grid taller than the view is drawn from the
+  fewest rows above it that keep the cursor row on screen. The cursor row
+  is counted from the live bottom and keeps its last value while the
+  cursor is off-screen; a DECTCEM-hidden cursor still anchors. Drawing,
+  cell mapping, overshoot, the IME rect, autoscroll and Page Up/Down go
+  through it. A scroll that reaches the oldest row pins the view to the
+  grid's top; a GRID keeps the pin; a downward scroll or a keystroke
+  releases it. When the grid differs from the view, any point in the
+  widget clamps to the grid, padding included. In-process tabs are
+  unchanged.
+- **The marker is a tab-band badge**, "Sized by `<label>`" with a Take size
+  button, shown only while another client owns the host tab on screen.
+- **Take size** is one function behind the badge, the palette row ("Take
+  Size"), the unbound `take_size` keybind action, the UI-socket
+  `tab.take_size` and `roostctl tab take-size --tab`. The UI op resolves
+  the tab like other tab ops and returns the session's result. An
+  in-process tab answers its own grid `{cols, rows}`, not `{}`: one result
+  shape, since an in-process tab always follows the window. A missing one
+  is `not-found`. `tab.dispatch_mouse_event` accepts a host tab ref, so the
+  host-client lane can drive pointer input.
+- **The background wave** (rule 8). The refusal is final: the wave parks
+  the tab, stamped with the owner epoch the mirror folds from
+  `tab.resized` and a mirror generation (a reset or reconnect bumps it),
+  and judges a refusal by the epoch and generation of its own send. Only a
+  tab this window parked waves again on going unowned; an unowned
+  `tab.resized` at another grid just forgets `last_sent`, so two windows
+  never chase each other's resizes. A retryable error always retries with
+  backoff. Parking is cleared on reconnect, resync and rebuild.
+- **Test readouts** (test mode only): `app.window_metrics` gains
+  `grid_offset_rows`, `mirror_grid` and `size_owner`; `host.size_trace
+  {tab_id}` returns `{actions, wave_sends, parked}`, recorded when a frame
+  is queued on the main thread, not when it is written.
 
 #### Terms
 
 - **Client:** an instance of a Roost client: one iced window, `roostctl`
   process or phone app. It has:
-  - an opaque **instance id**, stable across reconnects for the
-    client's lifetime;
-  - a display **label** (default: the hostname), used only for display.
+  - an opaque **client id** (`client_id` on the wire; first called the
+    instance id), stable across reconnects for the client's lifetime;
+  - a display **label** (iced sends the hostname, capped at 64
+    characters), used only for display.
 - **Attachment:** one data connection from a client to one tab.
 
 #### The rules
@@ -783,7 +958,7 @@ decision-log entry in `docs/development/vision.md` names both.
      ownership transfers **after** the text is captured, so the reflow
      can't change what was selected.
    - **Scrolling scrollback locally:** ownership transfers once
-     scrolling **settles**. The M3 plan sets the debounce. The
+     scrolling **settles**, 300 ms after the last scroll. The
      viewport stays anchored on the same line across the reflow.
    - **Resizing the window while it has focus:** see rule 4.
    - **If applying the geometry fails,** ownership doesn't transfer,
@@ -814,24 +989,29 @@ decision-log entry in `docs/development/vision.md` names both.
    a disconnect, or an explicit **release**.
    - **Release is a new op** that mobile sends when backgrounding.
      Losing focus on the desktop does *not* release.
-   - Ownership passes to the attachment with the most recently updated
-     advisory grid. Ties go to the earliest attachment.
+   - A **deliberate detach** (the `DETACH` frame) or a release hands
+     ownership on at once. **A disconnect** with no other attachment of
+     the same client starts rule 7's grace instead.
+   - Ownership passes first to another attachment of the leaving owner's
+     own client, else to the attachment with the most recently updated
+     advisory grid (the attach and every `RESIZE`). Ties go to the
+     earliest attachment.
+   - A release excludes the releasing client until it takes again.
    - If no attachment remains, the tab keeps its size and has no owner.
 7. **Reconnecting owners.** An owner that reconnects with the same
-   instance id within a short grace period (the M3 plan picks it, on
-   the order of a few seconds) gets ownership back. That covers lag,
+   client id within a **5 s** grace period gets ownership back. That covers lag,
    network blips and resume. There's no handoff churn and no double
    reflow.
 8. **Background resizes.** These are control-plane `tab.resize` calls:
    iced's background wave and `roostctl tab resize`.
    - They apply only to tabs with no owner.
    - On an owned tab they're refused with an explicit `owned` error
-     naming the owner's label. `tab.resize` waits for the tab task's
-     decision before replying. Today it returns once the request is
-     queued (`pty.rs:1588`).
-   - The background wave treats `owned` as a normal answer: no retry,
-     not recorded in `last_sent`. When a tab's owner goes to none, the
-     wave starts again.
+     naming the owner's label in its message. `tab.resize` waits for the
+     tab task's decision and terminal apply before replying (not the
+     winsize ack). It used to return once the request was queued.
+   - The background wave treats `owned` as a final answer: it parks the
+     tab and doesn't retry it. When a `tab.resized` says the tab has
+     no owner, the wave starts again, for a tab this window parked.
 9. **`tab.write`** (the compose box, quick replies, `roostctl send`)
    never changes ownership or size.
 10. **One serializer.** Ownership state, advisory grids, and every
@@ -845,11 +1025,14 @@ decision-log entry in `docs/development/vision.md` names both.
     - The `resize_first` decision at admission
       (`crates/roost-engine/src/ipc.rs:2011`) is removed. Two attaches
       to an unowned tab at the same moment resolve in the tab task.
-    - A failed or cancelled attach never becomes owner.
+    - A failed or cancelled attach never **ends up** owner. A `take:
+      true` attach is owner provisionally until its accepted line is
+      written, and is rolled back if it fails first.
 11. **Resizes are ordered with output.**
-    - A new server-to-client **data-plane frame** carries `{seq, cols,
-      rows, owner}`. The tab task emits it into the output stream at
-      the exact sequence position where a geometry change is applied.
+    - A new server-to-client **data-plane frame**, `GRID`, carries
+      `{seq, cols, rows, owner}`. The tab task emits it into the output
+      stream at the exact sequence position where a geometry change is
+      applied. It consumes no seq: `seq` is the last PTY seq before it.
     - Clients resize their mirror when they reach the frame, so output
       written for the old grid and the new grid is never mixed.
     - The control-plane `tab.resized {tab_id, cols, rows, owner}` event
@@ -876,8 +1059,8 @@ decision-log entry in `docs/development/vision.md` names both.
 These are used here, and by M4.
 
 - **`client.hello`, a new session-socket op.** It's the first request
-  on a control connection, and carries the instance id and label. The
-  data-plane attach handshake carries the instance id too.
+  on a control connection, and carries the client id and label. The
+  data-plane attach handshake carries the client id too.
   - All of this is session-only and rides protocol 7.
   - Session requests are `deny_unknown_fields`
     (`messages.rs:2618-2623`), so these are new message types, not new
@@ -896,16 +1079,17 @@ These are used here, and by M4.
     The values come from the bridge's own environment, which is the
     laptop's SSH connection.
   - **Server side:** the IPC server's first-line classifier
-    (`crates/roost-ipc/src/server.rs`, around 698 and 902) accepts and
-    strips the preamble before the attach handshake or the first
-    request, on both planes.
+    (`crates/roost-ipc/src/server.rs`, around 698 and 902) accepts,
+    acknowledges and strips the preamble before the attach handshake or
+    the first request, on both planes.
   - **What stays pure:** the direction toward the client (stdout).
-  - **No preamble:** the connection is local.
+  - **No preamble:** the connection is local. That includes a bridge
+    whose daemon never acknowledged one.
   - **Trust:** the only callers are same-uid processes
     (`serve.rs:369-375`), so the flag is advisory, not a security
     boundary.
 - **Labels are for display only.** Two windows on one host share a
-  hostname, and the instance id tells them apart.
+  hostname, and the client id tells them apart.
 - `#476` (a client list) can grow from this later. It's not in scope.
 
 #### The iced side
