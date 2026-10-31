@@ -1,0 +1,14 @@
+version: 1
+targets:
+  desktop:
+    kind: desktop
+    released: { tag_pattern: '^v\d+\.\d+\.\d+$' }
+    # release.yml builds the dmg and deb from the root workspace.
+    ships: [Cargo.lock]
+lockfiles:
+  # Its Cargo.toml: "A test tool, not product code", outside the root
+  # workspace; only the Mac real-input test harness runs it.
+  tools/input/mac/roost-input-mac/Cargo.lock: { role: test }
+  # pyproject.toml has only the docs and test dependency groups (the docs
+  # site build and the test harness); no release artifact contains them.
+  uv.lock: { role: test }
