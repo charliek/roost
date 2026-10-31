@@ -3539,8 +3539,10 @@ is about to carry with one line of its own, written toward the session:
 ```
 
 The two values are the bridge's own `SSH_CONNECTION` and `SSH_CLIENT` —
-the SSH connection the client came in on — each `null` when unset and
-cut to 256 bytes on a character boundary. The bridge then reads exactly
+the SSH connection the client came in on — each `null` when unset, and
+also when it holds a NUL, is not UTF-8 or is over 256 bytes: the bridge
+leaves out a value [`tab.open`'s rules](#tabopen) refuse, as every
+other opener does, rather than cut it. The bridge then reads exactly
 one line back **itself**: the session's acknowledgement,
 
 ```json

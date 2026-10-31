@@ -49,6 +49,7 @@
 //! preamble, and the bridge dials again and relays with none. Neither
 //! line ever reaches stdout.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,7 +61,7 @@ use roost_ipc::messages::{
     ops, BridgeOrigin, BridgePreamble, RawRequest, BRIDGE_ACCEPTED, MAX_BRIDGE_PREAMBLE,
 };
 use roost_ipc::old_session::{self, OldSession};
-use roost_ipc::opener::MAX_ORIGIN_VALUE;
+use roost_ipc::opener::remote_value_from;
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::socket_state::{classify_connect_error, SocketState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -149,10 +150,7 @@ async fn connect(socket_path: &Path) -> Result<UnixStream, Unreachable> {
 /// existed answers it as a malformed request, and the client must never
 /// see that answer.
 async fn announce(mut socket: UnixStream, socket_path: &Path) -> anyhow::Result<UnixStream> {
-    let line = preamble_line(
-        std::env::var("SSH_CONNECTION").ok(),
-        std::env::var("SSH_CLIENT").ok(),
-    );
+    let line = preamble_line(&std::env::vars_os().collect::<Vec<_>>());
     if accepted(&mut socket, &line).await {
         return Ok(socket);
     }
@@ -162,28 +160,19 @@ async fn announce(mut socket: UnixStream, socket_path: &Path) -> anyhow::Result<
         .map_err(|(Unreachable::Nothing(error) | Unreachable::Other(error))| error)
 }
 
-/// The preamble line, newline included.
-fn preamble_line(ssh_connection: Option<String>, ssh_client: Option<String>) -> Vec<u8> {
+/// The preamble line for `env`, newline included. Each value is collected
+/// as every other opener's is, so a value too long or not UTF-8 is left
+/// out rather than cut into an identity no other client would send.
+fn preamble_line(env: &[(OsString, OsString)]) -> Vec<u8> {
     let preamble = BridgePreamble {
         bridge: BridgeOrigin {
-            ssh_connection: ssh_connection.map(cut_origin_value),
-            ssh_client: ssh_client.map(cut_origin_value),
+            ssh_connection: remote_value_from(env, "SSH_CONNECTION"),
+            ssh_client: remote_value_from(env, "SSH_CLIENT"),
         },
     };
     let mut line = serde_json::to_vec(&preamble).expect("a preamble serializes");
     line.push(b'\n');
     line
-}
-
-fn cut_origin_value(mut value: String) -> String {
-    if value.len() > MAX_ORIGIN_VALUE {
-        let mut end = MAX_ORIGIN_VALUE;
-        while !value.is_char_boundary(end) {
-            end -= 1;
-        }
-        value.truncate(end);
-    }
-    value
 }
 
 /// Write the preamble and read exactly one line back, within
@@ -442,11 +431,25 @@ mod tests {
         assert_eq!(refused(b"garbage")["error"]["code"], codes::PARSE_ERROR);
     }
 
+    fn env(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        pairs
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect()
+    }
+
+    fn origin(line: &[u8]) -> serde_json::Value {
+        serde_json::from_slice::<serde_json::Value>(line).unwrap()["bridge"].clone()
+    }
+
     /// Plan 084 D2: the preamble is one line naming both values, null
     /// when unset.
     #[test]
     fn the_preamble_is_one_line_with_both_origin_values() {
-        let line = preamble_line(Some("10.0.0.1 5000 10.0.0.2 22".into()), None);
+        let line = preamble_line(&env(&[
+            ("SSH_CONNECTION", "10.0.0.1 5000 10.0.0.2 22"),
+            ("SSH_TTY", "/dev/pts/3"),
+        ]));
         assert_eq!(line.last(), Some(&b'\n'));
         assert_eq!(line.iter().filter(|b| **b == b'\n').count(), 1);
         let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
@@ -459,17 +462,54 @@ mod tests {
         );
     }
 
-    /// Each value is cut to 256 bytes on a char boundary, so the line
-    /// fits the session's limit even escaped.
+    /// Plan 085 D2: a value over 256 bytes or with a NUL is left out, as
+    /// the session's starter and roostctl leave it out — never cut to a
+    /// prefix no other opener would send. The other value is kept.
     #[test]
-    fn origin_values_are_cut_on_a_char_boundary() {
-        assert_eq!(cut_origin_value("a".repeat(256)).len(), 256);
-        assert_eq!(cut_origin_value("a".repeat(300)).len(), 256);
-        // 255 ASCII bytes then a 3-byte char straddling the limit.
-        let cut = cut_origin_value(format!("{}€tail", "a".repeat(255)));
-        assert_eq!(cut, "a".repeat(255));
-        let worst = preamble_line(Some("\u{1}".repeat(400)), Some("\u{1}".repeat(400)));
-        assert!(worst.len() - 1 <= MAX_BRIDGE_PREAMBLE, "{}", worst.len());
+    fn a_value_the_value_rules_refuse_is_left_out_not_cut() {
+        let client = "10.0.0.1 5000 22";
+        for refused in [
+            "a".repeat(257),
+            format!("{}€", "a".repeat(254)),
+            "1\0 2".into(),
+        ] {
+            let line = preamble_line(&env(&[
+                ("SSH_CONNECTION", &refused),
+                ("SSH_CLIENT", client),
+            ]));
+            assert_eq!(
+                origin(&line),
+                serde_json::json!({"ssh_connection": null, "ssh_client": client}),
+                "{} bytes",
+                refused.len()
+            );
+        }
+        let longest = "a".repeat(256);
+        let line = preamble_line(&env(&[("SSH_CONNECTION", &longest)]));
+        assert_eq!(origin(&line)["ssh_connection"], longest.as_str());
+    }
+
+    #[test]
+    fn a_value_that_is_not_utf8_is_left_out() {
+        use std::os::unix::ffi::OsStringExt;
+        let line = preamble_line(&[(
+            OsString::from("SSH_CLIENT"),
+            OsString::from_vec(b"10.0.0.1 \xff 22".to_vec()),
+        )]);
+        assert_eq!(
+            origin(&line),
+            serde_json::json!({"ssh_connection": null, "ssh_client": null})
+        );
+    }
+
+    /// Two values at the limit fit the session's line limit even when
+    /// every byte is escaped.
+    #[test]
+    fn the_longest_preamble_fits_the_line_limit() {
+        let worst = "\u{1}".repeat(256);
+        let line = preamble_line(&env(&[("SSH_CONNECTION", &worst), ("SSH_CLIENT", &worst)]));
+        assert!(!origin(&line)["ssh_client"].is_null(), "both are kept");
+        assert!(line.len() - 1 <= MAX_BRIDGE_PREAMBLE, "{}", line.len());
     }
 
     /// Plan 083 A2 review (R6): an envelope a session would refuse to

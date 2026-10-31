@@ -359,6 +359,47 @@ class LocalSetTests(unittest.TestCase):
             "no runtime dir to resolve it against",
         )
 
+    def test_a_value_over_the_byte_limit_is_skipped(self) -> None:
+        at_limit = "€" * (tab_env.MAX_LOCAL_VALUE // 3) + "a"
+        self.assertEqual(len(at_limit.encode()), tab_env.MAX_LOCAL_VALUE)
+        self.assertEqual(
+            tab_env.local_set_from({"DISPLAY": "a" * 4097, "SSH_AUTH_SOCK": at_limit}),
+            {"SSH_AUTH_SOCK": at_limit},
+            "the limit counts UTF-8 bytes, not characters",
+        )
+        self.assertEqual(
+            tab_env.local_set_from({"DISPLAY": at_limit + "a"}),
+            {},
+        )
+
+    def test_a_wayland_display_over_the_limit_once_made_absolute_is_skipped(self) -> None:
+        display = "w" * (tab_env.MAX_LOCAL_VALUE - 4)
+        self.assertEqual(
+            tab_env.local_set_from({"WAYLAND_DISPLAY": display, "XDG_RUNTIME_DIR": "/run"}),
+            {},
+        )
+        self.assertEqual(
+            tab_env.local_set_from({"WAYLAND_DISPLAY": display, "XDG_RUNTIME_DIR": "/r"}),
+            {"WAYLAND_DISPLAY": "/r/" + display},
+        )
+
+    def test_a_value_with_a_nul_is_skipped(self) -> None:
+        self.assertEqual(
+            tab_env.local_set_from({"DISPLAY": ":1\0", "SSH_AUTH_SOCK": "/a"}),
+            {"SSH_AUTH_SOCK": "/a"},
+        )
+
+    def test_a_value_that_is_not_utf8_is_skipped(self) -> None:
+        env = {"DISPLAY": os.fsdecode(b":1\xff"), "SSH_AUTH_SOCK": "/a"}
+        self.assertEqual(tab_env.local_set_from(env), {"SSH_AUTH_SOCK": "/a"})
+
+    def test_a_runtime_dir_that_is_not_utf8_leaves_a_relative_display_as_is(self) -> None:
+        env = {
+            "WAYLAND_DISPLAY": "wayland-2",
+            "XDG_RUNTIME_DIR": os.fsdecode(b"/run/\xff"),
+        }
+        self.assertEqual(tab_env.local_set_from(env), {"WAYLAND_DISPLAY": "wayland-2"})
+
 
 if __name__ == "__main__":
     unittest.main()

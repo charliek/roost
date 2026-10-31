@@ -41,6 +41,8 @@ from ui import OPENER_SET
 
 #: MIRRORS `roost_ipc::opener::LOCAL_SET`: what a local opener brings.
 LOCAL_SET = OPENER_SET[:4]
+#: MIRRORS `roost_ipc::opener::MAX_LOCAL_VALUE`, in UTF-8 bytes.
+MAX_LOCAL_VALUE = 4096
 
 _CTL_KERN = 1
 _KERN_ARGMAX = 8
@@ -334,12 +336,38 @@ def opener_vars(env: dict[str, str]) -> dict[str, str]:
 def local_set_from(env: dict[str, str]) -> dict[str, str]:
     """MIRRORS `roost_ipc::opener::local_set_from`: the local-set values
     `env` brings as an opener, a relative `WAYLAND_DISPLAY` made absolute
-    against `env`'s own `XDG_RUNTIME_DIR`."""
-    found = {name: env[name] for name in LOCAL_SET if name in env}
-    display, runtime = found.get("WAYLAND_DISPLAY"), env.get("XDG_RUNTIME_DIR", "")
-    if display and not os.path.isabs(display) and os.path.isabs(runtime):
-        found["WAYLAND_DISPLAY"] = os.path.join(runtime, display)
+    against `env`'s own `XDG_RUNTIME_DIR` — kept relative when the joined
+    path is not UTF-8. A value that is not UTF-8, holds a NUL or is over
+    `MAX_LOCAL_VALUE` bytes is skipped. `env` is `os.fsdecode`d, so bytes
+    that are not UTF-8 are lone surrogates here — which holds only under a
+    UTF-8 filesystem encoding, Python's default (PEP 538/540) and every
+    lane's."""
+    found: dict[str, str] = {}
+    for name in LOCAL_SET:
+        value = env.get(name)
+        if value is None or not _is_utf8(value):
+            continue
+        if name == "WAYLAND_DISPLAY":
+            value = _absolute_wayland_display(value, env.get("XDG_RUNTIME_DIR", ""))
+        if "\0" in value or len(os.fsencode(value)) > MAX_LOCAL_VALUE:
+            continue
+        found[name] = value
     return found
+
+
+def _absolute_wayland_display(display: str, runtime: str) -> str:
+    if not display or os.path.isabs(display) or not os.path.isabs(runtime):
+        return display
+    joined = os.path.join(runtime, display)
+    return joined if _is_utf8(joined) else display
+
+
+def _is_utf8(value: str) -> bool:
+    try:
+        value.encode()
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _require_child(pid: int, allowed: set[Path]) -> None:

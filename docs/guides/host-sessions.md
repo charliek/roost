@@ -317,7 +317,7 @@ A tab's environment reflects **who opened it**, not who started the session. A s
 | Roost-Iced on the machine itself (a new tab on the machine's own session, or a `localhost` host) | Roost-Iced's own `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` and `SSH_AUTH_SOCK`, so GUI programs open on that desk and `git push` uses the desk's agent. It sends them with the open. |
 | Roost-Iced on your laptop, connected over SSH | `SSH_CONNECTION` and `SSH_CLIENT` of that SSH connection, and nothing else of the seven: no display, bus, agent or `SSH_TTY`. Tools in the tab behave as remote, and the desk's display and agent are out of reach. |
 | `roostctl tab open` or `roostctl open` | The caller's own: inside an SSH login (or in a tab that carries `SSH_CONNECTION`) it declares itself remote, as above; otherwise it sends its display, bus and agent. This holds whichever socket it dials, and `roostctl` pointed at the window reaches the session with the original caller's values. |
-| Any other client that states nothing | The baseline: none of the seven. |
+| Any other client on a local connection (not through an SSH bridge) that states nothing | The baseline: none of the seven. A request through a bridge is remote, as above. |
 
 A remote tab does not get the laptop's `SSH_AUTH_SOCK` on purpose: a forwarded agent socket dies with its SSH connection, which is wrong for a tab that outlives it.
 

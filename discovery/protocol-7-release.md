@@ -1199,6 +1199,10 @@ the first entry amends:*
   message, naming the key.
 - **Value rules:** no NUL; local values at most 4096 bytes, remote at most
   256 (the preamble's), applied to preamble and `state.json` values too.
+  *Amended in execution (branch review):* every producer collects its
+  values by the same rule and leaves out one the rules refuse, the bridge
+  included: it no longer cuts an `SSH_*` value to 256 bytes, which gave a
+  bridged tab an identity no other opener would send.
 - **`WAYLAND_DISPLAY` is sent absolute**, resolved against the sender's own
   `XDG_RUNTIME_DIR` when relative.
 - **`XDG_RUNTIME_DIR`:** `/run/user/<uid>` when it is a non-symlink
@@ -1221,6 +1225,10 @@ the first entry amends:*
 - **The opener set is exactly the seven.** Other login-shaped variables
   (`XDG_SESSION_TYPE`, `XDG_SESSION_ID`, `SSH_ORIGINAL_COMMAND`, `TMUX`)
   still pass through the baseline.
+- *Amended in execution (C2, C3):* **in-process Roost-Iced honours `env`
+  and `origin` too.** Its UI socket resolves them with the same rules as a
+  session, and roostctl sends them there; rule 7 is corrected to say the
+  fields go to Rust targets, not only to session targets.
 - *Amended in execution (C3):* **the Roost.app skip is macOS-only.** Off
   macOS the `Mac` profile resolves to a Rust UI, which honours the fields.
   `roostctl open` against Roost.app fails `unsupported` before any
@@ -1309,9 +1317,11 @@ podman working in remote tabs.
 6. **macOS.** The same rules. A desk-started Roost-Iced has launchd's
    `SSH_AUTH_SOCK` in its environment and passes it as a local opener.
    The daemon's baseline never keeps one.
-7. **Frozen Swift.** `env` on `tab.open` goes only to session targets,
-   per the release rule. `roostctl tab open` against `Roost.app` keeps
-   working unchanged.
+7. **Frozen Swift.** `env` and `origin` on `tab.open` go only to Rust
+   targets — a session, or in-process Roost-Iced's UI socket — never to
+   a target roostctl knows is `Roost.app`, per the release rule. Reached
+   by `--socket`, `Roost.app` refuses them by name and roostctl asks once
+   more without; `roostctl tab open` against `Roost.app` keeps working.
 
 **Every op that spawns a PTY is in scope.** The M4 plan writes the full
 inventory: `tab.open`, project creation's first tab, startup restore,

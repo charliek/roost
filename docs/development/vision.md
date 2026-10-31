@@ -1327,7 +1327,8 @@ from the tab's **opener**. A local opener (the desk's Roost-Iced, or
 `tab.open`. A remote opener (a connection through a `client-bridge`, or a
 caller declaring itself remote) gets its `SSH_CONNECTION` and `SSH_CLIENT`
 and nothing else, so its tabs act remote and cannot reach the desk's
-display or the agent. A request that states neither gets the baseline. The
+display or the agent. A request on a local connection that states neither
+gets the baseline. The
 opener is saved with the tab, so a restart restores a tab as it was opened;
 a local session start may refresh the saved display, bus and agent with its
 own. `XDG_RUNTIME_DIR` is the machine's and the user's, not the opener's:
