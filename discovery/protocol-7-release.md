@@ -164,7 +164,8 @@ hosts the agents doing this work.
 | M4 | G9: tab environment by opener | amends 7 | M3 (needs client identity and the bridge preamble) |
 | M5 | B1: host-client modules into `roost-client` | none | M3 (edits `mirror.rs`, `host_tab.rs`) |
 
-**Release:** after M1–M5 have all landed, plus a `release.yml` dry run
+**Release:** all five milestones have landed (M5, the last, as #671
+on 2026-10-31). The release follows them, after a `release.yml` dry run
 with Zig 0.17. Its `vendored-ghostty-*` caches also start cold, and
 `ci-success` never runs that workflow. Then the mobile client gets its
 own feature branch.
@@ -1408,7 +1409,8 @@ because these files churn (#568, #570, #597).
 - **Clean dependencies:** `roost-client` builds on its own and doesn't
   depend on `roost-iced`, iced or winit. `cargo metadata` checks this,
   the same way the `examples/ipc-consumer` check does.
-**Status: in review (plan 086)**
+
+**Status: merged: #671** (plan 086).
 
 *How it shipped (plan 086 departures from this section):*
 - **Two more supporting items moved** than named above: `Shutdown` and
