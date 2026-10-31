@@ -32,6 +32,7 @@ path = "src/main.rs"
 # so every call it gets from here goes to the blocking pool.
 roost-agent = { path = "../roost-agent" }
 roost-agent-install = { path = "../roost-agent-install" }
+roost-client = { path = "../roost-client" }
 roost-engine = { path = "../roost-engine", features = ["vt"] }
 roost-ipc = { path = "../roost-ipc" }
 roost-ui-model = { path = "../roost-ui-model" }
@@ -238,6 +239,7 @@ wayland-protocols = { version = "0.32.13", default-features = false, features = 
 ] }
 
 [dev-dependencies]
+roost-client = { path = "../roost-client", features = ["test-support"] }
 swash = "=0.2.10"
 tempfile = "3"
 # `start_paused` only. One case has to let the reconnect timer actually

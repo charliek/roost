@@ -37,6 +37,7 @@ members = [
     "crates/roost-engine",
     "crates/roost-ui-model",
     "crates/roost-cli",
+    "crates/roost-client",
     "crates/roost-iced",
     "crates/roost-session",
 ]

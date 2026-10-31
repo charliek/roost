@@ -67,7 +67,7 @@ const BUDGET_PER_ENCODED_MIB: Duration = Duration::from_secs(20);
 ///
 /// Injectable ([`Uploads::with_budget`]) so a test need not wait out a
 /// real one.
-pub(crate) type Budget = fn(u64) -> Duration;
+pub type Budget = fn(u64) -> Duration;
 
 /// `(30 s + 20 s × encoded MiB) × scale()`.
 ///
@@ -75,7 +75,7 @@ pub(crate) type Budget = fn(u64) -> Duration;
 /// base64 is `div_ceil(3) * 4`, so a 10 MiB file is 13.4 MiB and gets
 /// ~298 s. The control leg's budget would not do — it is sized for a
 /// `tab.list`, and a slow link is not a fault here.
-pub(crate) fn budget(raw: u64) -> Duration {
+pub fn budget(raw: u64) -> Duration {
     let encoded = raw.div_ceil(3) * 4;
     let mib = encoded as f64 / (1024.0 * 1024.0);
     (BUDGET_BASE + BUDGET_PER_ENCODED_MIB.mul_f64(mib)).mul_f64(scale())
@@ -87,13 +87,13 @@ pub(crate) fn budget(raw: u64) -> Duration {
 /// disk on a host tab; a dropped file is read at upload time rather than
 /// trusted from the inspection that planned it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum UploadSource {
+pub enum UploadSource {
     Path(PathBuf),
     Bytes(Vec<u8>),
 }
 
 /// What an upload answers with.
-pub(crate) type UploadResult = Result<SessionPutFileResult, HostOpError>;
+pub type UploadResult = Result<SessionPutFileResult, HostOpError>;
 
 /// One queued upload, and where its answer goes.
 ///
@@ -114,7 +114,7 @@ struct Upload {
 /// an upload asked of a host that is not connected is refused here
 /// rather than queued behind a connect.
 #[derive(Debug, Clone)]
-pub(crate) struct Uploads {
+pub struct Uploads {
     lane: Arc<Mutex<Option<mpsc::Sender<Upload>>>>,
     budget: Budget,
 }
@@ -126,7 +126,7 @@ impl Default for Uploads {
 }
 
 impl Uploads {
-    pub(crate) fn with_budget(budget: Budget) -> Uploads {
+    pub fn with_budget(budget: Budget) -> Uploads {
         Uploads {
             lane: Arc::new(Mutex::new(None)),
             budget,
@@ -137,7 +137,7 @@ impl Uploads {
     ///
     /// The returned guard is the incarnation's lifetime: dropping it
     /// empties the slot and cancels every upload, in flight or queued.
-    pub(crate) fn open(&self, socket: PathBuf) -> Lane {
+    pub fn open(&self, socket: PathBuf) -> Lane {
         let (tx, rx) = mpsc::channel(QUEUE_DEPTH);
         let cancel = Arc::new(Shutdown::default());
         *self.locked() = Some(tx.clone());
@@ -163,7 +163,7 @@ impl Uploads {
     /// receiver that comes back is one the dispatcher will answer — the
     /// caller hearing nothing at all is the one outcome this lane does
     /// not have.
-    pub(crate) fn enqueue(
+    pub fn enqueue(
         &self,
         name: String,
         source: UploadSource,
@@ -212,7 +212,7 @@ impl Uploads {
 }
 
 /// One incarnation's hold on its lane. See [`Uploads::open`].
-pub(crate) struct Lane {
+pub struct Lane {
     cancel: Arc<Shutdown>,
     uploads: Uploads,
     sender: mpsc::Sender<Upload>,

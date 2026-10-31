@@ -37,11 +37,11 @@ const QUEUE_DEPTH: usize = 256;
 
 /// The label a barrier carries in the worker's logs. Not a wire op —
 /// see [`HostIntent::barrier`].
-pub(crate) const BARRIER_OP: &str = "attach-permit";
+pub const BARRIER_OP: &str = "attach-permit";
 
 /// Why an intent did not produce a result.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HostOpError {
+pub enum HostOpError {
     /// The queue was flushed because the connection left `Connected`
     /// before this intent reached the wire. Plan 037 §3.9's "a queue
     /// stuck behind a dead connection is flushed with errors".
@@ -82,13 +82,13 @@ impl std::fmt::Display for HostOpError {
 
 /// Where a reply goes. `None` is fire-and-forget: the worker logs a
 /// failure and moves on.
-pub(crate) type HostOpReply = oneshot::Sender<Result<serde_json::Value, HostOpError>>;
+pub type HostOpReply = oneshot::Sender<Result<serde_json::Value, HostOpError>>;
 
 /// One queued control-plane op.
 #[derive(Debug)]
-pub(crate) struct HostIntent {
-    pub(crate) op: Cow<'static, str>,
-    pub(crate) params: serde_json::Value,
+pub struct HostIntent {
+    pub op: Cow<'static, str>,
+    pub params: serde_json::Value,
     /// The incarnation this intent was issued *for*, when the caller
     /// cared.
     ///
@@ -104,18 +104,18 @@ pub(crate) struct HostIntent {
     /// administrative ops (a theme push, an `agent-hooks` raise) that are
     /// about the connection rather than about a row on it, and are
     /// correct on whichever connection serves them.
-    pub(crate) fence: Option<HostId>,
-    pub(crate) reply: Option<HostOpReply>,
+    pub fence: Option<HostId>,
+    pub reply: Option<HostOpReply>,
     /// The ordering barrier: the worker answers this item itself, where
     /// it stands, instead of putting it on the wire. Reaching it *is*
     /// the answer — see [`HostOps::attach_permit`], which is the only
     /// thing that makes one.
-    pub(crate) barrier: bool,
+    pub barrier: bool,
 }
 
 impl HostIntent {
     /// A fire-and-forget administrative op.
-    pub(crate) fn new(op: impl Into<Cow<'static, str>>, params: serde_json::Value) -> Self {
+    pub fn new(op: impl Into<Cow<'static, str>>, params: serde_json::Value) -> Self {
         Self {
             op: op.into(),
             params,
@@ -136,19 +136,19 @@ impl HostIntent {
 
     /// Bind this intent to the connection it was issued for. See
     /// [`Self::fence`].
-    pub(crate) fn fenced_at(mut self, incarnation: HostId) -> Self {
+    pub fn fenced_at(mut self, incarnation: HostId) -> Self {
         self.fence = Some(incarnation);
         self
     }
 
     /// Route the outcome to `reply`.
-    pub(crate) fn answering(mut self, reply: HostOpReply) -> Self {
+    pub fn answering(mut self, reply: HostOpReply) -> Self {
         self.reply = Some(reply);
         self
     }
 
     /// Hand a result to whoever is waiting, if anyone is.
-    pub(crate) fn answer(self, outcome: Result<serde_json::Value, HostOpError>) {
+    pub fn answer(self, outcome: Result<serde_json::Value, HostOpError>) {
         let op = self.op;
         match self.reply {
             Some(reply) => {
@@ -175,7 +175,7 @@ impl HostIntent {
 /// the fence has to outlive the answer, and this is where it lives. See
 /// [`AttachPermit::guarding`].
 #[derive(Debug, Clone)]
-pub(crate) struct Serving(Arc<watch::Sender<Option<HostId>>>);
+pub struct Serving(Arc<watch::Sender<Option<HostId>>>);
 
 impl Default for Serving {
     fn default() -> Self {
@@ -188,7 +188,7 @@ impl Serving {
     /// returned hold lives — the connection task opens one at its
     /// `Connected` edge and drops it on every way out, exactly as it
     /// does the upload lane ([`Uploads::open`]).
-    pub(crate) fn open(&self, incarnation: HostId) -> Hold {
+    pub fn open(&self, incarnation: HostId) -> Hold {
         self.0.send_replace(Some(incarnation));
         Hold {
             serving: self.clone(),
@@ -198,7 +198,7 @@ impl Serving {
 }
 
 /// One incarnation's hold on [`Serving`].
-pub(crate) struct Hold {
+pub struct Hold {
     serving: Serving,
     incarnation: HostId,
 }
@@ -234,7 +234,7 @@ impl Drop for Hold {
 /// is what makes that impossible to forget.
 #[derive(Debug)]
 #[must_use = "a permit is only good for the dial it guards"]
-pub(crate) struct AttachPermit {
+pub struct AttachPermit {
     incarnation: HostId,
     serving: watch::Receiver<Option<HostId>>,
 }
@@ -243,7 +243,7 @@ impl AttachPermit {
     /// Run `dial` only while the connection this permit was granted for
     /// is still the one being served, and abandon it the moment that
     /// stops being true.
-    pub(crate) async fn guarding<T>(
+    pub async fn guarding<T>(
         mut self,
         dial: impl std::future::Future<Output = T>,
     ) -> Result<T, HostOpError> {
@@ -271,7 +271,7 @@ impl AttachPermit {
 /// was enqueued": the worker owns the receiving half, so there is no
 /// other way to look.
 #[derive(Debug, Clone)]
-pub(crate) struct HostOps {
+pub struct HostOps {
     tx: mpsc::Sender<HostIntent>,
     /// The upload lane, which shares nothing with the queue above but
     /// the handle that reaches it. See [`upload`].
@@ -282,12 +282,12 @@ pub(crate) struct HostOps {
 
 impl HostOps {
     /// How many intents are queued and unread. See the struct doc.
-    #[cfg(test)]
-    pub(crate) fn queued_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn queued_for_test(&self) -> usize {
         self.tx.max_capacity() - self.tx.capacity()
     }
 
-    pub(crate) fn channel() -> (HostOps, mpsc::Receiver<HostIntent>) {
+    pub fn channel() -> (HostOps, mpsc::Receiver<HostIntent>) {
         let (tx, rx) = mpsc::channel(QUEUE_DEPTH);
         (
             HostOps {
@@ -300,13 +300,13 @@ impl HostOps {
     }
 
     /// The slot the connection task fills at its `Connected` edge.
-    pub(crate) fn uploads(&self) -> Uploads {
+    pub fn uploads(&self) -> Uploads {
         self.uploads.clone()
     }
 
     /// The fence the connection task holds open across a `Connected`
     /// incarnation. See [`Serving`].
-    pub(crate) fn serving(&self) -> Serving {
+    pub fn serving(&self) -> Serving {
         self.serving.clone()
     }
 
@@ -321,7 +321,7 @@ impl HostOps {
     /// Like [`Self::call`], the future always resolves: a dispatcher
     /// that went away mid-upload reads as [`HostOpError::Disconnected`],
     /// which is what happened.
-    pub(crate) fn put_file(
+    pub fn put_file(
         &self,
         name: String,
         source: UploadSource,
@@ -333,7 +333,7 @@ impl HostOps {
 
     /// Enqueue. The intent's own reply channel carries the outcome; the
     /// `Err` here is only the enqueue failing.
-    pub(crate) fn send(&self, intent: HostIntent) -> Result<(), HostOpError> {
+    pub fn send(&self, intent: HostIntent) -> Result<(), HostOpError> {
         self.enqueue(intent, |intent| {
             tracing::warn!(op = %intent.op, "host op queue is full");
         })
@@ -341,7 +341,7 @@ impl HostOps {
 
     /// [`Self::send`] for a caller that retries a full queue itself, and
     /// logs it at its own level.
-    pub(crate) fn send_quiet(&self, intent: HostIntent) -> Result<(), HostOpError> {
+    pub fn send_quiet(&self, intent: HostIntent) -> Result<(), HostOpError> {
         self.enqueue(intent, |_| {})
     }
 
@@ -371,7 +371,7 @@ impl HostOps {
     /// unanswered — the worker went away mid-op — reads as
     /// [`HostOpError::Disconnected`], which is what actually happened.
     /// A caller never sees a bare `RecvError` and never waits forever.
-    pub(crate) fn call(
+    pub fn call(
         &self,
         op: impl Into<Cow<'static, str>>,
         params: serde_json::Value,
@@ -405,7 +405,7 @@ impl HostOps {
     /// it releases afterwards. An attach must not dial the session that
     /// replaced the connection it was asked of, whether the replacement
     /// happened before the grant or after it.
-    pub(crate) fn attach_permit(
+    pub fn attach_permit(
         &self,
         incarnation: HostId,
     ) -> impl std::future::Future<Output = Result<AttachPermit, HostOpError>> + Send + 'static {
@@ -425,7 +425,7 @@ impl HostOps {
     /// [`Self::call`] bound to the incarnation it was issued for — see
     /// [`HostIntent::fence`]. The form every op that names a *row* on
     /// the session should use.
-    pub(crate) fn call_at(
+    pub fn call_at(
         &self,
         incarnation: HostId,
         op: impl Into<Cow<'static, str>>,
@@ -458,7 +458,7 @@ impl HostOps {
 /// *next* incarnation — a mutation the user asked of a session that is
 /// gone, applied to its replacement. The handle stays open because the
 /// same handle serves the reconnect.
-pub(crate) fn flush(rx: &mut mpsc::Receiver<HostIntent>, error: &HostOpError) {
+pub fn flush(rx: &mut mpsc::Receiver<HostIntent>, error: &HostOpError) {
     while let Ok(intent) = rx.try_recv() {
         intent.answer(Err(error.clone()));
     }
@@ -473,7 +473,7 @@ pub(crate) fn flush(rx: &mut mpsc::Receiver<HostIntent>, error: &HostOpError) {
 /// follows is exhaustive; a sender that races it gets
 /// [`mpsc::error::TrySendError::Closed`], which [`HostOps::send`] already
 /// answers as [`HostOpError::WorkerGone`].
-pub(crate) fn close_and_flush(rx: &mut mpsc::Receiver<HostIntent>, error: &HostOpError) {
+pub fn close_and_flush(rx: &mut mpsc::Receiver<HostIntent>, error: &HostOpError) {
     rx.close();
     flush(rx, error);
 }
@@ -481,7 +481,7 @@ pub(crate) fn close_and_flush(rx: &mut mpsc::Receiver<HostIntent>, error: &HostO
 /// What an op failure means for the *connection*, as opposed to for the
 /// caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum OpFault {
+pub enum OpFault {
     /// `shutting-down`: the session has latched a stop.
     ShuttingDown,
     /// The wire died.
@@ -493,7 +493,7 @@ pub(crate) enum OpFault {
 
 /// Map a client error onto its connection-level meaning and the error
 /// the caller is handed.
-pub(crate) fn classify(error: &ClientError) -> (OpFault, HostOpError) {
+pub fn classify(error: &ClientError) -> (OpFault, HostOpError) {
     match error.server_code() {
         // Every refusal reaches the caller the same way; the code only
         // decides what it means for the connection.
