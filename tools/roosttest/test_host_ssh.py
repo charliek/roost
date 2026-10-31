@@ -137,6 +137,7 @@ _SESSION_ENV_KEYS = (
     "SHELL",
     sessionlib.SESSION_SOCKET_DIR_ENV,
     "XDG_RUNTIME_DIR",
+    sessionlib.TEST_USER_RUNTIME_DIR_ENV,
     "XDG_DATA_HOME",
     "XDG_STATE_HOME",
     "XDG_CACHE_HOME",

@@ -215,6 +215,7 @@ def _session_backend_ui(target: str):
     agent_jail.make_private_runtime_dir(run)
     private = {
         "XDG_RUNTIME_DIR": str(run),
+        ui.TEST_USER_RUNTIME_DIR_ENV: str(run),
         "XDG_DATA_HOME": str(root / "data"),
         "XDG_STATE_HOME": str(root / "state"),
         "XDG_CACHE_HOME": str(root / "cache"),

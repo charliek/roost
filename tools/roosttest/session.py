@@ -88,10 +88,13 @@ import agent_jail
 from client import Roost, RoostError, scaled_timeout
 # Re-exported for the lanes, which reach the session knobs through here.
 from ui import (
+    OPENER_SET,
     SESSION_ISOLATION_ENV,
     SESSION_SOCKET_DIR_ENV,
     TEST_OLD_SESSION_DIR_ENV,
     TEST_PASSWD_HOME_ENV,
+    TEST_USER_RUNTIME_DIR_ENV,
+    pin_user_runtime_dir,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -167,7 +170,20 @@ _SANITIZE = (
     # comes back, now that a raise writes `agent-hooks` into a file that
     # variable can relocate (plan 064 §3.3).
     *agent_jail.AGENT_CONFIG_DIR_ENV.values(),
+    # The opener set and `HERDR_ENV` (plan 085 D9). A daemon's environment
+    # is its tabs' baseline and its starter opener, so a value inherited from
+    # the runner — an SSH login's identity, a desktop's bus, another
+    # multiplexer's marker — would put the runner's session into every tab
+    # here. A case that wants a start context passes it per launch.
+    *OPENER_SET,
+    "HERDR_ENV",
+    # Set per env below, from that daemon's own runtime dir.
+    TEST_USER_RUNTIME_DIR_ENV,
 )
+
+# What an `explicit` env takes from the runner: enough to run binaries and
+# read logs, nothing that says where or how the runner's session started.
+_EXPLICIT_INHERITED = ("PATH", "USER", "LOGNAME", "LANG", "RUST_LOG", "ROOST_TEST_TIMEOUT_SCALE")
 
 
 # ---------------------------------------------------------------------------
@@ -841,6 +857,7 @@ def make_env(
     binary: Path | None = None,
     dir_names: str | None = None,
     honours_socket_dir: bool = True,
+    explicit: bool = False,
 ) -> SessionEnv:
     """Build an isolated session profile, in a fresh temp root or in one
     the caller lends.
@@ -870,6 +887,11 @@ def make_env(
     and binds its platform default whatever it is handed: the override then
     names that very directory, so this tree's clients run under the same
     env (`roostctl`, a bridge) still reach the daemon.
+
+    `explicit=True` builds the environment from scratch rather than from
+    the runner's minus `_SANITIZE` (plan 085 D9): `_EXPLICIT_INHERITED`,
+    `ROOST_TEST_MODE=1` (so any build honours the runtime-dir knob), and
+    the paths below. A case adds its daemon's start context per launch.
     """
     binary = binary or session_binary()
     label, namespace = _dir_names(_is_debug_build(binary), dir_names)
@@ -890,7 +912,11 @@ def make_env(
 
     home = root / "home"
     launch_cwd = root / launch_cwd_name
-    env = {k: v for k, v in os.environ.items() if k not in _SANITIZE}
+    if explicit:
+        env = {k: os.environ[k] for k in _EXPLICIT_INHERITED if k in os.environ}
+        env["ROOST_TEST_MODE"] = "1"
+    else:
+        env = {k: v for k, v in os.environ.items() if k not in _SANITIZE}
     env["HOME"] = str(home)
     # The one shell every restored tab gets. See the module docstring.
     env["SHELL"] = "/bin/sh"
@@ -920,6 +946,7 @@ def make_env(
         # hardening: it is the one directory the daemon validates.
         runtime.chmod(0o700)
         env["XDG_RUNTIME_DIR"] = str(runtime)
+        pin_user_runtime_dir(env)
         env["XDG_DATA_HOME"] = str(data)
         env["XDG_STATE_HOME"] = str(state)
         env["XDG_CACHE_HOME"] = str(cache)

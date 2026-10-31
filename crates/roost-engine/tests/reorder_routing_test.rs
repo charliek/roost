@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle, UiRequest};
+use roost_engine::TabOpener;
 use roost_engine::{PtySupervisor, Workspace};
 use roost_ipc::messages::ops;
 use roost_ipc::{ConnCtx, Handler, HandlerError, HandlerOutcome};
@@ -149,8 +150,12 @@ fn server_error(error: HandlerError) -> (String, String) {
 /// and a host reorder has something to leave alone.
 fn seed(workspace: &Workspace) -> (i64, Vec<i64>) {
     let project = workspace.create_project("one", "/tmp").unwrap();
-    let a = workspace.open_tab(project.id, "/tmp", "", true).unwrap();
-    let b = workspace.open_tab(project.id, "/tmp", "", true).unwrap();
+    let a = workspace
+        .open_tab(project.id, "/tmp", "", true, TabOpener::None)
+        .unwrap();
+    let b = workspace
+        .open_tab(project.id, "/tmp", "", true, TabOpener::None)
+        .unwrap();
     (project.id, vec![a.id, b.id])
 }
 

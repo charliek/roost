@@ -20,6 +20,7 @@ use std::io::Read as _;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use roost_engine::TabOpener;
 use roost_engine::{PtyError, PtyOutputEvent, PtySupervisor, ShutdownReport};
 use tokio::sync::broadcast::{self, error::TryRecvError};
 use tokio::time::sleep;
@@ -473,6 +474,7 @@ fn try_spawn_tab(
         80,
         24,
         &socket(),
+        &TabOpener::None,
     )
     .map_err(|err| {
         // `{err:#}` walks the anyhow chain: the errno is the whole point
@@ -707,6 +709,7 @@ async fn spawn_is_rejected_once_shutdown_has_started() {
             80,
             24,
             &socket(),
+            &TabOpener::None,
         )
         .expect_err("spawn after shutdown must be refused");
     let pty_err = err
@@ -796,6 +799,7 @@ async fn spawns_racing_the_sweep_never_leak_a_session() {
                         80,
                         24,
                         &socket(),
+                        &TabOpener::None,
                     );
                     (id, result.err().map(|err| err.to_string()))
                 })

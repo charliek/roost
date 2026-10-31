@@ -6243,7 +6243,10 @@ mod tests {
         let resync = WorkspaceEvent::Resync(Vec::new());
 
         let sealed = ReadOnlyDir::seal(dir.path());
-        let tab = workspace.open_tab(project, "/one", "a", true).unwrap().id;
+        let tab = workspace
+            .open_tab(project, "/one", "a", true, TabOpener::None)
+            .unwrap()
+            .id;
         let error = workspace.persist_error().expect("the write failed");
 
         // The failure the client was too far behind to be told about.
@@ -6690,6 +6693,7 @@ mod tests {
                 DEFAULT_COLS,
                 DEFAULT_ROWS,
                 std::path::Path::new("/tmp/roost-iced-attach-retry-test.sock"),
+                &TabOpener::None,
             )
             .expect("spawn the PTY the retry is waiting for");
 
@@ -6737,6 +6741,7 @@ mod tests {
                 DEFAULT_COLS,
                 DEFAULT_ROWS,
                 std::path::Path::new("/tmp/roost-iced-attach-recovery-test.sock"),
+                &TabOpener::None,
             )
             .expect("the session finally arrives");
 
@@ -7003,7 +7008,7 @@ mod tests {
         let workspace = Workspace::new();
         let project = workspace.create_project("p", "/tmp").unwrap();
         let tab_id = workspace
-            .open_tab(project.id, "/tmp", "t", true)
+            .open_tab(project.id, "/tmp", "t", true, TabOpener::None)
             .unwrap()
             .id;
         let (mut tabs, supervisor) = attached(tab_id);
@@ -7089,7 +7094,9 @@ mod tests {
             let workspace = Workspace::new();
             workspace.set_window_focused(false);
             let project = workspace.create_project("p", "/tmp").unwrap().id;
-            workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+            workspace
+                .open_tab(project, "/tmp", "keep", true, TabOpener::None)
+                .unwrap();
             let (tabs, supervisor) = attached(9_000);
             Self {
                 workspace,
@@ -7106,7 +7113,7 @@ mod tests {
         fn run(&mut self, chunks: &[&[u8]]) -> (roost_ipc::messages::Tab, Vec<(String, String)>) {
             let row = self
                 .workspace
-                .open_tab(self.project, "/tmp", "t", false)
+                .open_tab(self.project, "/tmp", "t", false, TabOpener::None)
                 .unwrap()
                 .id;
             if self.hook_owner {
@@ -7490,10 +7497,10 @@ mod tests {
         let workspace = Workspace::new();
         let project = workspace.create_project("p", "/tmp").expect("project");
         let live = workspace
-            .open_tab(project.id, "/tmp", "live", true)
+            .open_tab(project.id, "/tmp", "live", true, TabOpener::None)
             .expect("tab");
         let other = workspace
-            .open_tab(project.id, "/tmp", "other", true)
+            .open_tab(project.id, "/tmp", "other", true, TabOpener::None)
             .expect("tab");
         workspace.focus_tab(other.id).expect("focus elsewhere");
         workspace
@@ -7691,10 +7698,10 @@ mod tests {
         let workspace = Workspace::new();
         let project = workspace.create_project("p", "/tmp").expect("project");
         let clicked = workspace
-            .open_tab(project.id, "/tmp", "one", true)
+            .open_tab(project.id, "/tmp", "one", true, TabOpener::None)
             .expect("tab");
         let other = workspace
-            .open_tab(project.id, "/tmp", "two", true)
+            .open_tab(project.id, "/tmp", "two", true, TabOpener::None)
             .expect("tab");
         workspace
             .set_tab_has_notification(clicked.id, true)
@@ -7739,10 +7746,10 @@ mod tests {
         let workspace = Workspace::new();
         let project = workspace.create_project("p", "/tmp").expect("project");
         let one = workspace
-            .open_tab(project.id, "/tmp", "one", true)
+            .open_tab(project.id, "/tmp", "one", true, TabOpener::None)
             .expect("tab");
         let two = workspace
-            .open_tab(project.id, "/tmp", "two", true)
+            .open_tab(project.id, "/tmp", "two", true, TabOpener::None)
             .expect("tab");
         workspace
             .set_tab_has_notification(one.id, true)

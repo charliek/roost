@@ -245,6 +245,15 @@ pub struct TabSnapshot {
     /// as "not user-titled" (the prior implicit value).
     #[serde(default)]
     pub user_titled: bool,
+    /// Who opened the tab (plan 085 D6). Every tab this build saves has
+    /// one, so an absent key is a tab saved before there were openers; an
+    /// entry that breaks D2's rules loads as `"none"`.
+    #[serde(
+        default,
+        deserialize_with = "crate::opener::deserialize_saved",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub opener: Option<crate::opener::PersistedOpener>,
 }
 
 /// Read `state.json` at `path`. Returns:
@@ -364,6 +373,7 @@ fn with_extension_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opener::{PersistedOpener, PersistedRemote};
     use tempfile::tempdir;
 
     #[test]
@@ -453,12 +463,14 @@ mod tests {
                         cwd: "/tmp".into(),
                         position: 0,
                         user_titled: false,
+                        opener: Some(PersistedOpener::None),
                     },
                     TabSnapshot {
                         title: "logs".into(),
                         cwd: "/var/log".into(),
                         position: 1,
                         user_titled: true,
+                        opener: None,
                     },
                 ],
                 last_tab_position: Some(1),
@@ -674,6 +686,112 @@ mod tests {
         assert!(
             !tab.user_titled,
             "missing user_titled key must default to false"
+        );
+    }
+
+    fn saved_tab(opener: Option<PersistedOpener>) -> TabSnapshot {
+        TabSnapshot {
+            title: "t".into(),
+            cwd: "/tmp".into(),
+            position: 0,
+            user_titled: false,
+            opener,
+        }
+    }
+
+    fn one_project(tabs: Vec<TabSnapshot>) -> SnapshotFile {
+        SnapshotFile {
+            next_id: 9,
+            projects: vec![ProjectSnapshot {
+                id: 1,
+                name: "p".into(),
+                cwd: "/tmp".into(),
+                position: 0,
+                created_at: 1,
+                tabs,
+                last_tab_position: None,
+            }],
+            ..SnapshotFile::default()
+        }
+    }
+
+    #[test]
+    fn every_opener_class_round_trips_through_the_file() {
+        let local = PersistedOpener::Local(
+            [("DISPLAY", ":1"), ("SSH_AUTH_SOCK", "")]
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .into(),
+        );
+        let remote = PersistedOpener::Remote(PersistedRemote {
+            ssh_connection: Some("10.0.0.2 51000 10.0.0.1 22".into()),
+            ssh_client: Some("10.0.0.2 51000 22".into()),
+        });
+        let tabs = [Some(PersistedOpener::None), Some(local), Some(remote), None];
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        let snap = one_project(tabs.iter().cloned().map(saved_tab).collect());
+        persist_state(&p, &snap, false).unwrap();
+        let back = read_state(&p).unwrap().expect("present");
+        let restored: Vec<_> = back.projects[0]
+            .tabs
+            .iter()
+            .map(|t| t.opener.clone())
+            .collect();
+        assert_eq!(restored, tabs);
+    }
+
+    #[test]
+    fn none_is_written_as_the_string_none_and_legacy_writes_no_key() {
+        let raw = serde_json::to_value(one_project(vec![
+            saved_tab(Some(PersistedOpener::None)),
+            saved_tab(None),
+        ]))
+        .unwrap();
+        let tabs = raw["projects"][0]["tabs"].as_array().unwrap();
+        assert_eq!(tabs[0]["opener"], serde_json::json!("none"));
+        assert!(
+            tabs[1].get("opener").is_none(),
+            "a legacy tab must stay legacy: {}",
+            tabs[1]
+        );
+    }
+
+    #[test]
+    fn a_tab_saved_before_openers_loads_with_none_and_an_invalid_one_as_none() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        std::fs::write(
+            &p,
+            br#"{
+                "next_id": 5,
+                "projects": [{
+                    "id": 1, "name": "Old", "cwd": "/tmp",
+                    "position": 0, "created_at": 1,
+                    "tabs": [
+                        { "title": "old", "cwd": "/usr", "position": 0 },
+                        { "title": "bad", "cwd": "/usr", "position": 1,
+                          "opener": {"local": {"PATH": "/bin"}} },
+                        { "title": "odd", "cwd": "/usr", "position": 2, "opener": 3 }
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let back = read_state(&p)
+            .unwrap()
+            .expect("one bad opener does not lose the file");
+        let openers: Vec<_> = back.projects[0]
+            .tabs
+            .iter()
+            .map(|t| t.opener.clone())
+            .collect();
+        assert_eq!(
+            openers,
+            [
+                None,
+                Some(PersistedOpener::None),
+                Some(PersistedOpener::None)
+            ]
         );
     }
 

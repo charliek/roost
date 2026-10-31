@@ -16,20 +16,27 @@
 //!   subscriber for now, but the design pre-bakes the multi-sub
 //!   path that M3+ doesn't need yet.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
+use roost_ipc::opener::OPENER_SET;
+use roost_ipc::paths::TEST_USER_RUNTIME_DIR_ENV;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tracing::{debug, error, info, warn};
+
+use crate::opener::TabOpener;
 
 /// Depth of a tab's output fan-out. A consumer that falls this far
 /// behind gets `RecvError::Lagged` and the skipped bytes are gone for
@@ -1100,9 +1107,13 @@ impl PtySupervisor {
     /// the deadline path becomes drain-then-`Exit` and nothing is teed
     /// after it. The flag-off path — every UI build — is untouched.
     ///
+    /// The child's environment is built for it from `opener`
+    /// (`build_command`), never inherited from this process wholesale.
+    ///
     /// Errors:
     /// * [`PtyError::DuplicateTab`] — `tab_id` already has a live
     ///   session. Caller must `close()` the prior session first.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         &self,
         tab_id: i64,
@@ -1111,8 +1122,9 @@ impl PtySupervisor {
         cols: u16,
         rows: u16,
         socket_path: &std::path::Path,
+        opener: &TabOpener,
     ) -> anyhow::Result<broadcast::Receiver<PtyOutputEvent>> {
-        self.spawn_with(tab_id, cwd, argv, cols, rows, socket_path, || {})
+        self.spawn_with(tab_id, cwd, argv, cols, rows, socket_path, opener, || {})
     }
 
     /// [`Self::spawn`], plus a seam for the one window nothing else can
@@ -1121,8 +1133,6 @@ impl PtySupervisor {
     /// inside it deterministically. It is invoked **outside every
     /// lock** — a hook holding `sessions` or `pending` would deadlock
     /// the very `close()` it exists to let in.
-    // `spawn`'s own list is already at clippy's bar; the seam is the
-    // one over it.
     #[allow(clippy::too_many_arguments)]
     fn spawn_with(
         &self,
@@ -1132,6 +1142,7 @@ impl PtySupervisor {
         cols: u16,
         rows: u16,
         socket_path: &std::path::Path,
+        opener: &TabOpener,
         before_promote: impl FnOnce(),
     ) -> anyhow::Result<broadcast::Receiver<PtyOutputEvent>> {
         // Reserve the slot atomically. Two concurrent
@@ -1242,7 +1253,7 @@ impl PtySupervisor {
             None => None,
         };
 
-        let cmd = build_command(cwd, argv, tab_id, socket_path);
+        let cmd = build_command(cwd, argv, tab_id, socket_path, opener);
         let mut child = pair.slave.spawn_command(cmd).context("spawn shell")?;
         // Sendable killer handle taken before the child moves into
         // the wait task — `close()` uses it to actively terminate
@@ -2432,11 +2443,87 @@ fn roost_resources_dir() -> Option<&'static std::path::Path> {
     .as_deref()
 }
 
+/// A tab's environment before Roost's own variables (plan 085 D1): the
+/// starter's minus the whole opener set, `runtime_dir` as its
+/// `XDG_RUNTIME_DIR` when one derived ([`user_runtime_dir`]), then the
+/// variables `opener` brings. Neither kind of opener inherits the
+/// starter's: a local tab gets its opener's display, a remote one its
+/// opener's SSH identity.
+fn tab_environment(
+    starter: impl Iterator<Item = (OsString, OsString)>,
+    opener: &TabOpener,
+    runtime_dir: Option<PathBuf>,
+) -> Vec<(OsString, OsString)> {
+    let mut env: BTreeMap<OsString, OsString> = starter
+        .filter(|(name, _)| !OPENER_SET.iter().any(|opened| name == opened))
+        .collect();
+    if let Some(dir) = runtime_dir {
+        env.insert("XDG_RUNTIME_DIR".into(), dir.into_os_string());
+    }
+    for (name, value) in opener.vars() {
+        env.insert(name.into(), value.into());
+    }
+    env.into_iter().collect()
+}
+
+/// Replace everything `cmd` inherited with `env`, keeping the `SHELL`
+/// `CommandBuilder::new` chose: the passwd shell, which the starter's own
+/// `$SHELL` in `env` would otherwise replace.
+fn set_environment(cmd: &mut CommandBuilder, env: Vec<(OsString, OsString)>) {
+    let shell = cmd.get_env("SHELL").map(OsStr::to_os_string);
+    cmd.env_clear();
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
+    if let Some(shell) = shell {
+        cmd.env("SHELL", shell);
+    }
+}
+
+/// A Linux tab's `XDG_RUNTIME_DIR` (plan 085 D3): `/run/user/<uid>`, or
+/// what [`TEST_USER_RUNTIME_DIR_ENV`] names instead in a debug or
+/// test-mode build, when it is a directory this uid owns. Read per spawn:
+/// logind makes and removes the directory at login and logout. `None`
+/// keeps the baseline's value, and always on macOS, which has none.
+fn user_runtime_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    let knob = runtime_dir_knob_honoured(
+        cfg!(debug_assertions),
+        std::env::var_os("ROOST_TEST_MODE").as_deref(),
+    )
+    .then(|| std::env::var_os(TEST_USER_RUNTIME_DIR_ENV))
+    .flatten();
+    owned_runtime_dir(knob, unsafe { libc::getuid() })
+}
+
+fn runtime_dir_knob_honoured(debug_build: bool, test_mode: Option<&OsStr>) -> bool {
+    debug_build || test_mode.is_some_and(|value| value == "1")
+}
+
+/// `knob`, or `/run/user/<uid>` without one, if `lstat` finds a directory
+/// (never a symlink) owned by `uid`. A knob that is not absolute derives
+/// nothing: a test that asked for a stand-in must not get the real one.
+/// `lstat` follows a symlink named with a trailing separator or `/.`, and
+/// `..` walks back out through one, so the path is rebuilt from its
+/// components (which drops both) and one with a `..` derives nothing.
+fn owned_runtime_dir(knob: Option<OsString>, uid: u32) -> Option<PathBuf> {
+    let named = knob.map_or_else(|| PathBuf::from(format!("/run/user/{uid}")), PathBuf::from);
+    if named.components().any(|part| part == Component::ParentDir) {
+        return None;
+    }
+    let dir: PathBuf = named.components().collect();
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    (dir.is_absolute() && meta.file_type().is_dir() && meta.uid() == uid).then_some(dir)
+}
+
 fn build_command(
     cwd: &str,
     argv: &[String],
     tab_id: i64,
     socket_path: &std::path::Path,
+    opener: &TabOpener,
 ) -> CommandBuilder {
     // Argv-first: never call a shell to parse a single command string.
     // An empty argv (plain "open a shell") resolves to the user's
@@ -2461,6 +2548,10 @@ fn build_command(
     if !cwd.is_empty() {
         cmd.cwd(cwd);
     }
+    set_environment(
+        &mut cmd,
+        tab_environment(std::env::vars_os(), opener, user_runtime_dir()),
+    );
     // Advertise the terminal Roost provides — force TERM rather than
     // inheriting the launching terminal's (a child seeing an inherited
     // TERM=tmux-256color / xterm-kitty would emit unsupported sequences).
@@ -2796,7 +2887,15 @@ pub(crate) async fn spawn_foreground_job(
     let argv = ["bash", "--norc", "--noprofile", "-i"].map(String::from);
     let socket = std::path::Path::new("/tmp/roost-foreground-job-test.sock");
     let mut rx = supervisor
-        .spawn(tab_id, &shell_dir.to_string_lossy(), &argv, 80, 24, socket)
+        .spawn(
+            tab_id,
+            &shell_dir.to_string_lossy(),
+            &argv,
+            80,
+            24,
+            socket,
+            &TabOpener::None,
+        )
         .expect("spawn bash");
     let mut seen = Vec::new();
     // The first prompt: the line editor is up, so the job isn't typed
@@ -2879,6 +2978,229 @@ async fn wait_for_output(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    // ---- the tab environment (plan 085 D1, D3) ------------------------
+
+    fn os_env(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        pairs
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect()
+    }
+
+    fn openers(env: &[(OsString, OsString)]) -> BTreeMap<String, String> {
+        env.iter()
+            .filter(|(name, _)| OPENER_SET.iter().any(|opened| name == opened))
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn get<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a str> {
+        env.iter()
+            .find(|(key, _)| key == name)
+            .and_then(|(_, value)| value.to_str())
+    }
+
+    /// A starter carrying all seven opener names, as a daemon started
+    /// over SSH from a desk shell would.
+    fn crowded_starter() -> Vec<(OsString, OsString)> {
+        os_env(&[
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/home/u"),
+            ("XDG_RUNTIME_DIR", "/starter/run"),
+            ("DISPLAY", ":0"),
+            ("WAYLAND_DISPLAY", "wayland-0"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/starter/bus"),
+            ("SSH_AUTH_SOCK", "/starter/agent"),
+            ("SSH_CONNECTION", "1.1.1.1 1 2.2.2.2 22"),
+            ("SSH_CLIENT", "1.1.1.1 1 22"),
+            ("SSH_TTY", "/dev/pts/9"),
+        ])
+    }
+
+    fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_baseline_drops_every_opener_variable_and_keeps_the_rest() {
+        let env = tab_environment(crowded_starter().into_iter(), &TabOpener::None, None);
+        assert_eq!(openers(&env), BTreeMap::new());
+        assert_eq!(get(&env, "PATH"), Some("/usr/bin:/bin"));
+        assert_eq!(get(&env, "HOME"), Some("/home/u"));
+        assert_eq!(
+            get(&env, "XDG_RUNTIME_DIR"),
+            Some("/starter/run"),
+            "kept when none derived"
+        );
+    }
+
+    #[test]
+    fn a_local_opener_adds_exactly_its_values_empty_ones_included() {
+        let local = TabOpener::Local(values(&[("DISPLAY", ":7"), ("SSH_AUTH_SOCK", "")]));
+        let env = tab_environment(crowded_starter().into_iter(), &local, None);
+        assert_eq!(
+            openers(&env),
+            values(&[("DISPLAY", ":7"), ("SSH_AUTH_SOCK", "")])
+        );
+    }
+
+    #[test]
+    fn a_remote_opener_adds_only_its_two_ssh_values() {
+        let remote = TabOpener::Remote {
+            ssh_connection: Some("3.3.3.3 3 4.4.4.4 22".into()),
+            ssh_client: Some("3.3.3.3 3 22".into()),
+        };
+        let env = tab_environment(crowded_starter().into_iter(), &remote, None);
+        assert_eq!(
+            openers(&env),
+            values(&[
+                ("SSH_CONNECTION", "3.3.3.3 3 4.4.4.4 22"),
+                ("SSH_CLIENT", "3.3.3.3 3 22"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_derived_runtime_dir_replaces_the_starters() {
+        let env = tab_environment(
+            crowded_starter().into_iter(),
+            &TabOpener::None,
+            Some(PathBuf::from("/run/user/4242")),
+        );
+        assert_eq!(get(&env, "XDG_RUNTIME_DIR"), Some("/run/user/4242"));
+        let bare = tab_environment(
+            os_env(&[("PATH", "/bin")]).into_iter(),
+            &TabOpener::None,
+            Some(PathBuf::from("/run/user/4242")),
+        );
+        assert_eq!(get(&bare, "XDG_RUNTIME_DIR"), Some("/run/user/4242"));
+    }
+
+    #[test]
+    fn the_environment_replaces_what_the_builder_inherited_but_keeps_its_shell() {
+        let mut cmd = CommandBuilder::new("/bin/true");
+        cmd.env("SHELL", "/builder/shell");
+        cmd.env("INHERITED_ONLY", "x");
+        set_environment(
+            &mut cmd,
+            os_env(&[("SHELL", "/starter/shell"), ("PATH", "/bin")]),
+        );
+        assert_eq!(cmd.get_env("SHELL"), Some(OsStr::new("/builder/shell")));
+        assert_eq!(cmd.get_env("PATH"), Some(OsStr::new("/bin")));
+        assert_eq!(cmd.get_env("INHERITED_ONLY"), None);
+    }
+
+    #[test]
+    fn roosts_own_variables_win_over_the_environment() {
+        let local = TabOpener::Local(values(&[("DISPLAY", ":7")]));
+        let cmd = build_command(
+            "/tmp",
+            &["/bin/true".into()],
+            31,
+            std::path::Path::new("/tmp/roost-env-test.sock"),
+            &local,
+        );
+        assert_eq!(cmd.get_env("TERM"), Some(OsStr::new("xterm-256color")));
+        assert_eq!(cmd.get_env("ROOST_TAB_ID"), Some(OsStr::new("31")));
+        assert_eq!(
+            cmd.get_env("ROOST_SOCKET"),
+            Some(OsStr::new("/tmp/roost-env-test.sock"))
+        );
+        assert_eq!(cmd.get_env("TERMINFO"), None);
+        assert_eq!(cmd.get_env("DISPLAY"), Some(OsStr::new(":7")));
+    }
+
+    fn uid() -> u32 {
+        unsafe { libc::getuid() }
+    }
+
+    #[test]
+    fn an_owned_directory_derives() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            owned_runtime_dir(Some(dir.path().into()), uid()),
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn a_missing_directory_derives_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert_eq!(owned_runtime_dir(Some(missing.into()), uid()), None);
+    }
+
+    #[test]
+    fn a_symlink_to_an_owned_directory_derives_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(owned_runtime_dir(Some(link.into()), uid()), None);
+        for spelled in ["link/", "link/."] {
+            let knob = dir.path().join(spelled);
+            assert_eq!(
+                owned_runtime_dir(Some(knob.into()), uid()),
+                None,
+                "{spelled}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parent_component_through_a_symlink_derives_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("real/inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::os::unix::fs::symlink(&inner, dir.path().join("link")).unwrap();
+        let knob = dir.path().join("link/..");
+        assert_eq!(owned_runtime_dir(Some(knob.into()), uid()), None);
+    }
+
+    #[test]
+    fn an_owned_directory_named_with_a_trailing_slash_derives_it_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut knob = dir.path().as_os_str().to_owned();
+        knob.push("/");
+        assert_eq!(
+            owned_runtime_dir(Some(knob), uid()).map(PathBuf::into_os_string),
+            Some(dir.path().as_os_str().to_owned())
+        );
+    }
+
+    #[test]
+    fn another_uids_directory_derives_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            owned_runtime_dir(Some(dir.path().into()), uid().wrapping_add(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_relative_knob_derives_nothing() {
+        assert_eq!(owned_runtime_dir(Some(".".into()), uid()), None);
+        assert_eq!(owned_runtime_dir(Some("".into()), uid()), None);
+    }
+
+    #[test]
+    fn the_knob_is_honoured_in_a_debug_build_or_under_test_mode() {
+        assert!(runtime_dir_knob_honoured(true, None));
+        assert!(runtime_dir_knob_honoured(false, Some(OsStr::new("1"))));
+        assert!(!runtime_dir_knob_honoured(false, None));
+        assert!(!runtime_dir_knob_honoured(false, Some(OsStr::new("0"))));
+        assert!(!runtime_dir_knob_honoured(false, Some(OsStr::new(""))));
+    }
 
     // ---- the password poller (plan 074 §D2) -------------------------
 
@@ -3084,7 +3406,10 @@ mod tests {
 
         let workspace = crate::Workspace::new();
         let project = workspace.create_project("p", "/tmp").unwrap().id;
-        let tab = workspace.open_tab(project, "/tmp", "", true).unwrap().id;
+        let tab = workspace
+            .open_tab(project, "/tmp", "", true, TabOpener::None)
+            .unwrap()
+            .id;
         let supervisor = Arc::new(PtySupervisor::new());
         let apply = |events: Vec<SupervisorEvent>| {
             for event in &events {
@@ -3161,7 +3486,7 @@ mod tests {
             let argv = ["/bin/sh", "-c", COOPERATIVE].map(String::from);
             let socket = std::path::Path::new("/tmp/roost-test.sock");
             supervisor
-                .spawn(1, "/tmp", &argv, 80, 24, socket)
+                .spawn(1, "/tmp", &argv, 80, 24, socket, &TabOpener::None)
                 .expect("spawn");
         }
         assert!(
@@ -3200,7 +3525,10 @@ mod tests {
         let mut tabs = Vec::new();
         let mut ptys = Vec::new();
         for _ in 0..CAPACITY + 4 {
-            let tab = workspace.open_tab(project, "/tmp", "", true).unwrap().id;
+            let tab = workspace
+                .open_tab(project, "/tmp", "", true, TabOpener::None)
+                .unwrap()
+                .id;
             ptys.push(spawn_in(
                 &supervisor,
                 tab,
@@ -3984,17 +4312,26 @@ mod tests {
             let sup = sup.clone();
             let (socket, argv) = (socket.clone(), argv.clone());
             move || {
-                sup.spawn_with(tab_id, "/tmp", &argv, 80, 24, &socket, || {
-                    parked_tx.send(()).expect("the test is listening");
-                    // Bounded, so a seam that ever moved inside the
-                    // promotion locks fails this test on its named
-                    // assertion instead of wedging the run: the park
-                    // would release, the spawn would promote, and the
-                    // `close()` it deadlocked would return.
-                    release_rx
-                        .recv_timeout(Duration::from_secs(10))
-                        .expect("the test releases the park");
-                })
+                sup.spawn_with(
+                    tab_id,
+                    "/tmp",
+                    &argv,
+                    80,
+                    24,
+                    &socket,
+                    &TabOpener::None,
+                    || {
+                        parked_tx.send(()).expect("the test is listening");
+                        // Bounded, so a seam that ever moved inside the
+                        // promotion locks fails this test on its named
+                        // assertion instead of wedging the run: the park
+                        // would release, the spawn would promote, and the
+                        // `close()` it deadlocked would return.
+                        release_rx
+                            .recv_timeout(Duration::from_secs(10))
+                            .expect("the test releases the park");
+                    },
+                )
             }
         });
 
@@ -4027,7 +4364,7 @@ mod tests {
             "the unwanted child was terminated and reaped"
         );
 
-        sup.spawn(tab_id, "/tmp", &argv, 80, 24, &socket)
+        sup.spawn(tab_id, "/tmp", &argv, 80, 24, &socket, &TabOpener::None)
             .expect("the freed slot leaked into neither pending nor sessions");
         sup.close(tab_id);
         assert!(

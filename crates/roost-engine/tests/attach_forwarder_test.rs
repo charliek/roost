@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle, MAX_DATA_CONNS_PER_SESSION};
 use roost_engine::program_status::RawOscAuthority;
 use roost_engine::tab_task::{AttachPause, AttachReleases, ServerVtConfig, ServerVtWorkspace};
+use roost_engine::TabOpener;
 use roost_engine::{PtySupervisor, Workspace};
 use roost_ipc::dataframe::{
     write_data_frame, DataFrame, DataFrameReader, InputTake, FRAME_DETACH, FRAME_ERROR, FRAME_EXIT,
@@ -325,6 +326,7 @@ impl Harness {
                 80,
                 24,
                 &self.socket,
+                &TabOpener::None,
             )
             .expect("the tab id is free once close() has taken the slot");
     }

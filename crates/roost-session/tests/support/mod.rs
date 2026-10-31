@@ -141,6 +141,9 @@ impl Layout {
             // hydrates a layout, and the withheld answer is driven out
             // of process by the local-backend e2e lane.
             first_project: roost_ipc::session_launch::FirstProject::Seed,
+            // No opener: these sessions run in the test process, whose
+            // environment is the runner's, never a desk's or a laptop's.
+            starter: roost_engine::TabOpener::None,
             // Likewise: the shipped window, which no in-process test
             // drives past.
             replay_window: None,

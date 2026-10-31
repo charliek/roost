@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::warn;
 
+use crate::opener::{PersistedOpener, TabOpener};
 use crate::persistence::{
     persist_state, read_state, HostSnapshot, HostTabMemory, ProjectSnapshot, SnapshotFile,
     WindowFrame,
@@ -154,6 +155,9 @@ struct TabRow {
     /// recent last; see [`record_veto`].
     vetoed_streams: VecDeque<u64>,
     user_titled: bool,
+    /// Who opened the tab (plan 085 D6). Persisted from the row's first
+    /// write, so a restore can open it with the same class.
+    opener: TabOpener,
     position: i32,
     created_at: i64,
     last_active: i64,
@@ -355,6 +359,9 @@ pub struct RestoreTab {
     /// silently re-derive the title from cwd. See `set_tab_cwd`
     /// for the gate. Persisted in `TabSnapshot.user_titled`.
     pub user_titled: bool,
+    /// Who opened the saved tab; `None` for a tab saved before there
+    /// were openers. Persisted in `TabSnapshot.opener`.
+    pub opener: Option<PersistedOpener>,
 }
 
 /// What a [`WorkspaceEvent::TabEffect`] carries, in process.
@@ -977,6 +984,7 @@ impl Workspace {
                                     cwd: t.cwd.clone(),
                                     title: t.title.clone(),
                                     user_titled: t.user_titled,
+                                    opener: t.opener.clone(),
                                 },
                             )
                         })
@@ -1637,12 +1645,15 @@ impl Workspace {
     ///
     /// With `activate` false the selection, each project's remembered
     /// tab included, is left as it was and only `TabOpened` is emitted.
+    ///
+    /// `opener` is stored on the row, so the write this commits saves it.
     pub fn open_tab(
         &self,
         project_id: i64,
         cwd: &str,
         title: &str,
         activate: bool,
+        opener: TabOpener,
     ) -> Result<Tab, WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let project_cwd = match inner.projects.get(&project_id) {
@@ -1688,6 +1699,7 @@ impl Workspace {
             // like `👻 /tmp` from ever appearing in the tab bar.
             // Mirrors the Mac fix in `mac/Sources/Roost/Workspace.swift`.
             user_titled: false,
+            opener,
             position,
             created_at: now,
             last_active: now,
@@ -2473,6 +2485,12 @@ impl Workspace {
         inner.projects.get(&project_id).map(|row| row.cwd.clone())
     }
 
+    /// Who opened `tab_id`, or `None` when no such tab is open.
+    pub fn tab_opener(&self, tab_id: i64) -> Option<TabOpener> {
+        let inner = self.inner.lock().unwrap();
+        inner.tabs.get(&tab_id).map(|row| row.opener.clone())
+    }
+
     pub fn tab(&self, tab_id: i64) -> Result<Tab, WorkspaceError> {
         let inner = self.inner.lock().unwrap();
         let is_active = inner.active_tab_id == tab_id;
@@ -3073,6 +3091,7 @@ impl Inner {
                                     cwd: t.cwd.clone(),
                                     position: t.position,
                                     user_titled: t.user_titled,
+                                    opener: Some(PersistedOpener::from(&t.opener)),
                                 })
                                 .collect(),
                             self.active_tabs_by_project
@@ -3120,6 +3139,7 @@ fn retained_tabs(saved: &RestoreProject) -> Vec<crate::persistence::TabSnapshot>
             cwd: t.cwd.clone(),
             position: index as i32,
             user_titled: t.user_titled,
+            opener: t.opener.clone(),
         })
         .collect()
 }
@@ -3862,7 +3882,7 @@ mod tests {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
         let mut rx = ws.subscribe();
-        let _ = ws.open_tab(pid, "/", "", true).unwrap();
+        let _ = ws.open_tab(pid, "/", "", true, TabOpener::None).unwrap();
         // Two events fire: TabOpened + ActiveChanged. Pull both.
         let _first = rx.try_recv().expect("event one");
         let _second = rx.try_recv().expect("event two");
@@ -3872,8 +3892,14 @@ mod tests {
     fn close_tab_falls_back_to_sibling() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let t1 = ws.open_tab(pid, "/", "one", true).unwrap().id;
-        let _t2 = ws.open_tab(pid, "/", "two", true).unwrap().id;
+        let t1 = ws
+            .open_tab(pid, "/", "one", true, TabOpener::None)
+            .unwrap()
+            .id;
+        let _t2 = ws
+            .open_tab(pid, "/", "two", true, TabOpener::None)
+            .unwrap()
+            .id;
         let (apid_before, atid_before) = ws.active();
         assert_eq!(apid_before, pid);
         ws.close_tab(atid_before).unwrap();
@@ -3888,10 +3914,19 @@ mod tests {
     fn preferred_tab_is_authoritative_per_project_and_repairs_after_close() {
         let ws = Workspace::new();
         let first_project = ws.create_project("first", "").unwrap().id;
-        let first = ws.open_tab(first_project, "/", "one", true).unwrap().id;
-        let second = ws.open_tab(first_project, "/", "two", true).unwrap().id;
+        let first = ws
+            .open_tab(first_project, "/", "one", true, TabOpener::None)
+            .unwrap()
+            .id;
+        let second = ws
+            .open_tab(first_project, "/", "two", true, TabOpener::None)
+            .unwrap()
+            .id;
         let other_project = ws.create_project("other", "").unwrap().id;
-        let other = ws.open_tab(other_project, "/", "other", true).unwrap().id;
+        let other = ws
+            .open_tab(other_project, "/", "other", true, TabOpener::None)
+            .unwrap()
+            .id;
 
         assert_eq!(ws.preferred_tab(first_project), Some(second));
         ws.focus_tab(first).unwrap();
@@ -3908,9 +3943,18 @@ mod tests {
     fn closing_the_active_tab_takes_the_right_hand_neighbour_by_position_not_by_id() {
         let ws = Workspace::new();
         let project = ws.create_project("project", "").unwrap().id;
-        let first = ws.open_tab(project, "/", "first", true).unwrap().id;
-        let middle = ws.open_tab(project, "/", "middle", true).unwrap().id;
-        let last = ws.open_tab(project, "/", "last", true).unwrap().id;
+        let first = ws
+            .open_tab(project, "/", "first", true, TabOpener::None)
+            .unwrap()
+            .id;
+        let middle = ws
+            .open_tab(project, "/", "middle", true, TabOpener::None)
+            .unwrap()
+            .id;
+        let last = ws
+            .open_tab(project, "/", "last", true, TabOpener::None)
+            .unwrap()
+            .id;
         ws.reorder_tabs(project, &[last, middle, first]).unwrap();
         ws.focus_tab(middle).unwrap();
 
@@ -3936,14 +3980,14 @@ mod tests {
     fn fallback_case() -> FallbackCase {
         let ws = Workspace::new();
         let p1 = ws.create_project("p1", "").unwrap().id;
-        let a = ws.open_tab(p1, "/", "a", true).unwrap().id;
-        let b = ws.open_tab(p1, "/", "b", true).unwrap().id;
-        let c = ws.open_tab(p1, "/", "c", true).unwrap().id;
+        let a = ws.open_tab(p1, "/", "a", true, TabOpener::None).unwrap().id;
+        let b = ws.open_tab(p1, "/", "b", true, TabOpener::None).unwrap().id;
+        let c = ws.open_tab(p1, "/", "c", true, TabOpener::None).unwrap().id;
         let p2 = ws.create_project("p2", "").unwrap().id;
-        let d = ws.open_tab(p2, "/", "d", true).unwrap().id;
+        let d = ws.open_tab(p2, "/", "d", true, TabOpener::None).unwrap().id;
         let p3 = ws.create_project("p3", "").unwrap().id;
-        let e = ws.open_tab(p3, "/", "e", true).unwrap().id;
-        let f = ws.open_tab(p3, "/", "f", true).unwrap().id;
+        let e = ws.open_tab(p3, "/", "e", true, TabOpener::None).unwrap().id;
+        let f = ws.open_tab(p3, "/", "f", true, TabOpener::None).unwrap().id;
         FallbackCase {
             ws,
             p1,
@@ -4011,9 +4055,9 @@ mod tests {
     fn case_5_closing_the_top_projects_last_tab_lands_on_the_project_below() {
         let ws = Workspace::new();
         let p1 = ws.create_project("p1", "").unwrap().id;
-        let a = ws.open_tab(p1, "/", "a", true).unwrap().id;
+        let a = ws.open_tab(p1, "/", "a", true, TabOpener::None).unwrap().id;
         let p2 = ws.create_project("p2", "").unwrap().id;
-        let d = ws.open_tab(p2, "/", "d", true).unwrap().id;
+        let d = ws.open_tab(p2, "/", "d", true, TabOpener::None).unwrap().id;
         ws.focus_tab(a).unwrap();
 
         ws.close_tab(a).unwrap();
@@ -4024,7 +4068,7 @@ mod tests {
     fn case_7_closing_the_only_remaining_tab_leaves_no_selection() {
         let ws = Workspace::new();
         let p2 = ws.create_project("p2", "").unwrap().id;
-        let d = ws.open_tab(p2, "/", "d", true).unwrap().id;
+        let d = ws.open_tab(p2, "/", "d", true, TabOpener::None).unwrap().id;
 
         ws.close_tab(d).unwrap();
         assert!(ws.snapshot().is_empty());
@@ -4099,7 +4143,10 @@ mod tests {
         let ws = Workspace::new();
         let above = ws.create_project("above", "").unwrap().id;
         let shown = ws.create_project("shown", "").unwrap().id;
-        let tab = ws.open_tab(shown, "/", "only", true).unwrap().id;
+        let tab = ws
+            .open_tab(shown, "/", "only", true, TabOpener::None)
+            .unwrap()
+            .id;
         let below = ws.create_project("below", "").unwrap().id;
         ws.focus_tab(tab).unwrap();
 
@@ -4131,7 +4178,10 @@ mod tests {
     fn close_last_tab_deletes_project() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let t = ws.open_tab(pid, "/", "only", true).unwrap().id;
+        let t = ws
+            .open_tab(pid, "/", "only", true, TabOpener::None)
+            .unwrap()
+            .id;
         let mut rx = ws.subscribe();
         ws.close_tab(t).unwrap();
         // The project is gone with its last tab, so the only-project
@@ -4163,9 +4213,9 @@ mod tests {
         // but must not steal the active selection from elsewhere.
         let ws = Workspace::new();
         let a = ws.create_project("a", "").unwrap().id;
-        let a_tab = ws.open_tab(a, "/", "a1", true).unwrap().id;
+        let a_tab = ws.open_tab(a, "/", "a1", true, TabOpener::None).unwrap().id;
         let b = ws.create_project("b", "").unwrap().id;
-        let b_tab = ws.open_tab(b, "/", "b1", true).unwrap().id;
+        let b_tab = ws.open_tab(b, "/", "b1", true, TabOpener::None).unwrap().id;
         // Make project A active, then close project B's last tab.
         ws.focus_tab(a_tab).unwrap();
         ws.close_tab(b_tab).unwrap();
@@ -4180,8 +4230,8 @@ mod tests {
     fn delete_project_cascades_tabs() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let _t1 = ws.open_tab(pid, "/", "one", true).unwrap();
-        let _t2 = ws.open_tab(pid, "/", "two", true).unwrap();
+        let _t1 = ws.open_tab(pid, "/", "one", true, TabOpener::None).unwrap();
+        let _t2 = ws.open_tab(pid, "/", "two", true, TabOpener::None).unwrap();
         let deleted = ws.delete_project(pid).unwrap();
         assert_eq!(deleted.len(), 2);
         assert!(ws.snapshot().is_empty());
@@ -4296,7 +4346,9 @@ mod tests {
     fn open_in_default_project(ws: &Workspace, activate: bool) -> (Tab, Vec<WorkspaceEvent>) {
         let mut events = ws.subscribe();
         let project = ws.ensure_default_project("/", activate);
-        let tab = ws.open_tab(project, "/", "", activate).unwrap();
+        let tab = ws
+            .open_tab(project, "/", "", activate, TabOpener::None)
+            .unwrap();
         (tab, drain(&mut events))
     }
 
@@ -4362,8 +4414,14 @@ mod tests {
         let ws = Workspace::new();
         let shown = ws.create_project("shown", "/").unwrap().id;
         let other = ws.create_project("other", "/").unwrap().id;
-        let remembered = ws.open_tab(other, "/", "remembered", true).unwrap().id;
-        let active = ws.open_tab(shown, "/", "active", true).unwrap().id;
+        let remembered = ws
+            .open_tab(other, "/", "remembered", true, TabOpener::None)
+            .unwrap()
+            .id;
+        let active = ws
+            .open_tab(shown, "/", "active", true, TabOpener::None)
+            .unwrap()
+            .id;
         let before = selection(&ws);
         assert_eq!(
             before,
@@ -4377,7 +4435,9 @@ mod tests {
 
         assert_eq!(ws.ensure_default_project("/", false), shown);
         for project in [shown, other] {
-            let tab = ws.open_tab(project, "/", "", false).unwrap();
+            let tab = ws
+                .open_tab(project, "/", "", false, TabOpener::None)
+                .unwrap();
             assert!(!tab.is_active);
             assert_eq!(tab.position, 1, "appended after the project's one tab");
         }
@@ -4399,7 +4459,7 @@ mod tests {
     fn set_tab_title_locks_against_osc() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let tid = ws.open_tab(pid, "/", "", true).unwrap().id;
+        let tid = ws.open_tab(pid, "/", "", true, TabOpener::None).unwrap().id;
         ws.set_tab_title(tid, "manual").unwrap();
         ws.set_tab_title_from_osc(tid, "shell-says").unwrap();
         let t = ws.tab(tid).unwrap();
@@ -4418,8 +4478,14 @@ mod tests {
     fn a_closed_tab_no_longer_resolves_or_focuses() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let keep = ws.open_tab(pid, "/tmp", "", true).unwrap().id;
-        let doomed = ws.open_tab(pid, "/tmp", "", true).unwrap().id;
+        let keep = ws
+            .open_tab(pid, "/tmp", "", true, TabOpener::None)
+            .unwrap()
+            .id;
+        let doomed = ws
+            .open_tab(pid, "/tmp", "", true, TabOpener::None)
+            .unwrap()
+            .id;
         assert!(ws.tab(doomed).is_ok());
 
         ws.close_tab(doomed).unwrap();
@@ -4440,7 +4506,10 @@ mod tests {
     fn set_tab_cwd_re_derives_title_when_not_user_titled() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let tid = ws.open_tab(pid, "/tmp", "", true).unwrap().id;
+        let tid = ws
+            .open_tab(pid, "/tmp", "", true, TabOpener::None)
+            .unwrap()
+            .id;
         assert_eq!(ws.tab(tid).unwrap().title, "tmp");
         let mut rx = ws.subscribe();
         ws.set_tab_cwd(tid, "/usr").unwrap();
@@ -4462,8 +4531,14 @@ mod tests {
     fn set_tab_start_cwd_keeps_a_supplied_title_and_moves_a_derived_one() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let supplied = ws.open_tab(pid, "/gone", "build", true).unwrap().id;
-        let derived = ws.open_tab(pid, "/gone", "", true).unwrap().id;
+        let supplied = ws
+            .open_tab(pid, "/gone", "build", true, TabOpener::None)
+            .unwrap()
+            .id;
+        let derived = ws
+            .open_tab(pid, "/gone", "", true, TabOpener::None)
+            .unwrap()
+            .id;
         for tid in [supplied, derived] {
             ws.set_tab_start_cwd(tid, "/usr").unwrap();
             assert_eq!(ws.tab(tid).unwrap().cwd, "/usr");
@@ -4478,7 +4553,10 @@ mod tests {
     fn set_tab_cwd_preserves_user_titled_title() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let tid = ws.open_tab(pid, "/tmp", "", true).unwrap().id;
+        let tid = ws
+            .open_tab(pid, "/tmp", "", true, TabOpener::None)
+            .unwrap()
+            .id;
         ws.set_tab_title(tid, "manual").unwrap();
         let mut rx = ws.subscribe();
         ws.set_tab_cwd(tid, "/usr").unwrap();
@@ -4499,7 +4577,10 @@ mod tests {
     fn set_tab_cwd_skips_title_event_when_basename_unchanged() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let tid = ws.open_tab(pid, "/tmp", "", true).unwrap().id;
+        let tid = ws
+            .open_tab(pid, "/tmp", "", true, TabOpener::None)
+            .unwrap()
+            .id;
         let mut rx = ws.subscribe();
         ws.set_tab_cwd(tid, "/tmp").unwrap();
         // Cwd event fires (same string but the model writes through);
@@ -4523,7 +4604,10 @@ mod tests {
     fn set_tab_cwd_overwrites_placeholder_title() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let tid = ws.open_tab(pid, "/tmp", "roostctl", true).unwrap().id;
+        let tid = ws
+            .open_tab(pid, "/tmp", "roostctl", true, TabOpener::None)
+            .unwrap()
+            .id;
         assert_eq!(ws.tab(tid).unwrap().title, "roostctl");
         assert!(!ws.tab(tid).unwrap().user_titled);
         ws.set_tab_cwd(tid, "/usr").unwrap();
@@ -4554,7 +4638,7 @@ mod tests {
     fn agent_ws() -> (Workspace, i64) {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let tid = ws.open_tab(pid, "/", "", true).unwrap().id;
+        let tid = ws.open_tab(pid, "/", "", true, TabOpener::None).unwrap().id;
         ws.set_window_focused(false);
         (ws, tid)
     }
@@ -4892,7 +4976,13 @@ mod tests {
 
         // Switching away must not resurrect it.
         let other = ws
-            .open_tab(ws.tab(tid).unwrap().project_id, "/", "", true)
+            .open_tab(
+                ws.tab(tid).unwrap().project_id,
+                "/",
+                "",
+                true,
+                TabOpener::None,
+            )
             .unwrap()
             .id;
         assert_ne!(other, tid);
@@ -4914,7 +5004,7 @@ mod tests {
     fn attention_policy_delivers_when_another_tab_is_active() {
         let (ws, tid) = agent_ws();
         let pid = ws.tab(tid).unwrap().project_id;
-        let other = ws.open_tab(pid, "/", "", true).unwrap().id;
+        let other = ws.open_tab(pid, "/", "", true, TabOpener::None).unwrap().id;
         ws.focus_tab(other).unwrap();
         ws.set_window_focused(true);
         let mut rx = ws.subscribe();
@@ -4934,8 +5024,8 @@ mod tests {
         let ws = Workspace::new();
         ws.set_window_focused(false);
         let pid = ws.create_project("p", "").unwrap().id;
-        let first = ws.open_tab(pid, "/", "", true).unwrap().id;
-        let second = ws.open_tab(pid, "/", "", true).unwrap().id;
+        let first = ws.open_tab(pid, "/", "", true, TabOpener::None).unwrap().id;
+        let second = ws.open_tab(pid, "/", "", true, TabOpener::None).unwrap().id;
         ws.focus_tab(first).unwrap();
         (ws, first, second)
     }
@@ -5004,7 +5094,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::open(dir.path().join("state.json"));
         let pid = ws.create_project("p", "").unwrap().id;
-        let tab = ws.open_tab(pid, "/", "", true).unwrap().id;
+        let tab = ws.open_tab(pid, "/", "", true, TabOpener::None).unwrap().id;
 
         assert_eq!(ws.active().1, tab, "the new tab took the selection");
         assert!(raises(&ws, tab));
@@ -5017,7 +5107,10 @@ mod tests {
     fn a_replaced_pipeline_never_announces_for_the_tab() {
         let ws = Workspace::new();
         let project = ws.create_project("p", "/tmp").unwrap();
-        let tab = ws.open_tab(project.id, "/tmp", "", false).unwrap().id;
+        let tab = ws
+            .open_tab(project.id, "/tmp", "", false, TabOpener::None)
+            .unwrap()
+            .id;
         let mut rx = ws.subscribe();
         let resized = |rx: &mut broadcast::Receiver<WorkspaceEvent>| -> Vec<(u16, u16)> {
             drain(rx)
@@ -5242,8 +5335,14 @@ mod tests {
     fn window_focus_defaults_to_focused() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let active = ws.open_tab(pid, "/", "a", true).unwrap().id;
-        let background = ws.open_tab(pid, "/", "b", true).unwrap().id;
+        let active = ws
+            .open_tab(pid, "/", "a", true, TabOpener::None)
+            .unwrap()
+            .id;
+        let background = ws
+            .open_tab(pid, "/", "b", true, TabOpener::None)
+            .unwrap()
+            .id;
         ws.focus_tab(active).unwrap();
 
         assert!(!raises(&ws, active));
@@ -5397,11 +5496,11 @@ mod tests {
         assert_eq!(d.position, 3, "new project position collided after delete");
 
         // Same invariant for tabs within a project.
-        let t0 = ws.open_tab(a.id, "/", "t0", true).unwrap();
-        let t1 = ws.open_tab(a.id, "/", "t1", true).unwrap();
+        let t0 = ws.open_tab(a.id, "/", "t0", true, TabOpener::None).unwrap();
+        let t1 = ws.open_tab(a.id, "/", "t1", true, TabOpener::None).unwrap();
         assert_eq!((t0.position, t1.position), (0, 1));
         ws.close_tab(t0.id).unwrap();
-        let t2 = ws.open_tab(a.id, "/", "t2", true).unwrap();
+        let t2 = ws.open_tab(a.id, "/", "t2", true, TabOpener::None).unwrap();
         assert_eq!(t2.position, 2, "new tab position collided after close");
     }
 
@@ -5412,7 +5511,7 @@ mod tests {
     fn next_position_saturates_at_i32_max() {
         let ws = Workspace::new();
         let p = ws.create_project("p", "").unwrap().id;
-        let t = ws.open_tab(p, "/", "t", true).unwrap().id;
+        let t = ws.open_tab(p, "/", "t", true, TabOpener::None).unwrap().id;
         {
             let mut inner = ws.inner.lock().unwrap();
             inner.projects.get_mut(&p).unwrap().position = i32::MAX;
@@ -5421,7 +5520,12 @@ mod tests {
             assert_eq!(inner.next_tab_position(p), i32::MAX);
         }
         assert_eq!(ws.create_project("q", "").unwrap().position, i32::MAX);
-        assert_eq!(ws.open_tab(p, "/", "u", true).unwrap().position, i32::MAX);
+        assert_eq!(
+            ws.open_tab(p, "/", "u", true, TabOpener::None)
+                .unwrap()
+                .position,
+            i32::MAX
+        );
     }
 
     /// States the rule rather than reproducing a bug: this test cannot
@@ -5438,9 +5542,9 @@ mod tests {
     fn persist_sorts_tabs_by_position_then_id() {
         let ws = Workspace::new();
         let p = ws.create_project("p", "").unwrap().id;
-        let a = ws.open_tab(p, "/", "a", true).unwrap().id;
-        let _b = ws.open_tab(p, "/", "b", true).unwrap().id;
-        let c = ws.open_tab(p, "/", "c", true).unwrap().id;
+        let a = ws.open_tab(p, "/", "a", true, TabOpener::None).unwrap().id;
+        let _b = ws.open_tab(p, "/", "b", true, TabOpener::None).unwrap().id;
+        let c = ws.open_tab(p, "/", "c", true, TabOpener::None).unwrap().id;
         let (snapshot, _seq) = {
             let mut inner = ws.inner.lock().unwrap();
             // c (the highest id) ties with a at position 0; b keeps 1.
@@ -5460,9 +5564,18 @@ mod tests {
     fn reorder_tabs_partial_keeps_unlisted() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let a = ws.open_tab(pid, "/", "a", true).unwrap().id;
-        let b = ws.open_tab(pid, "/", "b", true).unwrap().id;
-        let c = ws.open_tab(pid, "/", "c", true).unwrap().id;
+        let a = ws
+            .open_tab(pid, "/", "a", true, TabOpener::None)
+            .unwrap()
+            .id;
+        let b = ws
+            .open_tab(pid, "/", "b", true, TabOpener::None)
+            .unwrap()
+            .id;
+        let c = ws
+            .open_tab(pid, "/", "c", true, TabOpener::None)
+            .unwrap()
+            .id;
         // Reorder only [c, a] — b should land last.
         ws.reorder_tabs(pid, &[c, a]).unwrap();
         let projects = ws.snapshot();
@@ -5520,9 +5633,18 @@ mod tests {
         let pid = {
             let ws = Workspace::open(path.clone());
             let pid = ws.create_project("p", "/proj").unwrap().id;
-            let _a = ws.open_tab(pid, "/a", "atab", true).unwrap().id;
-            let b = ws.open_tab(pid, "/b", "btab", true).unwrap().id;
-            let _c = ws.open_tab(pid, "/c", "ctab", true).unwrap().id;
+            let _a = ws
+                .open_tab(pid, "/a", "atab", true, TabOpener::None)
+                .unwrap()
+                .id;
+            let b = ws
+                .open_tab(pid, "/b", "btab", true, TabOpener::None)
+                .unwrap()
+                .id;
+            let _c = ws
+                .open_tab(pid, "/c", "ctab", true, TabOpener::None)
+                .unwrap()
+                .id;
             // Select the middle tab so restore picks it by position.
             ws.focus_tab(b).unwrap();
             pid
@@ -5563,8 +5685,10 @@ mod tests {
         let pid = {
             let ws = Workspace::open(path.clone());
             let pid = ws.create_project("p", "/proj").unwrap().id;
-            ws.open_tab(pid, "/a", "atab", true).unwrap();
-            ws.open_tab(pid, "/b", "btab", true).unwrap();
+            ws.open_tab(pid, "/a", "atab", true, TabOpener::None)
+                .unwrap();
+            ws.open_tab(pid, "/b", "btab", true, TabOpener::None)
+                .unwrap();
             pid
         };
 
@@ -5617,12 +5741,18 @@ mod tests {
         let (first, second) = {
             let ws = Workspace::open(path.clone());
             let first = ws.create_project("first", "/first").unwrap().id;
-            ws.open_tab(first, "/a", "a", true).unwrap();
-            let b = ws.open_tab(first, "/b", "b", true).unwrap().id;
-            ws.open_tab(first, "/c", "c", true).unwrap();
+            ws.open_tab(first, "/a", "a", true, TabOpener::None)
+                .unwrap();
+            let b = ws
+                .open_tab(first, "/b", "b", true, TabOpener::None)
+                .unwrap()
+                .id;
+            ws.open_tab(first, "/c", "c", true, TabOpener::None)
+                .unwrap();
             ws.focus_tab(b).unwrap();
             let second = ws.create_project("second", "/second").unwrap().id;
-            ws.open_tab(second, "/x", "x", true).unwrap();
+            ws.open_tab(second, "/x", "x", true, TabOpener::None)
+                .unwrap();
             (first, second)
         };
 
@@ -5655,15 +5785,24 @@ mod tests {
         let path = dir.path().join("state.json");
         let ws = Workspace::open(path.clone());
         let first = ws.create_project("first", "/first").unwrap().id;
-        let a = ws.open_tab(first, "/a", "a", true).unwrap().id;
-        ws.open_tab(first, "/b", "b", true).unwrap();
-        let c = ws.open_tab(first, "/c", "c", true).unwrap().id;
-        ws.open_tab(first, "/d", "d", true).unwrap();
+        let a = ws
+            .open_tab(first, "/a", "a", true, TabOpener::None)
+            .unwrap()
+            .id;
+        ws.open_tab(first, "/b", "b", true, TabOpener::None)
+            .unwrap();
+        let c = ws
+            .open_tab(first, "/c", "c", true, TabOpener::None)
+            .unwrap()
+            .id;
+        ws.open_tab(first, "/d", "d", true, TabOpener::None)
+            .unwrap();
         ws.close_tab(a).unwrap();
         ws.focus_tab(c).unwrap();
         assert_eq!(ws.tab(c).unwrap().position, 2, "the precondition: sparse");
         let second = ws.create_project("second", "/second").unwrap().id;
-        ws.open_tab(second, "/x", "x", true).unwrap();
+        ws.open_tab(second, "/x", "x", true, TabOpener::None)
+            .unwrap();
 
         let on_disk = read_state(&path).unwrap().unwrap();
         let saved = on_disk.projects.iter().find(|p| p.id == first).unwrap();
@@ -5684,6 +5823,75 @@ mod tests {
     /// a **non-zero** tab index, so `0`, "the first project" and "a live
     /// value" are three distinguishable answers in the failure message.
     #[test]
+    fn a_tabs_opener_is_saved_by_the_write_that_opens_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Workspace::open(path.clone());
+        let pid = ws.create_project("p", "/").unwrap().id;
+        let opener = TabOpener::Remote {
+            ssh_connection: Some("1.2.3.4 5 6.7.8.9 22".into()),
+            ssh_client: None,
+        };
+        let tid = ws.open_tab(pid, "/", "", true, opener.clone()).unwrap().id;
+        let on_disk = read_state(&path).unwrap().unwrap();
+        assert_eq!(
+            on_disk.projects[0].tabs[0].opener,
+            Some(PersistedOpener::from(&opener))
+        );
+        assert_eq!(ws.tab_opener(tid), Some(opener));
+        assert_eq!(ws.tab_opener(tid + 100), None);
+    }
+
+    #[test]
+    fn an_unhydrated_layout_keeps_its_saved_openers_and_its_legacy_tabs_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let local = PersistedOpener::Local([("DISPLAY".to_string(), ":4".to_string())].into());
+        let saved =
+            |position: i32, opener: Option<PersistedOpener>| crate::persistence::TabSnapshot {
+                title: format!("t{position}"),
+                cwd: "/".into(),
+                position,
+                user_titled: false,
+                opener,
+            };
+        let file = SnapshotFile {
+            next_id: 10,
+            projects: vec![ProjectSnapshot {
+                id: 1,
+                name: "p".into(),
+                cwd: "/".into(),
+                position: 0,
+                created_at: 1,
+                tabs: vec![saved(0, None), saved(1, Some(local.clone()))],
+                last_tab_position: None,
+            }],
+            ..SnapshotFile::default()
+        };
+        persist_state(&path, &file, false).unwrap();
+
+        let ws = Workspace::open(path.clone());
+        let retained = ws.retained_layout().unwrap();
+        let openers =
+            |tabs: &[RestoreTab]| tabs.iter().map(|t| t.opener.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            openers(&retained.projects[0].tabs),
+            [None, Some(local.clone())]
+        );
+        ws.add_host("box", "ssh://box").unwrap();
+        let on_disk = read_state(&path).unwrap().unwrap();
+        assert_eq!(
+            on_disk.projects[0]
+                .tabs
+                .iter()
+                .map(|t| t.opener.clone())
+                .collect::<Vec<_>>(),
+            [None, Some(local)],
+            "a commit over an un-hydrated layout must not give a legacy tab a class"
+        );
+    }
+
+    #[test]
     fn an_unhydrated_selection_outlives_the_same_persist() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
@@ -5691,10 +5899,16 @@ mod tests {
             let ws = Workspace::open(path.clone());
             let first = ws.create_project("first", "/first").unwrap().id;
             let second = ws.create_project("second", "/second").unwrap().id;
-            ws.open_tab(first, "/a0", "a0", true).unwrap();
-            ws.open_tab(second, "/b0", "b0", true).unwrap();
-            let b1 = ws.open_tab(second, "/b1", "b1", true).unwrap().id;
-            ws.open_tab(second, "/b2", "b2", true).unwrap();
+            ws.open_tab(first, "/a0", "a0", true, TabOpener::None)
+                .unwrap();
+            ws.open_tab(second, "/b0", "b0", true, TabOpener::None)
+                .unwrap();
+            let b1 = ws
+                .open_tab(second, "/b1", "b1", true, TabOpener::None)
+                .unwrap()
+                .id;
+            ws.open_tab(second, "/b2", "b2", true, TabOpener::None)
+                .unwrap();
             ws.focus_tab(b1).unwrap();
             (first, second)
         };
@@ -5732,8 +5946,10 @@ mod tests {
             let ws = Workspace::open(path.clone());
             let kept = ws.create_project("kept", "/kept").unwrap().id;
             let emptied = ws.create_project("emptied", "/emptied").unwrap().id;
-            ws.open_tab(kept, "/saved-a", "saved-a", true).unwrap();
-            ws.open_tab(emptied, "/saved-b", "saved-b", true).unwrap();
+            ws.open_tab(kept, "/saved-a", "saved-a", true, TabOpener::None)
+                .unwrap();
+            ws.open_tab(emptied, "/saved-b", "saved-b", true, TabOpener::None)
+                .unwrap();
             (kept, emptied)
         };
 
@@ -5761,7 +5977,8 @@ mod tests {
         // A hydration that re-opens `kept` with a tab that DIFFERS from
         // its saved descriptor, and gives `emptied` none at all. If the
         // fallback still fired, both would come back as the saved ones.
-        ws2.open_tab(kept, "/live", "live", true).unwrap();
+        ws2.open_tab(kept, "/live", "live", true, TabOpener::None)
+            .unwrap();
 
         let on_disk = read_state(&path).unwrap().unwrap();
         let kept_row = on_disk.projects.iter().find(|p| p.id == kept).unwrap();
@@ -5798,8 +6015,10 @@ mod tests {
         let project = {
             let ws = Workspace::open(path.clone());
             let project = ws.create_project("kept", "/kept").unwrap().id;
-            ws.open_tab(project, "/saved-a", "saved-a", true).unwrap();
-            ws.open_tab(project, "/saved-b", "saved-b", true).unwrap();
+            ws.open_tab(project, "/saved-a", "saved-a", true, TabOpener::None)
+                .unwrap();
+            ws.open_tab(project, "/saved-b", "saved-b", true, TabOpener::None)
+                .unwrap();
             project
         };
 
@@ -6222,9 +6441,18 @@ mod tests {
         {
             let ws = Workspace::open(path.clone());
             let pid = ws.create_project("p", "/").unwrap().id;
-            let a = ws.open_tab(pid, "/a", "a", true).unwrap().id; // position 0
-            let _b = ws.open_tab(pid, "/b", "b", true).unwrap().id; // position 1
-            let c = ws.open_tab(pid, "/c", "c", true).unwrap().id; // position 2
+            let a = ws
+                .open_tab(pid, "/a", "a", true, TabOpener::None)
+                .unwrap()
+                .id; // position 0
+            let _b = ws
+                .open_tab(pid, "/b", "b", true, TabOpener::None)
+                .unwrap()
+                .id; // position 1
+            let c = ws
+                .open_tab(pid, "/c", "c", true, TabOpener::None)
+                .unwrap()
+                .id; // position 2
             ws.close_tab(a).unwrap(); // removes position 0 → surviving positions 1,2
             ws.focus_tab(c).unwrap(); // active = c (raw position 2, dense index 1)
         }
@@ -6256,8 +6484,14 @@ mod tests {
         {
             let ws = Workspace::open(path.clone());
             let pid = ws.create_project("p", "/").unwrap().id;
-            let manual = ws.open_tab(pid, "/tmp", "", true).unwrap().id;
-            let placeholder = ws.open_tab(pid, "/tmp", "roostctl", true).unwrap().id;
+            let manual = ws
+                .open_tab(pid, "/tmp", "", true, TabOpener::None)
+                .unwrap()
+                .id;
+            let placeholder = ws
+                .open_tab(pid, "/tmp", "roostctl", true, TabOpener::None)
+                .unwrap()
+                .id;
             ws.set_tab_title(manual, "docs").unwrap();
             assert!(ws.tab(manual).unwrap().user_titled);
             assert!(!ws.tab(placeholder).unwrap().user_titled);
@@ -6280,9 +6514,18 @@ mod tests {
         {
             let ws = Workspace::open(path.clone());
             let pid = ws.create_project("p", "/").unwrap().id;
-            let a = ws.open_tab(pid, "/a", "a", true).unwrap().id;
-            let b = ws.open_tab(pid, "/b", "b", true).unwrap().id;
-            let c = ws.open_tab(pid, "/c", "c", true).unwrap().id;
+            let a = ws
+                .open_tab(pid, "/a", "a", true, TabOpener::None)
+                .unwrap()
+                .id;
+            let b = ws
+                .open_tab(pid, "/b", "b", true, TabOpener::None)
+                .unwrap()
+                .id;
+            let c = ws
+                .open_tab(pid, "/c", "c", true, TabOpener::None)
+                .unwrap()
+                .id;
             // Reorder to c, a, b — restore must reflect the new order.
             ws.reorder_tabs(pid, &[c, a, b]).unwrap();
         }
@@ -6346,7 +6589,10 @@ mod tests {
         {
             let ws = Workspace::open(path.clone());
             let pid = ws.create_project("p", "/").unwrap().id;
-            let tid = ws.open_tab(pid, "/start", "", true).unwrap().id;
+            let tid = ws
+                .open_tab(pid, "/start", "", true, TabOpener::None)
+                .unwrap()
+                .id;
             ws.set_tab_cwd(tid, "/first").unwrap();
             ws.set_tab_cwd(tid, "/second").unwrap();
         }
@@ -6368,7 +6614,10 @@ mod tests {
         {
             let ws = Workspace::open(path.clone());
             let pid = ws.create_project("p", "/").unwrap().id;
-            let tid = ws.open_tab(pid, "/flushed", "", true).unwrap().id;
+            let tid = ws
+                .open_tab(pid, "/flushed", "", true, TabOpener::None)
+                .unwrap()
+                .id;
             ws.flush().expect("the flush lands");
             // Frozen — this write is a no-op.
             ws.set_tab_cwd(tid, "/after-flush").unwrap();
@@ -6784,10 +7033,14 @@ mod tests {
     fn the_ring_strips_every_moment_and_keeps_the_state_beside_it() {
         let ws = replaying(REPLAY_WINDOW, REPLAY_BUDGET_BYTES);
         let project = ws.create_project("p", "/").unwrap().id;
-        let tab = ws.open_tab(project, "/", "watched", true).unwrap().id;
+        let tab = ws
+            .open_tab(project, "/", "watched", true, TabOpener::None)
+            .unwrap()
+            .id;
         // A second tab takes the focus, so the raise on the first is not
         // suppressed as "the user is looking at it".
-        ws.open_tab(project, "/", "active", true).unwrap();
+        ws.open_tab(project, "/", "active", true, TabOpener::None)
+            .unwrap();
 
         ws.publish_tab_effect(tab, TabEffectKind::Bell);
         let effects_only = ws.revision();
@@ -6995,7 +7248,7 @@ mod tests {
         // tab, and the change has already been broadcast to every
         // client.
         let tid = ws
-            .open_tab(pid, "/one", "a", true)
+            .open_tab(pid, "/one", "a", true, TabOpener::None)
             .expect("the op still succeeds")
             .id;
         let first = ws.persist_error().expect("the write failed");
@@ -7156,7 +7409,8 @@ mod tests {
         let path = dir.path().join("state.json");
         let ws = Arc::new(Workspace::open(path.clone()));
         let pid = ws.create_project("p", "/").unwrap().id;
-        ws.open_tab(pid, "/flushed", "", true).unwrap();
+        ws.open_tab(pid, "/flushed", "", true, TabOpener::None)
+            .unwrap();
 
         let (flush_parked, flush_reached) = mpsc::channel::<()>();
         let (release_flush, flush_released) = mpsc::channel::<()>();
@@ -7232,7 +7486,8 @@ mod tests {
         let path = dir.path().join("state.json");
         let ws = Arc::new(Workspace::open(path.clone()));
         let pid = ws.create_project("p", "/").unwrap().id;
-        ws.open_tab(pid, "/flushed", "", true).unwrap();
+        ws.open_tab(pid, "/flushed", "", true, TabOpener::None)
+            .unwrap();
 
         let parked_flush = |ws: &Arc<Workspace>| {
             let (parked, reached) = mpsc::channel::<()>();
@@ -7277,7 +7532,10 @@ mod tests {
         let path = dir.path().join("state.json");
         let ws = Workspace::open(path);
         let pid = ws.create_project("p", "/").unwrap().id;
-        let tid = ws.open_tab(pid, "/one", "a", true).unwrap().id;
+        let tid = ws
+            .open_tab(pid, "/one", "a", true, TabOpener::None)
+            .unwrap()
+            .id;
 
         let sealed = ReadOnlyDir::seal(dir.path());
         ws.set_tab_title(tid, "b").unwrap();
@@ -7303,7 +7561,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::open(dir.path().join("state.json"));
         let pid = ws.create_project("p", "/").unwrap().id;
-        let tid = ws.open_tab(pid, "/", "a", true).unwrap().id;
+        let tid = ws
+            .open_tab(pid, "/", "a", true, TabOpener::None)
+            .unwrap()
+            .id;
         let written = ws.inner.lock().unwrap().persist_seq;
         let mut events = ws.subscribe();
 
@@ -7335,7 +7596,10 @@ mod tests {
     fn a_password_input_change_is_replayed_into_a_resume() {
         let ws = replaying(16, REPLAY_BUDGET_BYTES);
         let pid = ws.create_project("p", "/").unwrap().id;
-        let tid = ws.open_tab(pid, "/", "a", true).unwrap().id;
+        let tid = ws
+            .open_tab(pid, "/", "a", true, TabOpener::None)
+            .unwrap()
+            .id;
         let fence = ws.revision();
         ws.set_tab_password_input(tid, true);
 

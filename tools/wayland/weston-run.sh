@@ -39,6 +39,10 @@ if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -w "${XDG_RUNTIME_DIR}" ]; then
 fi
 export XDG_RUNTIME_DIR
 chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+# Plan 085 D3: a debug or test-mode Roost under this derives its tabs'
+# `XDG_RUNTIME_DIR` from here, never the desktop's `/run/user/<uid>`
+# (`ui.pin_user_runtime_dir`).
+export ROOST_TEST_USER_RUNTIME_DIR="$XDG_RUNTIME_DIR"
 
 socket="wayland-roost-$$"
 log="${ROOST_WL_LOG:-${XDG_RUNTIME_DIR}/weston-headless.log}"

@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use roost_engine::TabOpener;
 use roost_engine::{PtyOutputEvent, PtySupervisor};
 
 mod support;
@@ -42,6 +43,7 @@ async fn seqs_advance_and_exit_carries_the_highest_on_the_eof_path() {
             80,
             24,
             &socket,
+            &TabOpener::None,
         )
         .expect("spawn");
 
@@ -117,6 +119,7 @@ async fn seqs_stay_ordered_when_the_backstop_races_the_reader() {
             80,
             24,
             &socket,
+            &TabOpener::None,
         )
         .expect("spawn");
 
@@ -174,6 +177,7 @@ async fn a_respawned_tab_gets_a_fresh_counter() {
                 80,
                 24,
                 &socket,
+                &TabOpener::None,
             )
             .unwrap_or_else(|err| panic!("run {run}: spawn failed: {err:?}"));
 

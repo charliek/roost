@@ -343,6 +343,10 @@ class BootstrapJail:
         test_mode = os.environ.get("ROOST_TEST_MODE")
         if test_mode is not None:
             lines += [f"ROOST_TEST_MODE={sh_quote(test_mode)}", "export ROOST_TEST_MODE"]
+        # The far side has no runtime dir, so its knob is empty, as
+        # `ui.pin_user_runtime_dir` sets it for `daemon_env`.
+        knob = ui.TEST_USER_RUNTIME_DIR_ENV
+        lines += [f"{knob}=", f"export {knob}"]
         return "\n".join([*lines, ""])
 
     def daemon_env(self, **overrides: str) -> dict[str, str]:
@@ -372,6 +376,7 @@ class BootstrapJail:
         if test_mode is not None:
             env["ROOST_TEST_MODE"] = test_mode
         env.update(overrides)
+        ui.pin_user_runtime_dir(env)
         return env
 
     def socket(self) -> Path:
@@ -911,6 +916,22 @@ def _mismatched_stub() -> str:
         "  ;;\n"
         "esac\n"
     )
+
+
+def test_the_jails_daemons_derive_no_runtime_dir():
+    """Plan 085 D3: the far side has no runtime dir, so a daemon started
+    there — directly or over `run-remote` — gets an empty knob, which
+    derives none for its tabs; an absent one would derive this machine's
+    `/run/user/<uid>`. No UI is driven."""
+    jail = BootstrapJail()
+    try:
+        env = jail.daemon_env()
+        assert env.get(ui.TEST_USER_RUNTIME_DIR_ENV) == "", env
+        assert "XDG_RUNTIME_DIR" not in env, env
+        lines = jail.session_env_text().splitlines()
+        assert f"{ui.TEST_USER_RUNTIME_DIR_ENV}=" in lines, lines
+    finally:
+        jail.cleanup()
 
 
 # ---------------------------------------------------------------------------

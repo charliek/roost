@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use roost_engine::session::{TabOutput, TabSession};
+use roost_engine::TabOpener;
 use roost_engine::{PtyError, PtySupervisor};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::sleep;
@@ -88,6 +89,7 @@ async fn trailing_output_arrives_before_exit() {
                 80,
                 24,
                 &socket,
+                &TabOpener::None,
             )
             .expect("spawn");
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -147,6 +149,7 @@ async fn exit_arrives_while_a_descendant_holds_the_pty_open() {
             80,
             24,
             &socket,
+            &TabOpener::None,
         )
         .expect("spawn");
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -217,6 +220,7 @@ async fn a_fast_child_leaves_no_session_behind() {
                 80,
                 24,
                 &socket,
+                &TabOpener::None,
             )
             .expect("spawn");
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();

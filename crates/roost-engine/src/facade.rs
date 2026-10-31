@@ -19,7 +19,9 @@ use roost_ipc::messages::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::{LocalClient, PtyError, PtySupervisor, Workspace, WorkspaceError, WorkspaceEvent};
+use crate::{
+    LocalClient, PtyError, PtySupervisor, TabOpener, Workspace, WorkspaceError, WorkspaceEvent,
+};
 
 /// Versioned, serializable commands suitable for Rust UI adapters and a future
 /// serialized C ABI. Existing `roost-ipc` DTOs are reused deliberately.
@@ -267,7 +269,10 @@ impl Engine {
                     .reorder_projects(&local_projects(&p.project_ids)?)?;
                 Ok(CommandResult::Ack)
             }
-            EngineCommand::TabOpen(p) => self.open_tab(p).await.map(CommandResult::Tab),
+            EngineCommand::TabOpen(p) => self
+                .open_tab(p, &TabOpener::None)
+                .await
+                .map(CommandResult::Tab),
             EngineCommand::TabClose(p) => {
                 crate::application::close_tab(&self.workspace, &self.supervisor, p.tab_id)?;
                 Ok(CommandResult::Ack)
@@ -332,7 +337,11 @@ impl Engine {
         }
     }
 
-    async fn open_tab(&self, mut params: TabOpenParams) -> Result<Tab, EngineError> {
+    async fn open_tab(
+        &self,
+        mut params: TabOpenParams,
+        opener: &TabOpener,
+    ) -> Result<Tab, EngineError> {
         validate_dimension(params.cols, "cols")?;
         validate_dimension(params.rows, "rows")?;
         let activate = params.activate != Some(false);
@@ -346,9 +355,13 @@ impl Engine {
             crate::application::pty_dim(params.cols, 80, "cols").map_err(application_error)?;
         let rows =
             crate::application::pty_dim(params.rows, 24, "rows").map_err(application_error)?;
-        let mut tab =
-            self.workspace
-                .open_tab(params.project_id, &params.cwd, &params.title, activate)?;
+        let mut tab = self.workspace.open_tab(
+            params.project_id,
+            &params.cwd,
+            &params.title,
+            activate,
+            opener.clone(),
+        )?;
         crate::application::spawn_for_row(
             &self.workspace,
             &self.supervisor,
@@ -357,6 +370,7 @@ impl Engine {
             cols,
             rows,
             &self.client.socket_path,
+            opener,
         )
         .map_err(|error| application_error(error.context("pty spawn failed")))?;
         Ok(tab)
@@ -551,7 +565,7 @@ mod tests {
         let workspace = Arc::new(Workspace::new());
         let project = workspace.create_project("p", "/").unwrap().id;
         let source = workspace
-            .open_tab(project, &source_cwd, "src", false)
+            .open_tab(project, &source_cwd, "src", false, TabOpener::None)
             .unwrap()
             .id;
         let supervisor = Arc::new(PtySupervisor::new());
@@ -686,8 +700,12 @@ mod tests {
     async fn reorder_commands_refuse_host_qualified_refs() {
         let workspace = Arc::new(Workspace::new());
         let project = workspace.create_project("p", "/tmp").unwrap();
-        let first = workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
-        let second = workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
+        let first = workspace
+            .open_tab(project.id, "/tmp", "one", true, TabOpener::None)
+            .unwrap();
+        let second = workspace
+            .open_tab(project.id, "/tmp", "two", true, TabOpener::None)
+            .unwrap();
         let engine = Engine::new(
             workspace.clone(),
             Arc::new(PtySupervisor::new()),
@@ -784,8 +802,12 @@ mod tests {
     async fn compound_events_share_revision_and_keep_commit_order() {
         let workspace = Arc::new(Workspace::new());
         let project = workspace.create_project("p", "/tmp").unwrap();
-        let first = workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
-        let second = workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
+        let first = workspace
+            .open_tab(project.id, "/tmp", "one", true, TabOpener::None)
+            .unwrap();
+        let second = workspace
+            .open_tab(project.id, "/tmp", "two", true, TabOpener::None)
+            .unwrap();
         let mut events = workspace.subscribe_versioned();
 
         workspace.delete_project(project.id).unwrap();

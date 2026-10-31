@@ -806,7 +806,8 @@ use crate::persistence::HostSnapshot;
 #[cfg(feature = "server-vt")]
 use crate::pty::Geometry;
 use crate::{
-    AttentionSource, PtyError, PtySupervisor, ResumeCut, ResumeError, Workspace, WorkspaceError,
+    AttentionSource, PtyError, PtySupervisor, ResumeCut, ResumeError, TabOpener, Workspace,
+    WorkspaceError,
 };
 
 /// How long `session.stop` lets a hung-up child live before it escalates
@@ -3700,7 +3701,7 @@ async fn dispatch(
             crate::application::resolve_open_target(&h.workspace, &h.supervisor, &mut p, activate);
             let mut tab = h
                 .workspace
-                .open_tab(p.project_id, &p.cwd, &p.title, activate)
+                .open_tab(p.project_id, &p.cwd, &p.title, activate, TabOpener::None)
                 .map_err(ws_err)?;
             // Spawn the PTY. Use the tab's cwd, the requested argv,
             // and a sensible default winsize when the caller doesn't
@@ -3731,6 +3732,7 @@ async fn dispatch(
                 cols,
                 rows,
                 &h.socket_path,
+                &TabOpener::None,
             )
             .map_err(|err| match err.downcast_ref::<PtyError>() {
                 Some(pty) => pty_err(pty),
@@ -5530,7 +5532,7 @@ mod tests {
         let workspace = Arc::new(Workspace::open(dir.join("state.json")));
         let project = workspace.create_project("p", "/tmp").expect("project");
         workspace
-            .open_tab(project.id, "/tmp", "t", true)
+            .open_tab(project.id, "/tmp", "t", true, TabOpener::None)
             .expect("open a tab");
         assert_ne!(workspace.active(), (0, 0), "the fixture needs a selection");
         IpcHandler::new(
@@ -5810,7 +5812,10 @@ mod tests {
         std::fs::create_dir(&cwd).unwrap();
         let cwd = cwd.to_string_lossy().into_owned();
         let project = h.workspace.snapshot()[0].id;
-        let source = h.workspace.open_tab(project, &cwd, "src", false).unwrap();
+        let source = h
+            .workspace
+            .open_tab(project, &cwd, "src", false, TabOpener::None)
+            .unwrap();
         (project, source.id, cwd)
     }
 
@@ -5844,7 +5849,7 @@ mod tests {
         let project = h.workspace.snapshot()[0].id;
         let gone = h
             .workspace
-            .open_tab(project, "/no/such/dir", "gone", false)
+            .open_tab(project, "/no/such/dir", "gone", false, TabOpener::None)
             .unwrap()
             .id;
 

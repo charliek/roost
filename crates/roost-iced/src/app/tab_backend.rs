@@ -351,6 +351,7 @@ mod tests {
                 DEFAULT_COLS,
                 DEFAULT_ROWS,
                 std::path::Path::new(TEST_SOCKET),
+                &TabOpener::None,
             )
             .expect("spawn test PTY");
         let backend = TabBackend::in_process(Arc::clone(&supervisor), test_mode);

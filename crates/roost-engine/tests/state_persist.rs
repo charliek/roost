@@ -4,6 +4,7 @@
 //! fresh shells), not as live tabs in the workspace.
 
 use roost_engine::persistence::read_state;
+use roost_engine::TabOpener;
 use roost_engine::{Workspace, WorkspaceError};
 use tempfile::tempdir;
 
@@ -15,7 +16,9 @@ fn projects_and_next_id_survive_reopen() {
     let (project_id, first_tab_id) = {
         let ws = Workspace::open(state_path.clone());
         let p = ws.create_project("Roost", "/tmp").unwrap();
-        let t = ws.open_tab(p.id, "/tmp", "shell", true).unwrap();
+        let t = ws
+            .open_tab(p.id, "/tmp", "shell", true, TabOpener::None)
+            .unwrap();
         (p.id, t.id)
         // ws drops here; state.json should be on disk.
     };
@@ -49,7 +52,9 @@ fn projects_and_next_id_survive_reopen() {
     // against project_id alone wasn't strong enough — open_tab
     // already returns ids greater than any project id in practice,
     // so the meaningful invariant is "ids monotonically advance."
-    let next_tab = ws2.open_tab(project_id, "/", "", true).unwrap();
+    let next_tab = ws2
+        .open_tab(project_id, "/", "", true, TabOpener::None)
+        .unwrap();
     assert!(
         next_tab.id > first_tab_id,
         "ids must advance past the previous tab ({}), got {}",
@@ -85,7 +90,8 @@ fn saved_hosts_survive_an_ordinary_rewrite() {
     {
         let ws = Workspace::open(state_path.clone());
         let p = ws.create_project("Roost", "/tmp").unwrap();
-        ws.open_tab(p.id, "/tmp", "shell", true).unwrap();
+        ws.open_tab(p.id, "/tmp", "shell", true, TabOpener::None)
+            .unwrap();
     }
 
     let back = read_state(&state_path).unwrap().expect("present");

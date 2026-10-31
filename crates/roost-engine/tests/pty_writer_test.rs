@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use roost_engine::TabOpener;
 use roost_engine::{PtyOutputEvent, PtySupervisor};
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -30,6 +31,7 @@ fn spawn_tab(
         80,
         24,
         &socket(),
+        &TabOpener::None,
     )
     .expect("spawn")
 }

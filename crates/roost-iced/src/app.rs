@@ -27,7 +27,7 @@ use roost_engine::process::{self, ProcessRequest};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
 use roost_engine::single_instance::InstanceLocks;
 use roost_engine::{
-    Hydration, LocalClient, OnRestoreError, PtySupervisor, Workspace, WorkspaceError,
+    Hydration, LocalClient, OnRestoreError, PtySupervisor, TabOpener, Workspace, WorkspaceError,
     WorkspaceEvent,
 };
 use roost_ipc::messages::{
@@ -1809,6 +1809,7 @@ async fn open_tab_flow(
             &argv,
             u32::from(cols),
             u32::from(rows),
+            &TabOpener::None,
         )
         .await
         .map(|tab| tab.id)
@@ -11273,6 +11274,8 @@ async fn hydrate_local_workspace(client: &LocalClient, grid: (u16, u16)) -> Resu
             first_project: roost_ipc::session_launch::FirstProject::Seed,
             grid,
             on_error: OnRestoreError::Warn,
+            starter: TabOpener::None,
+            legacy: TabOpener::None,
         },
     )
     .await
@@ -12556,11 +12559,15 @@ mod tests {
     fn numeric_switch_helpers_follow_authoritative_snapshot_order() {
         let workspace = Workspace::new();
         let first = workspace.create_project("first", "/tmp").unwrap();
-        let first_tab = workspace.open_tab(first.id, "/tmp", "one", true).unwrap();
-        let second_tab = workspace.open_tab(first.id, "/tmp", "two", true).unwrap();
+        let first_tab = workspace
+            .open_tab(first.id, "/tmp", "one", true, TabOpener::None)
+            .unwrap();
+        let second_tab = workspace
+            .open_tab(first.id, "/tmp", "two", true, TabOpener::None)
+            .unwrap();
         let second = workspace.create_project("second", "/tmp").unwrap();
         let second_project_tab = workspace
-            .open_tab(second.id, "/tmp", "three", true)
+            .open_tab(second.id, "/tmp", "three", true, TabOpener::None)
             .unwrap();
 
         let local_ring = |projects: &[Project]| {
@@ -12712,10 +12719,10 @@ mod tests {
         let workspace = Arc::new(Workspace::new());
         let project = workspace.create_project("one", "/tmp").unwrap();
         let sibling = workspace
-            .open_tab(project.id, "/tmp", "sibling", true)
+            .open_tab(project.id, "/tmp", "sibling", true, TabOpener::None)
             .unwrap();
         let doomed = workspace
-            .open_tab(project.id, "/tmp", "doomed", true)
+            .open_tab(project.id, "/tmp", "doomed", true, TabOpener::None)
             .unwrap();
         workspace.focus_tab(doomed.id).unwrap();
         let client = LocalClient::new(
@@ -12745,7 +12752,7 @@ mod tests {
 
         let last_project = workspace.create_project("last", "/tmp").unwrap();
         let last = workspace
-            .open_tab(last_project.id, "/tmp", "last", true)
+            .open_tab(last_project.id, "/tmp", "last", true, TabOpener::None)
             .unwrap();
         workspace.focus_tab(last.id).unwrap();
         assert_eq!(
@@ -12828,6 +12835,7 @@ mod tests {
                     DEFAULT_COLS,
                     DEFAULT_ROWS,
                     std::path::Path::new("/tmp/roost-iced-create-project-midfail-test.sock"),
+                    &TabOpener::None,
                 )
             })
             .expect("occupy the id the seed tab will be allocated");
@@ -13700,6 +13708,7 @@ mod tests {
                 DEFAULT_COLS,
                 DEFAULT_ROWS,
                 std::path::Path::new("/tmp/roost-iced-launch-cwd-test.sock"),
+                &TabOpener::None,
             )
             .expect("spawn");
         guard
@@ -13710,7 +13719,13 @@ mod tests {
         let workspace = Workspace::new();
         let project = workspace.create_project("p", "/").unwrap().id;
         let tab = workspace
-            .open_tab(project, &tracked.to_string_lossy(), "", true)
+            .open_tab(
+                project,
+                &tracked.to_string_lossy(),
+                "",
+                true,
+                TabOpener::None,
+            )
             .unwrap()
             .id;
         assert_eq!(workspace.active(), (project, tab));
@@ -13765,7 +13780,13 @@ mod tests {
         let (workspace, shown) = workspace_tracking(shown_dir.path());
         let other = workspace.create_project("q", "/").unwrap().id;
         let source = workspace
-            .open_tab(other, &source_dir.path().to_string_lossy(), "", false)
+            .open_tab(
+                other,
+                &source_dir.path().to_string_lossy(),
+                "",
+                false,
+                TabOpener::None,
+            )
             .unwrap()
             .id;
         let supervisor = Arc::new(PtySupervisor::new());
@@ -14383,8 +14404,12 @@ mod tests {
     fn confirm_delete_targets_only_projects_present_in_the_snapshot() {
         let workspace = Workspace::new();
         let project = workspace.create_project("doomed", "/tmp").unwrap();
-        workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
-        workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
+        workspace
+            .open_tab(project.id, "/tmp", "one", true, TabOpener::None)
+            .unwrap();
+        workspace
+            .open_tab(project.id, "/tmp", "two", true, TabOpener::None)
+            .unwrap();
         let snapshot = workspace.snapshot();
 
         assert_eq!(
@@ -14444,7 +14469,9 @@ mod tests {
     fn a_confirmation_keeps_the_key_it_was_asked_about() {
         let workspace = Workspace::new();
         let project = workspace.create_project("mirrored", "/tmp").unwrap();
-        workspace.open_tab(project.id, "/tmp", "t", true).unwrap();
+        workspace
+            .open_tab(project.id, "/tmp", "t", true, TabOpener::None)
+            .unwrap();
         let rows = workspace.snapshot();
 
         let host = HostId::new(3);
@@ -14461,7 +14488,9 @@ mod tests {
     fn the_confirm_body_reads_exactly_as_the_mac_alert_does() {
         let workspace = Workspace::new();
         let project = workspace.create_project("polish", "/tmp").unwrap();
-        workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
+        workspace
+            .open_tab(project.id, "/tmp", "one", true, TabOpener::None)
+            .unwrap();
         let snapshot = workspace.snapshot();
         let confirm =
             confirm_delete_target(&snapshot, ProjectKey::local(project.id)).expect("target");
@@ -14480,8 +14509,12 @@ mod tests {
     fn a_confirm_whose_project_vanished_externally_is_auto_dismissed() {
         let workspace = Workspace::new();
         let project = workspace.create_project("doomed", "/tmp").unwrap();
-        let tab = workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
-        workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
+        let tab = workspace
+            .open_tab(project.id, "/tmp", "one", true, TabOpener::None)
+            .unwrap();
+        workspace
+            .open_tab(project.id, "/tmp", "two", true, TabOpener::None)
+            .unwrap();
         let snapshot = workspace.snapshot();
         let mut confirm = confirm_delete_target(&snapshot, ProjectKey::local(project.id));
 
@@ -14627,6 +14660,7 @@ mod tests {
                     &[],
                     u32::from(DEFAULT_COLS),
                     u32::from(DEFAULT_ROWS),
+                    &TabOpener::None,
                 ))
                 .unwrap()
         };

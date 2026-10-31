@@ -80,6 +80,7 @@ pub mod framing;
 pub mod local_route;
 pub mod messages;
 pub mod old_session;
+pub mod opener;
 pub mod paths;
 pub mod program_status;
 pub mod schema;

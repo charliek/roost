@@ -60,6 +60,7 @@ use roost_ipc::messages::{
     ops, BridgeOrigin, BridgePreamble, RawRequest, BRIDGE_ACCEPTED, MAX_BRIDGE_PREAMBLE,
 };
 use roost_ipc::old_session::{self, OldSession};
+use roost_ipc::opener::MAX_ORIGIN_VALUE;
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::socket_state::{classify_connect_error, SocketState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -75,11 +76,6 @@ const CHUNK: usize = 64 * 1024;
 /// How long a session has to answer the preamble before the bridge
 /// takes it for one that predates it.
 const PREAMBLE_ACK_BUDGET: Duration = Duration::from_secs(2);
-
-/// The most of each `SSH_*` value the preamble carries, so the line
-/// always fits the session's [`MAX_BRIDGE_PREAMBLE`] even when every
-/// byte has to be escaped.
-const MAX_ORIGIN_VALUE: usize = 256;
 
 /// Owns the reporting rather than returning an error, because the
 /// caller has no other channel: stdout belongs to the wire.

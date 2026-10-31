@@ -19,20 +19,30 @@
 //!   legitimate state: nothing in a session exits on empty, and the next
 //!   *ordinary* connect seeds it anyway (plan 063 §D6), so a caller that
 //!   withheld the seed and then failed leaves a session that heals itself.
+//! * A tab saved before there were openers restores with none, the
+//!   baseline: a session's tabs had many openers, and a saved file does
+//!   not say which (plan 085 D6).
 
 use anyhow::Result;
-use roost_engine::{Hydration, LocalClient, OnRestoreError};
+use roost_engine::{Hydration, LocalClient, OnRestoreError, TabOpener};
 
 use crate::consts::{FirstProject, DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS};
 
-/// Re-open the saved layout, or seed a first project at `$HOME`.
-pub async fn hydrate(client: &LocalClient, first_project: FirstProject) -> Result<()> {
+/// Re-open the saved layout, or seed a first project at `$HOME`, with
+/// `starter` as the session's own opener.
+pub async fn hydrate(
+    client: &LocalClient,
+    first_project: FirstProject,
+    starter: TabOpener,
+) -> Result<()> {
     roost_engine::hydrate(
         client,
         Hydration {
             first_project,
             grid: (DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS),
             on_error: OnRestoreError::Warn,
+            starter,
+            legacy: TabOpener::None,
         },
     )
     .await

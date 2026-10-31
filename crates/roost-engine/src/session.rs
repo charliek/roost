@@ -394,6 +394,7 @@ impl TabSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TabOpener;
     use std::time::{Duration, Instant};
 
     /// #80 A3: rapid `send_input` calls must reach the PTY in
@@ -407,7 +408,15 @@ mod tests {
         let supervisor = Arc::new(PtySupervisor::new());
         let socket = std::path::PathBuf::from("/tmp/roost-tabsession-order.sock");
         let rx_pty = supervisor
-            .spawn(1, "/tmp", &["/bin/cat".into()], 80, 24, &socket)
+            .spawn(
+                1,
+                "/tmp",
+                &["/bin/cat".into()],
+                80,
+                24,
+                &socket,
+                &TabOpener::None,
+            )
             .expect("spawn");
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
         // Keep `session` alive: it owns the serial channel's sender,
@@ -450,7 +459,15 @@ mod tests {
         let supervisor = Arc::new(PtySupervisor::new());
         let socket = std::path::PathBuf::from("/tmp/roost-tabsession-capture.sock");
         let rx_pty = supervisor
-            .spawn(7, "/tmp", &["/bin/cat".into()], 80, 24, &socket)
+            .spawn(
+                7,
+                "/tmp",
+                &["/bin/cat".into()],
+                80,
+                24,
+                &socket,
+                &TabOpener::None,
+            )
             .expect("spawn");
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
         let capture: InputCapture = Arc::new(Mutex::new(Vec::new()));
@@ -493,7 +510,7 @@ mod tests {
             "printf EARLY_MARKER; exec /bin/cat".to_string(),
         ];
         let _rx_dropped = supervisor
-            .spawn(21, "/tmp", &argv, 80, 24, &socket)
+            .spawn(21, "/tmp", &argv, 80, 24, &socket, &TabOpener::None)
             .expect("spawn");
         // Give the command time to run and its output time to reach
         // the broadcast channel — the window the old lazy subscribe
@@ -531,7 +548,15 @@ mod tests {
         let supervisor = Arc::new(PtySupervisor::new());
         let socket = std::path::PathBuf::from("/tmp/roost-tabsession-reattach.sock");
         let _rx = supervisor
-            .spawn(22, "/tmp", &["/bin/cat".into()], 80, 24, &socket)
+            .spawn(
+                22,
+                "/tmp",
+                &["/bin/cat".into()],
+                80,
+                24,
+                &socket,
+                &TabOpener::None,
+            )
             .expect("spawn");
         assert!(supervisor.take_initial_receiver(22).is_some());
         assert!(supervisor.take_initial_receiver(22).is_none());

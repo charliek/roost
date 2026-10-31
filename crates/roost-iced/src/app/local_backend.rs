@@ -5622,6 +5622,7 @@ mod migration_tests {
                             cwd: (*cwd).into(),
                             title: (*title).into(),
                             user_titled: *user_titled,
+                            opener: None,
                         })
                         .collect(),
                     last_tab_position: None,

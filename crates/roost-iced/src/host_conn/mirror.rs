@@ -414,6 +414,7 @@ fn reorder<T>(items: &mut [T], order: &[i64], id: impl Fn(&T) -> i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roost_engine::TabOpener;
     use roost_ipc::agent::{AgentLifecycle, ShellState};
     use roost_ipc::messages::TabState;
 
@@ -758,7 +759,10 @@ mod tests {
 
         let workspace = Workspace::new();
         let project = workspace.create_project("p", "/tmp").unwrap().id;
-        let tab = workspace.open_tab(project, "/tmp", "t", false).unwrap().id;
+        let tab = workspace
+            .open_tab(project, "/tmp", "t", false, TabOpener::None)
+            .unwrap()
+            .id;
         let mut terminal = roost_vt::Terminal::new(roost_vt::TerminalOptions {
             cols: 80,
             rows: 24,
