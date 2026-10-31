@@ -97,6 +97,7 @@ if platform.system() == "Darwin":
 
 import agent_jail  # noqa: E402
 import session as sessionlib  # noqa: E402
+import tab_env  # noqa: E402
 
 _ROOT = Path(tempfile.mkdtemp(prefix="roost-os-", dir="/tmp")).resolve()
 _RUN = _ROOT / "run"
@@ -105,6 +106,7 @@ for _sibling in ("data", "state", "cache"):
     (_ROOT / _sibling).mkdir()
 
 os.environ["XDG_RUNTIME_DIR"] = str(_RUN)
+sessionlib.pin_user_runtime_dir(os.environ)
 os.environ["XDG_DATA_HOME"] = str(_ROOT / "data")
 os.environ["XDG_STATE_HOME"] = str(_ROOT / "state")
 os.environ["XDG_CACHE_HOME"] = str(_ROOT / "cache")
@@ -122,8 +124,22 @@ os.environ[sessionlib.TEST_OLD_SESSION_DIR_ENV] = str(_RUN / "roost-session")
 # The shell the restart's session reopens every tab with, as on the old
 # side (`make_env`): nothing may rewrite the titles and cwds compared.
 os.environ["SHELL"] = "/bin/sh"
+
+
+def own_copy(binary: Path) -> Path:
+    """A private copy of `binary` (`tab_env.private_copy`), so a process
+    running it is this module's by its executable alone, wherever a
+    daemonizing start reparented it. Its directory is named like the
+    original's, which is what `session._is_debug_build` reads."""
+    dest = _ROOT / "bin" / binary.parent.name / binary.name
+    if not dest.exists():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tab_env.private_copy(binary, dest)
+    return dest
+
+
 # What the forced update restarts into: this tree's session.
-os.environ["ROOST_SESSION_BIN"] = str(sessionlib.session_binary())
+os.environ["ROOST_SESSION_BIN"] = str(own_copy(sessionlib.session_binary()))
 
 atexit.register(shutil.rmtree, _ROOT, ignore_errors=True)
 
@@ -228,8 +244,9 @@ def fetch(request: pytest.FixtureRequest, which: str) -> Release | str:
             fields[key] = value
     if "skip" in fields:
         return fields["skip"]
-    binary = Path(fields["binary"])
     assert_predates_m2(fields["version"])
+    binary = own_copy(Path(fields["binary"]))
+    _SESSION_BINARIES.add(binary)
     return Release(fields["version"], binary, generation(binary))
 
 
@@ -384,26 +401,26 @@ def write_backend(backend: str) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
+#: Every `roost-session` this module runs, each its `own_copy`: this
+#: tree's, and each release `fetch` hands back.
+_SESSION_BINARIES = {sessionlib.session_binary()}
+
+
 def sessions_under_the_root() -> list[int]:
-    """Every `roost-session` carrying this module's private runtime dir:
-    the old one, or the one a restart spawned. The restarted session binds
-    under the scratch passwd home rather than that runtime dir, but it
-    inherits the UI's environment, `XDG_RUNTIME_DIR` included — so it is
-    still matched here. Nothing else carries that directory, so nothing
-    else is found."""
-    marker = f"XDG_RUNTIME_DIR={_RUN}".encode()
-    found = []
-    for proc in Path("/proc").iterdir():
-        if not proc.name.isdigit():
-            continue
-        try:
-            if (proc / "comm").read_text().strip() == sessionlib.BIN_NAME and marker in (
-                proc / "environ"
-            ).read_bytes().split(b"\0"):
-                found.append(int(proc.name))
-        except OSError:
-            continue
-    return found
+    """Every session this module started that carries its private runtime
+    dir: the old one, or the one a restart spawned. Both daemonize, so
+    neither descends from this process; each runs one of
+    `_SESSION_BINARIES`, private copies, which is what proves it this
+    module's before its environment is read — the developer's own session,
+    even one run from this tree's build, never is. The restarted session
+    binds under the scratch passwd home rather than that runtime dir, but
+    it inherits the UI's environment, `XDG_RUNTIME_DIR` included — so it is
+    still matched here."""
+    return [
+        pid
+        for pid, env in tab_env.owned_processes(private=_SESSION_BINARIES)
+        if env.get("XDG_RUNTIME_DIR") == str(_RUN)
+    ]
 
 
 class Worlds:

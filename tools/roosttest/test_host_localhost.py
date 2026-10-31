@@ -87,6 +87,7 @@ for _sibling in ("data", "state", "cache"):
     (_ROOT / _sibling).mkdir()
 
 os.environ["XDG_RUNTIME_DIR"] = str(_RUN)
+sessionlib.pin_user_runtime_dir(os.environ)
 os.environ["XDG_DATA_HOME"] = str(_ROOT / "data")
 os.environ["XDG_STATE_HOME"] = str(_ROOT / "state")
 os.environ["XDG_CACHE_HOME"] = str(_ROOT / "cache")

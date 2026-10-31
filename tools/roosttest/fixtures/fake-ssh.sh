@@ -129,6 +129,13 @@
 #                                  the resolver reads as unset — and a
 #                                  test-mode remote then refuses to
 #                                  resolve its session socket at all.
+#   ROOST_TEST_USER_RUNTIME_DIR=<dir>  optional: the stand-in for the far
+#                                  side's `/run/user/<uid>` its tabs
+#                                  derive `XDG_RUNTIME_DIR` from (plan 085
+#                                  D3). Empty when the caller set none,
+#                                  which derives nothing — unset, a debug
+#                                  or test-mode remote would hand its tabs
+#                                  this machine's real one.
 #
 # Without all three the suite would pass or fail according to whether
 # the developer's own box is a Mac and whether it has the deb
@@ -354,6 +361,7 @@ run-remote)
         ROOST_BOOTSTRAP_FS_ROOT="${ROOST_BOOTSTRAP_FS_ROOT:-}" \
         ROOST_TEST_MODE="${ROOST_TEST_MODE:-}" \
         ROOST_SESSION_SOCKET_DIR="${ROOST_SESSION_SOCKET_DIR:-}" \
+        ROOST_TEST_USER_RUNTIME_DIR="${ROOST_TEST_USER_RUNTIME_DIR:-}" \
         sh -c "$remote"
     ;;
 drop-after:*)

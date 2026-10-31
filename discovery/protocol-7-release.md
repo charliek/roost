@@ -1157,6 +1157,110 @@ prove ordering.
 
 ### M4. G9: tab environment by opener
 
+**Status: implemented (plan 085), PR pending.**
+
+*How it shipped (plan 085 corrections to this section). The rule text
+below is already corrected where an entry changes it, except rule 5, which
+the first entry amends:*
+
+**Charlie's answers to the plan's §4.A**
+- **`roostctl` in an SSH context declares `origin` on any socket it
+  dials** (rule 4 read as "at the machine"): one command gives the same
+  tab whichever route it takes. A `roostctl` run in an SSH login, or in a
+  remote-opened tab (which now carries the laptop's `SSH_CONNECTION`), is a
+  remote caller whether it dials iced or the session.
+- **The starter and refresh.** A session's starter is its own environment
+  (SSH context: remote with its `SSH_CONNECTION` and `SSH_CLIENT`; else
+  local with its values); an in-process iced's starter is its own local
+  opener, never remote. The seed tab and the one tab a tab-less saved
+  project gets are opened by the starter. A restart refreshes saved local
+  tabs only when the starter is local **and has at least one local-set
+  value**, replacing the whole set; a remote or value-less starter refreshes
+  nothing.
+- **Option (b), an amendment of rule 5 for in-process iced.** Tabs restored
+  with no saved class get the baseline on a session (rule 5 as written), but
+  an in-process iced restores them with its own opener: only iced, or a local
+  caller on its socket, could have opened those tabs.
+
+**Terms and wire**
+- **The wire names `env` and `origin`.** `env` is a local opener's values
+  (keys limited to `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`,
+  `SSH_AUTH_SOCK`); `origin` is a caller declaring itself remote, a closed
+  `TabOrigin` of `ssh_connection` and `ssh_client`.
+- **Absent fields mean "no opener stated".** A local `tab.open` with neither
+  field gets the baseline; `env: {}` states a local opener with no values.
+  Every Roost client that is a local opener sends `env` explicitly. A
+  bridged connection's opener is always its bridge, so either field there is
+  refused, as is sending both.
+- **Every refusal is `invalid-param`, checked before anything mutates**
+  (before `resolve_open_target`, so a refused `project_id: "0"` creates no
+  project). *Amended in execution (C2):* an unknown key inside `origin`
+  answers `unknown-field`, the decoder's class for serde's unknown-field
+  message, naming the key.
+- **Value rules:** no NUL; local values at most 4096 bytes, remote at most
+  256 (the preamble's), applied to preamble and `state.json` values too.
+  *Amended in execution (branch review):* every producer collects its
+  values by the same rule and leaves out one the rules refuse, the bridge
+  included: it no longer cuts an `SSH_*` value to 256 bytes, which gave a
+  bridged tab an identity no other opener would send.
+- **`WAYLAND_DISPLAY` is sent absolute**, resolved against the sender's own
+  `XDG_RUNTIME_DIR` when relative.
+- **`XDG_RUNTIME_DIR`:** `/run/user/<uid>` when it is a non-symlink
+  directory the uid owns, else the baseline's value stays; macOS leaves the
+  baseline's. Test knob `ROOST_TEST_USER_RUNTIME_DIR`, honoured by debug
+  builds or `ROOST_TEST_MODE=1`.
+- **`SHELL` stays the passwd shell**, as before.
+- **Known limit:** a remote tab keeps `XDG_RUNTIME_DIR` (rule 1's carve-out),
+  so libwayland's `wayland-0` default and `$XDG_RUNTIME_DIR/bus` still reach
+  the desk from a remote tab. The opener variables are what M4 controls.
+- **`UnixSocket` hosts get iced's `env`**; such a socket may be an
+  ssh-forwarded remote one, in which case the desk's values reach that host.
+  Documented in `host-sessions.md`.
+- **Gestures driven over IPC** (`palette.activate`, `app.keybind_dispatch`)
+  open with iced's opener, since they drive iced's UI.
+- **No `env` retry in iced**: every protocol-7 session is an unreleased
+  build. roostctl retries once without the fields when the server refuses
+  `env` or `origin` by name (Swift's and serde's message formats); any other
+  `unknown-field` surfaces.
+- **The opener set is exactly the seven.** Other login-shaped variables
+  (`XDG_SESSION_TYPE`, `XDG_SESSION_ID`, `SSH_ORIGINAL_COMMAND`, `TMUX`)
+  still pass through the baseline.
+- *Amended in execution (C2, C3):* **in-process Roost-Iced honours `env`
+  and `origin` too.** Its UI socket resolves them with the same rules as a
+  session, and roostctl sends them there; rule 7 is corrected to say the
+  fields go to Rust targets, not only to session targets.
+- *Amended in execution (C3):* **the Roost.app skip is macOS-only.** Off
+  macOS the `Mac` profile resolves to a Rust UI, which honours the fields.
+  `roostctl open` against Roost.app fails `unsupported` before any
+  `tab.open`, as before M4.
+- *Amended in execution (C3):* **`SwitchTab.opener` decodes leniently**: one
+  bad saved entry reads `"none"` instead of losing the switch journal. A
+  live switch fills each opener from the workspace and drops a row whose tab
+  the workspace no longer holds (it was closed), instead of replaying it as a
+  legacy tab with iced's values.
+- *Amended in execution (C1), macOS facts found on the mini:* macOS
+  withholds a platform binary's environment (`/bin/sleep`, `/bin/sh`,
+  `/bin/zsh`) from every other process, so `KERN_PROCARGS2` returns argv and
+  stops. Tests there run the Python that is running them as the child, give
+  restored-shell cases a stand-in `SHELL`, and treat an argv-only buffer as
+  an error. The empty string ending the env block can be zero bytes long, so
+  the parser also stops at Apple's first key (`pfz=`, `stack_guard=`).
+
+**Upgrade day (for the release's CHANGELOG bullet).** Session tabs restored
+from a `state.json` written before M4 carry no saved opener and restore with
+none of the seven variables until reopened; in-process Roost-Iced tabs
+restore with iced's own values. Dev sessions built before the amendment
+refuse `env` and `origin`, so they need a restart onto the matching build.
+
+**Follow-ups (not in M4):** an "opened from" badge (the opener on the wire
+`Tab`); a refresh op for a running session (only a (re)start refreshes);
+widening the opener set (`XDG_SESSION_TYPE` decides X vs Wayland for some
+apps); stale saved values (a restored desk tab under a remote or value-less
+starter keeps a dead `SSH_AUTH_SOCK` after a macOS reboot until a desk
+start); `state.json` now holds client addresses and socket paths, in the
+user's own state file; `tools/session/live/`, the hand-run ssh harness
+(#395), was not run and its lanes may see tabs without the daemon's display.
+
 #### The rule: a tab's environment reflects where it was opened from
 
 The PTY's environment is **built explicitly for each tab**. It is not
@@ -1213,9 +1317,11 @@ podman working in remote tabs.
 6. **macOS.** The same rules. A desk-started Roost-Iced has launchd's
    `SSH_AUTH_SOCK` in its environment and passes it as a local opener.
    The daemon's baseline never keeps one.
-7. **Frozen Swift.** `env` on `tab.open` goes only to session targets,
-   per the release rule. `roostctl tab open` against `Roost.app` keeps
-   working unchanged.
+7. **Frozen Swift.** `env` and `origin` on `tab.open` go only to Rust
+   targets — a session, or in-process Roost-Iced's UI socket — never to
+   a target roostctl knows is `Roost.app`, per the release rule. Reached
+   by `--socket`, `Roost.app` refuses them by name and roostctl asks once
+   more without; `roostctl tab open` against `Roost.app` keeps working.
 
 **Every op that spawns a PTY is in scope.** The M4 plan writes the full
 inventory: `tab.open`, project creation's first tab, startup restore,

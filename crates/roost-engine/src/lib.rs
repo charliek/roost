@@ -25,6 +25,7 @@ pub mod git_metrics;
 pub mod ipc;
 #[cfg(feature = "vt")]
 pub mod memory;
+pub mod opener;
 pub mod osc;
 pub mod persistence;
 pub mod pointer;
@@ -77,6 +78,7 @@ pub use facade::{
     CommandResult, Engine, EngineCommand, EngineError, EngineEvent, EngineEventStream,
     EngineSnapshot,
 };
+pub use opener::TabOpener;
 pub use pty::{Geometry, PtyError, PtyOutputEvent, PtySupervisor, ShutdownReport, SupervisorEvent};
 #[cfg(feature = "server-vt")]
 pub use tab_task::{

@@ -308,6 +308,31 @@ A program in a terminal sees exactly one window size, so a tab shown in two wind
 
 A script's `roostctl tab resize` only sizes a tab nobody owns; on an owned tab it is refused with an `owned` error naming the owner. The wire rules are in [`ipc.md`](../reference/ipc.md#size-ownership).
 
+## Environment
+
+A tab's environment reflects **who opened it**, not who started the session. A session started over SSH no longer gives every tab the laptop's `SSH_CLIENT` and no display, and one started at the desk no longer gives a laptop's tab the desk's display. Seven variables are decided per tab: `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, `SSH_CONNECTION`, `SSH_CLIENT` and `SSH_TTY`. Everything else starts from the session's own environment. The wire rules are in [`ipc.md`](../reference/ipc.md#tab-environment).
+
+| Who opens the tab | What the tab gets |
+|---|---|
+| Roost-Iced on the machine itself (a new tab on the machine's own session, or a `localhost` host) | Roost-Iced's own `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` and `SSH_AUTH_SOCK`, so GUI programs open on that desk and `git push` uses the desk's agent. It sends them with the open. |
+| Roost-Iced on your laptop, connected over SSH | `SSH_CONNECTION` and `SSH_CLIENT` of that SSH connection, and nothing else of the seven: no display, bus, agent or `SSH_TTY`. Tools in the tab behave as remote, and the desk's display and agent are out of reach. |
+| `roostctl tab open` or `roostctl open` | The caller's own: inside an SSH login (or in a tab that carries `SSH_CONNECTION`) it declares itself remote, as above; otherwise it sends its display, bus and agent. This holds whichever socket it dials, and `roostctl` pointed at the window reaches the session with the original caller's values. |
+| Any other client on a local connection (not through an SSH bridge) that states nothing | The baseline: none of the seven. A request through a bridge is remote, as above. |
+
+A remote tab does not get the laptop's `SSH_AUTH_SOCK` on purpose: a forwarded agent socket dies with its SSH connection, which is wrong for a tab that outlives it.
+
+**`XDG_RUNTIME_DIR`** is the machine's, not the opener's. Every Linux tab gets `/run/user/<uid>` when that directory exists and the user owns it, so `systemctl --user` and podman work in a remote tab ([paths](../reference/paths.md#xdg_runtime_dir-in-a-tab)).
+
+**A restart keeps what a tab was opened with.** The opener is saved with the tab. Restored remote tabs keep their saved `SSH_*` values, and restored desk tabs keep their saved display, bus and agent. If the session was started from a desk, with at least one of those four set, it refreshes the saved ones with its own current values (so a tab does not hold a dead `SSH_AUTH_SOCK` from before a reboot). A session started over SSH, or from a shell with none of them, refreshes nothing.
+
+**The first tab and the starter.** The tab a first start opens, and the one tab a saved project that lost its tabs gets, have no client to ask. They are opened by whoever started the session: remote, with its `SSH_*` values, when it was started over SSH, otherwise a desk opener with its values.
+
+**Known limit.** A remote tab keeps `XDG_RUNTIME_DIR`, so a program that falls back to libwayland's default `wayland-0` socket, or to `$XDG_RUNTIME_DIR/bus`, can still reach the desk's compositor and bus. Roost controls the variables, not what a program finds by default.
+
+**A `UnixSocket` host gets your local values.** A host added as a socket path is reached directly, with no SSH bridge to say it is remote, so tabs opened on it carry Roost-Iced's display, bus and agent. If that socket is an `ssh -L` forward to another machine, those values name your machine and are of no use there; unset them in the tab if they get in the way. A host reached over Roost's own SSH transport is unaffected.
+
+**Upgrade day.** Tabs a session restores from state written before this change have no saved opener, and they restore with none of the seven variables until you reopen them. Tabs in Roost-Iced's own in-process workspace get Roost-Iced's own values instead, since only it could have opened them. A development session built before this change refuses the new `tab.open` fields, so restart it onto the matching build.
+
 ## The upgrade / restart flow
 
 `roost-session` and the Roost client both pin the same libghostty build. The most common way that pairing comes apart — on literally every package upgrade, until the host itself is restarted — is a build mismatch: you upgrade Roost, but a `roost-session` you started before the upgrade is still running the old build.

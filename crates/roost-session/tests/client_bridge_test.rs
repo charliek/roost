@@ -484,12 +484,19 @@ async fn origin_echo(root: &Path, preamble: bool) -> Arc<AtomicUsize> {
 }
 
 fn spawn_bridge_from(root: &Path, ssh_connection: &str) -> Child {
+    spawn_bridge_with(root, ssh_connection, None)
+}
+
+fn spawn_bridge_with(root: &Path, ssh_connection: &str, ssh_client: Option<&str>) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_roost-session"));
     command.arg("client-bridge");
     root_env(&mut command, root);
+    command.env("SSH_CONNECTION", ssh_connection);
+    match ssh_client {
+        Some(value) => command.env("SSH_CLIENT", value),
+        None => command.env_remove("SSH_CLIENT"),
+    };
     command
-        .env("SSH_CONNECTION", ssh_connection)
-        .env_remove("SSH_CLIENT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -560,6 +567,29 @@ async fn a_session_that_accepts_the_preamble_sees_the_bridged_origin() {
         "{lines:?}"
     );
     assert_eq!(finished(&conns, 1).await, 1, "one connection, relayed");
+}
+
+/// Plan 085 D2: an `SSH_CONNECTION` over 256 bytes reaches the session
+/// as unset, the way the starter and roostctl collect it, while a valid
+/// `SSH_CLIENT` beside it still does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversized_origin_value_reaches_the_session_unset() {
+    let root = root_dir();
+    let _conns = origin_echo(root.path(), true).await;
+
+    let (lines, status) = one_request(spawn_bridge_with(
+        root.path(),
+        &"1".repeat(257),
+        Some("10.0.0.1 5000 22"),
+    ))
+    .await;
+
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(
+        lines[0]["result"]["bridge"],
+        serde_json::json!({"ssh_connection": null, "ssh_client": "10.0.0.1 5000 22"}),
+        "{lines:?}"
+    );
 }
 
 /// Plan 084 D2: a session from before the preamble answers it as a

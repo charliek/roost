@@ -15,27 +15,32 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use roost_ipc::session_launch::timeout_scale;
-use roost_ipc::target::{TargetDiagnosis, TargetEnv, TargetOrigin, TargetSelector};
+use roost_ipc::target::{ResolvedTarget, TargetDiagnosis, TargetEnv, TargetOrigin, TargetSelector};
 use roost_ipc::IpcClient;
 
 use crate::error::CliError;
+use crate::opener::Opener;
 
 /// How long one window has to say which session it owns. One that hasn't
 /// answered by then owns nothing, so a hung window cannot hang the verb.
 const CLAIM_BUDGET: Duration = Duration::from_millis(500);
 
-/// What target selection reads from the process besides the flags.
+/// What target selection reads from the process besides the flags, and
+/// who this roostctl is as the opener of a tab it opens.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Environment {
     pub target: TargetEnv,
     pub windows: Windows,
+    pub opener: Opener,
 }
 
 impl Environment {
     pub fn from_process() -> Self {
+        let env: Vec<_> = std::env::vars_os().collect();
         Self {
             target: TargetEnv::from_process(),
             windows: Windows::Profiles,
+            opener: Opener::from_env(&env),
         }
     }
 }
@@ -82,23 +87,27 @@ pub(crate) fn inherited(selector: &TargetSelector, origin: TargetOrigin) -> bool
         && selector.kind_override.is_none()
 }
 
-/// The socket a verb dials: where the ladder points, or — for a verb that
-/// `follows_window` — the window that owns the local session it points at.
+/// The target a verb dials: where the ladder points, or — for a verb that
+/// `follows_window` — the window that owns the local session it points at,
+/// whose kind is unknown.
 pub(crate) async fn route(
     selector: &TargetSelector,
     environment: &Environment,
     follows_window: bool,
-) -> Result<PathBuf, CliError> {
+) -> Result<ResolvedTarget, CliError> {
     let diagnosis = selector.diagnose_in(&environment.target).await;
     if follows_window {
         let window = follow(selector, environment, &diagnosis)
             .await
             .map_err(|ambiguous| CliError::Usage(ambiguous.to_string()))?;
         if let Some(window) = window {
-            return Ok(window);
+            return Ok(ResolvedTarget {
+                socket_path: window,
+                kind: None,
+            });
         }
     }
-    Ok(diagnosis.resolved?.socket_path)
+    Ok(diagnosis.resolved?)
 }
 
 /// The window that owns the session `diagnosis` resolved to, when the

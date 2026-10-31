@@ -38,7 +38,8 @@ use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle};
 use roost_engine::single_instance::InstanceLocks;
 use roost_engine::workspace::{REPLAY_BUDGET_BYTES, REPLAY_WINDOW};
 use roost_engine::{
-    LocalClient, PtySupervisor, ReplayBounds, ServerVtConfig, ServerVtWorkspace, Workspace,
+    LocalClient, PtySupervisor, ReplayBounds, ServerVtConfig, ServerVtWorkspace, TabOpener,
+    Workspace,
 };
 use roost_ipc::messages::{ops, SessionStopParams};
 use roost_ipc::paths::BundleProfile;
@@ -136,6 +137,12 @@ pub struct SessionConfig {
     /// from inside `serve` would be a `remove_var` on a live tokio
     /// runtime.
     pub first_project: FirstProject,
+    /// This daemon's own opener, from its environment (plan 085 D6): the
+    /// environment of whatever started it, so a desk start is local with
+    /// the desk's values and a start over SSH is remote. The tabs it opens
+    /// of its own accord get it, and it refreshes restored local tabs.
+    /// Read once, at the edge, like every other field here.
+    pub starter: TabOpener,
     /// This daemon's executable, canonicalised once at start, before
     /// the fork — what `session.identify.exe_path` reports. `None` when
     /// it did not resolve.
@@ -193,6 +200,7 @@ impl SessionConfig {
             replay_window,
             ownership,
             first_project,
+            starter: TabOpener::starter(&std::env::vars_os().collect::<Vec<_>>()),
             exe_path,
             identity_override,
         }
@@ -312,7 +320,7 @@ pub async fn serve(
     );
     client.watch_password_input();
 
-    hydrate::hydrate(&client, config.first_project)
+    hydrate::hydrate(&client, config.first_project, config.starter.clone())
         .await
         .context("hydrate the saved layout")?;
 

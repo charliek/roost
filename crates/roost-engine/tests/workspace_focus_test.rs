@@ -7,6 +7,7 @@
 //! "same commit, in order" assertable here: a subscriber that sees the
 //! pair in one message could not have seen them split.
 
+use roost_engine::TabOpener;
 use roost_engine::{Workspace, WorkspaceEvent};
 
 #[tokio::test]
@@ -14,10 +15,10 @@ async fn focus_tab_clears_the_focused_tabs_notification_in_one_commit() {
     let workspace = Workspace::new();
     let project = workspace.create_project("p", "/tmp").unwrap();
     let badged = workspace
-        .open_tab(project.id, "/tmp", "badged", true)
+        .open_tab(project.id, "/tmp", "badged", true, TabOpener::None)
         .unwrap();
     let other = workspace
-        .open_tab(project.id, "/tmp", "other", true)
+        .open_tab(project.id, "/tmp", "other", true, TabOpener::None)
         .unwrap();
     workspace.focus_tab(other.id).unwrap();
     workspace.set_tab_has_notification(badged.id, true).unwrap();
@@ -53,8 +54,12 @@ async fn focus_tab_clears_the_focused_tabs_notification_in_one_commit() {
 async fn refocusing_a_clear_tab_emits_no_notification_event() {
     let workspace = Workspace::new();
     let project = workspace.create_project("p", "/tmp").unwrap();
-    let one = workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
-    let two = workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
+    let one = workspace
+        .open_tab(project.id, "/tmp", "one", true, TabOpener::None)
+        .unwrap();
+    let two = workspace
+        .open_tab(project.id, "/tmp", "two", true, TabOpener::None)
+        .unwrap();
     workspace.focus_tab(two.id).unwrap();
 
     let mut events = workspace.subscribe_versioned();
@@ -81,7 +86,7 @@ async fn focusing_the_already_active_tab_still_acknowledges_its_notification() {
     // suppressed, so the active tab can wear a badge and the user can
     // click the pill it is already on.
     let active = workspace
-        .open_tab(project.id, "/tmp", "active", true)
+        .open_tab(project.id, "/tmp", "active", true, TabOpener::None)
         .unwrap();
     workspace.focus_tab(active.id).unwrap();
     workspace.set_tab_has_notification(active.id, true).unwrap();
@@ -117,10 +122,10 @@ async fn closing_the_active_tab_does_not_acknowledge_the_fallback_tabs_notificat
     let workspace = Workspace::new();
     let project = workspace.create_project("p", "/tmp").unwrap();
     let fallback = workspace
-        .open_tab(project.id, "/tmp", "fallback", true)
+        .open_tab(project.id, "/tmp", "fallback", true, TabOpener::None)
         .unwrap();
     let active = workspace
-        .open_tab(project.id, "/tmp", "active", true)
+        .open_tab(project.id, "/tmp", "active", true, TabOpener::None)
         .unwrap();
     workspace.focus_tab(active.id).unwrap();
     workspace
@@ -144,13 +149,13 @@ async fn closing_the_active_middle_tab_does_not_acknowledge_the_right_neighbours
     let workspace = Workspace::new();
     let project = workspace.create_project("p", "/tmp").unwrap();
     let _left = workspace
-        .open_tab(project.id, "/tmp", "left", true)
+        .open_tab(project.id, "/tmp", "left", true, TabOpener::None)
         .unwrap();
     let active = workspace
-        .open_tab(project.id, "/tmp", "active", true)
+        .open_tab(project.id, "/tmp", "active", true, TabOpener::None)
         .unwrap();
     let right = workspace
-        .open_tab(project.id, "/tmp", "right", true)
+        .open_tab(project.id, "/tmp", "right", true, TabOpener::None)
         .unwrap();
     workspace.focus_tab(active.id).unwrap();
     workspace.set_tab_has_notification(right.id, true).unwrap();

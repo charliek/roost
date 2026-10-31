@@ -441,7 +441,7 @@ mod tests {
     use iced::keyboard::key::{Code, Named};
     use iced::keyboard::{Key, Location, Modifiers};
 
-    use roost_engine::Workspace;
+    use roost_engine::{TabOpener, Workspace};
 
     use super::*;
     use crate::app::focus_tab_in_core;
@@ -744,7 +744,7 @@ mod tests {
         let workspace = Workspace::new();
         let project = workspace.create_project("p", "/tmp").expect("project");
         let old = workspace
-            .open_tab(project.id, "/tmp", "old", true)
+            .open_tab(project.id, "/tmp", "old", true, TabOpener::None)
             .expect("tab");
         let mut keyboard = armed(100, HostId::LOCAL, Instant::now());
         typed(&mut keyboard, "ls");

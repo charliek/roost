@@ -12,6 +12,7 @@ use std::sync::Arc;
 use roost_engine::ipc::{
     AgentHooksError, AgentHooksHandle, AgentHooksRequest, IpcHandler, SessionInfo, StopHandle,
 };
+use roost_engine::TabOpener;
 use roost_engine::{PtySupervisor, Workspace};
 use roost_ipc::messages::{ops, AgentHooksOutcome, AgentHooksSkipped};
 use roost_ipc::{
@@ -133,7 +134,7 @@ async fn a_second_client_gates_nothing_and_deposes_nobody() {
     let f = fixture_with(Some(handle));
     let project = f.workspace.create_project("p", "/tmp").unwrap();
     f.workspace
-        .open_tab(project.id, "/tmp", "sh", true)
+        .open_tab(project.id, "/tmp", "sh", true, TabOpener::None)
         .unwrap();
 
     let first = conn(1);
@@ -319,7 +320,7 @@ async fn session_connect_and_a_lease_bearing_request_are_both_refused() {
     let project = f.workspace.create_project("p", "/tmp").unwrap();
     let tab = f
         .workspace
-        .open_tab(project.id, "/tmp", "sh", true)
+        .open_tab(project.id, "/tmp", "sh", true, TabOpener::None)
         .unwrap()
         .id;
 

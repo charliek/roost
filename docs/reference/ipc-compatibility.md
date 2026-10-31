@@ -140,6 +140,12 @@ when it is `0`, so an unset request stays byte-identical to what
 pre-053 clients always sent, and only a client that actually asks for
 history is refused by a server that predates the key.
 
+The same row is why `tab.open`'s `env` and `origin` (plan 085) are
+sent only to Rust servers — a session, or Roost-Iced's UI socket. The
+frozen Swift app's `tab.open` decodes against a fixed key list and
+answers either one `unknown-field`, so a client that may be talking to
+Roost.app omits them there, and the tab is opened as it always was.
+
 ### Closed enums
 
 Some string enums have no fallback case on either side of the wire —
@@ -401,6 +407,21 @@ gained `owner`, and the ops vector lists the two new ops. The identify
 vectors were re-cut at `7`
 (`session.identify{,.ops,.persist_error}.response.v7.json`) beside the
 frozen `v6` files, and the attach handshake vectors carry `7`.
+So does **the tab's opener** (plan 085): `tab.open` gains the optional
+`env` (a local opener's display, bus and agent) and `origin` (a caller
+declaring itself remote), the bridge preamble now decides the opener of
+every tab opened on a bridged connection, and a tab's environment no
+longer inherits the session's display or SSH variables ([Tab
+environment](ipc.md#tab-environment)). The fields are additive in shape
+(omitted unless set; `tab.open.env.request.json` and
+`tab.open.origin.request.json` beside the untouched vectors), but a
+session built before the amendment refuses either `unknown-field`, so
+dev builds of the UI and the session from different amendments need the
+session restarted onto the matching build. **Upgrade day:** a session's
+tabs restored from a `state.json` written before the amendment carry no
+saved opener and restore with none of the seven opener variables until
+reopened; an in-process Roost-Iced restores such tabs with its own
+values, since only it could have opened them.
 
 ## Fixtures are the contract
 

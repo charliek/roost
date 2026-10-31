@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import warnings
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -101,6 +102,38 @@ TEST_PASSWD_HOME_ENV = "ROOST_TEST_PASSWD_HOME"
 TEST_OLD_SESSION_DIR_ENV = "ROOST_TEST_OLD_SESSION_DIR"
 SESSION_ISOLATION_ENV = (SESSION_SOCKET_DIR_ENV, TEST_PASSWD_HOME_ENV, TEST_OLD_SESSION_DIR_ENV)
 
+# MIRRORS `roost_ipc::paths::TEST_USER_RUNTIME_DIR_ENV` (plan 085 D3): what a
+# debug or test-mode build derives a Linux tab's `XDG_RUNTIME_DIR` from in
+# place of `/run/user/<uid>`. Set by `pin_user_runtime_dir`.
+TEST_USER_RUNTIME_DIR_ENV = "ROOST_TEST_USER_RUNTIME_DIR"
+# MIRRORS `roost_ipc::opener::OPENER_SET`: what a tab gets from its opener,
+# never from the process serving it.
+OPENER_SET = (
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "SSH_AUTH_SOCK",
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "SSH_TTY",
+)
+
+
+def pin_user_runtime_dir(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
+    """Point `env`'s runtime-dir knob at `env`'s own `XDG_RUNTIME_DIR`,
+    whatever it inherited, so the tabs of a UI or daemon started under it
+    derive that private directory and never the desktop's. With no runtime
+    dir the knob is set empty, which derives nothing: an unset knob would
+    derive the real `/run/user/<uid>`.
+
+    Every environment this harness starts a UI or daemon under goes
+    through here, and so does its own `os.environ` whenever it moves
+    `XDG_RUNTIME_DIR`, for the children that inherit it (`roostctl session
+    start`)."""
+    env[TEST_USER_RUNTIME_DIR_ENV] = env.get("XDG_RUNTIME_DIR", "")
+    return env
+
+
 # Env vars to strip from a harness-launched Rust UI's inherited environment.
 # These are either per-tab values Roost injects itself (a stale inherited
 # value would leak into every tab — `pty.rs` keeps a pre-set
@@ -119,6 +152,16 @@ _UI_ENV_SANITIZE = (
     "ROOST_CONFIG",
     "ROOST_TEST_SESSION_DIR_NAMES",
     *SESSION_ISOLATION_ENV,
+    # The runner's SSH identity and agent (plan 085 D9): a UI is a local
+    # opener, and an inherited login would make its tabs about the runner's.
+    # Its display and bus stay — they are the harness's own xvfb/weston.
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "SSH_TTY",
+    "SSH_AUTH_SOCK",
+    # Another multiplexer's marker, which an agent inside a tab reads as
+    # "I am in herdr".
+    "HERDR_ENV",
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -203,7 +246,12 @@ def claim_session_isolation() -> tuple[Path, str | None]:
     a session root re-exports its own directory afterwards
     (`session.socket_dir`), and the old-session lane trades the override for
     a scratch passwd home. Returns the directory and the value it replaced.
+
+    The runtime-dir knob is pinned here too (`pin_user_runtime_dir`), for
+    the children that inherit this process's environment; a module that
+    moves `XDG_RUNTIME_DIR` re-pins after it.
     """
+    pin_user_runtime_dir(os.environ)
     inherited = os.environ.get(SESSION_SOCKET_DIR_ENV)
     for name in SESSION_ISOLATION_ENV:
         os.environ.pop(name, None)
@@ -1131,6 +1179,9 @@ def launch(
             env["ROOST_STATE_DIR"] = str(state_dir)
         # Last, so a lane can redirect what the harness just set.
         env.update(extra_env or {})
+        # After `extra_env`: the knob follows the runtime dir this UI actually
+        # gets, a lane's own included.
+        pin_user_runtime_dir(env)
         # Capture stdout+stderr (the UI tees its log to stdout, and an early
         # panic that predates the file logger only shows on stderr) so a boot
         # failure isn't blind — `wait_alive` reads this on timeout and CI

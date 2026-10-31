@@ -1306,6 +1306,55 @@ Protocol 7 is amended in place, with no generation bump. See
 [`development/host-sessions.md`](host-sessions.md#who-sizes-a-tab) for
 the mechanics, and the [user guide](../guides/host-sessions.md#who-sizes-a-tab).
 
+### DL-32: a tab's environment reflects who opened it (2026-10-31)
+
+Plan 085 (protocol-7 release M4, G9). A tab used to inherit the
+environment of whatever process served it, so whoever *started* the
+daemon decided every tab's. A `roost-session` started over SSH from a
+laptop handed every tab the laptop's `SSH_CLIENT` and no `DISPLAY`, so a
+headed browser at the desk failed with "Missing X server or $DISPLAY".
+Tools decide "am I remote?" from `SSH_CONNECTION` (Claude Code picks its
+clipboard path and whether to open a browser from it), and a forwarded
+`SSH_AUTH_SOCK` dies with the SSH connection that started the daemon, so
+a long-lived tab held a dead agent.
+
+**The rule.** Each tab's environment is built for that tab, not inherited
+and then trimmed. It starts from the server's own environment minus seven
+variables: `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`,
+`SSH_AUTH_SOCK`, `SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY`. Those come only
+from the tab's **opener**. A local opener (the desk's Roost-Iced, or
+`roostctl` run at the machine) states its display, bus and agent on
+`tab.open`. A remote opener (a connection through a `client-bridge`, or a
+caller declaring itself remote) gets its `SSH_CONNECTION` and `SSH_CLIENT`
+and nothing else, so its tabs act remote and cannot reach the desk's
+display or the agent. A request on a local connection that states neither
+gets the baseline. The
+opener is saved with the tab, so a restart restores a tab as it was opened;
+a local session start may refresh the saved display, bus and agent with its
+own. `XDG_RUNTIME_DIR` is the machine's and the user's, not the opener's:
+on Linux every tab gets `/run/user/<uid>` when that is a directory the uid
+owns. The wire is in [ipc.md](../reference/ipc.md#tab-environment), the user
+side in the [host-sessions guide](../guides/host-sessions.md#environment).
+
+**Rejected: tmux's `update-environment`**, which copies a list of variables
+from the most recent attaching client into the session. A process's
+environment is fixed when it starts, so only tabs opened afterwards could
+follow a client at all; and a daemon-wide "latest attach" environment flips
+as clients come and go, so a tab opened at the desk could get the laptop's
+display because the laptop attached later. Per-opener ties a tab to the one
+who opened it and never to who looked last. The release doc's reasoning is
+in `discovery/protocol-7-release.md` M4.
+
+**Known limit.** A remote tab keeps `XDG_RUNTIME_DIR` (so `systemctl --user`
+and podman work in it), which means libwayland's `wayland-0` default and the
+`$XDG_RUNTIME_DIR/bus` default can still reach the desk's compositor and bus
+from a remote tab. M4 controls the opener *variables*, not what a program
+finds by default.
+
+The values are advisory, like the bridge preamble: any process of the
+session's uid can state either. Protocol 7 is amended in place, with no
+generation bump.
+
 ## Direction (under evaluation)
 
 **Status: under evaluation — not a commitment.** Nothing in this section

@@ -98,8 +98,19 @@ class BridgeListener:
       holds its write half open for the life of an events connection).
     """
 
-    def __init__(self, env: sessionlib.SessionEnv, name: str = "bridge.sock"):
+    def __init__(
+        self,
+        env: sessionlib.SessionEnv,
+        name: str = "bridge.sock",
+        overrides: dict[str, str] | None = None,
+    ):
+        """`overrides` go into every child's environment on top of
+        `env.command_env()`: the SSH login a real bridge would run in (its
+        `SSH_CONNECTION` / `SSH_CLIENT`, a display or agent of its own).
+        Build `env` with `make_env(explicit=True)` when those are the point,
+        so nothing else of the runner's reaches the bridge."""
         self.env = env
+        self.overrides = dict(overrides or {})
         # Under the profile root (`/tmp/roost-hs-…`), which `session.py`
         # already keeps short for `sun_path`'s sake.
         self.path = env.root / name
@@ -201,7 +212,7 @@ class BridgeListener:
             child = subprocess.Popen(
                 [str(self.env.binary), "client-bridge"],
                 cwd=str(self.env.launch_cwd),
-                env=self.env.command_env(),
+                env=self.env.command_env(**self.overrides),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=errors,

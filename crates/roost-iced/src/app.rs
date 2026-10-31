@@ -27,7 +27,7 @@ use roost_engine::process::{self, ProcessRequest};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
 use roost_engine::single_instance::InstanceLocks;
 use roost_engine::{
-    Hydration, LocalClient, OnRestoreError, PtySupervisor, Workspace, WorkspaceError,
+    Hydration, LocalClient, OnRestoreError, PtySupervisor, TabOpener, Workspace, WorkspaceError,
     WorkspaceEvent,
 };
 use roost_ipc::messages::{
@@ -1511,6 +1511,7 @@ async fn create_host_project_flow(
     ops: crate::host_conn::HostOps,
     grid: (u16, u16),
     on_slot: bool,
+    opener: TabOpener,
 ) -> Result<(i64, i64), String> {
     use roost_ipc::messages::{ops as wire, ProjectCreateResult, TabOpenResult};
     let created: ProjectCreateResult = host_call(
@@ -1524,7 +1525,7 @@ async fn create_host_project_flow(
     let opened: Result<TabOpenResult, String> = host_call(
         &ops,
         wire::TAB_OPEN,
-        host_tab_open_params(project.id, &project.cwd, "", &[], None, grid),
+        host_tab_open_params(project.id, &project.cwd, "", &[], None, grid, &opener),
         on_slot,
     )
     .await;
@@ -1686,6 +1687,7 @@ fn host_tab_origin(
 /// `unknown-field` having created nothing (its arm decodes every param
 /// before it mutates), so that one refusal is asked once more without
 /// the field.
+#[allow(clippy::too_many_arguments)]
 async fn open_host_tab_flow(
     ops: crate::host_conn::HostOps,
     project: ProjectKey,
@@ -1694,6 +1696,7 @@ async fn open_host_tab_flow(
     argv: Vec<String>,
     grid: (u16, u16),
     on_slot: bool,
+    opener: TabOpener,
 ) -> Result<i64, String> {
     use crate::host_conn::HostOpError;
     use roost_ipc::client::ServerCode;
@@ -1709,6 +1712,7 @@ async fn open_host_tab_flow(
                 &argv,
                 cwd_from_tab,
                 grid,
+                &opener,
             ),
         )
     };
@@ -1738,7 +1742,8 @@ async fn open_host_tab_flow(
 /// on the slot as it does in-process.
 ///
 /// Built through `TabOpenParams` so an unset `cwd_from_tab` is absent:
-/// the request an older session accepts.
+/// the request an older session accepts. `opener` rides as the request's
+/// `env` (local) or `origin` (remote); `None` states neither.
 fn host_tab_open_params(
     project_id: i64,
     cwd: &str,
@@ -1746,7 +1751,22 @@ fn host_tab_open_params(
     argv: &[String],
     cwd_from_tab: Option<i64>,
     (cols, rows): (u16, u16),
+    opener: &TabOpener,
 ) -> serde_json::Value {
+    let (env, origin) = match opener {
+        TabOpener::None => (None, None),
+        TabOpener::Local(values) => (Some(values.clone()), None),
+        TabOpener::Remote {
+            ssh_connection,
+            ssh_client,
+        } => (
+            None,
+            Some(roost_ipc::messages::TabOrigin {
+                ssh_connection: ssh_connection.clone(),
+                ssh_client: ssh_client.clone(),
+            }),
+        ),
+    };
     serde_json::to_value(roost_ipc::messages::TabOpenParams {
         project_id,
         cwd: cwd.to_string(),
@@ -1756,8 +1776,22 @@ fn host_tab_open_params(
         title: title.to_string(),
         activate: None,
         cwd_from_tab,
+        env,
+        origin,
     })
     .expect("tab.open params serialize")
+}
+
+/// The opener iced states on a `tab.open` it sends a host reached by
+/// `transport` (plan 085 D7): itself, `iced`, on this machine's session
+/// and on a socket host; nothing over ssh, where the session takes the
+/// opener from the client bridge's preamble and refuses one stated.
+fn host_tab_opener(transport: crate::host_conn::HostTransport, iced: TabOpener) -> TabOpener {
+    use crate::host_conn::HostTransport;
+    match transport {
+        HostTransport::LocalSession | HostTransport::UnixSocket => iced,
+        HostTransport::Ssh => TabOpener::None,
+    }
 }
 
 /// One clear on a host tab, as a queued intent **fenced at the
@@ -1790,6 +1824,14 @@ pub(crate) fn clear_notification_intent(
         .fenced_at(tab.host)
 }
 
+/// What every tab iced opens itself is opened by (plan 085 D7): iced, a
+/// local opener bringing the display, bus and agent it runs with — never
+/// a remote one, whatever started it.
+fn iced_opener() -> TabOpener {
+    let env: Vec<_> = std::env::vars_os().collect();
+    TabOpener::Local(roost_ipc::opener::local_set_from(&env))
+}
+
 /// The one tab-open op behind every route that opens one: the new-tab
 /// button, keybind and palette row, the launcher's command rows, and
 /// create-project's seed tab.
@@ -1809,6 +1851,7 @@ async fn open_tab_flow(
             &argv,
             u32::from(cols),
             u32::from(rows),
+            &iced_opener(),
         )
         .await
         .map(|tab| tab.id)
@@ -4105,6 +4148,7 @@ impl App {
             LocalBackendMode::Session => local_backend::retained_migration(
                 &workspace.snapshot(),
                 workspace.retained_layout().as_ref(),
+                |tab| workspace.tab_opener(tab),
             ),
             LocalBackendMode::InProcess => None,
         };
@@ -7640,10 +7684,12 @@ impl App {
         let op = self.take_host_op_id(project.host, local_backend::HostOpKind::Other);
         let focus_generation = self.focus_generation;
         let on_slot = self.is_local_slot(project.host);
+        let opener = self.host_opener(project.host);
         EngineDispatch {
             task: self.engine_op(
                 async move {
-                    open_host_tab_flow(ops, project, origin, title, argv, grid, on_slot).await
+                    open_host_tab_flow(ops, project, origin, title, argv, grid, on_slot, opener)
+                        .await
                 },
                 move |result| EngineOpResult::TabOpened {
                     op,
@@ -7657,6 +7703,16 @@ impl App {
         }
     }
 
+    /// What a tab this window opens on `host` states as its opener
+    /// ([`host_tab_opener`]).
+    fn host_opener(&self, host: HostId) -> TabOpener {
+        self.hosts
+            .transport_at(host)
+            .map_or(TabOpener::None, |transport| {
+                host_tab_opener(transport, iced_opener())
+            })
+    }
+
     /// ⌘N / "+ New Project" when the selected project lives on a host,
     /// and every row of the ⌘⇧N picker but LOCAL.
     fn create_host_project_dispatch(&mut self, host: HostId) -> EngineDispatch {
@@ -7668,9 +7724,10 @@ impl App {
         let op = self.take_host_op_id(host, local_backend::HostOpKind::Create);
         let focus_generation = self.focus_generation;
         let on_slot = self.is_local_slot(host);
+        let opener = self.host_opener(host);
         EngineDispatch {
             task: self.engine_op(
-                async move { create_host_project_flow(ops, grid, on_slot).await },
+                async move { create_host_project_flow(ops, grid, on_slot, opener).await },
                 move |result| EngineOpResult::ProjectCreated {
                     op,
                     focus_generation,
@@ -11266,13 +11323,20 @@ fn hydrate_workspace(
 /// window's grid. **Two callers, one spelling** — the launch under
 /// `in-process`, and the reverse switch (plan 063 §D8), which is a
 /// launch of this workspace in every respect that matters.
+///
+/// iced is the starter, and also what a tab saved before there were
+/// openers restores with (plan 085 §4.A.3): only iced, or a local caller
+/// on its socket, ever opened a tab in this workspace.
 async fn hydrate_local_workspace(client: &LocalClient, grid: (u16, u16)) -> Result<()> {
+    let iced = iced_opener();
     roost_engine::hydrate(
         client,
         Hydration {
             first_project: roost_ipc::session_launch::FirstProject::Seed,
             grid,
             on_error: OnRestoreError::Warn,
+            starter: iced.clone(),
+            legacy: iced,
         },
     )
     .await
@@ -12556,11 +12620,15 @@ mod tests {
     fn numeric_switch_helpers_follow_authoritative_snapshot_order() {
         let workspace = Workspace::new();
         let first = workspace.create_project("first", "/tmp").unwrap();
-        let first_tab = workspace.open_tab(first.id, "/tmp", "one", true).unwrap();
-        let second_tab = workspace.open_tab(first.id, "/tmp", "two", true).unwrap();
+        let first_tab = workspace
+            .open_tab(first.id, "/tmp", "one", true, TabOpener::None)
+            .unwrap();
+        let second_tab = workspace
+            .open_tab(first.id, "/tmp", "two", true, TabOpener::None)
+            .unwrap();
         let second = workspace.create_project("second", "/tmp").unwrap();
         let second_project_tab = workspace
-            .open_tab(second.id, "/tmp", "three", true)
+            .open_tab(second.id, "/tmp", "three", true, TabOpener::None)
             .unwrap();
 
         let local_ring = |projects: &[Project]| {
@@ -12712,10 +12780,10 @@ mod tests {
         let workspace = Arc::new(Workspace::new());
         let project = workspace.create_project("one", "/tmp").unwrap();
         let sibling = workspace
-            .open_tab(project.id, "/tmp", "sibling", true)
+            .open_tab(project.id, "/tmp", "sibling", true, TabOpener::None)
             .unwrap();
         let doomed = workspace
-            .open_tab(project.id, "/tmp", "doomed", true)
+            .open_tab(project.id, "/tmp", "doomed", true, TabOpener::None)
             .unwrap();
         workspace.focus_tab(doomed.id).unwrap();
         let client = LocalClient::new(
@@ -12745,7 +12813,7 @@ mod tests {
 
         let last_project = workspace.create_project("last", "/tmp").unwrap();
         let last = workspace
-            .open_tab(last_project.id, "/tmp", "last", true)
+            .open_tab(last_project.id, "/tmp", "last", true, TabOpener::None)
             .unwrap();
         workspace.focus_tab(last.id).unwrap();
         assert_eq!(
@@ -12828,6 +12896,7 @@ mod tests {
                     DEFAULT_COLS,
                     DEFAULT_ROWS,
                     std::path::Path::new("/tmp/roost-iced-create-project-midfail-test.sock"),
+                    &TabOpener::None,
                 )
             })
             .expect("occupy the id the seed tab will be allocated");
@@ -13178,6 +13247,11 @@ mod tests {
 
             let open = rx.recv().await.expect("tab.open sent");
             assert_eq!(open.op, wire::TAB_OPEN);
+            assert_eq!(
+                open.params["env"],
+                desk_env(),
+                "the seed tab states the opener"
+            );
             open.answer(Err(crate::host_conn::HostOpError::Rejected {
                 code: ServerCode::InvalidParam,
                 message: "no such directory".into(),
@@ -13202,7 +13276,7 @@ mod tests {
             );
         });
 
-        let error = create_host_project_flow(ops, SPAWN_GRID, false)
+        let error = create_host_project_flow(ops, SPAWN_GRID, false, desk())
             .await
             .expect_err("the tab.open failed");
         assert!(error.contains("no such directory"), "{error}");
@@ -13229,7 +13303,12 @@ mod tests {
         use roost_ipc::messages::{ops as wire, ProjectCreateResult, Tab, TabListResult, TabState};
 
         let (ops, mut rx) = crate::host_conn::HostOps::channel();
-        let flow = tokio::spawn(create_host_project_flow(ops, SPAWN_GRID, false));
+        let flow = tokio::spawn(create_host_project_flow(
+            ops,
+            SPAWN_GRID,
+            false,
+            TabOpener::None,
+        ));
 
         let create = rx.recv().await.expect("project.create sent");
         create.answer(Ok(serde_json::to_value(ProjectCreateResult {
@@ -13310,7 +13389,12 @@ mod tests {
         // worker that already exited would silently swallow a stray
         // call rather than exposing it.
         let (ops, mut rx) = crate::host_conn::HostOps::channel();
-        let flow = tokio::spawn(create_host_project_flow(ops, SPAWN_GRID, false));
+        let flow = tokio::spawn(create_host_project_flow(
+            ops,
+            SPAWN_GRID,
+            false,
+            TabOpener::None,
+        ));
 
         let create = rx.recv().await.expect("project.create sent");
         assert_eq!(create.op, wire::PROJECT_CREATE);
@@ -13472,7 +13556,13 @@ mod tests {
         });
         assert_eq!(
             serde_json::to_string(&host_tab_open_params(
-                42, "/home/x", "htop", &argv, None, SPAWN_GRID
+                42,
+                "/home/x",
+                "htop",
+                &argv,
+                None,
+                SPAWN_GRID,
+                &TabOpener::None
             ))
             .unwrap(),
             serde_json::to_string(&before_070).unwrap()
@@ -13481,9 +13571,80 @@ mod tests {
         let mut with_source = before_070;
         with_source["cwd_from_tab"] = "7".into();
         assert_eq!(
-            host_tab_open_params(42, "/home/x", "htop", &argv, Some(7), SPAWN_GRID),
+            host_tab_open_params(
+                42,
+                "/home/x",
+                "htop",
+                &argv,
+                Some(7),
+                SPAWN_GRID,
+                &TabOpener::None
+            ),
             with_source
         );
+    }
+
+    fn desk() -> TabOpener {
+        TabOpener::Local(
+            [("DISPLAY", ":7"), ("SSH_AUTH_SOCK", "/desk/agent")]
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .into(),
+        )
+    }
+
+    /// [`desk`] as the `env` a `tab.open` states it.
+    fn desk_env() -> serde_json::Value {
+        serde_json::json!({ "DISPLAY": ":7", "SSH_AUTH_SOCK": "/desk/agent" })
+    }
+
+    /// Plan 085 D7: the opener rides as `env` when local and `origin`
+    /// when remote, and `None` leaves the request without either.
+    #[test]
+    fn host_tab_open_params_state_the_opener_as_env_or_origin() {
+        let params = |opener: &TabOpener| {
+            host_tab_open_params(42, "/home/x", "", &[], None, SPAWN_GRID, opener)
+        };
+        let none = params(&TabOpener::None);
+        assert_eq!(none.get("env"), None, "{none}");
+        assert_eq!(none.get("origin"), None, "{none}");
+
+        let local = params(&desk());
+        assert_eq!(local["env"], desk_env());
+        assert_eq!(local.get("origin"), None, "{local}");
+        let empty = params(&TabOpener::Local(BTreeMap::new()));
+        assert_eq!(
+            empty["env"],
+            serde_json::json!({}),
+            "a value-less local opener is stated"
+        );
+
+        let remote = params(&TabOpener::Remote {
+            ssh_connection: Some("10.0.0.2 5 10.0.0.1 22".into()),
+            ssh_client: None,
+        });
+        assert_eq!(
+            remote["origin"],
+            serde_json::json!({ "ssh_connection": "10.0.0.2 5 10.0.0.1 22" })
+        );
+        assert_eq!(remote.get("env"), None, "{remote}");
+    }
+
+    /// Plan 085 D7: iced states itself on this machine's session and on a
+    /// socket host, and nothing over ssh — whose session refuses an opener
+    /// stated on a bridged connection.
+    #[test]
+    fn iced_states_its_opener_to_every_host_but_an_ssh_one() {
+        use crate::host_conn::HostTransport;
+        for (transport, env) in [
+            (HostTransport::LocalSession, Some(desk_env())),
+            (HostTransport::UnixSocket, Some(desk_env())),
+            (HostTransport::Ssh, None),
+        ] {
+            let opener = host_tab_opener(transport, desk());
+            let params = host_tab_open_params(1, "", "", &[], None, SPAWN_GRID, &opener);
+            assert_eq!(params.get("env").cloned(), env, "{transport:?}: {params}");
+            assert_eq!(params.get("origin"), None, "{transport:?}: {params}");
+        }
     }
 
     /// One `tab.open` attempt, as the stand-in session received it.
@@ -13528,8 +13689,17 @@ mod tests {
             sent
         });
         let argv = argv.iter().map(|arg| arg.to_string()).collect();
-        let result =
-            open_host_tab_flow(ops, project, origin, title.into(), argv, SPAWN_GRID, false).await;
+        let result = open_host_tab_flow(
+            ops,
+            project,
+            origin,
+            title.into(),
+            argv,
+            SPAWN_GRID,
+            false,
+            desk(),
+        )
+        .await;
         (
             result,
             session.await.expect("the stand-in session must not panic"),
@@ -13599,6 +13769,11 @@ mod tests {
             );
             assert_eq!(attempt.params["cols"], SPAWN_GRID.0);
             assert_eq!(attempt.params["rows"], SPAWN_GRID.1);
+            assert_eq!(
+                attempt.params["env"],
+                desk_env(),
+                "the opener rides on both attempts"
+            );
         }
     }
 
@@ -13700,6 +13875,7 @@ mod tests {
                 DEFAULT_COLS,
                 DEFAULT_ROWS,
                 std::path::Path::new("/tmp/roost-iced-launch-cwd-test.sock"),
+                &TabOpener::None,
             )
             .expect("spawn");
         guard
@@ -13710,7 +13886,13 @@ mod tests {
         let workspace = Workspace::new();
         let project = workspace.create_project("p", "/").unwrap().id;
         let tab = workspace
-            .open_tab(project, &tracked.to_string_lossy(), "", true)
+            .open_tab(
+                project,
+                &tracked.to_string_lossy(),
+                "",
+                true,
+                TabOpener::None,
+            )
             .unwrap()
             .id;
         assert_eq!(workspace.active(), (project, tab));
@@ -13765,7 +13947,13 @@ mod tests {
         let (workspace, shown) = workspace_tracking(shown_dir.path());
         let other = workspace.create_project("q", "/").unwrap().id;
         let source = workspace
-            .open_tab(other, &source_dir.path().to_string_lossy(), "", false)
+            .open_tab(
+                other,
+                &source_dir.path().to_string_lossy(),
+                "",
+                false,
+                TabOpener::None,
+            )
             .unwrap()
             .id;
         let supervisor = Arc::new(PtySupervisor::new());
@@ -14383,8 +14571,12 @@ mod tests {
     fn confirm_delete_targets_only_projects_present_in_the_snapshot() {
         let workspace = Workspace::new();
         let project = workspace.create_project("doomed", "/tmp").unwrap();
-        workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
-        workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
+        workspace
+            .open_tab(project.id, "/tmp", "one", true, TabOpener::None)
+            .unwrap();
+        workspace
+            .open_tab(project.id, "/tmp", "two", true, TabOpener::None)
+            .unwrap();
         let snapshot = workspace.snapshot();
 
         assert_eq!(
@@ -14444,7 +14636,9 @@ mod tests {
     fn a_confirmation_keeps_the_key_it_was_asked_about() {
         let workspace = Workspace::new();
         let project = workspace.create_project("mirrored", "/tmp").unwrap();
-        workspace.open_tab(project.id, "/tmp", "t", true).unwrap();
+        workspace
+            .open_tab(project.id, "/tmp", "t", true, TabOpener::None)
+            .unwrap();
         let rows = workspace.snapshot();
 
         let host = HostId::new(3);
@@ -14461,7 +14655,9 @@ mod tests {
     fn the_confirm_body_reads_exactly_as_the_mac_alert_does() {
         let workspace = Workspace::new();
         let project = workspace.create_project("polish", "/tmp").unwrap();
-        workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
+        workspace
+            .open_tab(project.id, "/tmp", "one", true, TabOpener::None)
+            .unwrap();
         let snapshot = workspace.snapshot();
         let confirm =
             confirm_delete_target(&snapshot, ProjectKey::local(project.id)).expect("target");
@@ -14480,8 +14676,12 @@ mod tests {
     fn a_confirm_whose_project_vanished_externally_is_auto_dismissed() {
         let workspace = Workspace::new();
         let project = workspace.create_project("doomed", "/tmp").unwrap();
-        let tab = workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
-        workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
+        let tab = workspace
+            .open_tab(project.id, "/tmp", "one", true, TabOpener::None)
+            .unwrap();
+        workspace
+            .open_tab(project.id, "/tmp", "two", true, TabOpener::None)
+            .unwrap();
         let snapshot = workspace.snapshot();
         let mut confirm = confirm_delete_target(&snapshot, ProjectKey::local(project.id));
 
@@ -14627,6 +14827,7 @@ mod tests {
                     &[],
                     u32::from(DEFAULT_COLS),
                     u32::from(DEFAULT_ROWS),
+                    &TabOpener::None,
                 ))
                 .unwrap()
         };

@@ -44,6 +44,9 @@ KNOWN_HOSTS_BAK=$HOME/.ssh/known_hosts.roost-live
 BOGUS_KEY=/tmp/roost-live-bogus-hostkey
 
 export XDG_RUNTIME_DIR=/tmp/xdgrt-roost-live
+# Plan 085 D3: what a test-mode Roost's tabs derive `XDG_RUNTIME_DIR` from
+# instead of the desktop's `/run/user/<uid>` (`ui.pin_user_runtime_dir`).
+export ROOST_TEST_USER_RUNTIME_DIR=$XDG_RUNTIME_DIR
 export ROOST_TEST_MODE=1 RUST_LOG=info
 # Production ladder values: this is the live criterion, not a lane with
 # a shortened budget. `ROOST_TEST_MODE` gates these seams, and inheriting

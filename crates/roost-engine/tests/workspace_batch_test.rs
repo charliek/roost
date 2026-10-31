@@ -4,14 +4,19 @@
 //! observe half of a commit, and every revision it skips is a real loss
 //! rather than an event-free commit it was never told about.
 
+use roost_engine::TabOpener;
 use roost_engine::{Workspace, WorkspaceEvent};
 
 #[tokio::test]
 async fn a_multi_event_commit_arrives_as_one_message_in_order() {
     let workspace = Workspace::new();
     let project = workspace.create_project("p", "/tmp").unwrap();
-    let first = workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
-    let second = workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
+    let first = workspace
+        .open_tab(project.id, "/tmp", "one", true, TabOpener::None)
+        .unwrap();
+    let second = workspace
+        .open_tab(project.id, "/tmp", "two", true, TabOpener::None)
+        .unwrap();
     let mut events = workspace.subscribe_versioned();
 
     // `delete_project` is the widest commit the workspace makes: both
@@ -81,7 +86,7 @@ async fn the_revision_stream_advances_by_exactly_one_per_commit() {
     let project = workspace.create_project("p", "/tmp").unwrap();
     for i in 0..8 {
         workspace
-            .open_tab(project.id, "/tmp", &format!("t{i}"), true)
+            .open_tab(project.id, "/tmp", &format!("t{i}"), true, TabOpener::None)
             .unwrap();
     }
     workspace.delete_project(project.id).unwrap();

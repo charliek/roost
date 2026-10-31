@@ -367,6 +367,7 @@ pub(super) fn attach_test_terminal(
             DEFAULT_COLS,
             DEFAULT_ROWS,
             std::path::Path::new("/tmp/roost-iced-terminal-test.sock"),
+            &TabOpener::None,
         )
         .expect("spawn test PTY");
     let mut tab = TerminalTab::attach(

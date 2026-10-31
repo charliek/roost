@@ -25,6 +25,7 @@ use roost_engine::tab_task::{
     AttachDecision, AttachPause, ServerVtConfig, ServerVtWorkspace, TabCmd, TabError,
     SERVER_VT_CONTINUATION_MAX,
 };
+use roost_engine::TabOpener;
 use roost_engine::{
     Geometry, PtyOutputEvent, PtySupervisor, TabEffectKind, Workspace, WorkspaceEvent,
 };
@@ -237,6 +238,7 @@ async fn seqs_relocate_to_the_tab_task_without_moving_the_fence() {
             80,
             24,
             &socket("fence"),
+            &TabOpener::None,
         )
         .expect("spawn");
 
@@ -296,6 +298,7 @@ async fn a_descendant_holding_the_slave_fd_cannot_tee_bytes_after_exit() {
             80,
             24,
             &socket("descendant"),
+            &TabOpener::None,
         )
         .expect("spawn");
 
@@ -340,7 +343,15 @@ async fn a_descendant_holding_the_slave_fd_cannot_tee_bytes_after_exit() {
 async fn terminal_queries_are_answered_exactly_once_with_no_client() {
     let (sup, _workspace) = enabled_supervisor(true);
     let _output = sup
-        .spawn(912, "/tmp", &sh("exec sleep 30"), 80, 24, &socket("reply"))
+        .spawn(
+            912,
+            "/tmp",
+            &sh("exec sleep 30"),
+            80,
+            24,
+            &socket("reply"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(912).expect("server-vt tab task");
 
@@ -402,7 +413,15 @@ fn cell_at(dump: &ResolvedCellsData, row: u32, col: u16) -> &ResolvedCellData {
 async fn dump_and_dump_resolved_match_the_shared_densifier() {
     let (sup, _workspace) = enabled_supervisor(false);
     let _output = sup
-        .spawn(913, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("dump"))
+        .spawn(
+            913,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("dump"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(913).expect("server-vt tab task");
 
@@ -498,7 +517,15 @@ async fn dump_and_dump_resolved_match_the_shared_densifier() {
 async fn memory_usage_reads_the_tabs_own_terminal() {
     let (sup, _workspace) = enabled_supervisor(false);
     let _output = sup
-        .spawn(935, "/tmp", &sh("exec sleep 30"), 80, 24, &socket("memory"))
+        .spawn(
+            935,
+            "/tmp",
+            &sh("exec sleep 30"),
+            80,
+            24,
+            &socket("memory"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(935).expect("server-vt tab task");
 
@@ -531,7 +558,15 @@ async fn memory_usage_reads_the_tabs_own_terminal() {
 async fn resume_accepts_the_ring_window_and_the_empty_slice() {
     let (sup, _workspace) = enabled_supervisor(false);
     let _output = sup
-        .spawn(914, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("resume"))
+        .spawn(
+            914,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("resume"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(914).expect("server-vt tab task");
 
@@ -585,7 +620,15 @@ async fn resume_accepts_the_ring_window_and_the_empty_slice() {
 async fn the_replay_ring_evicts_oldest_first() {
     let (sup, _workspace) = enabled_supervisor(false);
     let _output = sup
-        .spawn(915, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("ring"))
+        .spawn(
+            915,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("ring"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(915).expect("server-vt tab task");
 
@@ -637,6 +680,7 @@ async fn a_resume_after_the_exit_replays_the_stored_exit() {
             20,
             6,
             &socket("postexit"),
+            &TabOpener::None,
         )
         .expect("spawn");
     let commands = sup.tab_commands(916).expect("server-vt tab task");
@@ -696,7 +740,15 @@ async fn a_stalled_task_backs_the_child_up_without_losing_bytes() {
          for(i=0;i<{LINES};i++) print s}}'; exit 0"
     );
     let mut output = sup
-        .spawn(917, "/tmp", &sh(&script), 80, 24, &socket("stall"))
+        .spawn(
+            917,
+            "/tmp",
+            &sh(&script),
+            80,
+            24,
+            &socket("stall"),
+            &TabOpener::None,
+        )
         .expect("spawn");
 
     // Long enough for the child to fill the 32-chunk channel and the
@@ -754,6 +806,7 @@ async fn a_query_flood_against_a_full_writer_never_blocks_the_task() {
             80,
             24,
             &socket("flood"),
+            &TabOpener::None,
         )
         .expect("spawn");
     // Close on every exit path, not just the happy one. The writer task
@@ -859,6 +912,7 @@ async fn the_runtime_flag_off_builds_no_tab_task() {
             80,
             24,
             &socket("off"),
+            &TabOpener::None,
         )
         .expect("spawn");
     assert!(
@@ -884,7 +938,15 @@ async fn the_runtime_flag_off_builds_no_tab_task() {
 async fn a_snapshot_carries_the_fence_and_the_stream_identity() {
     let (sup, _workspace) = enabled_supervisor(false);
     let _output = sup
-        .spawn(920, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("snap"))
+        .spawn(
+            920,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("snap"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(920).expect("server-vt tab task");
 
@@ -931,7 +993,15 @@ async fn a_snapshot_carries_the_fence_and_the_stream_identity() {
 async fn a_parked_vt_encode_is_failed_by_the_tab_s_exit() {
     let (sup, _workspace) = enabled_supervisor(false);
     let _output = sup
-        .spawn(925, "/tmp", &sh("read _"), 20, 6, &socket("vt-park"))
+        .spawn(
+            925,
+            "/tmp",
+            &sh("read _"),
+            20,
+            6,
+            &socket("vt-park"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(925).expect("server-vt tab task");
 
@@ -1029,7 +1099,15 @@ fn geometry(cols: u16, rows: u16, cell_w: u32, cell_h: u32) -> Geometry {
 async fn a_resize_drains_the_in_band_size_report() {
     let (sup, _workspace) = enabled_supervisor(true);
     let _output = sup
-        .spawn(921, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("resize"))
+        .spawn(
+            921,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("resize"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(921).expect("server-vt tab task");
 
@@ -1069,7 +1147,15 @@ async fn a_resize_drains_the_in_band_size_report() {
 async fn a_take_at_the_grid_already_applied_is_still_answered() {
     let (sup, _workspace) = enabled_supervisor(true);
     let _output = sup
-        .spawn(931, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("fence"))
+        .spawn(
+            931,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("fence"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(931).expect("server-vt tab task");
 
@@ -1108,6 +1194,7 @@ async fn a_grid_resize_keeps_the_cell_metrics_the_tab_holds() {
             20,
             6,
             &socket("resize-grid"),
+            &TabOpener::None,
         )
         .expect("spawn");
     let commands = sup.tab_commands(922).expect("server-vt tab task");
@@ -1167,6 +1254,7 @@ async fn a_refused_resize_leaves_the_geometry_retryable() {
             20,
             6,
             &socket("refused-resize"),
+            &TabOpener::None,
         )
         .expect("spawn");
     let commands = sup.tab_commands(931).expect("server-vt tab task");
@@ -1220,6 +1308,7 @@ async fn a_take_waits_for_the_childs_winsize_outside_the_tab_task() {
             20,
             6,
             &socket("acked-resize"),
+            &TabOpener::None,
         )
         .expect("spawn");
     let commands = sup.tab_commands(932).expect("server-vt tab task");
@@ -1256,7 +1345,15 @@ async fn a_take_waits_for_the_childs_winsize_outside_the_tab_task() {
     // buffer the writer task blocks in `write_all_nonblocking`, and the
     // resize behind it cannot reach the `ioctl`.
     let _output = sup
-        .spawn(933, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("stalled"))
+        .spawn(
+            933,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("stalled"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(933).expect("server-vt tab task");
     // Newline-terminated on purpose: in canonical mode the tty
@@ -1311,7 +1408,15 @@ async fn a_take_waits_for_the_childs_winsize_outside_the_tab_task() {
 async fn a_take_after_the_tab_exited_answers_at_once_and_changes_nothing() {
     let (sup, _workspace) = enabled_supervisor(false);
     let mut output = sup
-        .spawn(934, "/tmp", &sh("exit 0"), 20, 6, &socket("writer-gone"))
+        .spawn(
+            934,
+            "/tmp",
+            &sh("exit 0"),
+            20,
+            6,
+            &socket("writer-gone"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(934).expect("server-vt tab task");
 
@@ -1374,7 +1479,15 @@ async fn a_take_after_the_tab_exited_answers_at_once_and_changes_nothing() {
 async fn a_background_resize_of_an_owned_tab_is_refused_with_its_owners_label() {
     let (sup, _workspace) = enabled_supervisor(false);
     let _output = sup
-        .spawn(935, "/tmp", &sh("exec cat"), 20, 6, &socket("owned"))
+        .spawn(
+            935,
+            "/tmp",
+            &sh("exec cat"),
+            20,
+            6,
+            &socket("owned"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(935).expect("server-vt tab task");
 
@@ -1410,7 +1523,15 @@ async fn a_background_resize_of_an_owned_tab_is_refused_with_its_owners_label() 
 async fn a_failed_apply_keeps_the_owner_and_still_delivers_the_input() {
     let (sup, workspace) = enabled_supervisor(true);
     let mut tee = sup
-        .spawn(936, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("failed"))
+        .spawn(
+            936,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("failed"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(936).expect("server-vt tab task");
 
@@ -1507,7 +1628,15 @@ async fn the_grace_timer_hands_a_dropped_owners_tab_on() {
     )
     .expect("server-vt enables once");
     let _output = sup
-        .spawn(937, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("grace"))
+        .spawn(
+            937,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("grace"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(937).expect("server-vt tab task");
 
@@ -1564,6 +1693,7 @@ async fn a_replaced_generation_never_announces_for_its_successor() {
             80,
             24,
             &socket("replaced-old"),
+            &TabOpener::None,
         )
         .expect("spawn");
     let old = sup.tab_commands(939).expect("server-vt tab task");
@@ -1584,6 +1714,7 @@ async fn a_replaced_generation_never_announces_for_its_successor() {
             80,
             24,
             &socket("replaced-new"),
+            &TabOpener::None,
         )
         .expect("respawn");
     let new = sup.tab_commands(939).expect("the replacement's tab task");
@@ -1641,6 +1772,7 @@ async fn a_grace_outlived_by_its_tab_leaves_the_task_idle() {
             20,
             6,
             &socket("outlived"),
+            &TabOpener::None,
         )
         .expect("spawn");
     let commands = sup.tab_commands(938).expect("server-vt tab task");
@@ -1711,7 +1843,7 @@ async fn output_already_queued_reaches_the_tee_before_the_grid() {
                 &sh("read _; head -c 40000 /dev/zero | tr '\\000' x; printf 'ROOST_QUEUED_END'; exec sleep 30"),
                 80,
                 24,
-                &socket("queued"),
+                &socket("queued"), &TabOpener::None,
             )
             .expect("spawn");
         let commands = sup.tab_commands(938).expect("server-vt tab task");
@@ -1781,7 +1913,15 @@ async fn output_already_queued_reaches_the_tee_before_the_grid() {
 async fn workspace_osc_and_client_effects_take_their_own_seams() {
     let (sup, workspace) = enabled_supervisor(false);
     let _output = sup
-        .spawn(922, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("osc"))
+        .spawn(
+            922,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("osc"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(922).expect("server-vt tab task");
 
@@ -1825,7 +1965,15 @@ async fn workspace_osc_and_client_effects_take_their_own_seams() {
 async fn bells_and_clipboard_writes_reach_the_effects_seam() {
     let (sup, workspace) = enabled_supervisor(false);
     let _output = sup
-        .spawn(923, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("effects"))
+        .spawn(
+            923,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("effects"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(923).expect("server-vt tab task");
 
@@ -1865,7 +2013,15 @@ async fn bells_and_clipboard_writes_reach_the_effects_seam() {
 async fn an_oversized_clipboard_write_is_dropped_whole() {
     let (sup, workspace) = enabled_supervisor(false);
     let _output = sup
-        .spawn(924, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("cap"))
+        .spawn(
+            924,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("cap"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(924).expect("server-vt tab task");
 
@@ -1904,7 +2060,15 @@ async fn an_oversized_clipboard_write_is_dropped_whole() {
 async fn a_theme_reseed_changes_what_a_color_query_is_answered_with() {
     let (sup, _workspace) = enabled_supervisor(true);
     let _output = sup
-        .spawn(925, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("theme"))
+        .spawn(
+            925,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("theme"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(925).expect("server-vt tab task");
 
@@ -1972,7 +2136,15 @@ async fn a_tab_opened_after_a_reseed_starts_on_the_new_theme() {
     );
 
     let _output = sup
-        .spawn(926, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("theme2"))
+        .spawn(
+            926,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("theme2"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(926).expect("server-vt tab task");
     feed(&commands, b"\x1b]11;?\x07").await;
@@ -2008,7 +2180,15 @@ fn osc7501(body: &str) -> Vec<u8> {
 async fn the_program_status_probe_is_answered_once() {
     let (sup, _workspace) = enabled_supervisor(true);
     let _output = sup
-        .spawn(930, "/tmp", &sh("exec sleep 30"), 80, 24, &socket("probe"))
+        .spawn(
+            930,
+            "/tmp",
+            &sh("exec sleep 30"),
+            80,
+            24,
+            &socket("probe"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(930).expect("server-vt tab task");
 
@@ -2031,7 +2211,15 @@ async fn the_program_status_probe_is_answered_once() {
 async fn a_chunks_status_events_precede_its_osc_actions() {
     let (sup, workspace) = enabled_supervisor(false);
     let _output = sup
-        .spawn(931, "/tmp", &sh("exec sleep 30"), 80, 24, &socket("order"))
+        .spawn(
+            931,
+            "/tmp",
+            &sh("exec sleep 30"),
+            80,
+            24,
+            &socket("order"),
+            &TabOpener::None,
+        )
         .expect("spawn");
     let commands = sup.tab_commands(931).expect("server-vt tab task");
 
@@ -2090,7 +2278,10 @@ async fn run_stream(
     hook_owner: bool,
     chunks: &[&[u8]],
 ) -> Outcome {
-    let tab_id = workspace.open_tab(project, "/tmp", "t", false).unwrap().id;
+    let tab_id = workspace
+        .open_tab(project, "/tmp", "t", false, TabOpener::None)
+        .unwrap()
+        .id;
     if hook_owner {
         let claim = TabAgentReportParams {
             session_id: "s1".into(),
@@ -2112,6 +2303,7 @@ async fn run_stream(
             80,
             24,
             &socket("partition"),
+            &TabOpener::None,
         )
         .expect("spawn");
     let commands = sup.tab_commands(tab_id).expect("server-vt tab task");
@@ -2165,7 +2357,9 @@ async fn program_status_does_not_depend_on_read_boundaries() {
     workspace.set_window_focused(false);
     let project = workspace.create_project("p", "/tmp").unwrap().id;
     // A row no run closes, so closing a run's tab never takes the project.
-    workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+    workspace
+        .open_tab(project, "/tmp", "keep", true, TabOpener::None)
+        .unwrap();
     let sup = PtySupervisor::new();
     sup.enable_server_vt(ServerVtConfig::new(workspace.clone()))
         .expect("server-vt enables once");
@@ -2250,7 +2444,9 @@ async fn a_raw_notification_is_judged_where_it_falls_whatever_the_reads() {
     let workspace = Arc::new(Workspace::new());
     workspace.set_window_focused(false);
     let project = workspace.create_project("p", "/tmp").unwrap().id;
-    workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+    workspace
+        .open_tab(project, "/tmp", "keep", true, TabOpener::None)
+        .unwrap();
     let sup = PtySupervisor::new();
     sup.enable_server_vt(ServerVtConfig::new(workspace.clone()))
         .expect("server-vt enables once");
@@ -2287,7 +2483,9 @@ async fn banners_after(lead: &[u8]) -> Vec<(String, String)> {
     let workspace = Arc::new(Workspace::new());
     workspace.set_window_focused(false);
     let project = workspace.create_project("p", "/tmp").unwrap().id;
-    workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+    workspace
+        .open_tab(project, "/tmp", "keep", true, TabOpener::None)
+        .unwrap();
     let sup = PtySupervisor::new();
     sup.enable_server_vt(ServerVtConfig::new(workspace.clone()))
         .expect("server-vt enables once");
@@ -2339,7 +2537,9 @@ async fn outcome_however_split(hook_owner: bool, stream: &[u8]) -> Outcome {
     let workspace = Arc::new(Workspace::new());
     workspace.set_window_focused(false);
     let project = workspace.create_project("p", "/tmp").unwrap().id;
-    workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+    workspace
+        .open_tab(project, "/tmp", "keep", true, TabOpener::None)
+        .unwrap();
     let sup = PtySupervisor::new();
     sup.enable_server_vt(ServerVtConfig::new(workspace.clone()))
         .expect("server-vt enables once");
@@ -2369,7 +2569,9 @@ async fn outcome_whatever_the_reads(hook_owner: bool, stream: &[u8]) -> Outcome 
     let workspace = Arc::new(Workspace::new());
     workspace.set_window_focused(false);
     let project = workspace.create_project("p", "/tmp").unwrap().id;
-    workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+    workspace
+        .open_tab(project, "/tmp", "keep", true, TabOpener::None)
+        .unwrap();
     let sup = PtySupervisor::new();
     sup.enable_server_vt(ServerVtConfig::new(workspace.clone()))
         .expect("server-vt enables once");

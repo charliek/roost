@@ -37,6 +37,7 @@ sys.path.insert(0, str(REPO / "tools" / "roosttest"))
 sys.path.insert(0, str(REPO / "tools" / "screenshot"))
 
 import pngtool  # noqa: E402
+import ui  # noqa: E402
 from iced_clipboard_check import (  # noqa: E402
     AUTOSCROLL_PREFIX,
     TERMINAL_PADDING,
@@ -437,6 +438,7 @@ def main() -> int:
     env.pop("DBUS_SESSION_BUS_ADDRESS", None)
     for knob in ("ROOST_TEST_PASSWD_HOME", "ROOST_TEST_OLD_SESSION_DIR"):
         env.pop(knob, None)
+    ui.pin_user_runtime_dir(env)
 
     process = None
     client = None

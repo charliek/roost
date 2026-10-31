@@ -13,7 +13,10 @@ Each job pins a different leg of the quit (see `OwnedRuntime` in `app.rs`):
 
 The UI is launched directly, as `test_boot_failure.py` launches its own,
 under `local-backend = in-process` from its own `ROOST_CONFIG` — the
-session backend's UI holds no PTYs, so it has nothing to hang up.
+session backend's UI holds no PTYs, so it has nothing to hang up. Its jobs
+run private copies of `sh` and `sleep`, so the `/proc` sweep reads the
+environment only of processes this test provably started — those, and the
+UI's binary only under this process (`tab_env.owned_processes`).
 """
 
 from __future__ import annotations
@@ -39,7 +42,12 @@ if sys.platform != "linux":
 import agent_jail  # noqa: E402
 import ui  # noqa: E402
 from client import Roost, RoostError, scaled_timeout  # noqa: E402
-from test_boot_failure import _marked_pids, _tail, _wait_unmarked  # noqa: E402
+from test_boot_failure import (  # noqa: E402
+    _marked_pids,
+    _private_copy,
+    _tail,
+    _wait_unmarked,
+)
 
 MARKER_ENV = "ROOST_QUIT_JOB_MARKER"
 # `app.rs`'s `QUIT_SHUTDOWN_DEADLINE`, plus room for `shutdown_all`'s
@@ -47,13 +55,14 @@ MARKER_ENV = "ROOST_QUIT_JOB_MARKER"
 QUIT_SHUTDOWN_DEADLINE = 2.0
 QUIT_MARGIN = 1.0
 
+# `{sh}` and `{sleep}` name the test's private copies.
 JOBS = [
-    pytest.param(["/bin/sh", "-c", "exec sleep 3600"], False, id="honors-hup"),
-    pytest.param(["/bin/sh", "-c", 'trap "" HUP; exec sleep 3600'], False, id="ignores-hup"),
+    pytest.param(["{sh}", "-c", "exec {sleep} 3600"], False, id="honors-hup"),
+    pytest.param(["{sh}", "-c", 'trap "" HUP; exec {sleep} 3600'], False, id="ignores-hup"),
     # The trailing `:` keeps the outer shell from exec'ing the inner one,
     # so the sleep is a grandchild of the UI, not its child.
     pytest.param(
-        ["/bin/sh", "-c", "/bin/sh -c 'trap \"\" HUP; exec sleep 3600'; :"],
+        ["{sh}", "-c", "{sh} -c 'trap \"\" HUP; exec {sleep} 3600'; :"],
         True,
         id="grandchild-ignores-hup",
     ),
@@ -67,8 +76,8 @@ def _comm(pid: int) -> str | None:
         return None
 
 
-def _marked_sleeps(marker: bytes) -> list[int]:
-    return [pid for pid in _marked_pids(marker) if _comm(pid) == "sleep"]
+def _marked_sleeps(marker: str, ours: dict[str, list[Path]]) -> list[int]:
+    return [pid for pid in _marked_pids(marker, ours) if _comm(pid) == "sleep"]
 
 
 def _wait_for(predicate, timeout: float, interval: float = 0.05):
@@ -115,9 +124,15 @@ def test_one_sigterm_ends_the_ui_and_its_foreground_job(
         path.mkdir()
     # Private, though an in-process UI reaches no session through it.
     dirs["session-socket"] = short_root / "sock"
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    job_sh = _private_copy("sh", tools / "sh")
+    job_sleep = _private_copy("sleep", tools / "sleep")
+    argv = [arg.format(sh=job_sh, sleep=job_sleep) for arg in argv]
+    ours = {"private": [job_sh, job_sleep], "shared": [binary]}
 
     marker_value = uuid.uuid4().hex
-    marker = f"{MARKER_ENV}={marker_value}".encode()
+    marker = f"{MARKER_ENV}={marker_value}"
     env = dict(os.environ)
     for leaked in ui._UI_ENV_SANITIZE:
         env.pop(leaked, None)
@@ -136,6 +151,7 @@ def test_one_sigterm_ends_the_ui_and_its_foreground_job(
             MARKER_ENV: marker_value,
         }
     )
+    ui.pin_user_runtime_dir(env)
     log_path = ui._rust_log_path(f"iced-quit-{request.node.callspec.id}")
     with open(log_path, "wb") as log_fh:
         proc = subprocess.Popen(
@@ -149,7 +165,7 @@ def test_one_sigterm_ends_the_ui_and_its_foreground_job(
         with c:
             project = c.create_project(name="quit-with-job", cwd=str(tmp_path))
             c.open_tab(project, argv=argv)
-        assert _wait_for(lambda: _marked_sleeps(marker), scaled_timeout(10.0)), (
+        assert _wait_for(lambda: _marked_sleeps(marker, ours), scaled_timeout(10.0)), (
             f"the tab's `sleep` never started\n{_tail(log_path)}"
         )
 
@@ -167,7 +183,7 @@ def test_one_sigterm_ends_the_ui_and_its_foreground_job(
         def outlived():
             return [
                 (p, comm)
-                for p in _marked_pids(marker)
+                for p in _marked_pids(marker, ours)
                 if (comm := _comm(p)) != "sleep" or not escapes_the_reap
             ]
 
@@ -181,8 +197,8 @@ def test_one_sigterm_ends_the_ui_and_its_foreground_job(
                 proc.kill()
             proc.wait(timeout=scaled_timeout(10.0))
         finally:
-            for pid in _marked_pids(marker):
+            for pid in _marked_pids(marker, ours):
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(pid, signal.SIGKILL)
-            survivors = _wait_unmarked(marker, scaled_timeout(5.0))
+            survivors = _wait_unmarked(marker, ours, scaled_timeout(5.0))
             assert not survivors, f"processes that outlived SIGKILL: {survivors}"

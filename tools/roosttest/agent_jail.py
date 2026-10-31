@@ -223,7 +223,7 @@ def jailed_ui_env(jail: Jail, *, force: bool = True, extra: "dict | None" = None
     for key, value in (extra or {}).items():
         assert key not in JAIL_ENV_KEYS, f"{key} is the jail's to set, not a case's"
         env[key] = value
-    return env
+    return ui.pin_user_runtime_dir(env)
 
 
 def jailed_socket(jail: Jail) -> Path:

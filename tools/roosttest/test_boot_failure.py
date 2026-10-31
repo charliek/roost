@@ -15,7 +15,11 @@ the error.
 
 Every process the UI starts inherits a marker from its environment, so
 "no shell left behind" is a `/proc` sweep for that marker rather than a
-pid the shell would have had to report.
+pid the shell would have had to report. The sweep reads the environment
+only of processes this test provably started (`tab_env.owned_processes`):
+anything running the private copies of `sh` and `sleep` the stub shell is
+made of, wherever it was reparented, and the UI's binary only under this
+process — never another process's on the box.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -31,6 +36,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+import tab_env
 import ui
 from client import scaled_timeout
 
@@ -57,28 +63,26 @@ ABORT_DEADLINE = 2.0
 ABORT_MARGIN = 1.0
 
 
-def _marked_pids(marker: bytes) -> list[int]:
-    """Live processes carrying `marker` in their environment (a zombie's
-    environ reads empty)."""
-    pids = []
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            environ = (entry / "environ").read_bytes()
-        except OSError:
-            continue
-        if marker in environ.split(b"\0"):
-            pids.append(int(entry.name))
-    return pids
+def _marked_pids(marker: str, ours: dict[str, list[Path]]) -> list[int]:
+    """Live processes this test started, by `ours` (`owned_processes`'s
+    `private` and `shared`), whose environment carries `marker`, a
+    `NAME=value` entry."""
+    name, _, value = marker.partition("=")
+    return [pid for pid, env in tab_env.owned_processes(**ours) if env.get(name) == value]
 
 
-def _wait_unmarked(marker: bytes, timeout: float) -> list[int]:
+def _wait_unmarked(marker: str, ours: dict[str, list[Path]], timeout: float) -> list[int]:
     """Poll until no process carries `marker`; return what is left."""
     deadline = time.monotonic() + timeout
-    while (left := _marked_pids(marker)) and time.monotonic() < deadline:
+    while (left := _marked_pids(marker, ours)) and time.monotonic() < deadline:
         time.sleep(0.02)
     return left
+
+
+def _private_copy(command: str, dest: Path) -> Path:
+    found = shutil.which(command)
+    assert found, f"no {command} on PATH"
+    return tab_env.private_copy(found, dest)
 
 
 def _persisted_tabs(state_dir: Path) -> int:
@@ -112,9 +116,12 @@ def test_a_bind_failure_after_hydrate_exits_and_reaps_the_shell(tmp_path):
     config.write_text("agent-hooks = off\nlocal-backend = in-process\n")
     # An ignored signal stays ignored across `exec`: when the stub gets to
     # run at all, only a SIGKILL removes it.
+    stub_sh = _private_copy("sh", tmp_path / "stub-sh")
+    stub_sleep = _private_copy("sleep", tmp_path / "stub-sleep")
     stub = tmp_path / "stub-shell"
-    stub.write_text("#!/bin/sh\ntrap '' HUP\nexec sleep 300\n")
+    stub.write_text(f"#!{stub_sh}\ntrap '' HUP\nexec {stub_sleep} 300\n")
     stub.chmod(0o755)
+    ours = {"private": [stub_sh, stub_sleep], "shared": [binary]}
     dirs = {name: tmp_path / name for name in ("data", "state", "cache", "state-dir")}
     for path in dirs.values():
         path.mkdir()
@@ -122,7 +129,7 @@ def test_a_bind_failure_after_hydrate_exits_and_reaps_the_shell(tmp_path):
     dirs["session-socket"] = tmp_path / "session-socket"
 
     marker_value = uuid.uuid4().hex
-    marker = f"{MARKER_ENV}={marker_value}".encode()
+    marker = f"{MARKER_ENV}={marker_value}"
     env = dict(os.environ)
     for leaked in ui._UI_ENV_SANITIZE:
         env.pop(leaked, None)
@@ -141,6 +148,7 @@ def test_a_bind_failure_after_hydrate_exits_and_reaps_the_shell(tmp_path):
             MARKER_ENV: marker_value,
         }
     )
+    ui.pin_user_runtime_dir(env)
     log_path = ui._rust_log_path("iced-boot-failure")
     with open(log_path, "wb") as log_fh:
         proc = subprocess.Popen(
@@ -180,7 +188,7 @@ def test_a_bind_failure_after_hydrate_exits_and_reaps_the_shell(tmp_path):
             f"{_tail(log_path)}"
         )
 
-        left = _wait_unmarked(marker, scaled_timeout(ABORT_DEADLINE + ABORT_MARGIN))
+        left = _wait_unmarked(marker, ours, scaled_timeout(ABORT_DEADLINE + ABORT_MARGIN))
         assert not left, f"the UI's shell outlived its boot abort: {left}\n{_tail(log_path)}"
     finally:
         try:
@@ -188,8 +196,8 @@ def test_a_bind_failure_after_hydrate_exits_and_reaps_the_shell(tmp_path):
                 proc.kill()
             proc.wait(timeout=scaled_timeout(10.0))
         finally:
-            for pid in _marked_pids(marker):
+            for pid in _marked_pids(marker, ours):
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(pid, signal.SIGKILL)
-            survivors = _wait_unmarked(marker, scaled_timeout(5.0))
+            survivors = _wait_unmarked(marker, ours, scaled_timeout(5.0))
             assert not survivors, f"processes that outlived SIGKILL: {survivors}"

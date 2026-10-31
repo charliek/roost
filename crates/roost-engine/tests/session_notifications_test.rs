@@ -12,6 +12,7 @@ use std::sync::Arc;
 use roost_engine::ipc::{
     AgentHooksError, AgentHooksHandle, AgentHooksRequest, IpcHandler, SessionInfo, StopHandle,
 };
+use roost_engine::TabOpener;
 use roost_engine::{AttentionSource, PtySupervisor, Workspace, WorkspaceEvent};
 use roost_ipc::messages::{ops, AgentHooksOutcome};
 use roost_ipc::{ConnCloseWatch, ConnCtx, Handler, HandlerOutcome};
@@ -88,7 +89,7 @@ fn reply(outcome: HandlerOutcome) -> serde_json::Value {
 fn a_tab(f: &Fixture) -> i64 {
     let project = f.workspace.create_project("p", "/tmp").unwrap().id;
     f.workspace
-        .open_tab(project, "/tmp", "sh", true)
+        .open_tab(project, "/tmp", "sh", true, TabOpener::None)
         .unwrap()
         .id
 }
@@ -97,7 +98,7 @@ fn a_tab(f: &Fixture) -> i64 {
 fn sibling_tab(f: &Fixture, tab: i64) -> i64 {
     let project = f.workspace.tab(tab).unwrap().project_id;
     f.workspace
-        .open_tab(project, "/tmp", "sh", true)
+        .open_tab(project, "/tmp", "sh", true, TabOpener::None)
         .unwrap()
         .id
 }
@@ -254,7 +255,10 @@ async fn a_connection_ending_retires_no_ones_attention() {
         "ai.stridelabs.Roost.test",
     );
     let project = workspace.create_project("p", "/tmp").unwrap().id;
-    let ui_tab = workspace.open_tab(project, "/tmp", "sh", true).unwrap().id;
+    let ui_tab = workspace
+        .open_tab(project, "/tmp", "sh", true, TabOpener::None)
+        .unwrap()
+        .id;
     workspace.focus_tab(ui_tab).unwrap();
 
     handler.connection_ended(1);

@@ -394,6 +394,8 @@ whoever started the daemon decides every tab's environment.
 **Decided:** environment by opener, in
 [protocol-7-release.md](protocol-7-release.md) M4.
 
+**Status: shipped in protocol-7 M4 (plan 085).**
+
 ## Retiring in-process local tabs (later)
 
 Not proposed now. This section records what it would involve so it can

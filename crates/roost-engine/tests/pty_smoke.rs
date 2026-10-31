@@ -3,6 +3,7 @@
 
 use std::time::{Duration, Instant};
 
+use roost_engine::TabOpener;
 use roost_engine::{PtyOutputEvent, PtySupervisor, SupervisorEvent};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::TryRecvError;
@@ -71,6 +72,7 @@ async fn pty_echo_emits_bytes_and_exit() {
             80,
             24,
             &socket,
+            &TabOpener::None,
         )
         .expect("spawn");
 
@@ -112,7 +114,15 @@ async fn pty_injects_roost_env_vars() {
     let sup = PtySupervisor::new();
     let socket = std::path::PathBuf::from("/tmp/roost-pty-env.sock");
     let mut output = sup
-        .spawn(99, "/tmp", &["/usr/bin/env".into()], 80, 24, &socket)
+        .spawn(
+            99,
+            "/tmp",
+            &["/usr/bin/env".into()],
+            80,
+            24,
+            &socket,
+            &TabOpener::None,
+        )
         .expect("spawn");
 
     let (collected, exit_status) = collect_until_exit(&mut output, Duration::from_secs(5)).await;
@@ -147,6 +157,7 @@ async fn duplicate_spawn_for_same_tab_id_is_rejected() {
             80,
             24,
             &socket,
+            &TabOpener::None,
         )
         .expect("first spawn");
 
@@ -158,6 +169,7 @@ async fn duplicate_spawn_for_same_tab_id_is_rejected() {
             80,
             24,
             &socket,
+            &TabOpener::None,
         )
         .expect_err("duplicate spawn must error");
     // The error is anyhow-wrapped, so we walk the source chain to
@@ -185,6 +197,7 @@ async fn duplicate_spawn_for_same_tab_id_is_rejected() {
             80,
             24,
             &socket,
+            &TabOpener::None,
         )
         .expect("post-close spawn");
 }
@@ -204,6 +217,7 @@ async fn write_after_exit_returns_not_found() {
             80,
             24,
             &socket,
+            &TabOpener::None,
         )
         .expect("spawn");
 
@@ -253,6 +267,7 @@ async fn close_force_kills_sighup_ignoring_child() {
             80,
             24,
             &socket,
+            &TabOpener::None,
         )
         .expect("spawn");
 

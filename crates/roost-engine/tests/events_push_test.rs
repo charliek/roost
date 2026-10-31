@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use roost_engine::event_push::{self, PushLimits};
 use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle};
+use roost_engine::TabOpener;
 use roost_engine::{PtySupervisor, ReplayBounds, Workspace, WorkspaceEvent};
 use roost_ipc::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
 use roost_ipc::codes;
@@ -221,8 +222,14 @@ async fn the_ack_fences_the_stream_and_the_first_batch_is_the_next_commit() {
 async fn a_multi_event_commit_is_one_batch() {
     let h = harness(true, None).await;
     let project = h.workspace.create_project("p", "/tmp").unwrap();
-    let a = h.workspace.open_tab(project.id, "/tmp", "a", true).unwrap();
-    let b = h.workspace.open_tab(project.id, "/tmp", "b", true).unwrap();
+    let a = h
+        .workspace
+        .open_tab(project.id, "/tmp", "a", true, TabOpener::None)
+        .unwrap();
+    let b = h
+        .workspace
+        .open_tab(project.id, "/tmp", "b", true, TabOpener::None)
+        .unwrap();
 
     let (mut reader, _w, fence) = h.subscribe().await;
     h.workspace.delete_project(project.id).unwrap();
@@ -318,7 +325,10 @@ async fn a_subscriber_that_stops_draining_is_closed_and_can_heal() {
     };
     let h = harness(true, Some(limits)).await;
     let project = h.workspace.create_project("p", "/tmp").unwrap();
-    let tab = h.workspace.open_tab(project.id, "/tmp", "t", true).unwrap();
+    let tab = h
+        .workspace
+        .open_tab(project.id, "/tmp", "t", true, TabOpener::None)
+        .unwrap();
     let (mut reader, w, _fence) = h.subscribe().await;
 
     // Commit far faster than a client that never reads can absorb. Which
@@ -540,7 +550,7 @@ async fn every_stream_receives_the_same_effect() {
     let project = h.workspace.create_project("p", "/tmp").unwrap();
     let tab = h
         .workspace
-        .open_tab(project.id, "/tmp", "sh", true)
+        .open_tab(project.id, "/tmp", "sh", true, TabOpener::None)
         .unwrap();
 
     let (mut holder, mut hw) = h.dial().await;
@@ -575,12 +585,15 @@ async fn every_stream_receives_the_same_effect() {
 async fn a_notification_reaches_a_subscriber() {
     let h = harness(true, None).await;
     let project = h.workspace.create_project("p", "/tmp").unwrap();
-    let tab = h.workspace.open_tab(project.id, "/tmp", "t", true).unwrap();
+    let tab = h
+        .workspace
+        .open_tab(project.id, "/tmp", "t", true, TabOpener::None)
+        .unwrap();
     // A second tab takes the selection: a focused, *active* tab
     // suppresses its own notification, which would make this pass or
     // fail on which tab happened to be selected rather than on routing.
     h.workspace
-        .open_tab(project.id, "/tmp", "other", true)
+        .open_tab(project.id, "/tmp", "other", true, TabOpener::None)
         .unwrap();
     let (mut watcher, _ww, _fence) = h.subscribe().await;
 
@@ -611,7 +624,10 @@ async fn a_lone_prompt_mark_reaches_a_subscriber_and_a_repeat_does_not() {
     use roost_ipc::program_status::{PromptMark, StatusEvent};
     let h = harness(true, None).await;
     let project = h.workspace.create_project("p", "/tmp").unwrap();
-    let tab = h.workspace.open_tab(project.id, "/tmp", "t", true).unwrap();
+    let tab = h
+        .workspace
+        .open_tab(project.id, "/tmp", "t", true, TabOpener::None)
+        .unwrap();
     let (mut watcher, _ww, fence) = h.subscribe().await;
     let mark = |mark| {
         h.workspace

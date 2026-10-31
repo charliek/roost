@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use roost_engine::application::{close_tab, spawn_for_row};
+use roost_engine::TabOpener;
 use roost_engine::{PtyError, PtySupervisor, SupervisorEvent, Workspace};
 use roost_ipc::messages::Tab;
 use tokio::sync::broadcast;
@@ -21,7 +22,7 @@ fn fixture() -> (Workspace, PtySupervisor, PathBuf, Tab) {
         .create_project("p", "/tmp")
         .expect("create_project");
     let tab = workspace
-        .open_tab(project.id, "/tmp", "", true)
+        .open_tab(project.id, "/tmp", "", true, TabOpener::None)
         .expect("open_tab");
     (workspace, supervisor, socket, tab)
 }
@@ -66,6 +67,7 @@ async fn a_close_that_beats_the_reservation_still_tears_the_child_down() {
         80,
         24,
         &socket,
+        &TabOpener::None,
     )
     .expect_err("the row is gone");
     assert!(
@@ -92,6 +94,7 @@ async fn an_uncontended_open_keeps_its_row_and_its_session() {
         80,
         24,
         &socket,
+        &TabOpener::None,
     )
     .expect("spawn");
 

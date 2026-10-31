@@ -10,6 +10,7 @@
 use std::ffi::OsString;
 use std::sync::Mutex;
 
+use roost_engine::TabOpener;
 use roost_engine::Workspace;
 
 static HOME_LOCK: Mutex<()> = Mutex::new(());
@@ -57,7 +58,9 @@ fn open_tab_with_an_empty_cwd_uses_the_projects_cwd() {
     let workspace = Workspace::new();
     let project = workspace.create_project("proj", "/usr/local").unwrap();
 
-    let tab = workspace.open_tab(project.id, "", "", true).unwrap();
+    let tab = workspace
+        .open_tab(project.id, "", "", true, TabOpener::None)
+        .unwrap();
 
     assert_eq!(tab.cwd, "/usr/local");
     assert_eq!(tab.title, "local");
@@ -76,7 +79,9 @@ fn open_tab_falls_back_to_home_when_the_project_has_none() {
     // to `$HOME`. That matches Mac and is correct, not a bug to fix.
     let project_id = workspace.ensure_default_project("", true);
 
-    let tab = workspace.open_tab(project_id, "", "", true).unwrap();
+    let tab = workspace
+        .open_tab(project_id, "", "", true, TabOpener::None)
+        .unwrap();
 
     assert_eq!(tab.cwd, "/home/tester");
     assert_eq!(tab.title, "tester");
@@ -90,7 +95,9 @@ fn open_tab_falls_back_to_slash_without_home() {
     let workspace = Workspace::new();
     let project_id = workspace.ensure_default_project("", true);
 
-    let tab = workspace.open_tab(project_id, "", "", true).unwrap();
+    let tab = workspace
+        .open_tab(project_id, "", "", true, TabOpener::None)
+        .unwrap();
 
     assert_eq!(tab.cwd, "/");
     assert_eq!(tab.title, "/");

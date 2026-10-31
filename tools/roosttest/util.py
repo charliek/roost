@@ -96,6 +96,18 @@ def roostctl_path() -> str:
     return str(REPO_ROOT / "target/debug/roostctl")
 
 
+def explicit_roostctl(*args: str, env: dict[str, str]) -> subprocess.CompletedProcess:
+    """`roostctl <args>` with `env` and nothing of the runner's but `PATH`:
+    what it reads of its environment is then exactly what a case gave it."""
+    return subprocess.run(
+        [roostctl_path(), *args],
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), **env},
+        capture_output=True,
+        text=True,
+        timeout=scaled_timeout(60.0),
+    )
+
+
 # The wall-clock budget one hook invocation may take, before
 # `ROOST_TEST_TIMEOUT_SCALE`.
 #

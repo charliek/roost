@@ -11,6 +11,7 @@
 use std::time::{Duration, Instant};
 
 use roost_engine::pty::{PtyOutputEvent, PtySupervisor};
+use roost_engine::TabOpener;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::sleep;
 
@@ -21,7 +22,15 @@ async fn inherited_terminfo_is_stripped_from_child_env() {
     let sup = PtySupervisor::new();
     let socket = std::path::PathBuf::from("/tmp/roost-pty-terminfo.sock");
     let mut output = sup
-        .spawn(11, "/tmp", &["/usr/bin/env".into()], 80, 24, &socket)
+        .spawn(
+            11,
+            "/tmp",
+            &["/usr/bin/env".into()],
+            80,
+            24,
+            &socket,
+            &TabOpener::None,
+        )
         .expect("spawn");
 
     // Same drain rationale as pty_smoke's collect_until_exit: `Exit`

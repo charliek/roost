@@ -161,6 +161,15 @@ pub const TEST_PASSWD_HOME_ENV: &str = "ROOST_TEST_PASSWD_HOME";
 /// instead of any real candidate. Frozen by a test.
 pub const TEST_OLD_SESSION_DIR_ENV: &str = "ROOST_TEST_OLD_SESSION_DIR";
 
+/// Test-only, honoured by **debug** builds and by any build with
+/// `ROOST_TEST_MODE=1` (a release lane's tabs need it too): an absolute
+/// directory standing in for `/run/user/<uid>` when a Linux tab's
+/// `XDG_RUNTIME_DIR` is derived (plan 085 D3), held to the same
+/// directory-owned-by-this-uid check. The harness points it at each
+/// process's own runtime dir, so no test tab reaches the desktop's.
+/// Frozen by a test.
+pub const TEST_USER_RUNTIME_DIR_ENV: &str = "ROOST_TEST_USER_RUNTIME_DIR";
+
 /// [`SESSION_SOCKET_DIR_ENV`]'s rule. Silent for unset and empty, like
 /// `ROOST_STATE_DIR` and the XDG dirs; loud for a relative value, which
 /// would otherwise bind a session socket against the process CWD.
@@ -1199,6 +1208,13 @@ mod tests {
         assert_eq!(SESSION_SOCKET_DIR_ENV, "ROOST_SESSION_SOCKET_DIR");
         assert_eq!(TEST_PASSWD_HOME_ENV, "ROOST_TEST_PASSWD_HOME");
         assert_eq!(TEST_OLD_SESSION_DIR_ENV, "ROOST_TEST_OLD_SESSION_DIR");
+    }
+
+    /// A cross-process contract: `tools/roosttest` sets it on every daemon
+    /// and UI it starts.
+    #[test]
+    fn the_user_runtime_dir_knob_name_is_frozen() {
+        assert_eq!(TEST_USER_RUNTIME_DIR_ENV, "ROOST_TEST_USER_RUNTIME_DIR");
     }
 
     const SAFE_DEFAULT: &str = "/run/user/1000/roost-session-dev/roost.sock";

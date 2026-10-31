@@ -21,6 +21,7 @@ use roost_ipc::session_launch::FirstProject;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::opener::{restore_opener, TabOpener};
 use crate::program_status::RawOscAuthority;
 use crate::{
     AttentionSource, PtyError, PtySupervisor, RestoreTab, SupervisorEvent, Workspace,
@@ -176,6 +177,7 @@ pub fn resolve_open_target(
 ///
 /// `pub` for the same reason [`close_tab`] is: the race test lives in
 /// `tests/` with a real PTY and a multi-thread runtime.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_for_row(
     workspace: &Workspace,
     supervisor: &PtySupervisor,
@@ -184,6 +186,7 @@ pub fn spawn_for_row(
     cols: u16,
     rows: u16,
     socket_path: &std::path::Path,
+    opener: &TabOpener,
 ) -> Result<()> {
     let project_cwd = workspace.project_cwd(tab.project_id).unwrap_or_default();
     let cwd = usable_cwd(&tab.cwd, &project_cwd);
@@ -197,7 +200,7 @@ pub fn spawn_for_row(
             Err(err) => return Err(err.into()),
         }
     }
-    match supervisor.spawn(tab.id, &tab.cwd, argv, cols, rows, socket_path) {
+    match supervisor.spawn(tab.id, &tab.cwd, argv, cols, rows, socket_path, opener) {
         // The pre-subscribed receiver `spawn` returns is dropped; the
         // supervisor's stashed twin (`take_initial_receiver`) is what an
         // attach consumes, so early output survives however late that
@@ -278,6 +281,7 @@ impl LocalClient {
             .context("pty resize failed")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_tab(
         &self,
         project_id: i64,
@@ -286,12 +290,15 @@ impl LocalClient {
         argv: &[String],
         cols: u32,
         rows: u32,
+        opener: &TabOpener,
     ) -> Result<Tab> {
         // An empty cwd resolves in `Workspace::open_tab` (project's cwd
         // → $HOME → "/"), and one that is not a directory in
         // `spawn_for_row`, so every caller (this, the facade,
         // `ops::TAB_OPEN`) gets both once.
-        let mut tab = self.workspace.open_tab(project_id, cwd, title, true)?;
+        let mut tab = self
+            .workspace
+            .open_tab(project_id, cwd, title, true, opener.clone())?;
         // Clamp + validate PTY dims. Zero → terminal default; values
         // exceeding u16 surface as a clear error rather than
         // silently truncating via `as u16` (CR-flagged: a CLI
@@ -312,6 +319,7 @@ impl LocalClient {
             cols,
             rows,
             &self.socket_path,
+            opener,
         )
         .context("pty spawn failed")?;
         Ok(tab)
@@ -459,7 +467,7 @@ fn recover_from_lag(workspace: &Workspace, supervisor: &PtySupervisor) {
 
 /// Where the two hydrations differ: a UI's in-process launch (and its
 /// reverse switch, plan 063 §D8), and a `roost-session` coming up.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Hydration {
     /// What an empty workspace starts with.
     pub first_project: FirstProject,
@@ -469,6 +477,13 @@ pub struct Hydration {
     /// that fails is always only logged: one tab whose directory is gone
     /// must not cost the rest of the layout.
     pub on_error: OnRestoreError,
+    /// The process's own opener (plan 085 D6): what the tabs it opens of
+    /// its own accord get — the seeded project's, and the one a project
+    /// that saved none gets — and what refreshes a restored local tab.
+    pub starter: TabOpener,
+    /// What a tab saved before there were openers restores with
+    /// ([`restore_opener`]).
+    pub legacy: TabOpener,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -498,10 +513,11 @@ impl OnRestoreError {
 /// where `restorable_cwd` falls back to when a shell can no longer enter
 /// it; no process or scrollback survives. In order:
 ///
-/// 1. Each project with no live tabs re-opens its saved tabs (one tab at
-///    the project's cwd if it saved none), recording which saved position
-///    became which tab. A position whose open failed maps to nothing, so
-///    nothing below can land on the tab after it instead.
+/// 1. Each project with no live tabs re-opens its saved tabs, each with
+///    the opener [`restore_opener`] gives it, or one tab at the project's
+///    cwd with the starter opener if it saved none, recording which saved
+///    position became which tab. A position whose open failed maps to
+///    nothing, so nothing below can land on the tab after it instead.
 /// 2. Each project remembers its saved tab when that position opened, and
 ///    otherwise keeps the one the opens left it on.
 /// 3. The saved active pair is re-selected through the same mapping, else
@@ -517,18 +533,22 @@ impl OnRestoreError {
 /// so a second run adds nothing.
 pub async fn hydrate(client: &LocalClient, how: Hydration) -> Result<()> {
     let (cols, rows) = (u32::from(how.grid.0), u32::from(how.grid.1));
-    hydrate_with(&client.workspace, how, move |project_id, spec| async move {
-        client
-            .open_tab(project_id, &spec.cwd, &spec.title, &[], cols, rows)
-            .await
-    })
+    hydrate_with(
+        &client.workspace,
+        how,
+        move |project_id, spec, opener| async move {
+            client
+                .open_tab(project_id, &spec.cwd, &spec.title, &[], cols, rows, &opener)
+                .await
+        },
+    )
     .await
 }
 
 /// [`hydrate`] with the open stated, so a test can fail one.
 async fn hydrate_with<F, Fut>(workspace: &Workspace, how: Hydration, mut open: F) -> Result<()>
 where
-    F: FnMut(i64, RestoreTab) -> Fut,
+    F: FnMut(i64, RestoreTab, TabOpener) -> Fut,
     Fut: Future<Output = Result<Tab>>,
 {
     let mut projects = workspace.snapshot();
@@ -546,18 +566,29 @@ where
     let restore = workspace.take_restore_layout();
     let mut opened: BTreeMap<(i64, usize), i64> = BTreeMap::new();
     for project in projects.iter().filter(|project| project.tabs.is_empty()) {
-        let specs = match restore
+        let specs: Vec<(RestoreTab, TabOpener)> = match restore
             .as_ref()
             .and_then(|layout| layout.project(project.id))
         {
-            Some(saved) if !saved.tabs.is_empty() => saved.tabs.clone(),
-            _ => vec![RestoreTab {
-                cwd: project.cwd.clone(),
-                title: String::new(),
-                user_titled: false,
-            }],
+            Some(saved) if !saved.tabs.is_empty() => saved
+                .tabs
+                .iter()
+                .map(|spec| {
+                    let opener = restore_opener(spec.opener.as_ref(), &how.starter, &how.legacy);
+                    (spec.clone(), opener)
+                })
+                .collect(),
+            _ => vec![(
+                RestoreTab {
+                    cwd: project.cwd.clone(),
+                    title: String::new(),
+                    user_titled: false,
+                    opener: None,
+                },
+                how.starter.clone(),
+            )],
         };
-        for (position, spec) in specs.into_iter().enumerate() {
+        for (position, (spec, opener)) in specs.into_iter().enumerate() {
             let title_lock =
                 (spec.user_titled && !spec.title.is_empty()).then(|| spec.title.clone());
             let cwd = restorable_cwd(&spec.cwd, &project.cwd);
@@ -565,7 +596,7 @@ where
                 cwd: cwd.clone(),
                 ..spec
             };
-            match open(project.id, spec).await {
+            match open(project.id, spec, opener).await {
                 Ok(tab) => {
                     if let Some(title) = title_lock {
                         how.on_error.settle(
@@ -743,7 +774,15 @@ pub(crate) fn spawn_in(
     let argv = ["/bin/sh", "-c", script].map(String::from);
     let socket = Path::new("/tmp/roost-test.sock");
     let _rx = supervisor
-        .spawn(tab_id, &dir.to_string_lossy(), &argv, 80, 24, socket)
+        .spawn(
+            tab_id,
+            &dir.to_string_lossy(),
+            &argv,
+            80,
+            24,
+            socket,
+            &TabOpener::None,
+        )
         .expect("spawn");
     guard
 }
@@ -857,7 +896,10 @@ mod tests {
     async fn a_lag_has_the_poller_republish_every_live_tab() {
         let (workspace, tab) = workspace_with_tab("/tmp");
         let project = workspace.tab(tab).unwrap().project_id;
-        let orphaned = workspace.open_tab(project, "/tmp", "", true).unwrap().id;
+        let orphaned = workspace
+            .open_tab(project, "/tmp", "", true, TabOpener::None)
+            .unwrap()
+            .id;
         let workspace = Arc::new(workspace);
         let supervisor = Arc::new(PtySupervisor::new());
         LocalClient::new(
@@ -918,7 +960,10 @@ mod tests {
     fn client_with_tab() -> (LocalClient, i64) {
         let workspace = Arc::new(Workspace::new());
         let pid = workspace.create_project("p", "").unwrap().id;
-        let tab_id = workspace.open_tab(pid, "/", "", true).unwrap().id;
+        let tab_id = workspace
+            .open_tab(pid, "/", "", true, TabOpener::None)
+            .unwrap()
+            .id;
         // Unfocused: these tests are about the OSC gate, not about
         // policy §3.5's focus suppression (covered in `daemon::state`).
         workspace.set_window_focused(false);
@@ -1056,7 +1101,10 @@ mod tests {
     fn workspace_with_tab(tracked: &str) -> (Workspace, i64) {
         let workspace = Workspace::new();
         let project = workspace.create_project("p", "/").unwrap().id;
-        let tab = workspace.open_tab(project, tracked, "", true).unwrap().id;
+        let tab = workspace
+            .open_tab(project, tracked, "", true, TabOpener::None)
+            .unwrap()
+            .id;
         (workspace, tab)
     }
 
@@ -1304,14 +1352,26 @@ mod tests {
         let gone = string(&project_dir.path().join("gone"));
         let workspace = Workspace::new();
         let project = workspace.create_project("p", &project_cwd).unwrap().id;
-        let mut tab = workspace.open_tab(project, &gone, "", true).unwrap();
+        let mut tab = workspace
+            .open_tab(project, &gone, "", true, TabOpener::None)
+            .unwrap();
         assert_eq!(tab.cwd, gone, "the precondition: the row names {gone}");
         let supervisor = Arc::new(PtySupervisor::new());
         let _guard = HangUp(supervisor.clone(), vec![tab.id]);
 
         let argv = ["/bin/sh", "-c", "exec sleep 30"].map(String::from);
         let socket = Path::new("/tmp/roost-spawn-for-row-test.sock");
-        spawn_for_row(&workspace, &supervisor, &mut tab, &argv, 80, 24, socket).expect("spawn");
+        spawn_for_row(
+            &workspace,
+            &supervisor,
+            &mut tab,
+            &argv,
+            80,
+            24,
+            socket,
+            &TabOpener::None,
+        )
+        .expect("spawn");
 
         assert_eq!(workspace.tab(tab.id).unwrap().cwd, project_cwd, "the row");
         assert_eq!(tab.cwd, project_cwd, "the caller's copy");
@@ -1345,10 +1405,10 @@ mod tests {
     fn open_rows<'a>(
         workspace: &'a Workspace,
         failing: &'a [&'a str],
-    ) -> impl FnMut(i64, RestoreTab) -> std::future::Ready<Result<Tab>> + 'a {
-        move |project_id, spec| {
+    ) -> impl FnMut(i64, RestoreTab, TabOpener) -> std::future::Ready<Result<Tab>> + 'a {
+        move |project_id, spec, opener| {
             let opened = workspace
-                .open_tab(project_id, &spec.cwd, &spec.title, true)
+                .open_tab(project_id, &spec.cwd, &spec.title, true, opener)
                 .map_err(anyhow::Error::from)
                 .and_then(|tab| {
                     if failing.iter().any(|name| spec.cwd.ends_with(name)) {
@@ -1366,6 +1426,8 @@ mod tests {
             first_project: FirstProject::Seed,
             grid: (80, 24),
             on_error: OnRestoreError::Propagate,
+            starter: TabOpener::None,
+            legacy: TabOpener::None,
         };
         hydrate_with(workspace, launch, open_rows(workspace, failing))
             .await
@@ -1385,11 +1447,13 @@ mod tests {
         let ws = Workspace::open(path.to_path_buf());
         let p1 = ws.create_project("p1", "/p1").unwrap().id;
         for name in tabs {
-            ws.open_tab(p1, &dir(name), "", true).unwrap();
+            ws.open_tab(p1, &dir(name), "", true, TabOpener::None)
+                .unwrap();
         }
         ws.focus_tab(tab_at(&ws, p1, viewed)).unwrap();
         let p2 = ws.create_project("p2", "/p2").unwrap().id;
-        ws.open_tab(p2, &dir("/x"), "", true).unwrap();
+        ws.open_tab(p2, &dir("/x"), "", true, TabOpener::None)
+            .unwrap();
         (p1, p2)
     }
 
@@ -1482,26 +1546,31 @@ mod tests {
         let p1 = {
             let ws = Workspace::open(path.clone());
             let p1 = ws.create_project("p1", "/p1").unwrap().id;
-            ws.open_tab(p1, &dir("a"), "", true).unwrap();
-            ws.open_tab(p1, &dir("b"), "", true).unwrap();
+            ws.open_tab(p1, &dir("a"), "", true, TabOpener::None)
+                .unwrap();
+            ws.open_tab(p1, &dir("b"), "", true, TabOpener::None)
+                .unwrap();
             let p2 = ws.create_project("p2", "/p2").unwrap().id;
-            ws.open_tab(p2, &dir("x"), "", true).unwrap();
+            ws.open_tab(p2, &dir("x"), "", true, TabOpener::None)
+                .unwrap();
             ws.focus_tab(tab_at(&ws, p1, "/a")).unwrap();
             p1
         };
 
         let ws = Workspace::open(path.clone());
         let mut rows = open_rows(&ws, &[]);
-        let exits_early = |project_id: i64, spec: RestoreTab| {
+        let exits_early = |project_id: i64, spec: RestoreTab, opener: TabOpener| {
             if spec.cwd.ends_with("/x") {
                 let _ = ws.close_tab(tab_at(&ws, p1, "/a"));
             }
-            rows(project_id, spec)
+            rows(project_id, spec, opener)
         };
         let launch = Hydration {
             first_project: FirstProject::Seed,
             grid: (80, 24),
             on_error: OnRestoreError::Propagate,
+            starter: TabOpener::None,
+            legacy: TabOpener::None,
         };
         hydrate_with(&ws, launch, exits_early)
             .await
@@ -1525,18 +1594,23 @@ mod tests {
         let p1 = {
             let ws = Workspace::open(path.clone());
             let p1 = ws.create_project("p1", "/p1").unwrap().id;
-            ws.open_tab(p1, &folder("b"), "", true).unwrap();
-            let pinned = ws.open_tab(p1, &folder("a"), "", true).unwrap().id;
+            ws.open_tab(p1, &folder("b"), "", true, TabOpener::None)
+                .unwrap();
+            let pinned = ws
+                .open_tab(p1, &folder("a"), "", true, TabOpener::None)
+                .unwrap()
+                .id;
             ws.set_tab_title(pinned, "Pinned").unwrap();
-            ws.open_tab(p1, &folder("c"), "", true).unwrap();
+            ws.open_tab(p1, &folder("c"), "", true, TabOpener::None)
+                .unwrap();
             p1
         };
 
         let ws = Workspace::open(path.clone());
         let mut rows = open_rows(&ws, &[]);
-        let exits_at_once = |project_id: i64, spec: RestoreTab| {
+        let exits_at_once = |project_id: i64, spec: RestoreTab, opener: TabOpener| {
             let title = spec.title.clone();
-            let opened = rows(project_id, spec);
+            let opened = rows(project_id, spec, opener);
             std::future::ready(opened.into_inner().inspect(|tab| {
                 if title == "Pinned" {
                     let _ = ws.close_tab(tab.id);
@@ -1547,6 +1621,8 @@ mod tests {
             first_project: FirstProject::Seed,
             grid: (80, 24),
             on_error: OnRestoreError::Warn,
+            starter: TabOpener::None,
+            legacy: TabOpener::None,
         };
         hydrate_with(&ws, launch, exits_at_once)
             .await
@@ -1559,6 +1635,129 @@ mod tests {
             "the tab after the failed lock restored and was written: {:?}",
             saved.tabs
         );
+    }
+
+    fn local(name: &str, value: &str) -> TabOpener {
+        TabOpener::Local([(name.to_string(), value.to_string())].into())
+    }
+
+    fn hydration(starter: TabOpener, legacy: TabOpener) -> Hydration {
+        Hydration {
+            first_project: FirstProject::Seed,
+            grid: (80, 24),
+            on_error: OnRestoreError::Propagate,
+            starter,
+            legacy,
+        }
+    }
+
+    fn opener_titled(workspace: &Workspace, title: &str) -> Option<TabOpener> {
+        let tab = workspace
+            .snapshot()
+            .into_iter()
+            .flat_map(|project| project.tabs)
+            .find(|tab| tab.title == title)
+            .unwrap_or_else(|| panic!("no tab titled {title}"));
+        workspace.tab_opener(tab.id)
+    }
+
+    #[tokio::test]
+    async fn the_seeded_projects_tab_gets_the_starter() {
+        let ws = Workspace::new();
+        let starter = local("DISPLAY", ":5");
+        hydrate_with(
+            &ws,
+            hydration(starter.clone(), TabOpener::None),
+            open_rows(&ws, &[]),
+        )
+        .await
+        .unwrap();
+        let tabs: Vec<_> = ws.snapshot().into_iter().flat_map(|p| p.tabs).collect();
+        assert_eq!(tabs.len(), 1, "the seed: {tabs:?}");
+        assert_eq!(ws.tab_opener(tabs[0].id), Some(starter));
+    }
+
+    /// One saved tab of each class, legacy included, beside a project
+    /// that saved none.
+    #[tokio::test]
+    async fn restored_tabs_take_restore_openers_answer_and_a_tabless_project_the_starter() {
+        use crate::opener::{PersistedOpener, PersistedRemote};
+        use crate::persistence::{persist_state, ProjectSnapshot, SnapshotFile, TabSnapshot};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let saved = |title: &str, position: i32, opener: Option<PersistedOpener>| TabSnapshot {
+            title: title.into(),
+            cwd: "/".into(),
+            position,
+            user_titled: true,
+            opener,
+        };
+        let remote = PersistedRemote {
+            ssh_connection: Some("1.2.3.4 5 6.7.8.9 22".into()),
+            ssh_client: Some("1.2.3.4 5 22".into()),
+        };
+        let project = |id: i64, tabs: Vec<TabSnapshot>| ProjectSnapshot {
+            id,
+            name: format!("p{id}"),
+            cwd: "/".into(),
+            position: id as i32,
+            created_at: 1,
+            tabs,
+            last_tab_position: None,
+        };
+        let file = SnapshotFile {
+            next_id: 10,
+            projects: vec![
+                project(
+                    1,
+                    vec![
+                        saved("legacy", 0, None),
+                        saved("none", 1, Some(PersistedOpener::None)),
+                        saved(
+                            "local",
+                            2,
+                            Some(PersistedOpener::Local(
+                                [("DISPLAY".to_string(), ":1".to_string())].into(),
+                            )),
+                        ),
+                        saved("remote", 3, Some(PersistedOpener::Remote(remote))),
+                    ],
+                ),
+                project(2, Vec::new()),
+            ],
+            ..SnapshotFile::default()
+        };
+        persist_state(&path, &file, false).unwrap();
+
+        let ws = Workspace::open(path);
+        let starter = local("DISPLAY", ":5");
+        let legacy = local("SSH_AUTH_SOCK", "/legacy/agent");
+        hydrate_with(
+            &ws,
+            hydration(starter.clone(), legacy.clone()),
+            open_rows(&ws, &[]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(opener_titled(&ws, "legacy"), Some(legacy));
+        assert_eq!(opener_titled(&ws, "none"), Some(TabOpener::None));
+        assert_eq!(
+            opener_titled(&ws, "local"),
+            Some(starter.clone()),
+            "refreshed"
+        );
+        assert_eq!(
+            opener_titled(&ws, "remote"),
+            Some(TabOpener::Remote {
+                ssh_connection: Some("1.2.3.4 5 6.7.8.9 22".into()),
+                ssh_client: Some("1.2.3.4 5 22".into()),
+            })
+        );
+        let tabless = ws.snapshot().into_iter().find(|p| p.id == 2).unwrap();
+        assert_eq!(tabless.tabs.len(), 1, "{tabless:?}");
+        assert_eq!(ws.tab_opener(tabless.tabs[0].id), Some(starter));
     }
 
     #[tokio::test]

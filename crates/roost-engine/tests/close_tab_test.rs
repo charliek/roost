@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use roost_engine::application::close_tab;
+use roost_engine::TabOpener;
 use roost_engine::{PtySupervisor, SupervisorEvent, Workspace, WorkspaceError};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::TryRecvError;
@@ -45,10 +46,18 @@ async fn a_live_tab_closes_cleanly_and_its_child_is_reaped() {
         .create_project("p", "/tmp")
         .expect("create_project");
     let tab = workspace
-        .open_tab(project.id, "/tmp", "", true)
+        .open_tab(project.id, "/tmp", "", true, TabOpener::None)
         .expect("open_tab");
     let _rx = supervisor
-        .spawn(tab.id, "/tmp", &quiet_argv(), 80, 24, &socket)
+        .spawn(
+            tab.id,
+            "/tmp",
+            &quiet_argv(),
+            80,
+            24,
+            &socket,
+            &TabOpener::None,
+        )
         .expect("spawn");
 
     close_tab(&workspace, &supervisor, tab.id).expect("close_tab");
@@ -72,7 +81,15 @@ async fn a_session_without_a_row_is_still_torn_down() {
     let orphan = 99;
 
     let _rx = supervisor
-        .spawn(orphan, "/tmp", &quiet_argv(), 80, 24, &socket)
+        .spawn(
+            orphan,
+            "/tmp",
+            &quiet_argv(),
+            80,
+            24,
+            &socket,
+            &TabOpener::None,
+        )
         .expect("spawn");
     assert!(supervisor.has(orphan));
 

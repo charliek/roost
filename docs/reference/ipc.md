@@ -615,6 +615,48 @@ From the CLI: `--cwd-from-tab <id>` on `tab open` (plan 072, #536), or
 otherwise not necessarily this call's own id space; see
 [cli.md](cli.md#tab-open-close-send-resize-reorder-dump).
 
+**`env` and `origin` (optional, plan 085).** Who is opening the tab,
+which decides the tab's display, bus, agent and SSH variables — see
+[Tab environment](#tab-environment) for the whole rule. `env` is a
+**local** opener's values, an object whose keys may only be
+`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` and
+`SSH_AUTH_SOCK`:
+
+```json
+{"id": "2", "op": "tab.open", "params": {"project_id": "3", "argv": [],
+  "env": {"DISPLAY": ":1", "WAYLAND_DISPLAY": "/run/user/1000/wayland-1"}}}
+```
+
+A name it leaves out stays unset in the tab, an empty value is set
+empty, and `{}` states a local opener that brings none. `origin` is a
+caller declaring itself **remote**, with its own SSH identity; its keys
+are exactly `ssh_connection` and `ssh_client`, each optional:
+
+```json
+{"id": "2", "op": "tab.open", "params": {"project_id": "3", "argv": [],
+  "origin": {"ssh_connection": "100.1.2.3 51000 100.9.8.7 22",
+             "ssh_client": "100.1.2.3 51000 22"}}}
+```
+
+On a local connection, neither field sent means **no opener stated**:
+the tab gets the baseline alone. On a [bridged](#the-bridge-preamble)
+connection the opener is always the bridge's — sending neither gives the
+preamble's remote identity, and sending either is refused. Both fields
+together, an `env` or `origin` that is not an object of strings (an
+array, a string, a number; `null` is unset), an `env` key outside those
+four, a value with a NUL, an `env` value over 4096 bytes or an `origin`
+value over 256 are each `invalid-param` naming the field or key, never
+the value; `origin` is closed like the params around it, so a key other
+than its two is `unknown-field`, naming that key. All of it is checked
+before anything else, so a refused request opens no tab and, with
+`project_id: "0"`, creates no project. An omitted field is not sent, so
+a request without them is the bytes it always was. Served by sessions
+and Roost-Iced's UI socket; on a UI socket under [`local-backend =
+session`](#a-ui-socket-under-local-backend-session) the request is
+forwarded to the local session as it arrived, so the session resolves
+the original caller's fields. The Swift Mac app answers either field
+`unknown-field`.
+
 Response: `{"tab": <Tab>}`.
 
 ### `tab.close`
@@ -3497,8 +3539,10 @@ is about to carry with one line of its own, written toward the session:
 ```
 
 The two values are the bridge's own `SSH_CONNECTION` and `SSH_CLIENT` —
-the SSH connection the client came in on — each `null` when unset and
-cut to 256 bytes on a character boundary. The bridge then reads exactly
+the SSH connection the client came in on — each `null` when unset, and
+also when it holds a NUL, is not UTF-8 or is over 256 bytes: the bridge
+leaves out a value [`tab.open`'s rules](#tabopen) refuse, as every
+other opener does, rather than cut it. The bridge then reads exactly
 one line back **itself**: the session's acknowledgement,
 
 ```json
@@ -3529,7 +3573,48 @@ connection that opens with anything else carries no preamble and is
 **local**. The origin is advisory, not a credential: every peer of this
 socket is already the session's own uid. A UI socket does not recognise
 the preamble at all — such a line is a malformed request there.
-[`client.hello`](#clienthello)'s `bridged` reports it.
+[`client.hello`](#clienthello)'s `bridged` reports it, and it decides
+who opened a tab asked for on that connection ([below](#tab-environment)).
+
+#### Tab environment
+
+A tab's environment is built for that tab, not inherited from the
+process serving it (plan 085). It starts from the server's own
+environment **minus seven variables** — `DISPLAY`, `WAYLAND_DISPLAY`,
+`DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, `SSH_CONNECTION`,
+`SSH_CLIENT`, `SSH_TTY` — so a session started over SSH no longer hands
+every tab the laptop's `SSH_CLIENT`, and one started at the desk no
+longer hands a laptop's tab the desk's display. Those seven come only
+from the tab's **opener**, which [`tab.open`](#tabopen) decides:
+
+| connection | `env` | `origin` | the tab gets |
+|---|---|---|---|
+| bridged (a [preamble](#the-bridge-preamble)) | absent | absent | the preamble's `SSH_CONNECTION` / `SSH_CLIENT` (remote) |
+| bridged | present | — | `invalid-param`: a bridged connection's opener is its bridge |
+| bridged | — | present | `invalid-param` (same) |
+| local | absent | present | `origin`'s `SSH_CONNECTION` / `SSH_CLIENT` (remote) |
+| local | present | absent | exactly `env`'s values (local; `{}` brings none) |
+| local | absent | absent | none of the seven: no opener stated |
+| any | present | present | `invalid-param` |
+
+A remote tab gets its two `SSH_*` values when set and nothing else of
+its opener — no `SSH_TTY`, agent or display. On Linux `XDG_RUNTIME_DIR`
+is `/run/user/<uid>` when that is a directory (not a symlink) the
+server's uid owns, else the server's own value; on macOS it is left as
+the server has it. `SHELL` stays the passwd shell, and Roost's own
+variables ([paths.md](paths.md#environment-variables-roost-sets)) are
+set on top as before.
+
+The opener is saved with the tab in `state.json`. On restart a remote
+or opener-less tab keeps what it was opened with; a local one takes the
+starting session's display, bus and agent when that session was started
+locally with at least one of them, and keeps its own otherwise. A tab
+saved before openers existed restores with none of the seven on a
+session. The seed tab of a first start, and the one tab a tab-less
+saved project gets, are opened by the session's own starter: remote
+with its `SSH_*` when it was started over SSH, else local with its
+values. The values are advisory, like the preamble: any process of the
+session's uid can state either.
 
 `roostctl session start|stop|status` address this socket directly; they
 are a pre-connect carve-out (`session start` has to work when nothing is
@@ -4806,8 +4891,9 @@ amended in place before its first release — program status, then
 `client.hello` and the bridge preamble, then tab size ownership (`take`
 and `client_id` on the handshake, `owner` on its reply, `ROOSTDP3` with
 `GRID`/`TAKE`/`DETACH` and the flag bytes, `tab.take_size`,
-`tab.release_size`, `tab.resized`, `owned`) — so no released peer
-speaks an earlier 7.
+`tab.release_size`, `tab.resized`, `owned`), then the tab's opener
+(`env` and `origin` on `tab.open`, the preamble deciding a bridged
+connection's tabs) — so no released peer speaks an earlier 7.
 
 **The consumption and compatibility policy lives in
 [`ipc-compatibility.md`](ipc-compatibility.md)** — what is additive in
