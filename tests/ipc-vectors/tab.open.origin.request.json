@@ -1,0 +1,16 @@
+{
+  "id": "2",
+  "op": "tab.open",
+  "params": {
+    "project_id": "3",
+    "cwd": "",
+    "argv": [],
+    "cols": 120,
+    "rows": 30,
+    "title": "",
+    "origin": {
+      "ssh_connection": "100.1.2.3 51000 100.9.8.7 22",
+      "ssh_client": "100.1.2.3 51000 22"
+    }
+  }
+}

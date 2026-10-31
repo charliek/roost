@@ -1513,6 +1513,8 @@ async fn run_on_ui(
                         title,
                         activate: no_activate.then_some(false),
                         cwd_from_tab,
+                        env: None,
+                        origin: None,
                     },
                 )
                 .await?;
@@ -1602,6 +1604,8 @@ async fn run_on_ui(
                         title,
                         activate: no_activate.then_some(false),
                         cwd_from_tab: None,
+                        env: None,
+                        origin: None,
                     },
                 )
                 .await?;

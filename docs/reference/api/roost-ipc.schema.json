@@ -4672,6 +4672,25 @@
             "null"
           ]
         },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TabOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "project_id": {
           "default": "0",
           "type": "string"
@@ -4709,6 +4728,24 @@
       "required": [
         "tab"
       ],
+      "type": "object"
+    },
+    "TabOrigin": {
+      "additionalProperties": false,
+      "properties": {
+        "ssh_client": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ssh_connection": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "TabPasswordInputEvent": {

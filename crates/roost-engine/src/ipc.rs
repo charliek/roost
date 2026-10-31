@@ -62,7 +62,7 @@ use roost_ipc::messages::{
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{AttachHandshake, SessionSetThemeResult};
-use roost_ipc::messages::{ClientHelloParams, ClientHelloResult};
+use roost_ipc::messages::{BridgeOrigin, ClientHelloParams, ClientHelloResult};
 use roost_ipc::{
     codes, CloseReason, ConnAction, ConnCloser, ConnCtx, Handler, HandlerError, HandlerOutcome,
     LocalBackendCell, LocalBackendMode, LocalRoute, StopFinalizer,
@@ -806,8 +806,7 @@ use crate::persistence::HostSnapshot;
 #[cfg(feature = "server-vt")]
 use crate::pty::Geometry;
 use crate::{
-    AttentionSource, PtyError, PtySupervisor, ResumeCut, ResumeError, TabOpener, Workspace,
-    WorkspaceError,
+    AttentionSource, PtyError, PtySupervisor, ResumeCut, ResumeError, Workspace, WorkspaceError,
 };
 
 /// How long `session.stop` lets a hung-up child live before it escalates
@@ -2789,7 +2788,9 @@ async fn dispatch_outcome(
         };
     }
     let Some(session) = h.session.as_ref() else {
-        return dispatch(h, op, params).await.map(HandlerOutcome::Reply);
+        return dispatch(h, ctx.bridge.as_ref(), op, params)
+            .await
+            .map(HandlerOutcome::Reply);
     };
 
     match op {
@@ -2852,7 +2853,9 @@ async fn dispatch_outcome(
     }
 
     if !is_mutating_op(op) {
-        return dispatch(h, op, params).await.map(HandlerOutcome::Reply);
+        return dispatch(h, ctx.bridge.as_ref(), op, params)
+            .await
+            .map(HandlerOutcome::Reply);
     }
 
     if session.stopping.load(Ordering::Acquire) {
@@ -2896,7 +2899,9 @@ async fn dispatch_outcome(
         return session_put_file(h, p).await.map(HandlerOutcome::Reply);
     }
 
-    dispatch(h, op, params).await.map(HandlerOutcome::Reply)
+    dispatch(h, ctx.bridge.as_ref(), op, params)
+        .await
+        .map(HandlerOutcome::Reply)
 }
 
 /// The grid an attaching client declared, refused when it is not a grid.
@@ -3627,6 +3632,7 @@ fn strip_ui_socket_fence(op: &str, reply: &mut serde_json::Value) {
 
 async fn dispatch(
     h: &IpcHandler,
+    bridge: Option<&BridgeOrigin>,
     op: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, HandlerError> {
@@ -3697,11 +3703,15 @@ async fn dispatch(
         }
         ops::TAB_OPEN => {
             let mut p: TabOpenParams = decode(params)?;
+            // Before `resolve_open_target`, which can create the default
+            // project: a refused opener must leave nothing behind.
+            let opener = crate::opener::opener_for(bridge, p.env.as_ref(), p.origin.as_ref())
+                .map_err(|refused| HandlerError::invalid_param(refused.to_string()))?;
             let activate = p.activate != Some(false);
             crate::application::resolve_open_target(&h.workspace, &h.supervisor, &mut p, activate);
             let mut tab = h
                 .workspace
-                .open_tab(p.project_id, &p.cwd, &p.title, activate, TabOpener::None)
+                .open_tab(p.project_id, &p.cwd, &p.title, activate, opener.clone())
                 .map_err(ws_err)?;
             // Spawn the PTY. Use the tab's cwd, the requested argv,
             // and a sensible default winsize when the caller doesn't
@@ -3732,7 +3742,7 @@ async fn dispatch(
                 cols,
                 rows,
                 &h.socket_path,
-                &TabOpener::None,
+                &opener,
             )
             .map_err(|err| match err.downcast_ref::<PtyError>() {
                 Some(pty) => pty_err(pty),
@@ -5223,6 +5233,7 @@ fn parse_clipboard_op(s: &str) -> Result<ClipboardOp, HandlerError> {
 mod tests {
     use super::*;
     use crate::application::HangUp;
+    use crate::TabOpener;
     use roost_ipc::paths::BundleProfile;
     use std::collections::BTreeSet;
 
@@ -5545,7 +5556,7 @@ mod tests {
     }
 
     async fn identify_of(h: &IpcHandler) -> IdentifyResult {
-        let value = dispatch(h, ops::IDENTIFY, serde_json::json!({}))
+        let value = dispatch(h, None, ops::IDENTIFY, serde_json::json!({}))
             .await
             .expect("identify");
         serde_json::from_value(value).expect("decode identify")
@@ -5724,9 +5735,14 @@ mod tests {
         let h = forwarding_handler(dir.path(), Some(2));
         let before = h.workspace.snapshot().len();
 
-        let error = dispatch(&h, ops::TAB_OPEN, serde_json::json!({"project_id": "0"}))
-            .await
-            .expect_err("there is no UI to forward to");
+        let error = dispatch(
+            &h,
+            None,
+            ops::TAB_OPEN,
+            serde_json::json!({"project_id": "0"}),
+        )
+        .await
+        .expect_err("there is no UI to forward to");
         // It left through the forward, not through the local arm.
         assert_eq!(error.code, "internal", "{error:?}");
         assert_eq!(error.message, "no UI attached");
@@ -5745,7 +5761,9 @@ mod tests {
         mut params: serde_json::Value,
     ) -> roost_ipc::messages::Tab {
         params["argv"] = serde_json::json!(["/bin/sh", "-c", "exec sleep 60"]);
-        let result = dispatch(h, ops::TAB_OPEN, params).await.expect("tab.open");
+        let result = dispatch(h, None, ops::TAB_OPEN, params)
+            .await
+            .expect("tab.open");
         let TabOpenResult { tab } = serde_json::from_value(result).expect("a tab");
         opened.1.push(tab.id);
         tab
@@ -5954,7 +5972,7 @@ mod tests {
                 "argv": ["/bin/sh", "-c", "exit 0"],
                 "cwd_from_tab": bad,
             });
-            let error = dispatch(&h, ops::TAB_OPEN, params)
+            let error = dispatch(&h, None, ops::TAB_OPEN, params)
                 .await
                 .expect_err("a malformed id is refused");
             assert_eq!(error.code, codes::INVALID_PARAM, "{bad}: {error:?}");
@@ -5971,6 +5989,7 @@ mod tests {
         let before = h.workspace.snapshot().len();
         let error = dispatch(
             &h,
+            None,
             ops::PROJECT_CREATE,
             serde_json::json!({"name": "ghost", "cwd": "/tmp"}),
         )
@@ -5995,6 +6014,7 @@ mod tests {
         let before = h.workspace.snapshot().len();
         dispatch(
             &h,
+            None,
             ops::PROJECT_CREATE,
             serde_json::json!({"name": "ghost", "cwd": "/tmp"}),
         )
@@ -6014,6 +6034,7 @@ mod tests {
         for name in ["p", "ghost"] {
             let error = dispatch(
                 &h,
+                None,
                 ops::PROJECT_ENSURE,
                 serde_json::json!({"name": name, "cwd": "/tmp"}),
             )
@@ -6029,7 +6050,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let h = identify_handler(dir.path());
         let active = h.workspace.active();
-        let ensure = |params: serde_json::Value| dispatch(&h, ops::PROJECT_ENSURE, params);
+        let ensure = |params: serde_json::Value| dispatch(&h, None, ops::PROJECT_ENSURE, params);
 
         for params in [
             serde_json::json!({"name": " ", "cwd": "/tmp"}),
@@ -6071,6 +6092,7 @@ mod tests {
         let h = forwarding_handler(dir.path(), Some(2));
         let error = dispatch(
             &h,
+            None,
             ops::TAB_REORDER,
             serde_json::json!({"project_id": "h9.1", "tab_ids": ["h9.7"]}),
         )
@@ -6090,7 +6112,7 @@ mod tests {
     async fn a_rewrite_op_with_no_connected_slot_says_so() {
         let dir = tempfile::tempdir().unwrap();
         let h = forwarding_handler(dir.path(), None);
-        let error = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
+        let error = dispatch(&h, None, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
             .await
             .expect_err("no slot");
         assert_eq!(error.code, roost_ipc::local_route::SLOT_UNAVAILABLE_CODE);
@@ -6112,14 +6134,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let h = forwarding_handler(dir.path(), None);
 
-        let bare = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
+        let bare = dispatch(&h, None, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
             .await
             .expect_err("a bare id names a slot that is not there");
         assert_eq!(bare.code, roost_ipc::local_route::SLOT_UNAVAILABLE_CODE);
 
-        let qualified = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": "h9.7"}))
-            .await
-            .expect_err("there is no UI to read host 9's terminal");
+        let qualified = dispatch(
+            &h,
+            None,
+            ops::TAB_DUMP,
+            serde_json::json!({"tab_id": "h9.7"}),
+        )
+        .await
+        .expect_err("there is no UI to read host 9's terminal");
         assert_ne!(
             qualified.code,
             roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
@@ -6130,6 +6157,7 @@ mod tests {
         // The same for the ops that carry their own route parser.
         let reorder = dispatch(
             &h,
+            None,
             ops::TAB_REORDER,
             serde_json::json!({"project_id": "h9.1", "tab_ids": ["h9.7"]}),
         )
@@ -6140,6 +6168,7 @@ mod tests {
 
         let send_file = dispatch(
             &h,
+            None,
             ops::TAB_SEND_FILE,
             serde_json::json!({"tab": "h9.7", "paths": ["/tmp/x"]}),
         )
@@ -6601,6 +6630,194 @@ mod tests {
         identify_handler(dir).with_session(session_state().info, StopHandle::new(|| async {}))
     }
 
+    /// `tab.open` on `ctx` with a parked child, recorded for hang-up;
+    /// answers the new tab's id and the opener it was given.
+    async fn open_on(
+        h: &IpcHandler,
+        ctx: &mut ConnCtx,
+        opened: &mut HangUp,
+        mut params: serde_json::Value,
+    ) -> Result<(i64, TabOpener), HandlerError> {
+        params["argv"] = serde_json::json!(["/bin/sh", "-c", "exec sleep 60"]);
+        let reply = call(h, ctx, ops::TAB_OPEN, params).await?;
+        let TabOpenResult { tab } = serde_json::from_value(reply).expect("a tab");
+        opened.1.push(tab.id);
+        Ok((tab.id, h.workspace.tab_opener(tab.id).expect("the row")))
+    }
+
+    /// Plan 085 D4: the arm reads the connection it was asked on — a
+    /// bridged one's tab is remote with the preamble's values, a local
+    /// one's is what its `env` / `origin` state, or the baseline.
+    #[tokio::test]
+    async fn tab_open_takes_its_opener_from_the_connection_and_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = a_session(dir.path());
+        let mut opened = HangUp(h.supervisor.clone(), Vec::new());
+        let project = h.workspace.snapshot()[0].id.to_string();
+        let open = |extra: serde_json::Value| {
+            let mut params = serde_json::json!({"project_id": project});
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            params
+        };
+
+        let (mut bridged, _w) = ConnCtx::new(1);
+        bridged.bridge = Some(BridgeOrigin {
+            ssh_connection: Some("10.0.0.2 51000 10.0.0.1 22".into()),
+            ssh_client: Some("10.0.0.2 51000 22".into()),
+        });
+        let (_, opener) = open_on(&h, &mut bridged, &mut opened, open(serde_json::json!({})))
+            .await
+            .expect("a bridged open");
+        assert_eq!(
+            opener,
+            TabOpener::Remote {
+                ssh_connection: Some("10.0.0.2 51000 10.0.0.1 22".into()),
+                ssh_client: Some("10.0.0.2 51000 22".into()),
+            }
+        );
+
+        let (mut local, _w) = ConnCtx::new(2);
+        let cases = [
+            (serde_json::json!({}), TabOpener::None),
+            (
+                serde_json::json!({"env": {}}),
+                TabOpener::Local(Default::default()),
+            ),
+            (
+                serde_json::json!({"env": {"DISPLAY": ":1", "SSH_AUTH_SOCK": ""}}),
+                TabOpener::Local(
+                    [("DISPLAY", ":1"), ("SSH_AUTH_SOCK", "")]
+                        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                        .into(),
+                ),
+            ),
+            (
+                serde_json::json!({"origin": {"ssh_client": "10.0.0.3 52000 22"}}),
+                TabOpener::Remote {
+                    ssh_connection: None,
+                    ssh_client: Some("10.0.0.3 52000 22".into()),
+                },
+            ),
+        ];
+        for (extra, expected) in cases {
+            let (_, opener) = open_on(&h, &mut local, &mut opened, open(extra.clone()))
+                .await
+                .expect("a local open");
+            assert_eq!(opener, expected, "{extra}");
+        }
+
+        let refused = open_on(
+            &h,
+            &mut bridged,
+            &mut opened,
+            open(serde_json::json!({"env": {"DISPLAY": ":1"}})),
+        )
+        .await
+        .expect_err("env on a bridged connection");
+        assert_eq!(refused.code, codes::INVALID_PARAM, "{refused:?}");
+        assert!(refused.message.contains("bridged"), "{refused:?}");
+    }
+
+    /// Plan 085 D4: a refused opener — a refused name or value, or a
+    /// malformed `env` / `origin` — is refused before anything is
+    /// resolved (no default project, no tab, no selection, no write), and
+    /// never quotes a value it was sent.
+    #[tokio::test]
+    async fn a_refused_tab_open_mutates_nothing() {
+        const SECRET: &str = "100.99.88.77 54321 10.0.0.1 22";
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.json");
+        let h = IpcHandler::new(
+            Arc::new(Workspace::open(state.clone())),
+            Arc::new(PtySupervisor::new()),
+            dir.path().join("roost.sock"),
+            "Roost-test",
+            "ai.stridelabs.Roost.test",
+        );
+        let (mut bridged, _w) = ConnCtx::new(1);
+        bridged.bridge = Some(BridgeOrigin::default());
+        let (mut local, _w2) = ConnCtx::new(2);
+        let refusals = [
+            (
+                false,
+                serde_json::json!({"env": {"SSH_CONNECTION": "a b c d"}}),
+                "`SSH_CONNECTION`",
+            ),
+            (
+                false,
+                serde_json::json!({"env": {"PATH": "/bin"}}),
+                "`PATH`",
+            ),
+            (
+                false,
+                serde_json::json!({"env": {}, "origin": {}}),
+                "exclusive",
+            ),
+            (
+                false,
+                serde_json::json!({"origin": {"ssh_client": "a\0b"}}),
+                "`ssh_client`",
+            ),
+            (true, serde_json::json!({"origin": {}}), "bridged"),
+            (true, serde_json::json!({"env": {}}), "bridged"),
+            (
+                false,
+                serde_json::json!({"origin": []}),
+                "`origin` must be an object",
+            ),
+            (
+                false,
+                serde_json::json!({"origin": [SECRET, SECRET]}),
+                "`origin` must be an object",
+            ),
+            (
+                false,
+                serde_json::json!({"origin": SECRET}),
+                "`origin` must be an object",
+            ),
+            (
+                false,
+                serde_json::json!({"env": {"DISPLAY": [SECRET]}}),
+                "`env` must be an object",
+            ),
+            (
+                false,
+                serde_json::json!({"env": SECRET}),
+                "`env` must be an object",
+            ),
+        ];
+        for (on_bridge, extra, named) in refusals {
+            let ctx = if on_bridge { &mut bridged } else { &mut local };
+            let mut params = extra.clone();
+            params["project_id"] = "0".into();
+            params["cwd"] = dir.path().to_string_lossy().into_owned().into();
+            params["argv"] = serde_json::json!(["/bin/sh", "-c", "exec sleep 60"]);
+            let refused = match call(&h, ctx, ops::TAB_OPEN, params).await {
+                Ok(reply) => {
+                    // Hung up before the failure unwinds: a live child
+                    // would hold the runtime's drop instead of failing.
+                    let TabOpenResult { tab } = serde_json::from_value(reply).expect("a tab");
+                    drop(HangUp(h.supervisor.clone(), vec![tab.id]));
+                    panic!("{extra} opened tab {}", tab.id);
+                }
+                Err(refused) => refused,
+            };
+            assert_eq!(refused.code, codes::INVALID_PARAM, "{extra}: {refused:?}");
+            assert!(refused.message.contains(named), "{extra}: {refused:?}");
+            assert!(!refused.message.contains(SECRET), "{extra}: {refused:?}");
+            assert_eq!(
+                h.workspace.snapshot_with_revision(),
+                (0, Vec::new()),
+                "{extra}"
+            );
+            assert_eq!(h.workspace.active(), (0, 0), "{extra}");
+            assert!(!state.exists(), "{extra}: nothing was written");
+        }
+    }
+
     /// Plan 084 D1: `client.hello` answers whether the connection came
     /// through a bridge, records the client, and names it to the ops that
     /// act for "this connection's client".
@@ -6627,7 +6844,7 @@ mod tests {
         );
 
         let (mut bridged, _w) = ConnCtx::new(2);
-        bridged.bridge = Some(roost_ipc::messages::BridgeOrigin::default());
+        bridged.bridge = Some(BridgeOrigin::default());
         let reply = call(
             &h,
             &mut bridged,
@@ -6934,7 +7151,7 @@ mod tests {
             .expect("subscribe");
 
         let listed: TabListResult = serde_json::from_value(
-            dispatch(&h, ops::TAB_LIST, serde_json::json!({}))
+            dispatch(&h, None, ops::TAB_LIST, serde_json::json!({}))
                 .await
                 .unwrap(),
         )
@@ -6959,7 +7176,7 @@ mod tests {
                 }
             }
         });
-        let listed = dispatch(&h, ops::TAB_LIST, serde_json::json!({}))
+        let listed = dispatch(&h, None, ops::TAB_LIST, serde_json::json!({}))
             .await
             .expect("the slot answered");
         assert_eq!(listed, serde_json::json!({"projects": []}));
@@ -7002,6 +7219,7 @@ mod tests {
             });
             let answered = dispatch(
                 &h,
+                None,
                 ops::TAB_MEMORY_USAGE,
                 serde_json::json!({"tab_id": sent}),
             )
@@ -7094,6 +7312,7 @@ mod tests {
         for tab_id in ["7", "h2.7"] {
             let dumped = dispatch(
                 &h,
+                None,
                 ops::TAB_DUMP,
                 serde_json::json!({"tab_id": tab_id, "scrollback": 50}),
             )
@@ -7126,9 +7345,14 @@ mod tests {
             (identify_handler(in_process.path()), "h2.7"),
         ] {
             let (h, asks) = dump_app(h, no_terminal, Ok(serde_json::json!({})));
-            let error = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": tab_id}))
-                .await
-                .expect_err("no terminal, and no slot to ask");
+            let error = dispatch(
+                &h,
+                None,
+                ops::TAB_DUMP,
+                serde_json::json!({"tab_id": tab_id}),
+            )
+            .await
+            .expect_err("no terminal, and no slot to ask");
             assert_eq!(error.code, "not-found", "{tab_id}: {error:?}");
             assert_eq!(error.message, format!("tab {tab_id} has no live terminal"));
             assert!(asks.lock().unwrap().forwarded.is_empty(), "{tab_id}");
@@ -7151,7 +7375,13 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (h, asks) = dump_app(handler(dir.path()), no_terminal, Ok(serde_json::json!({})));
-            let _ = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": tab_id})).await;
+            let _ = dispatch(
+                &h,
+                None,
+                ops::TAB_DUMP,
+                serde_json::json!({"tab_id": tab_id}),
+            )
+            .await;
 
             let asks = asks.lock().unwrap();
             let asked = WireTabRef::parse(tab_id).unwrap();
@@ -7174,7 +7404,7 @@ mod tests {
             |_| DumpError::Read("read scrollback rows: vt error".into()),
             Ok(serde_json::json!({})),
         );
-        let error = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
+        let error = dispatch(&h, None, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
             .await
             .expect_err("the read failed");
         assert_eq!(error.code, "internal", "{error:?}");
@@ -7196,7 +7426,7 @@ mod tests {
                 "session is shutting down",
             )),
         );
-        let error = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
+        let error = dispatch(&h, None, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
             .await
             .expect_err("the session refused");
         assert_eq!(error.code, "shutting-down", "{error:?}");
@@ -7315,20 +7545,20 @@ mod tests {
         );
         let before = h.workspace.snapshot();
 
-        let refused = dispatch(&h, ops::PROJECT_CREATE, create("ghost"))
+        let refused = dispatch(&h, None, ops::PROJECT_CREATE, create("ghost"))
             .await
             .expect_err("a switch is in flight");
         assert_busy(&refused);
         assert_eq!(h.workspace.snapshot(), before, "the refusal landed nothing");
-        dispatch(&h, ops::TAB_LIST, serde_json::json!({}))
+        dispatch(&h, None, ops::TAB_LIST, serde_json::json!({}))
             .await
             .expect("a read never touches the gate");
 
         cell.store(LocalRoute::default());
-        dispatch(&h, ops::PROJECT_CREATE, create("real"))
+        dispatch(&h, None, ops::PROJECT_CREATE, create("real"))
             .await
             .expect("with no phase the create lands");
-        dispatch(&h, ops::TAB_LIST, serde_json::json!({}))
+        dispatch(&h, None, ops::TAB_LIST, serde_json::json!({}))
             .await
             .expect("and the read still answers");
         assert_eq!(h.workspace.snapshot().len(), before.len() + 1);
@@ -7349,7 +7579,7 @@ mod tests {
                 (ops::PROJECT_CREATE, create("ghost")),
                 (ops::TAB_LIST, serde_json::json!({})),
             ] {
-                let error = dispatch(h, op, params)
+                let error = dispatch(h, None, op, params)
                     .await
                     .expect_err("there is no UI to forward to");
                 answers.push((error.code, error.message));
@@ -7383,7 +7613,7 @@ mod tests {
 
         let crossing = tokio::spawn({
             let h = Arc::clone(&h);
-            async move { dispatch(&h, ops::PROJECT_CREATE, create("crossing")).await }
+            async move { dispatch(&h, None, ops::PROJECT_CREATE, create("crossing")).await }
         });
         pause.reached.notified().await;
 
@@ -7411,11 +7641,11 @@ mod tests {
         assert_eq!(h.workspace.snapshot(), before, "nothing landed");
 
         assert_busy(
-            &dispatch(&h, ops::PROJECT_CREATE, create("after"))
+            &dispatch(&h, None, ops::PROJECT_CREATE, create("after"))
                 .await
                 .expect_err("the phase is up"),
         );
-        dispatch(&h, ops::TAB_LIST, serde_json::json!({}))
+        dispatch(&h, None, ops::TAB_LIST, serde_json::json!({}))
             .await
             .expect("reads still answer");
     }

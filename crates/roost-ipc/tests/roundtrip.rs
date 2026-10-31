@@ -53,6 +53,8 @@ fn tab_open_request_envelope_uses_string_ids() {
         title: "".into(),
         activate: None,
         cwd_from_tab: None,
+        env: None,
+        origin: None,
     };
     let json = serde_json::to_value(&params).unwrap();
     assert_eq!(json["project_id"], "17");
@@ -64,10 +66,36 @@ fn tab_open_request_envelope_uses_string_ids() {
 /// carry stays absent.
 #[test]
 fn tab_open_vectors_decode_and_re_encode_to_themselves() {
-    for (name, activate, cwd_from_tab) in [
-        ("tab.open.request.json", None, None),
-        ("tab.open.activate-false.request.json", Some(false), None),
-        ("tab.open.cwd-from-tab.request.json", None, Some(5)),
+    let env = Some(
+        [
+            ("DISPLAY", ":1"),
+            ("WAYLAND_DISPLAY", "/run/user/1000/wayland-1"),
+        ]
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .into(),
+    );
+    let origin = Some(TabOrigin {
+        ssh_connection: Some("100.1.2.3 51000 100.9.8.7 22".into()),
+        ssh_client: Some("100.1.2.3 51000 22".into()),
+    });
+    for (name, activate, cwd_from_tab, env, origin) in [
+        ("tab.open.request.json", None, None, None, None),
+        (
+            "tab.open.activate-false.request.json",
+            Some(false),
+            None,
+            None,
+            None,
+        ),
+        (
+            "tab.open.cwd-from-tab.request.json",
+            None,
+            Some(5),
+            None,
+            None,
+        ),
+        ("tab.open.env.request.json", None, None, env, None),
+        ("tab.open.origin.request.json", None, None, None, origin),
     ] {
         let path = format!(
             "{}/../../tests/ipc-vectors/{name}",
@@ -79,6 +107,8 @@ fn tab_open_vectors_decode_and_re_encode_to_themselves() {
         let params: TabOpenParams = serde_json::from_value(request.params.clone()).expect(name);
         assert_eq!(params.activate, activate, "{name}");
         assert_eq!(params.cwd_from_tab, cwd_from_tab, "{name}");
+        assert_eq!(params.env, env, "{name}");
+        assert_eq!(params.origin, origin, "{name}");
         assert_eq!(
             serde_json::to_value(&params).unwrap(),
             request.params,

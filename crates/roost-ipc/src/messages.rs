@@ -15,6 +15,7 @@
 //! to add fields in a backwards-compatible way.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
@@ -393,6 +394,86 @@ pub struct TabOpenParams {
     )]
     #[schemars(with = "Option<String>")]
     pub cwd_from_tab: Option<i64>,
+    /// A local opener's display, bus and agent values
+    /// ([`crate::opener::LOCAL_SET`] names only); `{}` states a local
+    /// opener that brings none. See `ipc.md`'s "Tab environment".
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "env_values"
+    )]
+    pub env: Option<BTreeMap<String, String>>,
+    /// The caller declaring itself remote, with its SSH identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<TabOrigin>,
+}
+
+/// A `tab.open` caller's own `SSH_CONNECTION` / `SSH_CLIENT`. Closed,
+/// unlike [`BridgeOrigin`]: a misspelt key here would otherwise open a
+/// remote tab that silently carries nothing.
+///
+/// Decoded by hand: a derived struct deserializer also takes a positional
+/// array, and its type errors quote the value they refused — here an SSH
+/// client's address.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TabOrigin {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_connection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_client: Option<String>,
+}
+
+const TAB_ORIGIN_SHAPE: &str =
+    "`origin` must be an object whose `ssh_connection` and `ssh_client` are strings";
+
+impl<'de> Deserialize<'de> for TabOrigin {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let Value::Object(map) = Value::deserialize(deserializer)? else {
+            return Err(D::Error::custom(TAB_ORIGIN_SHAPE));
+        };
+        let mut origin = TabOrigin::default();
+        for (key, value) in map {
+            let slot = match key.as_str() {
+                "ssh_connection" => &mut origin.ssh_connection,
+                "ssh_client" => &mut origin.ssh_client,
+                _ => {
+                    return Err(D::Error::unknown_field(
+                        &key,
+                        &["ssh_connection", "ssh_client"],
+                    ))
+                }
+            };
+            *slot = match value {
+                Value::Null => None,
+                Value::String(value) => Some(value),
+                _ => return Err(D::Error::custom(TAB_ORIGIN_SHAPE)),
+            };
+        }
+        Ok(origin)
+    }
+}
+
+/// `TabOpenParams.env`'s decoder: an object of strings, or null. Its
+/// refusal names the shape, never a value serde would have quoted.
+fn env_values<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, String>>, D::Error> {
+    use serde::de::Error;
+    const SHAPE: &str = "`env` must be an object whose values are strings";
+    match Option::<Value>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Value::Object(map)) => map
+            .into_iter()
+            .map(|(name, value)| match value {
+                Value::String(value) => Ok((name, value)),
+                _ => Err(D::Error::custom(SHAPE)),
+            })
+            .collect::<Result<_, _>>()
+            .map(Some),
+        Some(_) => Err(D::Error::custom(SHAPE)),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -5448,6 +5529,8 @@ mod tests {
             title: String::new(),
             activate: None,
             cwd_from_tab: None,
+            env: None,
+            origin: None,
         };
         let before = r#"{"project_id":"17","cwd":"/tmp","argv":["/bin/zsh"],"cols":120,"rows":30,"title":""}"#;
         assert_eq!(serde_json::to_string(&params).unwrap(), before);
@@ -5479,6 +5562,140 @@ mod tests {
             assert_eq!(json["cwd_from_tab"], id.to_string(), "{json}");
             round_trip(&params);
         }
+    }
+
+    /// Plan 085 D4: absent, `env` and `origin` leave the request the
+    /// bytes it always was; set, each rides as its own key.
+    #[test]
+    fn tab_open_env_and_origin_are_on_the_wire_only_when_set() {
+        let mut params = TabOpenParams {
+            project_id: 3,
+            ..Default::default()
+        };
+        let bare = r#"{"project_id":"3","cwd":"","argv":[],"cols":0,"rows":0,"title":""}"#;
+        assert_eq!(serde_json::to_string(&params).unwrap(), bare);
+        assert_eq!(serde_json::from_str::<TabOpenParams>(bare).unwrap(), params);
+
+        params.env = Some(BTreeMap::new());
+        assert!(
+            serde_json::to_string(&params)
+                .unwrap()
+                .ends_with(r#","title":"","env":{}}"#),
+            "an empty env is still stated"
+        );
+        params.env = Some(
+            [("DISPLAY", ":1"), ("SSH_AUTH_SOCK", "")]
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .into(),
+        );
+        assert!(serde_json::to_string(&params)
+            .unwrap()
+            .ends_with(r#","env":{"DISPLAY":":1","SSH_AUTH_SOCK":""}}"#));
+        round_trip(&params);
+
+        params.env = None;
+        params.origin = Some(TabOrigin {
+            ssh_connection: Some("10.0.0.2 51000 10.0.0.1 22".into()),
+            ssh_client: None,
+        });
+        assert!(serde_json::to_string(&params)
+            .unwrap()
+            .ends_with(r#","origin":{"ssh_connection":"10.0.0.2 51000 10.0.0.1 22"}}"#));
+        round_trip(&params);
+
+        let decoded: TabOpenParams = serde_json::from_str(
+            r#"{"project_id":"3","env":null,"origin":{"ssh_client":"a b c"}}"#,
+        )
+        .unwrap();
+        assert_eq!(decoded.env, None, "null is unset");
+        assert_eq!(
+            decoded.origin,
+            Some(TabOrigin {
+                ssh_connection: None,
+                ssh_client: Some("a b c".into())
+            })
+        );
+    }
+
+    /// A misspelt `origin` key is refused rather than read as a remote
+    /// opener with no values ([`BridgeOrigin`] is the open one).
+    #[test]
+    fn tab_origin_refuses_an_unknown_key() {
+        let error = serde_json::from_str::<TabOpenParams>(
+            r#"{"project_id":"1","origin":{"ssh_conection":"a b c d"}}"#,
+        )
+        .expect_err("an unknown origin key");
+        assert!(
+            error.to_string().contains("unknown field `ssh_conection`"),
+            "{error}"
+        );
+        assert!(serde_json::from_str::<TabOrigin>(r#"{"ssh_tty":"/dev/pts/1"}"#).is_err());
+        assert!(
+            serde_json::from_str::<BridgeOrigin>(r#"{"ssh_tty":"/dev/pts/1"}"#).is_ok(),
+            "the control: the preamble's origin stays open"
+        );
+    }
+
+    /// Plan 085 D4: `env` and `origin` are objects or nothing, and a
+    /// refused shape names the field, never the value it carried.
+    #[test]
+    fn tab_open_env_and_origin_refuse_any_other_shape_without_quoting_it() {
+        const SECRET: &str = "100.99.88.77 54321 10.0.0.1 22";
+        let shapes = [
+            ("origin", "[]".to_string()),
+            ("origin", format!(r#"["{SECRET}","{SECRET}"]"#)),
+            ("origin", format!(r#""{SECRET}""#)),
+            ("origin", "987654321".to_string()),
+            ("origin", "true".to_string()),
+            ("origin", r#"{"ssh_connection":987654321}"#.to_string()),
+            ("origin", format!(r#"{{"ssh_client":["{SECRET}"]}}"#)),
+            ("origin", format!(r#"{{"ssh_client":{{"x":"{SECRET}"}}}}"#)),
+            ("env", "[]".to_string()),
+            ("env", format!(r#"["{SECRET}"]"#)),
+            ("env", format!(r#""{SECRET}""#)),
+            ("env", "987654321".to_string()),
+            ("env", r#"{"DISPLAY":987654321}"#.to_string()),
+            ("env", format!(r#"{{"DISPLAY":["{SECRET}"]}}"#)),
+            ("env", r#"{"DISPLAY":null}"#.to_string()),
+        ];
+        for (field, shape) in shapes {
+            let text = format!(r#"{{"project_id":"1","{field}":{shape}}}"#);
+            let message =
+                serde_json::from_value::<TabOpenParams>(serde_json::from_str(&text).unwrap())
+                    .expect_err(&text)
+                    .to_string();
+            assert!(
+                message.starts_with(&format!("`{field}` must be an object")),
+                "{text}: {message}"
+            );
+            assert!(
+                !message.contains(SECRET) && !message.contains("987654321"),
+                "{text}: {message}"
+            );
+        }
+
+        let text = format!(r#"{{"project_id":"1","origin":{{"ssh_cliënt":"{SECRET}"}}}}"#);
+        let message = serde_json::from_value::<TabOpenParams>(serde_json::from_str(&text).unwrap())
+            .expect_err("an unknown origin key")
+            .to_string();
+        assert!(
+            message.starts_with("unknown field `ssh_cliënt`"),
+            "{message}"
+        );
+        assert!(!message.contains(SECRET), "{message}");
+
+        let decoded: TabOpenParams = serde_json::from_str(
+            r#"{"project_id":"1","origin":{"ssh_connection":null,"ssh_client":"a b c"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.origin,
+            Some(TabOrigin {
+                ssh_connection: None,
+                ssh_client: Some("a b c".into())
+            }),
+            "the control: an object with a null and a string decodes"
+        );
     }
 
     #[test]

@@ -458,9 +458,17 @@ without a restart.
 
 ## Environment variables Roost sets
 
-When Roost spawns a tab's shell, it injects the following. Existing
-environment is inherited verbatim *before* these are set — the user's
-own values for `TERM_PROGRAM_VERSION` etc. would be overwritten;
+When Roost spawns a tab's shell, it injects the following. The rest of
+a tab's environment is **built per tab**, not inherited verbatim: it is
+the serving process's environment minus `DISPLAY`, `WAYLAND_DISPLAY`,
+`DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, `SSH_CONNECTION`,
+`SSH_CLIENT` and `SSH_TTY`, which come only from whoever opened the tab
+(a desk opener's display, bus and agent; a remote opener's two `SSH_*`
+values) — see [Tab environment](ipc.md#tab-environment) for who that is.
+`SHELL` is the passwd shell. (Roost-Iced and `roost-session`; the
+frozen Swift app still inherits its own environment whole.) The
+variables below are set on top — the user's own values for
+`TERM_PROGRAM_VERSION` etc. would be overwritten;
 `ROOST_SHELL_FEATURES` is the only one that defers to a pre-existing
 value (you can opt out of the default features by setting it in your
 rc — see [Feature flags](../guides/cwd-tracking.md#feature-flags)).

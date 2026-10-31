@@ -155,7 +155,9 @@ class Roost:
                  cols: int = 80, rows: int = 24,
                  argv: list[str] | None = None,
                  activate: bool | None = None,
-                 cwd_from_tab: int | None = None) -> int:
+                 cwd_from_tab: int | None = None,
+                 env: dict[str, str] | None = None,
+                 origin: dict[str, str | None] | None = None) -> int:
         params = {"project_id": str(project_id), "cwd": cwd,
                   "title": title, "cols": cols, "rows": rows}
         if argv:
@@ -164,6 +166,10 @@ class Roost:
             params["activate"] = activate
         if cwd_from_tab is not None:
             params["cwd_from_tab"] = str(cwd_from_tab)
+        if env is not None:
+            params["env"] = env
+        if origin is not None:
+            params["origin"] = origin
         r = self.call("tab.open", params)
         return int(r["tab"]["id"])
 

@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 
+use roost_ipc::messages::{BridgeOrigin, TabOrigin};
 use roost_ipc::opener::{
     check_local, check_remote, is_ssh_context, local_set_from, remote_value_from, OpenerValueError,
 };
@@ -94,13 +95,7 @@ impl PersistedOpener {
             Self::Local(values) => values
                 .iter()
                 .try_for_each(|(name, value)| check_local(name, value)),
-            Self::Remote(remote) => [
-                ("ssh_connection", &remote.ssh_connection),
-                ("ssh_client", &remote.ssh_client),
-            ]
-            .into_iter()
-            .filter_map(|(name, value)| Some((name, value.as_deref()?)))
-            .try_for_each(|(name, value)| check_remote(name, value)),
+            Self::Remote(remote) => check_remote_pair(&remote.ssh_connection, &remote.ssh_client),
         }
     }
 }
@@ -166,6 +161,74 @@ pub fn restore_opener(
             _ => TabOpener::Local(saved.clone()),
         },
     }
+}
+
+/// Why a `tab.open` was refused before anything opened (D4).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OpenerRefused {
+    #[error("a bridged connection's opener is its bridge: `env` and `origin` are refused on it")]
+    Bridged,
+    #[error("`env` and `origin` are exclusive: a tab has one opener")]
+    Both,
+    #[error("`env`: {0}")]
+    Env(OpenerValueError),
+    #[error("`origin`: {0}")]
+    Origin(OpenerValueError),
+    #[error("the bridge preamble: {0}")]
+    Bridge(OpenerValueError),
+}
+
+/// The opener of a `tab.open` that arrived on a connection `bridge` says
+/// came through a client bridge (or `None`, a local one), with the
+/// request's own `env` and `origin`: a bridged connection's opener is its
+/// bridge, a local caller states one of the two or neither (the
+/// baseline). Every value is held to D2's rules first.
+pub fn opener_for(
+    bridge: Option<&BridgeOrigin>,
+    env: Option<&BTreeMap<String, String>>,
+    origin: Option<&TabOrigin>,
+) -> Result<TabOpener, OpenerRefused> {
+    match (bridge, env, origin) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(OpenerRefused::Bridged),
+        (None, Some(_), Some(_)) => Err(OpenerRefused::Both),
+        (Some(bridge), None, None) => {
+            remote(&bridge.ssh_connection, &bridge.ssh_client).map_err(OpenerRefused::Bridge)
+        }
+        (None, None, Some(origin)) => {
+            remote(&origin.ssh_connection, &origin.ssh_client).map_err(OpenerRefused::Origin)
+        }
+        (None, Some(env), None) => {
+            env.iter()
+                .try_for_each(|(name, value)| check_local(name, value))
+                .map_err(OpenerRefused::Env)?;
+            Ok(TabOpener::Local(env.clone()))
+        }
+        (None, None, None) => Ok(TabOpener::None),
+    }
+}
+
+fn remote(
+    ssh_connection: &Option<String>,
+    ssh_client: &Option<String>,
+) -> Result<TabOpener, OpenerValueError> {
+    check_remote_pair(ssh_connection, ssh_client)?;
+    Ok(TabOpener::Remote {
+        ssh_connection: ssh_connection.clone(),
+        ssh_client: ssh_client.clone(),
+    })
+}
+
+fn check_remote_pair(
+    ssh_connection: &Option<String>,
+    ssh_client: &Option<String>,
+) -> Result<(), OpenerValueError> {
+    [
+        ("ssh_connection", ssh_connection),
+        ("ssh_client", ssh_client),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| Some((name, value.as_deref()?)))
+    .try_for_each(|(name, value)| check_remote(name, value))
 }
 
 #[cfg(test)]
@@ -399,5 +462,145 @@ mod tests {
                 "{starter:?}"
             );
         }
+    }
+
+    fn bridge(connection: Option<&str>, client: Option<&str>) -> BridgeOrigin {
+        BridgeOrigin {
+            ssh_connection: connection.map(str::to_owned),
+            ssh_client: client.map(str::to_owned),
+        }
+    }
+
+    fn origin(connection: Option<&str>, client: Option<&str>) -> TabOrigin {
+        TabOrigin {
+            ssh_connection: connection.map(str::to_owned),
+            ssh_client: client.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_bridged_open_is_remote_with_the_preambles_values() {
+        let preamble = bridge(Some("a b c d"), Some("a b c"));
+        assert_eq!(
+            opener_for(Some(&preamble), None, None),
+            Ok(remote("a b c d", "a b c"))
+        );
+        assert_eq!(
+            opener_for(Some(&BridgeOrigin::default()), None, None),
+            Ok(TabOpener::Remote {
+                ssh_connection: None,
+                ssh_client: None
+            }),
+            "a bridge with no SSH identity is still remote"
+        );
+    }
+
+    #[test]
+    fn a_bridged_open_refuses_env_or_origin() {
+        let preamble = bridge(Some("a b c d"), None);
+        let env = map(&[("DISPLAY", ":1")]);
+        let declared = origin(Some("e f g h"), None);
+        for (env, origin) in [
+            (Some(&env), None),
+            (Some(&BTreeMap::new()), None),
+            (None, Some(&declared)),
+            (Some(&env), Some(&declared)),
+        ] {
+            assert_eq!(
+                opener_for(Some(&preamble), env, origin),
+                Err(OpenerRefused::Bridged),
+                "{env:?} {origin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_open_states_one_opener_or_none() {
+        let env = map(&[("DISPLAY", ":1"), ("SSH_AUTH_SOCK", "")]);
+        assert_eq!(
+            opener_for(None, Some(&env), None),
+            Ok(TabOpener::Local(env.clone()))
+        );
+        assert_eq!(
+            opener_for(None, Some(&BTreeMap::new()), None),
+            Ok(TabOpener::Local(BTreeMap::new())),
+            "`{{}}` is a value-less local opener, not the baseline"
+        );
+        assert_eq!(
+            opener_for(None, None, Some(&origin(Some("a b c d"), None))),
+            Ok(TabOpener::Remote {
+                ssh_connection: Some("a b c d".into()),
+                ssh_client: None
+            })
+        );
+        assert_eq!(opener_for(None, None, None), Ok(TabOpener::None));
+        assert_eq!(
+            opener_for(None, Some(&env), Some(&origin(None, None))),
+            Err(OpenerRefused::Both)
+        );
+    }
+
+    #[test]
+    fn a_local_env_refuses_any_name_outside_the_local_set() {
+        for name in [
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+            "SSH_AUTH_SOCKX",
+            "PATH",
+        ] {
+            let env = map(&[("DISPLAY", ":1"), (name, "x")]);
+            let refused = opener_for(None, Some(&env), None).expect_err(name);
+            assert_eq!(
+                refused,
+                OpenerRefused::Env(OpenerValueError::NotLocal(name.into()))
+            );
+            assert!(
+                refused.to_string().contains(&format!("`{name}`")),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_value_is_held_to_the_value_rules() {
+        let nul = map(&[("DISPLAY", ":1\0")]);
+        assert_eq!(
+            opener_for(None, Some(&nul), None),
+            Err(OpenerRefused::Env(OpenerValueError::Nul("DISPLAY".into())))
+        );
+        let long_local = "x".repeat(roost_ipc::opener::MAX_LOCAL_VALUE + 1);
+        assert!(matches!(
+            opener_for(None, Some(&map(&[("SSH_AUTH_SOCK", &long_local)])), None),
+            Err(OpenerRefused::Env(OpenerValueError::TooLong { .. }))
+        ));
+        let at_limit = "x".repeat(roost_ipc::opener::MAX_LOCAL_VALUE);
+        assert!(opener_for(None, Some(&map(&[("SSH_AUTH_SOCK", &at_limit)])), None).is_ok());
+
+        let long = "x".repeat(roost_ipc::opener::MAX_ORIGIN_VALUE + 1);
+        assert_eq!(
+            opener_for(None, None, Some(&origin(None, Some(&long)))),
+            Err(OpenerRefused::Origin(OpenerValueError::TooLong {
+                name: "ssh_client".into(),
+                len: long.len(),
+                max: roost_ipc::opener::MAX_ORIGIN_VALUE
+            }))
+        );
+        assert_eq!(
+            opener_for(None, None, Some(&origin(Some("a\0b"), None))),
+            Err(OpenerRefused::Origin(OpenerValueError::Nul(
+                "ssh_connection".into()
+            )))
+        );
+        assert_eq!(
+            opener_for(Some(&bridge(Some("a\0b"), None)), None, None),
+            Err(OpenerRefused::Bridge(OpenerValueError::Nul(
+                "ssh_connection".into()
+            )))
+        );
+        assert!(matches!(
+            opener_for(Some(&bridge(None, Some(&long))), None, None),
+            Err(OpenerRefused::Bridge(OpenerValueError::TooLong { .. }))
+        ));
     }
 }

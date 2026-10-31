@@ -1756,6 +1756,8 @@ fn host_tab_open_params(
         title: title.to_string(),
         activate: None,
         cwd_from_tab,
+        env: None,
+        origin: None,
     })
     .expect("tab.open params serialize")
 }
