@@ -18,6 +18,9 @@
 //!   order, flushed with errors when the connection dies.
 //! * [`task`] — the connection owner that wires the three to a socket.
 //!
+//! The first three live in the `roost-client` crate and are re-exported
+//! here under their old paths; the task stays in this crate.
+//!
 //! # Incarnations
 //!
 //! [`HostId`] identifies a connection *instance*, not a host

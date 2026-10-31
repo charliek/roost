@@ -16,6 +16,7 @@ host-sessions, started with `roostctl session start`.
 * Linux UI (shipped): Rust + iced, `crates/roost-iced/` (packaged as `/usr/bin/roost`).
 * CLI: `crates/roost-cli/` (binary `roostctl`).
 * IPC + path resolution: `crates/roost-ipc/`.
+* Host-session client core: `crates/roost-client/` (state machine, mirror, reconnect, op queue, uploads; `roost-iced` is its consumer).
 * libghostty-vt FFI + OSC: `crates/roost-vt/`, `crates/roost-osc/`.
 
 **North star.** Every surface — UI clicks, hotkeys, `roostctl`, and Lua
@@ -184,7 +185,9 @@ wrapper small.
   (default `~/.local/state/roost/roost.log`) **and** tees to stdout
   (synchronous file appender in `crates/roost-iced/src/main.rs`, so
   entries survive a crash). `tail -f` it while reproducing; set
-  `RUST_LOG=info,roost_ipc=debug` to adjust.
+  `RUST_LOG=info,roost_ipc=debug` to adjust. The host-client modules
+  (`roost-client`) log under `roost_client`, so add `roost_client=debug` to
+  see their debug lines.
 - **IPC wire trace**: launch the UI with `RUST_LOG=roost_ipc=debug`
   (Linux) or `OS_ACTIVITY_MODE=disable` + `swift run` (Mac) to see
   per-frame logging. The wire format is human-readable JSON; `nc -U`

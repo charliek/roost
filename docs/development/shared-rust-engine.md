@@ -115,5 +115,15 @@ step covers `roost-engine` (gtk4/libadwaita/iced) and additionally
 renderer-independent `roost_vt::ColorRgb`; enabling libghostty-vt FFI remains a
 UI-adapter choice.
 
+`roost-client` (the host-session client core, which `roost-iced` consumes and
+a future mobile client will link) must build on its own and depend on no UI
+crate: not `roost-iced`, `iced`, `iced_*` or `winit`, nor the toolkit names
+above. CI checks it in `rust-build` rather than `iced-build-e2e`: `cargo build
+-p roost-client`, then a walk of the `cargo metadata --all-features` resolve
+graph over normal and build edges that names any offender, plus a `cargo tree`
+check that it does not turn on `roost-vt`'s `ffi` feature (no libghostty
+archive is needed). Locally, `make check-iced` runs a `cargo tree` check of the
+same deny list.
+
 `roost-iced` depends on `roost-engine`; neither shared crate depends back on
 the adapter.

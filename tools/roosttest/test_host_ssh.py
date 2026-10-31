@@ -272,7 +272,7 @@ def _install_wrapper() -> None:
     os.environ["ROOST_SSH_BIN"] = str(SSH_WRAPPER)
     # Beside it, and for the same reason: the reconnect ladder reads
     # these once, out of the UI process's own environment, and only under
-    # `ROOST_TEST_MODE=1` (`host_conn/reconnect.rs`) — which
+    # `ROOST_TEST_MODE=1` (`roost-client`'s `reconnect.rs`) — which
     # `make e2e-host-ssh` sets.
     #
     # Shipped, the ladder is ten attempts on a 1s base, and a give-up

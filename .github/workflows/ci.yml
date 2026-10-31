@@ -479,6 +479,69 @@ jobs:
           print("examples/ipc-consumer dependency isolation OK")
           PYEOF
 
+      # roost-client is the host-session client core the mobile client links
+      # (discovery/protocol-7-release.md, M5). It must build alone and reach
+      # no UI crate.
+      - name: Build roost-client on its own
+        run: cargo build -p roost-client
+
+      # The resolve graph of the root workspace, not the package list the
+      # ipc-consumer check scans: roost-client is a member, so its closure is
+      # walked over normal and build edges (dev edges are skipped; tests may
+      # use anything). --all-features makes the resolve a superset of every
+      # feature combination, so an optional dependency counts; metadata builds
+      # nothing, so the "never --all-features" rule for roost-iced does not
+      # apply. Names, not paths: a renamed dependency still counts.
+      - name: roost-client depends on no UI crate
+        run: |
+          cargo metadata --format-version 1 --all-features > /tmp/roost-client-metadata.json
+          python3 - <<'PYEOF'
+          import json
+          import sys
+
+          with open("/tmp/roost-client-metadata.json") as f:
+              metadata = json.load(f)
+
+          packages = {pkg["id"]: pkg for pkg in metadata["packages"]}
+          nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
+          roots = [pkg["id"] for pkg in metadata["packages"] if pkg["name"] == "roost-client"]
+          if len(roots) != 1 or roots[0] not in nodes:
+              sys.exit("roost-client is not in the resolved workspace graph")
+          seen, stack = set(), list(roots)
+          while stack:
+              node = stack.pop()
+              if node in seen:
+                  continue
+              seen.add(node)
+              for dep in nodes[node]["deps"]:
+                  if any(kind["kind"] in (None, "build") for kind in dep["dep_kinds"]):
+                      stack.append(dep["pkg"])
+
+          # The release doc's three, plus the UI-toolkit names the existing
+          # roost-engine and roost-ui-model boundary checks deny.
+          DENY = {"roost-iced", "iced", "winit", "gtk4", "libadwaita", "pango", "cairo-rs",
+                  "wgpu", "zbus", "arboard", "notify-rust"}
+          offenders = sorted(
+              {packages[i]["name"] for i in seen
+               if packages[i]["name"] in DENY or packages[i]["name"].startswith("iced_")}
+          )
+          if offenders:
+              sys.exit(
+                  "policy violation (discovery/protocol-7-release.md, M5): roost-client must "
+                  "not depend on roost-iced, iced, winit or a UI toolkit; found: " + ", ".join(offenders)
+              )
+          print(f"roost-client dependency graph OK ({len(seen)} packages)")
+          PYEOF
+          # Resolved on its own, roost-client must not turn on roost-vt's ffi
+          # (no libghostty archive). A per-package tree sees what the
+          # workspace metadata cannot: roost-session enables ffi workspace-wide.
+          cargo tree -p roost-client -e normal,build -e features --target all > /tmp/roost-client-features.txt
+          if grep -F 'roost-vt feature "ffi"' /tmp/roost-client-features.txt; then
+            echo "policy violation: roost-client enables roost-vt's ffi feature (needs libghostty)" >&2
+            exit 1
+          fi
+          echo "roost-client dependency isolation OK"
+
   swift-mac:
     needs: changes
     if: needs.changes.outputs.mac == 'true' || needs.changes.outputs.fixtures == 'true' || needs.changes.outputs.ci == 'true'
