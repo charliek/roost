@@ -97,6 +97,7 @@ os.environ["ROOST_SESSION_BIN"] = str(sessionlib.session_binary())
 
 atexit.register(shutil.rmtree, _ROOT, ignore_errors=True)
 
+import tab_env  # noqa: E402
 import ui  # noqa: E402
 from client import Roost, RoostError, scaled_timeout  # noqa: E402
 from eventstream import ENDED_EVENT, EventStream  # noqa: E402
@@ -359,6 +360,21 @@ def _restore_the_shared_ui(target):
 @pytest.fixture
 def lane(target):
     """One case's UI + session, wiped before and reaped after."""
+    with _lane(target, explicit=False) as made:
+        yield made
+
+
+@pytest.fixture
+def explicit_lane(target):
+    """[`lane`] whose own daemons start from a scrubbed, explicit
+    environment (`make_env(explicit=True)`), for the cases that read a
+    session tab's environment back (plan 085 D9)."""
+    with _lane(target, explicit=True) as made:
+        yield made
+
+
+@contextlib.contextmanager
+def _lane(target: str, *, explicit: bool):
     assert target == "iced", "this lane drives the Rust UI's switch verbs"
     state_dir = ui.session_state_dir()
     assert state_dir is not None, (
@@ -367,7 +383,7 @@ def lane(target):
         "XDG_RUNTIME_DIR there should never have been an instance to reuse"
     )
     env = sessionlib.make_env(
-        root=_ROOT, state_dir=state_dir / ui.DERIVED_SESSION_SUBDIR
+        root=_ROOT, state_dir=state_dir / ui.DERIVED_SESSION_SUBDIR, explicit=explicit
     )
     made = Lane(target=target, state_dir=state_dir, env=env)
     ui.quit(target)
@@ -3906,3 +3922,243 @@ def test_restarting_the_slot_keeps_its_layout_and_the_window(lane: Lane):
     assert shape() == before, "every project and tab reopens in its directory"
     assert roost.identify()["local_backend"] == "session"
     assert local_band(roost)["saved_id"] == slot
+
+
+# ---------------------------------------------------------------------------
+# 18. Plan 085 D7: a session tab's environment comes from who opened it
+# ---------------------------------------------------------------------------
+#
+# The session here is a foreground daemon this test starts, from a scrubbed
+# environment, before the UI: a direct child, so its tabs' environments can be
+# read (`tab_env.tab_process`), and already answering, so the UI connects to
+# it rather than spawning one of its own. Its pid is the one the *session*
+# socket's `identify` names, never the UI's.
+
+#: iced's own agent, bus and SSH login: fakes, distinct from every other
+#: opener here. Its display stays the harness's own.
+ICED_OPENER_ENV = {
+    "SSH_AUTH_SOCK": "/fake/iced/agent",
+    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/fake/iced/bus",
+    "SSH_CONNECTION": "100.93.0.1 50300 100.93.0.2 22",
+    "SSH_CLIENT": "100.93.0.1 50300 22",
+}
+#: A caller's local values, stated on the UI socket.
+CALLER_LOCAL = {"DISPLAY": ":61", "SSH_AUTH_SOCK": "/caller/agent", "DBUS_SESSION_BUS_ADDRESS": ""}
+#: A caller declaring itself remote on the UI socket.
+CALLER_ORIGIN = {"ssh_connection": "100.94.0.5 50400 100.94.0.1 22", "ssh_client": "100.94.0.5 50400 22"}
+CALLER_REMOTE = {"SSH_CONNECTION": CALLER_ORIGIN["ssh_connection"], "SSH_CLIENT": CALLER_ORIGIN["ssh_client"]}
+#: A saved local tab's values, as an in-process `state.json` holds them.
+SAVED_LOCAL = {"DISPLAY": ":12", "SSH_AUTH_SOCK": "/saved/agent"}
+#: A desk start of the session: a local starter with values.
+DESK_START = {
+    "DISPLAY": ":71",
+    "WAYLAND_DISPLAY": "/desk/run/wayland-7",
+    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/desk/bus",
+    "SSH_AUTH_SOCK": "/desk/agent",
+}
+#: A tab saved before tabs carried an opener.
+LEGACY_OPENER = object()
+
+
+def serve_session(lane: Lane, *, seed: bool = False, **context: str) -> sessionlib.Foreground:
+    """A foreground session on the sentinel, started in `context`,
+    answering. Unseeded unless `seed`: a switch's destination is then
+    exactly what the switch put there."""
+    if not seed:
+        context["ROOST_SESSION_NO_SEED"] = "1"
+    daemon = lane.env.start_foreground(**context)
+    verdict = daemon.verdict()
+    assert verdict.kind == "ready", verdict
+    lane.env.wait_answering()
+    return daemon
+
+
+def restart_session(lane: Lane, daemon: sessionlib.Foreground, **context: str) -> sessionlib.Foreground:
+    """The session stopped and started again in `context`, with the UI down
+    so nothing respawns it in between."""
+    ui.quit(lane.target)
+    lane.env.stop_over_the_wire()
+    daemon.wait()
+    lane.env.wait_socket_gone()
+    return serve_session(lane, **context)
+
+
+def session_tab_opener(lane: Lane, daemon: sessionlib.Foreground, tab: int) -> dict[str, str]:
+    """The opener-set variables session tab `tab` was exec'd with."""
+    with lane.session() as c:
+        pid = c.identify()["pid"]
+    assert pid == daemon.proc.pid, "the session socket is this test's daemon"
+    _, environ = tab_env.tab_process(pid, tab, binaries=[lane.env.binary])
+    return tab_env.opener_vars(environ)
+
+
+def session_tab_titled(lane: Lane, title: str) -> int:
+    matches = [
+        int(tab["id"])
+        for project in lane.session_projects()
+        for tab in project["tabs"]
+        if tab["title"] == title
+    ]
+    assert len(matches) == 1, f"session tabs titled {title!r}: {lane.session_projects()}"
+    return matches[0]
+
+
+def iced_opener(lane: Lane) -> dict[str, str]:
+    """What the running iced brings as a local opener, read from the
+    environment the harness exec'd it with."""
+    proc = ui.owned_process(lane.target)
+    assert proc is not None, "the harness launched this UI"
+    environ = tab_env.child_environ(proc.pid, binaries=[ui.rust_binary_path(lane.target)[0]])
+    assert environ["SSH_CONNECTION"] == ICED_OPENER_ENV["SSH_CONNECTION"], "the premise"
+    return tab_env.local_set_from(environ)
+
+
+def write_in_process_state(lane: Lane, tabs: list[tuple[str, object]]) -> None:
+    """An in-process `state.json` of one project whose tabs are
+    `(title, saved opener)`, each user-titled so the title names it on the
+    far side of a switch."""
+
+    def tab(position: int, title: str, opener: object) -> dict:
+        saved = {"title": title, "cwd": "/tmp", "position": position, "user_titled": True}
+        if opener is not LEGACY_OPENER:
+            saved["opener"] = opener
+        return saved
+
+    state = {
+        "next_id": 100,
+        "projects": [
+            {
+                "id": 1,
+                "name": "openers",
+                "cwd": "/tmp",
+                "position": 0,
+                "created_at": 1,
+                "tabs": [tab(position, *spec) for position, spec in enumerate(tabs)],
+            }
+        ],
+    }
+    (lane.state_dir / "state.json").write_text(json.dumps(state))
+
+
+def session_ui_over(lane: Lane) -> Roost:
+    """The UI up on `session` with iced's fake opener values, over the
+    session already serving, its slot's tab selected."""
+    roost = lane.start("session", wipe=False, extra_env=ICED_OPENER_ENV)
+    wait_until(
+        lambda: roost.identify()["active_tab_id"] != 0,
+        scaled_timeout(60.0),
+        "the UI to select the slot's tab",
+    )
+    return roost
+
+
+def test_a_forwarded_open_keeps_the_callers_opener(explicit_lane: Lane):
+    """Rule 4: a `tab.open` on the UI socket crosses to the session
+    verbatim, so the session tab has the caller's values, never iced's —
+    stated on the socket, and as `roostctl tab open` / `open` state them
+    at a desk and in an SSH login."""
+    lane = explicit_lane
+    daemon = serve_session(lane, seed=True)
+    roost = session_ui_over(lane)
+    project = int(roost.list()[0]["id"])
+    socket = str(ui.socket_path(lane.target))
+    sleep = tab_env.sleep_argv(600)
+
+    local = roost.open_tab(project, cwd="/tmp", argv=sleep, env=CALLER_LOCAL)
+    assert session_tab_opener(lane, daemon, local) == CALLER_LOCAL
+    remote = roost.open_tab(project, cwd="/tmp", argv=sleep, origin=CALLER_ORIGIN)
+    assert session_tab_opener(lane, daemon, remote) == CALLER_REMOTE
+
+    desk = {"DISPLAY": ":62", "SSH_AUTH_SOCK": "/roostctl/agent"}
+    login = {"SSH_CONNECTION": "100.95.0.6 50500 100.95.0.1 22", "SSH_CLIENT": "100.95.0.6 50500 22",
+             "DISPLAY": "localhost:12.0"}
+    for opener_env, expected in [
+        (desk, desk),
+        (login, {name: login[name] for name in ("SSH_CONNECTION", "SSH_CLIENT")}),
+    ]:
+        opened = util.explicit_roostctl("--socket", socket, "tab", "open", "--project-id", str(project),
+                                        "--cwd", "/tmp", "--", *sleep, env=opener_env)
+        assert opened.returncode == 0, opened
+        assert session_tab_opener(lane, daemon, int(opened.stdout)) == expected, opener_env
+        ensured = util.explicit_roostctl("--socket", socket, "open", "--project", "roostctl-openers",
+                                         "--cwd", "/tmp", "--", *sleep, env=opener_env)
+        assert ensured.returncode == 0, ensured
+        tab = int(json.loads(ensured.stdout)["tab"]["id"])
+        assert session_tab_opener(lane, daemon, tab) == expected, opener_env
+
+
+def test_a_tab_iced_opens_on_the_session_has_iceds_values(explicit_lane: Lane):
+    """D7: on this machine's session iced states itself — its local values,
+    none of its own `SSH_*` though it was started in an SSH login."""
+    lane = explicit_lane
+    daemon = serve_session(lane, seed=True)
+    roost = session_ui_over(lane)
+    with lane.session() as c:
+        before = set(session_tab_ids(lane))
+        util.press_new_tab(roost)
+        tab = util.spawned_tab_id(c, before, "the palette's new tab on the session", timeout=30.0)
+    assert session_tab_opener(lane, daemon, tab) == iced_opener(lane)
+
+
+def assert_migrated_openers(lane: Lane, daemon: sessionlib.Foreground, remote: dict[str, str]) -> None:
+    """What a forward switch owes each class of tab (D7): remote kept,
+    field-less still the baseline, local and legacy refreshed to iced's
+    own values. Then, under a desk-started session, the field-less tab is
+    still the baseline — it went across stating nothing, not as a
+    value-less local opener a starter would refresh."""
+    iced = iced_opener(lane)
+    assert session_tab_opener(lane, daemon, session_tab_titled(lane, "remote")) == remote
+    assert session_tab_opener(lane, daemon, session_tab_titled(lane, "fieldless")) == {}
+    assert session_tab_opener(lane, daemon, session_tab_titled(lane, "local")) == iced
+    assert session_tab_opener(lane, daemon, session_tab_titled(lane, "legacy")) == iced
+
+    daemon = restart_session(lane, daemon, **DESK_START)
+    assert session_tab_opener(lane, daemon, session_tab_titled(lane, "fieldless")) == {}
+    assert session_tab_opener(lane, daemon, session_tab_titled(lane, "remote")) == remote
+    assert session_tab_opener(lane, daemon, session_tab_titled(lane, "local")) == DESK_START
+
+
+def test_a_live_switch_keeps_each_tabs_opener(explicit_lane: Lane):
+    """The live snapshot reads each tab's opener off the workspace: one
+    opened with `origin`, one stating nothing, one with `env`, and one
+    restored from a tab saved before openers (which the in-process launch
+    made iced's)."""
+    lane = explicit_lane
+    write_in_process_state(lane, [("legacy", LEGACY_OPENER)])
+    roost = lane.start("in-process", wipe=False, extra_env=ICED_OPENER_ENV)
+    project = int(roost.list()[0]["id"])
+    for title, opener in [
+        ("remote", {"origin": CALLER_ORIGIN}),
+        ("fieldless", {}),
+        ("local", {"env": CALLER_LOCAL}),
+    ]:
+        roost.set_title(roost.open_tab(project, cwd="/tmp", **opener), title)
+    daemon = serve_session(lane)
+
+    switch(roost, USE_SESSION, "session")
+    assert_migrated_openers(lane, daemon, CALLER_REMOTE)
+
+
+def test_a_launch_migration_keeps_each_saved_opener(explicit_lane: Lane):
+    """The launch migration's snapshot reads each tab's opener off the
+    retained descriptors, the one record of a workspace that was never
+    hydrated."""
+    lane = explicit_lane
+    saved_remote = {"ssh_connection": "10.3.3.3 43000 10.4.4.4 22", "ssh_client": "10.3.3.3 43000 22"}
+    write_in_process_state(
+        lane,
+        [
+            ("remote", {"remote": saved_remote}),
+            ("fieldless", "none"),
+            ("local", {"local": SAVED_LOCAL}),
+            ("legacy", LEGACY_OPENER),
+        ],
+    )
+    daemon = serve_session(lane)
+    roost = lane.start("session", wipe=False, extra_env=ICED_OPENER_ENV)
+    migrated(lane, roost)
+    assert_migrated_openers(
+        lane,
+        daemon,
+        {"SSH_CONNECTION": saved_remote["ssh_connection"], "SSH_CLIENT": saved_remote["ssh_client"]},
+    )

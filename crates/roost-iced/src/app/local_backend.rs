@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use roost_ipc::messages::Project;
+use roost_engine::opener::{restore_opener, PersistedOpener};
+use roost_engine::{RestoreTab, TabOpener};
+use roost_ipc::messages::{Project, Tab};
 use roost_ipc::{LocalBackendMode, LocalRoute};
 use roost_ui_model::config::RoostConfig;
 use roost_ui_model::context_menu::ContextAction;
@@ -944,6 +946,77 @@ pub(crate) struct SwitchTab {
     /// Only a user-titled tab gets a `tab.set_title` on the far side; a
     /// title the shell wrote is the shell's to write again.
     pub(crate) user_titled: bool,
+    /// Who opened the source tab, as `state.json` saves it (plan 085
+    /// D7); `None` for a tab saved before there were openers. The replay
+    /// re-opens it with [`restore_opener`]'s answer.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "roost_engine::opener::deserialize_saved"
+    )]
+    pub(crate) opener: Option<PersistedOpener>,
+}
+
+impl SwitchTab {
+    /// A live tab, with the opener the workspace holds for it: always
+    /// one, never the absence a tab saved before openers has.
+    fn live(tab: &Tab, opener: &TabOpener) -> Self {
+        Self {
+            cwd: tab.cwd.clone(),
+            title: tab.title.clone(),
+            user_titled: tab.user_titled,
+            opener: Some(PersistedOpener::from(opener)),
+        }
+    }
+
+    /// A tab the workspace kept a restore descriptor for and never
+    /// opened.
+    fn retained(tab: &RestoreTab) -> Self {
+        Self {
+            cwd: tab.cwd.clone(),
+            title: tab.title.clone(),
+            user_titled: tab.user_titled,
+            opener: tab.opener.clone(),
+        }
+    }
+}
+
+/// The live layout a forward switch replays (§D8 phase 2), each tab with
+/// the opener `opener_of` holds for it, and the position `active` has in
+/// it.
+///
+/// A row `opener_of` holds no opener for is a tab closed since `projects`
+/// was read: they are the window's last reconciled rows, and a close the
+/// window dispatched runs on the engine runtime, not fenced by the
+/// switch's drain. It is left out — replayed, it would come back — and
+/// the positions are of the rows that are kept.
+pub(crate) fn live_snapshot(
+    projects: &[Project],
+    active: Option<i64>,
+    opener_of: impl Fn(i64) -> Option<TabOpener>,
+) -> (Vec<SwitchProject>, Option<(usize, usize)>) {
+    let mut active_at = None;
+    let snapshot = projects
+        .iter()
+        .enumerate()
+        .map(|(position, project)| {
+            let kept: Vec<(i64, SwitchTab)> = project
+                .tabs
+                .iter()
+                .filter_map(|tab| Some((tab.id, SwitchTab::live(tab, &opener_of(tab.id)?))))
+                .collect();
+            if let Some(tab) = kept.iter().position(|(id, _)| Some(*id) == active) {
+                active_at = Some((position, tab));
+            }
+            SwitchProject {
+                source: project.id,
+                name: project.name.clone(),
+                cwd: project.cwd.clone(),
+                tabs: kept.into_iter().map(|(_, tab)| tab).collect(),
+            }
+        })
+        .collect();
+    (snapshot, active_at)
 }
 
 /// What the forward replay actually created over there, in the order it
@@ -1133,43 +1206,22 @@ pub(crate) struct MigrationSource {
 pub(crate) fn retained_migration(
     projects: &[Project],
     layout: Option<&roost_engine::RestoreLayout>,
+    opener_of: impl Fn(i64) -> Option<TabOpener>,
 ) -> Option<MigrationSource> {
     if projects.is_empty() {
         return None;
     }
-    let retained = |project_id: i64| {
-        layout
-            .and_then(|layout| layout.project(project_id))
-            .map(|row| row.tabs.as_slice())
-            .unwrap_or(&[])
-    };
-    let source: Vec<SwitchProject> = projects
-        .iter()
-        .map(|project| SwitchProject {
-            source: project.id,
-            name: project.name.clone(),
-            cwd: project.cwd.clone(),
-            tabs: match project.tabs.is_empty() {
-                true => retained(project.id)
-                    .iter()
-                    .map(|tab| SwitchTab {
-                        cwd: tab.cwd.clone(),
-                        title: tab.title.clone(),
-                        user_titled: tab.user_titled,
-                    })
-                    .collect(),
-                false => project
-                    .tabs
-                    .iter()
-                    .map(|tab| SwitchTab {
-                        cwd: tab.cwd.clone(),
-                        title: tab.title.clone(),
-                        user_titled: tab.user_titled,
-                    })
-                    .collect(),
-            },
-        })
-        .collect();
+    let (mut source, _) = live_snapshot(projects, None, opener_of);
+    for (snapshot, project) in source.iter_mut().zip(projects) {
+        if project.tabs.is_empty() {
+            snapshot.tabs = layout
+                .and_then(|layout| layout.project(project.id))
+                .map_or(&[][..], |row| row.tabs.as_slice())
+                .iter()
+                .map(SwitchTab::retained)
+                .collect();
+        }
+    }
     // The retained selection, in the same positional coordinates the
     // replay maps through. `active_tab_position` is already the dense
     // display index `RestoreLayout` promises, so it indexes the tab list
@@ -2196,33 +2248,10 @@ impl super::App {
         let (snapshot, active_at) = match migration {
             Some(migration) => (migration.projects, migration.active_at),
             None => {
-                let snapshot: Vec<SwitchProject> = self
-                    .projects
-                    .iter()
-                    .map(|project| SwitchProject {
-                        source: project.id,
-                        name: project.name.clone(),
-                        cwd: project.cwd.clone(),
-                        tabs: project
-                            .tabs
-                            .iter()
-                            .map(|tab| SwitchTab {
-                                cwd: tab.cwd.clone(),
-                                title: tab.title.clone(),
-                                user_titled: tab.user_titled,
-                            })
-                            .collect(),
-                    })
-                    .collect();
                 let (_, active_tab) = self.workspace.active();
-                let active_at = self.projects.iter().enumerate().find_map(|(p, project)| {
-                    project
-                        .tabs
-                        .iter()
-                        .position(|tab| tab.id == active_tab)
-                        .map(|t| (p, t))
-                });
-                (snapshot, active_at)
+                live_snapshot(&self.projects, Some(active_tab), |tab| {
+                    self.workspace.tab_opener(tab)
+                })
             }
         };
 
@@ -2246,8 +2275,10 @@ impl super::App {
         let feed = self.feed_tx.clone();
         let home = roost_engine::home_dir();
         let grid = self.current_grid();
+        let iced = super::iced_opener();
         self.runtime_handle.spawn(async move {
-            let outcome = replay_onto_slot(&ops, snapshot, &path, journal, &home, grid).await;
+            let outcome =
+                replay_onto_slot(&ops, snapshot, &path, journal, &home, grid, &iced).await;
 
             feed.send(crate::engine_feed::EngineFeed::LocalBackendSwitch(
                 Box::new(SwitchStepDone {
@@ -2836,6 +2867,11 @@ impl super::App {
 /// The journal is rewritten after **each** project commits rather than
 /// at the end, because the ids it carries are what a rollback deletes
 /// and a crash mid-replay is exactly the case a rollback exists for.
+///
+/// Each tab is re-opened with [`restore_opener`]'s answer for it, iced's
+/// own opener (`iced`) standing as both the starter and what a tab saved
+/// before there were openers gets (plan 085 D7): a restore onto the
+/// session, as iced would have made it in-process.
 async fn replay_onto_slot(
     ops: &crate::host_conn::HostOps,
     snapshot: Vec<SwitchProject>,
@@ -2843,6 +2879,7 @@ async fn replay_onto_slot(
     mut journal: SwitchJournal,
     home: &str,
     grid: (u16, u16),
+    iced: &TabOpener,
 ) -> ReplayOutcome {
     use roost_ipc::messages::{ops as wire, ProjectCreateResult, TabOpenResult};
     let mut created: Vec<CreatedProject> = Vec::with_capacity(snapshot.len());
@@ -2922,10 +2959,11 @@ async fn replay_onto_slot(
         let mut tabs: Vec<CreatedTab> = Vec::with_capacity(project.tabs.len());
         for (position, tab) in project.tabs.iter().enumerate() {
             let cwd = replay_cwd(&tab.cwd, &made.cwd, home);
+            let opener = restore_opener(tab.opener.as_ref(), iced, iced);
             let opened: Result<TabOpenResult, String> = super::host_call(
                 ops,
                 wire::TAB_OPEN,
-                super::host_tab_open_params(made.id, &cwd, &tab.title, &[], None, grid),
+                super::host_tab_open_params(made.id, &cwd, &tab.title, &[], None, grid, &opener),
                 true,
             )
             .await;
@@ -4272,7 +4310,7 @@ mod switch_tests {
     use super::super::SPAWN_GRID;
     use super::*;
     use roost_ipc::messages::{Tab, TabState};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     fn journal(phase: SwitchState, direction: SwitchDirection, created: &[i64]) -> SwitchJournal {
         SwitchJournal {
@@ -4290,6 +4328,7 @@ mod switch_tests {
                     cwd: "/tmp".into(),
                     title: "shell".into(),
                     user_titled: true,
+                    opener: None,
                 }],
             }],
             created_dest_ids: created.to_vec(),
@@ -4376,6 +4415,47 @@ mod switch_tests {
         assert_eq!(read_journal(&path), None);
         // Clearing what is not there is the state the caller wanted.
         clear_journal(&path);
+    }
+
+    /// Plan 085 D7: a journal written before tabs carried an opener still
+    /// decodes, its tabs reading as saved before there were openers; a
+    /// written opener comes back as it went; an invalid one reads as
+    /// `"none"` rather than costing the whole record.
+    #[test]
+    fn a_journal_tab_without_an_opener_decodes_as_saved_before_openers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = journal_path(dir.path());
+        std::fs::write(
+            &path,
+            br#"{"from_mode":"in-process","to_mode":"session","phase":"replaying",
+                "source_snapshot":[{"source":"3","name":"one","cwd":"/tmp","tabs":[
+                    {"cwd":"/tmp","title":"old","user_titled":false},
+                    {"cwd":"/tmp","title":"bad","user_titled":false,
+                     "opener":{"local":{"PATH":"/bin"}}}]}]}"#,
+        )
+        .unwrap();
+        let tabs = read_journal(&path)
+            .expect("an old journal decodes")
+            .source_snapshot[0]
+            .tabs
+            .clone();
+        assert_eq!(tabs[0].opener, None);
+        assert_eq!(tabs[1].opener, Some(PersistedOpener::None));
+
+        let mut written = journal(SwitchState::Replaying, SwitchDirection::ToSession, &[]);
+        let raw: serde_json::Value = serde_json::to_value(&written).unwrap();
+        assert!(
+            raw["source_snapshot"][0]["tabs"][0].get("opener").is_none(),
+            "an unknown opener is written as no key: {raw}"
+        );
+        written.source_snapshot[0].tabs[0].opener = Some(PersistedOpener::Remote(
+            roost_engine::opener::PersistedRemote {
+                ssh_connection: Some("10.0.0.2 5 10.0.0.1 22".into()),
+                ssh_client: None,
+            },
+        ));
+        write_journal(&path, &written).unwrap();
+        assert_eq!(read_journal(&path).as_ref(), Some(&written));
     }
 
     /// A file this build cannot read is left where it is and ignored —
@@ -5318,6 +5398,16 @@ mod switch_tests {
         snapshot: Vec<SwitchProject>,
         refuse: impl Fn(&str, usize) -> bool + Send + 'static,
     ) -> (ReplayOutcome, Vec<serde_json::Value>) {
+        replay_as(path, snapshot, refuse, &TabOpener::None).await
+    }
+
+    /// [`replay_journalled_at`] by an iced whose own opener is `iced`.
+    async fn replay_as(
+        path: &Path,
+        snapshot: Vec<SwitchProject>,
+        refuse: impl Fn(&str, usize) -> bool + Send + 'static,
+        iced: &TabOpener,
+    ) -> (ReplayOutcome, Vec<serde_json::Value>) {
         let home = tempfile::tempdir().unwrap();
         let (ops, worker) = fake_slot(refuse);
         let journal = SwitchJournal::new(SwitchDirection::ToSession, snapshot.clone());
@@ -5328,6 +5418,7 @@ mod switch_tests {
             journal,
             &home.path().to_string_lossy(),
             SPAWN_GRID,
+            iced,
         )
         .await;
         drop(ops);
@@ -5354,6 +5445,7 @@ mod switch_tests {
                     cwd: "/tmp".into(),
                     title: (*title).into(),
                     user_titled: *user_titled,
+                    opener: None,
                 })
                 .collect(),
         }
@@ -5475,6 +5567,101 @@ mod switch_tests {
         );
         assert!(!outcome.created[0].complete);
         assert!(deletable_sources(&outcome.created).is_empty());
+    }
+
+    fn local(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// One source tab per restore class, in the order
+    /// [`a_replay_reopens_each_tab_with_restore_openers_answer`] reads
+    /// them back.
+    fn one_of_each_class() -> Vec<SwitchProject> {
+        let mut project = source(
+            11,
+            &[
+                ("remote", true),
+                ("none", true),
+                ("local", true),
+                ("legacy", true),
+            ],
+        );
+        let openers = [
+            Some(PersistedOpener::Remote(
+                roost_engine::opener::PersistedRemote {
+                    ssh_connection: Some("10.9.9.9 5 10.0.0.1 22".into()),
+                    ssh_client: Some("10.9.9.9 5 22".into()),
+                },
+            )),
+            Some(PersistedOpener::None),
+            Some(PersistedOpener::Local(local(&[("DISPLAY", ":3")]))),
+            None,
+        ];
+        for (tab, opener) in project.tabs.iter_mut().zip(openers) {
+            tab.opener = opener;
+        }
+        vec![project]
+    }
+
+    /// Plan 085 D7: the replay re-opens a tab as a restore would, with
+    /// iced standing as the starter and as what a tab saved before there
+    /// were openers gets: a remote tab stays remote, a `"none"` tab states
+    /// nothing, a local one takes iced's values and a legacy one iced's.
+    #[tokio::test]
+    async fn a_replay_reopens_each_tab_with_restore_openers_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let iced = TabOpener::Local(local(&[
+            ("DISPLAY", ":0"),
+            ("SSH_AUTH_SOCK", "/iced/agent"),
+        ]));
+        let (outcome, opened) = replay_as(
+            &journal_path(dir.path()),
+            one_of_each_class(),
+            |_, _| false,
+            &iced,
+        )
+        .await;
+        assert!(outcome.error.is_none(), "{outcome:?}");
+        let stated: Vec<_> = opened
+            .iter()
+            .map(|params| (params.get("env").cloned(), params.get("origin").cloned()))
+            .collect();
+        let iced_env = serde_json::json!({ "DISPLAY": ":0", "SSH_AUTH_SOCK": "/iced/agent" });
+        assert_eq!(
+            stated,
+            vec![
+                (
+                    None,
+                    Some(serde_json::json!({
+                        "ssh_connection": "10.9.9.9 5 10.0.0.1 22",
+                        "ssh_client": "10.9.9.9 5 22",
+                    }))
+                ),
+                (None, None),
+                (Some(iced_env.clone()), None),
+                (Some(iced_env), None),
+            ]
+        );
+    }
+
+    /// An iced with none of the local values refreshes nothing: a saved
+    /// local tab keeps its own, and a legacy one is opened as iced's —
+    /// a stated, value-less local opener, never the baseline.
+    #[tokio::test]
+    async fn a_value_less_iced_keeps_a_saved_local_tabs_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, opened) = replay_as(
+            &journal_path(dir.path()),
+            one_of_each_class(),
+            |_, _| false,
+            &TabOpener::Local(BTreeMap::new()),
+        )
+        .await;
+        assert_eq!(opened[2]["env"], serde_json::json!({ "DISPLAY": ":3" }));
+        assert_eq!(opened[3]["env"], serde_json::json!({}));
     }
 
     /// Plan 070 §D2: the tab a replay copies ran on the other backend,
@@ -5610,6 +5797,11 @@ mod migration_tests {
     /// A tab, as both fixtures spell one: `(cwd, title, user_titled)`.
     type Spec<'a> = (&'a str, &'a str, bool);
 
+    /// Every live tab still in the workspace, opened stating nothing.
+    fn opened_by_no_one(_tab: i64) -> Option<TabOpener> {
+        Some(TabOpener::None)
+    }
+
     fn retained(rows: &[(i64, &[Spec<'_>])], active: (i64, i32)) -> RestoreLayout {
         RestoreLayout {
             projects: rows
@@ -5690,7 +5882,8 @@ mod migration_tests {
             (9, 2),
         );
 
-        let migrated = retained_migration(&projects, Some(&layout)).expect("a layout to migrate");
+        let migrated = retained_migration(&projects, Some(&layout), opened_by_no_one)
+            .expect("a layout to migrate");
         assert_eq!(
             shape(&migrated),
             vec![
@@ -5721,6 +5914,133 @@ mod migration_tests {
         assert_eq!(migrated.active_at, Some((2, 2)));
     }
 
+    /// Plan 085 D7: a retained tab carries the opener its descriptor
+    /// saved — none for one saved before there were openers — and a live
+    /// tab the one the workspace holds for it.
+    #[test]
+    fn the_migration_snapshot_carries_each_tabs_opener() {
+        use roost_engine::opener::PersistedOpener;
+
+        let desk = TabOpener::Local([("DISPLAY".to_string(), ":1".to_string())].into());
+        let projects = [
+            project(7, "alpha", "/home/a", &[]),
+            project(
+                8,
+                "beta",
+                "/home/b",
+                &[("/b", "live", false), ("/b", "bare", false)],
+            ),
+        ];
+        let mut layout = retained(
+            &[(7, &[("/a", "saved", false), ("/a", "legacy", false)])],
+            (0, 0),
+        );
+        layout.projects[0].tabs[0].opener = Some(PersistedOpener::from(&desk));
+        let live = projects[1].tabs[0].id;
+        let opener_of = |tab: i64| {
+            Some(if tab == live {
+                desk.clone()
+            } else {
+                TabOpener::None
+            })
+        };
+
+        let migrated =
+            retained_migration(&projects, Some(&layout), opener_of).expect("a layout to migrate");
+        let openers: Vec<_> = migrated
+            .projects
+            .iter()
+            .flat_map(|project| project.tabs.iter().map(|tab| tab.opener.clone()))
+            .collect();
+        assert_eq!(
+            openers,
+            vec![
+                Some(PersistedOpener::from(&desk)),
+                None,
+                Some(PersistedOpener::from(&desk)),
+                Some(PersistedOpener::None),
+            ]
+        );
+    }
+
+    /// Plan 085 D7: a live switch's snapshot carries each tab's opener as
+    /// the workspace holds it, `None` included, read by tab id.
+    #[test]
+    fn the_live_snapshot_carries_each_tabs_opener_from_the_workspace() {
+        use roost_engine::opener::{PersistedOpener, PersistedRemote};
+        use roost_engine::Workspace;
+
+        let workspace = Workspace::new();
+        let project = workspace.create_project("p", "/").unwrap().id;
+        let remote = TabOpener::Remote {
+            ssh_connection: Some("10.0.0.2 5 10.0.0.1 22".into()),
+            ssh_client: Some("10.0.0.2 5 22".into()),
+        };
+        let desk = TabOpener::Local([("WAYLAND_DISPLAY".to_string(), "/run/w".to_string())].into());
+        for opener in [remote, TabOpener::None, desk] {
+            workspace.open_tab(project, "/", "", true, opener).unwrap();
+        }
+
+        let (snapshot, _) =
+            live_snapshot(&workspace.snapshot(), None, |tab| workspace.tab_opener(tab));
+        let openers: Vec<_> = snapshot[0]
+            .tabs
+            .iter()
+            .map(|tab| tab.opener.clone())
+            .collect();
+        assert_eq!(
+            openers,
+            vec![
+                Some(PersistedOpener::Remote(PersistedRemote {
+                    ssh_connection: Some("10.0.0.2 5 10.0.0.1 22".into()),
+                    ssh_client: Some("10.0.0.2 5 22".into()),
+                })),
+                Some(PersistedOpener::None),
+                Some(PersistedOpener::Local(
+                    [("WAYLAND_DISPLAY".to_string(), "/run/w".to_string())].into()
+                )),
+            ]
+        );
+    }
+
+    /// Plan 085 D7: the window's rows can name a tab the workspace has
+    /// since closed. That row is left out — never replayed as a tab saved
+    /// before there were openers, which would bring a closed remote tab
+    /// back with iced's own display and agent — and the selection is the
+    /// position its tab has among the rows that are kept.
+    #[test]
+    fn a_live_row_whose_tab_has_closed_is_left_out() {
+        use roost_engine::opener::PersistedOpener;
+        use roost_engine::Workspace;
+
+        let workspace = Workspace::new();
+        let project = workspace.create_project("p", "/").unwrap().id;
+        let remote = TabOpener::Remote {
+            ssh_connection: Some("10.0.0.2 5 10.0.0.1 22".into()),
+            ssh_client: Some("10.0.0.2 5 22".into()),
+        };
+        let closed = workspace
+            .open_tab(project, "/", "closed", true, remote)
+            .unwrap()
+            .id;
+        let shown = workspace
+            .open_tab(project, "/", "shown", true, TabOpener::None)
+            .unwrap()
+            .id;
+        let rows = workspace.snapshot();
+        workspace.close_tab(closed).unwrap();
+
+        let (snapshot, active_at) =
+            live_snapshot(&rows, Some(shown), |tab| workspace.tab_opener(tab));
+        let kept: Vec<_> = snapshot[0]
+            .tabs
+            .iter()
+            .map(|tab| (tab.title.as_str(), tab.opener.clone()))
+            .collect();
+        assert_eq!(kept, vec![("shown", Some(PersistedOpener::None))]);
+        assert_eq!(active_at, Some((0, 0)));
+    }
+
     /// A live tab outranks a descriptor of the same project, because it
     /// is the newer truth — the same precedence
     /// `Workspace::snapshot_for_persist` applies to the same two
@@ -5741,7 +6061,8 @@ mod migration_tests {
             (0, 0),
         );
 
-        let migrated = retained_migration(&projects, Some(&layout)).expect("a layout to migrate");
+        let migrated = retained_migration(&projects, Some(&layout), opened_by_no_one)
+            .expect("a layout to migrate");
         assert_eq!(
             shape(&migrated),
             vec![
@@ -5755,9 +6076,13 @@ mod migration_tests {
     /// layout can be short.
     #[test]
     fn an_empty_workspace_owes_no_migration_and_a_missing_row_owes_no_tabs() {
-        assert_eq!(retained_migration(&[], None), None);
+        assert_eq!(retained_migration(&[], None, opened_by_no_one), None);
         assert_eq!(
-            retained_migration(&[], Some(&retained(&[(7, &[("/x", "x", false)])], (7, 0)))),
+            retained_migration(
+                &[],
+                Some(&retained(&[(7, &[("/x", "x", false)])], (7, 0))),
+                opened_by_no_one
+            ),
             None,
             "a layout without projects to hang it on is not a migration"
         );
@@ -5771,6 +6096,7 @@ mod migration_tests {
                 project(8, "beta", "/home/b", &[]),
             ],
             Some(&retained(&[(7, &[("/home/a", "editor", true)])], (7, 0))),
+            opened_by_no_one,
         )
         .expect("a layout to migrate");
         assert_eq!(
@@ -5794,15 +6120,19 @@ mod migration_tests {
         let tabs: &[Spec<'_>] = &[("/home/a", "editor", true)];
         for active in [(99, 0), (7, 4), (7, -1), (0, 0)] {
             assert_eq!(
-                retained_migration(&projects, Some(&retained(&[(7, tabs)], active)))
-                    .expect("a layout to migrate")
-                    .active_at,
+                retained_migration(
+                    &projects,
+                    Some(&retained(&[(7, tabs)], active)),
+                    opened_by_no_one
+                )
+                .expect("a layout to migrate")
+                .active_at,
                 None,
                 "{active:?}"
             );
         }
         assert_eq!(
-            retained_migration(&projects, None)
+            retained_migration(&projects, None, opened_by_no_one)
                 .expect("a layout to migrate")
                 .active_at,
             None,

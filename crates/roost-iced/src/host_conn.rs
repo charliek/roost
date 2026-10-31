@@ -2217,6 +2217,12 @@ impl HostConnSet {
         self.ops(&host)
     }
 
+    /// How the host that owns this incarnation is reached.
+    pub(crate) fn transport_at(&self, incarnation: HostId) -> Option<HostTransport> {
+        let host = self.owner_of(incarnation)?;
+        Some(self.entries.get(&host)?.conn.as_ref()?.transport)
+    }
+
     /// The connection an incarnation belongs to, to write on. `None`
     /// for a stale one — [`Self::owner_of`] has already ruled on that,
     /// which is what makes the recorders below silent no-ops rather than

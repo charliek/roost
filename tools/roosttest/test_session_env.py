@@ -30,7 +30,7 @@ import session as sessionlib
 import tab_env
 from client import Roost, RoostError
 from test_ssh_transport import BridgeListener
-from ui import OPENER_SET, TEST_USER_RUNTIME_DIR_ENV
+from ui import TEST_USER_RUNTIME_DIR_ENV
 
 pytestmark = pytest.mark.session_daemon
 
@@ -96,10 +96,7 @@ def readable_shell(env: sessionlib.SessionEnv) -> dict[str, str]:
     Linux, where the harness's `/bin/sh` reads."""
     if sys.platform != "darwin":
         return {}
-    shell = env.root / "readable-shell"
-    shell.write_text(f"#!{tab_env.sleeper()}\nimport time\ntime.sleep(600)\n")
-    shell.chmod(0o755)
-    return {"SHELL": str(shell)}
+    return {"SHELL": str(tab_env.readable_shell(env.root))}
 
 
 def serve(env: sessionlib.SessionEnv, **context: str) -> sessionlib.Foreground:
@@ -173,10 +170,6 @@ def tab_environ(env: sessionlib.SessionEnv, daemon: sessionlib.Foreground, tab_i
     return environ
 
 
-def openers(environ: dict[str, str]) -> dict[str, str]:
-    return {name: value for name, value in environ.items() if name in OPENER_SET}
-
-
 def open_on(client: Roost, profile: sessionlib.SessionEnv, *, title: str = "", project: int | None = None,
             **opener) -> int:
     """A sleeping tab opened on `client`, stating `opener` (`env=` /
@@ -219,7 +212,7 @@ def test_a_tab_opened_through_a_real_bridge_has_exactly_its_ssh_identity(env):
     daemon = serve(env, **DESK)
     with BridgeListener(env, overrides=BRIDGE_LOGIN) as bridge, bridge.client() as client:
         tab = open_on(client, env)
-    assert openers(tab_environ(env, daemon, tab)) == {
+    assert tab_env.opener_vars(tab_environ(env, daemon, tab)) == {
         "SSH_CONNECTION": BRIDGE_LOGIN["SSH_CONNECTION"],
         "SSH_CLIENT": BRIDGE_LOGIN["SSH_CLIENT"],
     }
@@ -244,7 +237,7 @@ def test_a_local_open_gets_exactly_the_values_it_states(env, stated):
     daemon = serve(env, **DESK)
     with env.client() as client:
         tab = open_on(client, env, env=stated)
-    assert openers(tab_environ(env, daemon, tab)) == stated
+    assert tab_env.opener_vars(tab_environ(env, daemon, tab)) == stated
     stop(env, daemon)
 
 
@@ -334,8 +327,8 @@ def test_simultaneous_local_and_remote_opens_each_get_their_own(env):
         for thread in threads:
             thread.join(timeout=120)
     assert not failures, failures
-    assert openers(tab_environ(env, daemon, opened["local"])) == OPENER_LOCAL
-    assert openers(tab_environ(env, daemon, opened["remote"])) == {
+    assert tab_env.opener_vars(tab_environ(env, daemon, opened["local"])) == OPENER_LOCAL
+    assert tab_env.opener_vars(tab_environ(env, daemon, opened["remote"])) == {
         "SSH_CONNECTION": BRIDGE_LOGIN["SSH_CONNECTION"],
         "SSH_CLIENT": BRIDGE_LOGIN["SSH_CLIENT"],
     }
@@ -355,9 +348,9 @@ def test_a_declared_origin_is_remote_and_a_field_less_open_is_the_baseline(env):
         declared = open_on(client, env, origin=OPENER_ORIGIN)
         half = open_on(client, env, origin={"ssh_client": OPENER_ORIGIN["ssh_client"]})
         bare = open_on(client, env)
-    assert openers(tab_environ(env, daemon, declared)) == OPENER_REMOTE
-    assert openers(tab_environ(env, daemon, half)) == {"SSH_CLIENT": OPENER_ORIGIN["ssh_client"]}
-    assert openers(tab_environ(env, daemon, bare)) == {}
+    assert tab_env.opener_vars(tab_environ(env, daemon, declared)) == OPENER_REMOTE
+    assert tab_env.opener_vars(tab_environ(env, daemon, half)) == {"SSH_CLIENT": OPENER_ORIGIN["ssh_client"]}
+    assert tab_env.opener_vars(tab_environ(env, daemon, bare)) == {}
     stop(env, daemon)
 
 
@@ -388,7 +381,7 @@ def test_a_restore_keeps_each_saved_class_and_only_a_desk_start_refreshes_local_
     write_state(env, [("saved", SAVED_TABS)])
     daemon = serve(env, **starter)
 
-    got = {title: openers(tab_environ(env, daemon, tab_named(env, title))) for title, _ in SAVED_TABS}
+    got = {title: tab_env.opener_vars(tab_environ(env, daemon, tab_named(env, title))) for title, _ in SAVED_TABS}
     assert got == {
         "legacy": {},
         "none": {},
@@ -421,7 +414,7 @@ def test_tabs_opened_over_the_wire_restore_with_the_opener_they_were_opened_with
     stop(env, daemon)
 
     daemon = serve(env, **starter)
-    got = {title: openers(tab_environ(env, daemon, tab_named(env, title))) for title in ("local", "remote", "bare")}
+    got = {title: tab_env.opener_vars(tab_environ(env, daemon, tab_named(env, title))) for title in ("local", "remote", "bare")}
     assert got == {"local": local_gets, "remote": OPENER_REMOTE, "bare": {}}
     stop(env, daemon)
 
@@ -460,19 +453,19 @@ def test_a_desk_started_daemon_gives_its_own_tabs_the_desk_and_no_other_tab_any_
     daemon = serve(env, **DESK)
     seed = only_tab(env)
     seeded = tab_environ(env, daemon, seed)
-    assert openers(seeded) == DESK, "the seed tab is the daemon's own"
+    assert tab_env.opener_vars(seeded) == DESK, "the seed tab is the daemon's own"
     assert seeded["SHELL"] == pwd.getpwuid(os.getuid()).pw_shell, "SHELL is the passwd shell"
-    assert openers(tab_environ(env, daemon, open_bare(env))) == {}
+    assert tab_env.opener_vars(tab_environ(env, daemon, open_bare(env))) == {}
     stop(env, daemon)
 
     write_state(env, [("saved", [("remote", {"remote": SAVED_REMOTE}), ("none", "none")]), ("bare", [])])
     daemon = serve(env, **DESK)
-    assert openers(tab_environ(env, daemon, tab_named(env, "remote"))) == REMOTE_VARS
-    assert openers(tab_environ(env, daemon, tab_named(env, "none"))) == {}
+    assert tab_env.opener_vars(tab_environ(env, daemon, tab_named(env, "remote"))) == REMOTE_VARS
+    assert tab_env.opener_vars(tab_environ(env, daemon, tab_named(env, "none"))) == {}
     with env.client() as client:
         bare = next(project for project in client.list() if project["name"] == "bare")
     assert len(bare["tabs"]) == 1, bare
-    assert openers(tab_environ(env, daemon, int(bare["tabs"][0]["id"]))) == DESK, (
+    assert tab_env.opener_vars(tab_environ(env, daemon, int(bare["tabs"][0]["id"]))) == DESK, (
         "a project that saved no tabs gets the daemon's own"
     )
     stop(env, daemon)
@@ -481,15 +474,15 @@ def test_a_desk_started_daemon_gives_its_own_tabs_the_desk_and_no_other_tab_any_
 def test_an_ssh_started_daemon_opens_its_own_tab_as_the_laptop_and_no_other_tab_as_it(env):
     daemon = serve(env, **LAPTOP)
     seed = only_tab(env)
-    assert openers(tab_environ(env, daemon, seed)) == {
+    assert tab_env.opener_vars(tab_environ(env, daemon, seed)) == {
         "SSH_CONNECTION": LAPTOP["SSH_CONNECTION"],
         "SSH_CLIENT": LAPTOP["SSH_CLIENT"],
     }, "a remote opener brings its identity alone: no TTY, no agent"
-    assert openers(tab_environ(env, daemon, open_bare(env))) == {}
+    assert tab_env.opener_vars(tab_environ(env, daemon, open_bare(env))) == {}
     stop(env, daemon)
 
     write_state(env, [("saved", [("local", {"local": {"DISPLAY": ":12"}}), ("none", "none")])])
     daemon = serve(env, **LAPTOP)
-    assert openers(tab_environ(env, daemon, tab_named(env, "local"))) == {"DISPLAY": ":12"}
-    assert openers(tab_environ(env, daemon, tab_named(env, "none"))) == {}
+    assert tab_env.opener_vars(tab_environ(env, daemon, tab_named(env, "local"))) == {"DISPLAY": ":12"}
+    assert tab_env.opener_vars(tab_environ(env, daemon, tab_named(env, "none"))) == {}
     stop(env, daemon)

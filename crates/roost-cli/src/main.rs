@@ -73,6 +73,7 @@ mod doctor;
 mod error;
 mod events;
 mod host;
+mod opener;
 mod prompt;
 mod report;
 mod session;
@@ -1228,6 +1229,9 @@ struct UiSocket<'a> {
     follows_window: bool,
     client: Option<IpcClient>,
     path: PathBuf,
+    /// The kind of UI `client` dialled, when the target ladder named one;
+    /// `None` before it has dialled.
+    kind: Option<BundleProfileKind>,
 }
 
 impl<'a> UiSocket<'a> {
@@ -1242,6 +1246,7 @@ impl<'a> UiSocket<'a> {
             follows_window,
             client: None,
             path: PathBuf::new(),
+            kind: None,
         }
     }
 
@@ -1249,10 +1254,11 @@ impl<'a> UiSocket<'a> {
         let client = match self.client.take() {
             Some(client) => client,
             None => {
-                let socket =
+                let target =
                     window::route(self.selector, self.environment, self.follows_window).await?;
-                let client = dial(&socket).await?;
-                self.path = socket;
+                let client = dial(&target.socket_path).await?;
+                self.path = target.socket_path;
+                self.kind = target.kind;
                 client
             }
         };
@@ -1284,6 +1290,37 @@ impl<'a> UiSocket<'a> {
             print_json(&reply)?;
         }
         Ok(())
+    }
+}
+
+/// `tab.open` with this roostctl stated as the tab's opener (plan 085
+/// D7), the one way `tab open` and `open` send it.
+///
+/// Nothing is stated to a target the ladder named Roost.app: the Swift
+/// app is frozen and refuses both fields. Only on macOS — elsewhere that
+/// profile resolves to a Rust UI, which honours them. A server that
+/// refuses them by name — Roost.app reached by `--socket`, a session from
+/// before them — is asked once more without; any other refusal is the
+/// answer.
+async fn open_tab(
+    ui: &mut UiSocket<'_>,
+    mut params: TabOpenParams,
+) -> Result<TabOpenResult, CliError> {
+    ui.client().await?;
+    let stated = !(cfg!(target_os = "macos") && ui.kind == Some(BundleProfileKind::Mac));
+    if stated {
+        ui.environment.opener.state(&mut params);
+    }
+    match ui.client().await?.call(ops::TAB_OPEN, &params).await {
+        Err(roost_ipc::ClientError::Server { code, message })
+            if stated && opener::refuses_opener_fields(&code, &message) =>
+        {
+            tracing::debug!(%message, "the server refuses the opener fields; asking again");
+            params.env = None;
+            params.origin = None;
+            Ok(ui.client().await?.call(ops::TAB_OPEN, &params).await?)
+        }
+        reply => Ok(reply?),
     }
 }
 
@@ -1500,24 +1537,23 @@ async fn run_on_ui(
             } else {
                 argv
             };
+            let resp = open_tab(
+                ui,
+                TabOpenParams {
+                    project_id,
+                    cwd,
+                    argv,
+                    cols,
+                    rows,
+                    title,
+                    activate: no_activate.then_some(false),
+                    cwd_from_tab,
+                    env: None,
+                    origin: None,
+                },
+            )
+            .await?;
             let client = ui.client().await?;
-            let resp: TabOpenResult = client
-                .call(
-                    ops::TAB_OPEN,
-                    TabOpenParams {
-                        project_id,
-                        cwd,
-                        argv,
-                        cols,
-                        rows,
-                        title,
-                        activate: no_activate.then_some(false),
-                        cwd_from_tab,
-                        env: None,
-                        origin: None,
-                    },
-                )
-                .await?;
             let new_id = resp.tab.id;
             // `--after-tab`: place the new tab right after that one via a
             // reorder over the project's current order.
@@ -1591,24 +1627,23 @@ async fn run_on_ui(
             } else {
                 argv
             };
+            let opened = open_tab(
+                ui,
+                TabOpenParams {
+                    project_id: ensured.project.id,
+                    cwd,
+                    argv,
+                    cols: 80,
+                    rows: 24,
+                    title,
+                    activate: no_activate.then_some(false),
+                    cwd_from_tab: None,
+                    env: None,
+                    origin: None,
+                },
+            )
+            .await?;
             let client = ui.client().await?;
-            let opened: TabOpenResult = client
-                .call(
-                    ops::TAB_OPEN,
-                    TabOpenParams {
-                        project_id: ensured.project.id,
-                        cwd,
-                        argv,
-                        cols: 80,
-                        rows: 24,
-                        title,
-                        activate: no_activate.then_some(false),
-                        cwd_from_tab: None,
-                        env: None,
-                        origin: None,
-                    },
-                )
-                .await?;
             if focus {
                 client
                     .call::<_, serde_json::Value>(
@@ -4032,6 +4067,7 @@ mod tests {
                 session: PathBuf::from(session),
                 sockets: windows.iter().map(|w| w.to_path_buf()).collect(),
             },
+            opener: Default::default(),
         }
     }
 
@@ -5435,6 +5471,213 @@ mod tests {
             1,
             "{sent:?}"
         );
+    }
+
+    fn desk_opener() -> opener::Opener {
+        opener::Opener::Local(
+            [("DISPLAY", ":4"), ("SSH_AUTH_SOCK", "/desk/agent")]
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .into(),
+        )
+    }
+
+    fn laptop_opener() -> opener::Opener {
+        opener::Opener::Remote(roost_ipc::messages::TabOrigin {
+            ssh_connection: Some("10.0.0.2 5 10.0.0.1 22".into()),
+            ssh_client: Some("10.0.0.2 5 22".into()),
+        })
+    }
+
+    /// The `env` and `origin` a recorded `tab.open` carried.
+    fn stated(
+        params: &serde_json::Value,
+    ) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+        (params.get("env").cloned(), params.get("origin").cloned())
+    }
+
+    fn tab_opens(sent: &[(String, serde_json::Value)]) -> Vec<&serde_json::Value> {
+        sent.iter()
+            .filter(|(op, _)| op == ops::TAB_OPEN)
+            .map(|(_, params)| params)
+            .collect()
+    }
+
+    /// Plan 085 D7: both verbs that open a tab state this roostctl as its
+    /// opener — `env` at the machine, `origin` in an SSH login — on the
+    /// socket the ladder resolved, whatever kind of UI that is.
+    #[tokio::test]
+    async fn tab_open_and_open_state_roostctl_as_the_tabs_opener() {
+        let ui = FakeUi::start("opener-stated", answer_ensure_and_open);
+        let desk = serde_json::json!({ "DISPLAY": ":4", "SSH_AUTH_SOCK": "/desk/agent" });
+        let laptop = serde_json::json!({
+            "ssh_connection": "10.0.0.2 5 10.0.0.1 22",
+            "ssh_client": "10.0.0.2 5 22",
+        });
+        for verb in [
+            &["open", "--project", "proj", "--cwd", "/x"][..],
+            &["tab", "open", "--project-id", "42"],
+        ] {
+            for (opener, expected) in [
+                (desk_opener(), (Some(desk.clone()), None)),
+                (laptop_opener(), (None, Some(laptop.clone()))),
+            ] {
+                let environment = Environment {
+                    opener,
+                    ..Environment::default()
+                };
+                let mut argv = vec!["--socket", ui.socket.as_str()];
+                argv.extend_from_slice(verb);
+                let args = parse(&argv).unwrap();
+                assert_eq!(run(args, None, None, &environment).await, Ok(0), "{argv:?}");
+                let sent = ui.take();
+                let opens = tab_opens(&sent);
+                assert_eq!(opens.len(), 1, "{argv:?}: {sent:?}");
+                assert_eq!(stated(opens[0]), expected, "{argv:?}");
+            }
+        }
+    }
+
+    /// `open_tab` on a connection already dialled to `ui`, as the ladder
+    /// would have left it had it resolved a UI of `kind`.
+    async fn open_tab_on(
+        ui: &FakeUi,
+        kind: Option<BundleProfileKind>,
+        opener: opener::Opener,
+    ) -> Result<TabOpenResult, CliError> {
+        let selector = TargetSelector::default();
+        let environment = Environment {
+            opener,
+            ..Environment::default()
+        };
+        let mut socket = UiSocket::new(&selector, &environment, false);
+        socket.client = Some(dial(Path::new(&ui.socket)).await.unwrap());
+        socket.kind = kind;
+        open_tab(
+            &mut socket,
+            TabOpenParams {
+                project_id: 42,
+                ..TabOpenParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Plan 085 D7 (rule 7): a target the ladder named Roost.app is sent
+    /// neither field — the frozen Swift app refuses both — while every
+    /// other kind, and a socket of unknown kind, is.
+    #[tokio::test]
+    async fn nothing_is_stated_to_a_target_named_roost_app() {
+        let ui = FakeUi::start("opener-mac-kind", answer_ensure_and_open);
+        for (kind, opener) in [
+            (Some(BundleProfileKind::Mac), desk_opener()),
+            (Some(BundleProfileKind::Mac), laptop_opener()),
+        ] {
+            open_tab_on(&ui, kind, opener).await.expect("opened");
+            let sent = ui.take();
+            let opener_fields = stated(tab_opens(&sent)[0]);
+            if cfg!(target_os = "macos") {
+                assert_eq!(opener_fields, (None, None), "{kind:?}");
+            } else {
+                assert_ne!(
+                    opener_fields,
+                    (None, None),
+                    "{kind:?} is a Rust UI off macOS"
+                );
+            }
+        }
+        for kind in [
+            None,
+            Some(BundleProfileKind::Iced),
+            Some(BundleProfileKind::Linux),
+            Some(BundleProfileKind::Session),
+        ] {
+            open_tab_on(&ui, kind, desk_opener()).await.expect("opened");
+            let sent = ui.take();
+            assert!(stated(tab_opens(&sent)[0]).0.is_some(), "{kind:?}");
+        }
+    }
+
+    /// A stand-in UI that refuses the first `tab.open` it is sent with
+    /// `refusal` and answers everything else as [`answer_ensure_and_open`].
+    fn refusing_first_open(tag: &str, refusal: (&'static str, &'static str)) -> FakeUi {
+        let opens = std::sync::atomic::AtomicUsize::new(0);
+        FakeUi::start(tag, move |op| {
+            if op == ops::TAB_OPEN && opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err(refusal);
+            }
+            answer_ensure_and_open(op)
+        })
+    }
+
+    /// Plan 085 D7: a server that refuses `env` or `origin` by name —
+    /// Swift's spelling and serde's — is asked once more with neither.
+    #[tokio::test]
+    async fn a_server_refusing_the_opener_by_name_is_asked_again_without_it() {
+        for (tag, refusal, opener) in [
+            ("opener-swift-env", "unknown params: env", desk_opener()),
+            (
+                "opener-swift-origin",
+                "unknown params: origin",
+                laptop_opener(),
+            ),
+            (
+                "opener-serde-env",
+                "unknown field `env`, expected one of `project_id`, `cwd`, `origin`",
+                desk_opener(),
+            ),
+            (
+                "opener-serde-origin",
+                "unknown field `origin`, expected one of `project_id`, `env`",
+                laptop_opener(),
+            ),
+        ] {
+            let ui = refusing_first_open(tag, ("unknown-field", refusal));
+            let opened = open_tab_on(&ui, None, opener).await;
+            assert!(opened.is_ok(), "{refusal}: {opened:?}");
+            let sent = ui.take();
+            let opens = tab_opens(&sent);
+            assert_eq!(opens.len(), 2, "exactly one retry for {refusal}: {sent:?}");
+            assert_ne!(stated(opens[0]), (None, None), "{refusal}");
+            assert_eq!(
+                stated(opens[1]),
+                (None, None),
+                "the retry drops both: {refusal}"
+            );
+            assert_eq!(opens[1]["project_id"], "42", "{refusal}");
+        }
+    }
+
+    /// Any other `unknown-field` is the answer, unretried: a key inside
+    /// `origin`, and another field whose serde refusal goes on to list
+    /// every field `tab.open` knows, `env` and `origin` among them. (An
+    /// `activate` refusal in Swift's spelling is pinned the same way by
+    /// [`no_activate_sends_activate_false_and_nothing_otherwise`].)
+    #[tokio::test]
+    async fn any_other_unknown_field_surfaces_unretried() {
+        for (tag, refusal) in [
+            (
+                "opener-inner-key",
+                "unknown field `ssh_tty`, expected `ssh_connection` or `ssh_client`",
+            ),
+            (
+                "opener-other-field",
+                "unknown field `actvate`, expected one of `project_id`, `cwd`, `argv`, \
+                 `cols`, `rows`, `title`, `activate`, `cwd_from_tab`, `env`, `origin`",
+            ),
+        ] {
+            let ui = refusing_first_open(tag, ("unknown-field", refusal));
+            let error = open_tab_on(&ui, None, laptop_opener())
+                .await
+                .expect_err("the refusal surfaces");
+            assert_eq!(
+                error,
+                CliError::Server {
+                    code: "unknown-field".into(),
+                    message: refusal.into(),
+                }
+            );
+            assert_eq!(tab_opens(&ui.take()).len(), 1, "{refusal}");
+        }
     }
 
     #[tokio::test]

@@ -316,5 +316,49 @@ class TabProcessTests(unittest.TestCase):
             tab_env.tab_process(server.pid, 9, binaries=[python], timeout=0.5)
 
 
+class ChildEnvironTests(unittest.TestCase):
+    def test_a_child_running_one_of_the_binaries_is_read(self) -> None:
+        child = _spawn(tab_env.sleep_argv(30), AWKWARD)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        _placed_environ(child.pid)
+        self.assertEqual(tab_env.child_environ(child.pid, binaries=[SLEEPER]), AWKWARD)
+
+    def test_a_child_running_another_binary_is_refused(self) -> None:
+        child = _spawn(tab_env.sleep_argv(30), AWKWARD)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        with tempfile.TemporaryDirectory() as scratch:
+            elsewhere = Path(scratch) / "roost-iced"
+            elsewhere.write_text("")
+            with self.assertRaisesRegex(AssertionError, "refusing"):
+                tab_env.child_environ(child.pid, binaries=[elsewhere])
+
+    def test_a_process_this_one_did_not_start_is_refused(self) -> None:
+        orphan = _orphan(self, tab_env.sleep_argv(30), {"PATH": "/usr/bin:/bin"})
+        with self.assertRaisesRegex(AssertionError, "not a child of this test"):
+            tab_env.child_environ(orphan, binaries=[tab_env.exe_of(orphan)])
+
+
+class LocalSetTests(unittest.TestCase):
+    def test_the_local_set_is_taken_and_a_relative_wayland_display_made_absolute(self) -> None:
+        env = {
+            "DISPLAY": ":1",
+            "WAYLAND_DISPLAY": "wayland-2",
+            "XDG_RUNTIME_DIR": "/run/user/7",
+            "SSH_AUTH_SOCK": "",
+            "SSH_CONNECTION": "1 2 3 4",
+        }
+        self.assertEqual(
+            tab_env.local_set_from(env),
+            {"DISPLAY": ":1", "WAYLAND_DISPLAY": "/run/user/7/wayland-2", "SSH_AUTH_SOCK": ""},
+        )
+        self.assertEqual(
+            tab_env.local_set_from({"WAYLAND_DISPLAY": "wayland-2"}),
+            {"WAYLAND_DISPLAY": "wayland-2"},
+            "no runtime dir to resolve it against",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

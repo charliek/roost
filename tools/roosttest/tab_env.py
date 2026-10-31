@@ -37,6 +37,10 @@ from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
 from client import scaled_timeout
+from ui import OPENER_SET
+
+#: MIRRORS `roost_ipc::opener::LOCAL_SET`: what a local opener brings.
+LOCAL_SET = OPENER_SET[:4]
 
 _CTL_KERN = 1
 _KERN_ARGMAX = 8
@@ -90,6 +94,17 @@ def sleep_argv(seconds: float, binary: Path | str | None = None) -> list[str]:
     if sys.platform == "darwin":
         return [binary, "-c", _SLEEP_CODE, str(seconds)]
     return [binary, str(seconds)]
+
+
+def readable_shell(directory: Path) -> Path:
+    """A `SHELL` for a UI or daemon to give its restored and new tabs whose
+    environment this module can read on macOS: a script `sleeper()` runs,
+    so the kernel passes the block Roost gave it on unchanged. Written
+    into `directory`, which the caller owns."""
+    shell = directory / "readable-shell"
+    shell.write_text(f"#!{sleeper()}\nimport time\ntime.sleep(600)\n")
+    shell.chmod(0o755)
+    return shell
 
 
 #: A process as metadata tells it apart: its parent and its start time.
@@ -311,6 +326,53 @@ def _pairs(entries: Iterable[bytes]) -> dict[str, str]:
     return env
 
 
+def opener_vars(env: dict[str, str]) -> dict[str, str]:
+    """The opener-set part of `env`: what a tab's opener decides."""
+    return {name: value for name, value in env.items() if name in OPENER_SET}
+
+
+def local_set_from(env: dict[str, str]) -> dict[str, str]:
+    """MIRRORS `roost_ipc::opener::local_set_from`: the local-set values
+    `env` brings as an opener, a relative `WAYLAND_DISPLAY` made absolute
+    against `env`'s own `XDG_RUNTIME_DIR`."""
+    found = {name: env[name] for name in LOCAL_SET if name in env}
+    display, runtime = found.get("WAYLAND_DISPLAY"), env.get("XDG_RUNTIME_DIR", "")
+    if display and not os.path.isabs(display) and os.path.isabs(runtime):
+        found["WAYLAND_DISPLAY"] = os.path.join(runtime, display)
+    return found
+
+
+def _require_child(pid: int, allowed: set[Path]) -> None:
+    """Refuse `pid` unless it is a child of this process — so its pid
+    cannot be reused before this process reaps it — running one of
+    `allowed`, the binaries this test launched."""
+    identity = _identity(pid)
+    if identity is None or identity[0] != os.getpid():
+        raise AssertionError(f"pid {pid} is not a child of this test: refusing to read it")
+    exe = exe_of(pid)
+    if exe is None or Path(os.path.realpath(exe)) not in allowed:
+        raise AssertionError(
+            f"pid {pid} runs {exe}, not one of this test's binaries "
+            f"{sorted(map(str, allowed))}: refusing to read it"
+        )
+
+
+def child_environ(pid: int, *, binaries: Iterable[Path | str]) -> dict[str, str]:
+    """The environment `pid` was exec'd with, when it is a direct child of
+    this test running one of `binaries` — a UI or daemon the test started
+    — or nothing is read at all."""
+    allowed = {Path(os.path.realpath(binary)) for binary in binaries}
+    _require_child(pid, allowed)
+    env = _owned_environ(
+        pid,
+        lambda identity, exe: identity[0] == os.getpid()
+        and Path(os.path.realpath(exe)) in allowed,
+    )
+    if env is None:
+        raise AssertionError(f"pid {pid} went away before its environment could be read")
+    return env
+
+
 def tab_process(
     server_pid: int, tab_id: int, *, binaries: Iterable[Path | str], timeout: float = 30.0
 ) -> tuple[int, dict[str, str]]:
@@ -324,18 +386,7 @@ def tab_process(
     environment, which has no `ROOST_TAB_ID`, and one inside `execve` reads
     empty. More than one match is an error.
     """
-    allowed = {Path(os.path.realpath(binary)) for binary in binaries}
-    server = _identity(server_pid)
-    if server is None or server[0] != os.getpid():
-        raise AssertionError(
-            f"pid {server_pid} is not a child of this test: refusing to read its children"
-        )
-    exe = exe_of(server_pid)
-    if exe is None or Path(os.path.realpath(exe)) not in allowed:
-        raise AssertionError(
-            f"pid {server_pid} runs {exe}, not one of this test's binaries "
-            f"{sorted(map(str, allowed))}: refusing to read its children"
-        )
+    _require_child(server_pid, {Path(os.path.realpath(binary)) for binary in binaries})
     wanted = str(tab_id)
     deadline = time.monotonic() + scaled_timeout(timeout)
     while True:
