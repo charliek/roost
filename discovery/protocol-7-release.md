@@ -1157,7 +1157,7 @@ prove ordering.
 
 ### M4. G9: tab environment by opener
 
-**Status: implemented (plan 085), PR pending.**
+**Status: merged: #668** (plan 085).
 
 *How it shipped (plan 085 corrections to this section). The rule text
 below is already corrected where an entry changes it, except rule 5, which
