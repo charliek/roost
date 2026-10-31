@@ -133,7 +133,7 @@ def own_copy(binary: Path) -> Path:
     original's, which is what `session._is_debug_build` reads."""
     dest = _ROOT / "bin" / binary.parent.name / binary.name
     if not dest.exists():
-        dest.parent.mkdir(parents=True)
+        dest.parent.mkdir(parents=True, exist_ok=True)
         tab_env.private_copy(binary, dest)
     return dest
 
