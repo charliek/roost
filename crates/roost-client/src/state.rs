@@ -22,7 +22,7 @@ use roost_ui_model::keys::HostId;
 /// inactive screen, soft-wrap flags, Kitty images); `vt` is the
 /// build-independent fallback. Which one an attach lands on is the
 /// server's to negotiate — this list is only what may be asked for.
-pub(crate) const CLIENT_PAYLOAD_KINDS: [&str; 2] =
+pub const CLIENT_PAYLOAD_KINDS: [&str; 2] =
     [AttachPayloadKind::GHOSTTY_SNAPSHOT, AttachPayloadKind::VT];
 
 /// First retry delay after a mid-session drop.
@@ -40,7 +40,7 @@ const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// a payload kind it cannot decode means the attach can never work, and
 /// only then does the build string matter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MismatchKind {
+pub enum MismatchKind {
     /// `session_protocol` is not [`SESSION_PROTOCOL_VERSION`].
     Protocol,
     /// `payload_kinds` contains none of [`CLIENT_PAYLOAD_KINDS`].
@@ -62,7 +62,7 @@ pub(crate) enum MismatchKind {
 /// attach ends up on is the handshake's to negotiate, per attach, and
 /// nothing here predicts it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Compatibility {
+pub enum Compatibility {
     /// Protocol and libghostty build both match.
     Exact,
     /// The two libghostty builds disagree, and the session serves the
@@ -81,7 +81,7 @@ pub(crate) enum Compatibility {
 /// retry?" and "what can we offer when the builds disagree?") cannot
 /// drift apart: there is one value, and each is a function of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HostTransport {
+pub enum HostTransport {
     /// The `"localhost"` sentinel: this machine's own session.
     LocalSession,
     /// A Unix socket path — somebody else's process, reached directly.
@@ -93,13 +93,13 @@ pub(crate) enum HostTransport {
 impl HostTransport {
     /// Whether this is this machine's own session. Gates the spawn
     /// ladder and the auto-retry policy.
-    pub(crate) fn is_localhost(self) -> bool {
+    pub fn is_localhost(self) -> bool {
         matches!(self, Self::LocalSession)
     }
 
     /// What this client can offer when the build gate refuses — decided
     /// **structurally**, never probed (plan 039 §3.5).
-    pub(crate) fn restart_action(self) -> RestartAction {
+    pub fn restart_action(self) -> RestartAction {
         match self {
             Self::LocalSession => RestartAction::RestartLocal,
             Self::Ssh => RestartAction::OfferRemoteUpdate,
@@ -115,7 +115,7 @@ impl HostTransport {
 /// actual install source is resolved later, at confirm time (plan 039
 /// §3.5), so nothing here costs a round trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RestartAction {
+pub enum RestartAction {
     /// This machine's own session: stop it and start it again from here.
     RestartLocal,
     /// Reached over `ssh`, so an update *can* be offered — whether a
@@ -143,33 +143,33 @@ pub(crate) enum RestartAction {
 /// user staring at "this session was started by an older Roost" wants
 /// to see which two builds disagreed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BuildMismatch {
-    pub(crate) kind: MismatchKind,
-    pub(crate) session_protocol: u32,
-    pub(crate) client_protocol: u32,
-    pub(crate) session_build: String,
-    pub(crate) client_build: String,
-    pub(crate) session_payload_kinds: Vec<String>,
+pub struct BuildMismatch {
+    pub kind: MismatchKind,
+    pub session_protocol: u32,
+    pub client_protocol: u32,
+    pub session_build: String,
+    pub client_build: String,
+    pub session_payload_kinds: Vec<String>,
     /// What this client can offer about it — a local restart, a remote
     /// update, or nothing but a pointer at the docs.
-    pub(crate) restart: RestartAction,
+    pub restart: RestartAction,
     /// The refused session's build, as the update logic compares it
     /// (plan 076 D3).
-    pub(crate) running: BuildId,
+    pub running: BuildId,
     /// The refused session's own id and executable, so a restart of it
     /// is bound to this session and can consider its binary (plan 076
     /// D4, D8).
-    pub(crate) session_id: String,
-    pub(crate) exe_path: Option<String>,
+    pub session_id: String,
+    pub exe_path: Option<String>,
     /// Where an [`MismatchKind::OldSocketPath`] session was found — the
     /// socket a restart stops it on, which is never the one it then
     /// starts and connects at. `None` for every other kind.
-    pub(crate) old_socket: Option<PathBuf>,
+    pub old_socket: Option<PathBuf>,
 }
 
 /// `host.status`'s `reason` for a session found on an old path; its
 /// `detail` is that path.
-pub(crate) const OLD_SOCKET_PATH_REASON: &str = "old socket path";
+pub const OLD_SOCKET_PATH_REASON: &str = "old socket path";
 
 impl BuildMismatch {
     fn new(
@@ -200,11 +200,7 @@ impl BuildMismatch {
     /// The session `identity` answered for at `socket`, a path this
     /// build no longer uses. Only this machine's own session is ever
     /// found there, so the offer is always a local restart.
-    pub(crate) fn at_old_socket(
-        identity: &SessionIdentify,
-        client_build: &str,
-        socket: PathBuf,
-    ) -> Self {
+    pub fn at_old_socket(identity: &SessionIdentify, client_build: &str, socket: PathBuf) -> Self {
         Self {
             old_socket: Some(socket),
             ..Self::new(
@@ -218,7 +214,7 @@ impl BuildMismatch {
 
     /// Whether the refused session speaks the newer protocol (plan 076
     /// D3's `Gate::Failed`).
-    pub(crate) fn protocol_newer(&self) -> bool {
+    pub fn protocol_newer(&self) -> bool {
         self.session_protocol > self.client_protocol
     }
 }
@@ -227,7 +223,7 @@ impl BuildMismatch {
 ///
 /// `Ok` means every negotiation this client depends on holds; the error
 /// is what the `NeedsRestart` state carries.
-pub(crate) fn check_compatibility(
+pub fn check_compatibility(
     identity: &SessionIdentify,
     client_build: &str,
     restart: RestartAction,
@@ -267,16 +263,16 @@ pub(crate) fn check_compatibility(
 /// ripple through every `match` and every exhaustive table for a value
 /// no transition depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConnectFacts {
+pub struct ConnectFacts {
     /// The session's own id, from `session.identify`. It is what binds a
     /// later decision — a resume, a consent card — to the session the
     /// facts describe rather than to whatever is behind the host now.
-    pub(crate) session_id: String,
+    pub session_id: String,
     /// The two libghostty builds. Filled on every connection, skewed or
     /// not, and only *read* when [`Self::reduced_fidelity`] is set: the
     /// reason lines print the pair, and a pair assembled later would
     /// have to re-identify to get it.
-    pub(crate) skew: Skew,
+    pub skew: Skew,
     /// The connection is on the build-independent `vt` fallback: links,
     /// the inactive screen and soft-wrap flags are gone until the
     /// session runs a matching build.
@@ -285,11 +281,11 @@ pub(crate) struct ConnectFacts {
     /// surface keys on it rather than on the negotiated payload kind —
     /// that one is `None` until a tab attaches, so a skewed host nobody
     /// has clicked into would show nothing.
-    pub(crate) reduced_fidelity: bool,
+    pub reduced_fidelity: bool,
     /// How this attempt's prologue actually subscribed: `Some` when it
     /// replayed from a carried fence, `None` when it took a fresh
     /// snapshot.
-    pub(crate) resumed: Option<ResumeFacts>,
+    pub resumed: Option<ResumeFacts>,
     /// The session's standing durability failure, from
     /// `session.identify` (#481).
     ///
@@ -300,14 +296,14 @@ pub(crate) struct ConnectFacts {
     /// so the one change a gap can swallow is exactly this one, and both
     /// gaps (the prologue's and a lagged stream's) are closed the same
     /// way.
-    pub(crate) persist_error: Option<String>,
+    pub persist_error: Option<String>,
     /// The session's build, as the update logic compares it (plan 076
     /// D3) — settled at the identify gate like everything but
     /// `persist_error`.
-    pub(crate) running: BuildId,
+    pub running: BuildId,
     /// [`SessionIdentify::exe_path`], verbatim. A path a peer supplied:
     /// only ever run for a session on this machine (plan 076 D4).
-    pub(crate) exe_path: Option<String>,
+    pub exe_path: Option<String>,
 }
 
 /// The two libghostty builds a reduced-fidelity connection sits between.
@@ -316,17 +312,17 @@ pub(crate) struct ConnectFacts {
 /// [`BuildMismatch`] keeps them: a person reading "this session is at
 /// reduced fidelity" wants to see which two builds disagreed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Skew {
-    pub(crate) session_build: String,
-    pub(crate) client_build: String,
+pub struct Skew {
+    pub session_build: String,
+    pub client_build: String,
 }
 
 /// What a resumed prologue replayed from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ResumeFacts {
+pub struct ResumeFacts {
     /// The subscribe **ack's** revision — server-attested, not the fence
     /// the client asked from.
-    pub(crate) from_revision: u64,
+    pub from_revision: u64,
 }
 
 impl ConnectFacts {
@@ -334,7 +330,7 @@ impl ConnectFacts {
     ///
     /// `resumed` is the prologue's to fill once it knows how it
     /// subscribed.
-    pub(crate) fn new(
+    pub fn new(
         identity: &SessionIdentify,
         client_build: &str,
         compatibility: Compatibility,
@@ -362,24 +358,24 @@ impl ConnectFacts {
 /// happen until you ask". A section renders the difference; nothing
 /// infers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Disconnected {
+pub struct Disconnected {
     /// One line, shown as-is. "session ended" is an honest reading of a
     /// clean EOF from a localhost session, and the plan requires it be
     /// said rather than dressed up as a transient blip.
-    pub(crate) reason: String,
+    pub reason: String,
     /// The untruncated text behind `reason`, when `reason` is a band
     /// line too short to carry it — the launch ladder's three rungs, an
     /// exec error, the daemon's own verdict. Only [`HostStateMachine::settled`]
     /// writes it; the band renders `reason` alone and `host.status`
     /// carries this beside it.
-    pub(crate) detail: Option<String>,
-    pub(crate) retry_in: Option<Duration>,
+    pub detail: Option<String>,
+    pub retry_in: Option<Duration>,
 }
 
 /// Per-host connection lifecycle: `Disconnected → Connecting →
 /// Connected → {Stopped, NeedsRestart, Disconnected}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HostConnState {
+pub enum HostConnState {
     Disconnected(Disconnected),
     /// An attempt is in flight. `previous` names the incarnation whose
     /// UI state must be purged — the feed tags this event with the *new*
@@ -400,7 +396,7 @@ pub(crate) enum HostConnState {
 impl HostConnState {
     /// Whether this connection reached a session and is still on it:
     /// everything a connected host can do is open.
-    pub(crate) fn is_connected(&self) -> bool {
+    pub fn is_connected(&self) -> bool {
         matches!(self, HostConnState::Connected)
     }
 
@@ -414,7 +410,7 @@ impl HostConnState {
     /// anything held *about the session across connections*: a resume
     /// point offered to a session that restarted names a history that
     /// no longer exists, and revisions restart at zero in every process.
-    pub(crate) fn session_is_gone(&self) -> bool {
+    pub fn session_is_gone(&self) -> bool {
         match self {
             HostConnState::Stopped | HostConnState::NeedsRestart(_) => true,
             HostConnState::Disconnected(disconnected) => disconnected.detail.is_some(),
@@ -426,7 +422,7 @@ impl HostConnState {
     /// which dot it paints, whether its rows respond, and what its
     /// rollup says. The mapping lives here so the section model in
     /// `roost-ui-model` stays free of the connection machinery.
-    pub(crate) fn section_state(&self) -> roost_ui_model::host_sidebar::SectionState {
+    pub fn section_state(&self) -> roost_ui_model::host_sidebar::SectionState {
         use roost_ui_model::host_sidebar::SectionState;
         match self {
             Self::Disconnected(_) => SectionState::Disconnected,
@@ -438,7 +434,7 @@ impl HostConnState {
     }
 
     /// Whether an auto-retry is pending, and how long away.
-    pub(crate) fn retry_in(&self) -> Option<Duration> {
+    pub fn retry_in(&self) -> Option<Duration> {
         match self {
             HostConnState::Disconnected(d) => d.retry_in,
             _ => None,
@@ -446,7 +442,7 @@ impl HostConnState {
     }
 
     /// The band's one-line reason, when this state carries one.
-    pub(crate) fn reason(&self) -> Option<&str> {
+    pub fn reason(&self) -> Option<&str> {
         match self {
             HostConnState::Disconnected(d) => Some(d.reason.as_str()),
             HostConnState::NeedsRestart(mismatch) if mismatch.old_socket.is_some() => {
@@ -459,7 +455,7 @@ impl HostConnState {
     /// The long form behind the band line, when this state carries one:
     /// a settled launch's whole story, or where a session on an old path
     /// was found.
-    pub(crate) fn detail(&self) -> Option<&str> {
+    pub fn detail(&self) -> Option<&str> {
         match self {
             HostConnState::Disconnected(d) => d.detail.as_deref(),
             HostConnState::NeedsRestart(mismatch) => mismatch
@@ -482,7 +478,7 @@ impl HostConnState {
 /// and wrong for a TCP + auth handshake (the SSH reconnect ladder builds
 /// its own). [`Default`] is the localhost pair.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Backoff {
+pub struct Backoff {
     attempt: u32,
     base: Duration,
     cap: Duration,
@@ -495,7 +491,7 @@ impl Default for Backoff {
 }
 
 impl Backoff {
-    pub(crate) fn new(base: Duration, cap: Duration) -> Self {
+    pub fn new(base: Duration, cap: Duration) -> Self {
         Self {
             attempt: 0,
             base,
@@ -510,7 +506,7 @@ impl Backoff {
     /// Full-jitter-down-to-half rather than full-jitter-to-zero: a
     /// storm of clients must spread out, but a single client must not
     /// spin on a socket that is not there.
-    pub(crate) fn next_delay(&mut self, jitter: f64) -> Duration {
+    pub fn next_delay(&mut self, jitter: f64) -> Duration {
         let jitter = if jitter.is_finite() {
             jitter.clamp(0.0, 1.0)
         } else {
@@ -531,12 +527,12 @@ impl Backoff {
 
     /// A successful connect clears the ladder: the next drop starts over
     /// at the base delay, not wherever the last outage left off.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.attempt = 0;
     }
 
     #[cfg(test)]
-    pub(crate) fn attempt_number(&self) -> u32 {
+    pub fn attempt_number(&self) -> u32 {
         self.attempt
     }
 }
@@ -548,14 +544,14 @@ impl Backoff {
 /// any other host is reachable only through something the user set up
 /// (an `ssh -L` forward today) and is manual-reconnect only per D8.
 #[derive(Debug)]
-pub(crate) struct HostStateMachine {
+pub struct HostStateMachine {
     localhost: bool,
     state: HostConnState,
     backoff: Backoff,
 }
 
 impl HostStateMachine {
-    pub(crate) fn new(localhost: bool) -> Self {
+    pub fn new(localhost: bool) -> Self {
         Self {
             localhost,
             state: HostConnState::Disconnected(Disconnected {
@@ -567,39 +563,39 @@ impl HostStateMachine {
         }
     }
 
-    pub(crate) fn state(&self) -> &HostConnState {
+    pub fn state(&self) -> &HostConnState {
         &self.state
     }
 
     /// An attempt begins. `previous` is the incarnation being replaced —
     /// `None` on the very first attempt, `Some` on every reconnect.
-    pub(crate) fn begin_attempt(&mut self, previous: Option<HostId>) -> HostConnState {
+    pub fn begin_attempt(&mut self, previous: Option<HostId>) -> HostConnState {
         self.transition(HostConnState::Connecting { previous })
     }
 
     /// The theme is seeded, the stream is subscribed, the mirror is built.
-    pub(crate) fn connected(&mut self) -> HostConnState {
+    pub fn connected(&mut self) -> HostConnState {
         self.backoff.reset();
         self.transition(HostConnState::Connected)
     }
 
     /// The compatibility gate refused. Terminal until the user acts —
     /// retrying a build mismatch just reproduces it.
-    pub(crate) fn needs_restart(&mut self, mismatch: BuildMismatch) -> HostConnState {
+    pub fn needs_restart(&mut self, mismatch: BuildMismatch) -> HostConnState {
         self.transition(HostConnState::NeedsRestart(mismatch))
     }
 
     /// A `session.stopping` envelope, or the equivalent op refusal.
     /// Whatever reason the session gave, the answer is the same: stop
     /// driving it rather than retry into something that said goodbye.
-    pub(crate) fn stopping(&mut self) -> HostConnState {
+    pub fn stopping(&mut self) -> HostConnState {
         self.transition(HostConnState::Stopped)
     }
 
     /// The connection dropped for a transport reason (EOF, refused, an
     /// io error). Localhost schedules a retry; anything else waits for
     /// the user.
-    pub(crate) fn dropped(&mut self, reason: impl Into<String>, jitter: f64) -> HostConnState {
+    pub fn dropped(&mut self, reason: impl Into<String>, jitter: f64) -> HostConnState {
         let retry_in = self.localhost.then(|| self.backoff.next_delay(jitter));
         self.transition(HostConnState::Disconnected(Disconnected {
             reason: reason.into(),
@@ -615,7 +611,7 @@ impl HostStateMachine {
     /// because a retry here would dial a socket nothing is going to
     /// create and overwrite this reason with a generic io error every
     /// 250ms. ↻ Reconnect is the recovery.
-    pub(crate) fn settled(
+    pub fn settled(
         &mut self,
         reason: impl Into<String>,
         detail: impl Into<String>,
@@ -630,7 +626,7 @@ impl HostStateMachine {
     /// The user asked to disconnect. Never schedules a retry, whatever
     /// the host is — asking to disconnect and being reconnected two
     /// seconds later is the one outcome nobody wants.
-    pub(crate) fn disconnect_requested(&mut self) -> HostConnState {
+    pub fn disconnect_requested(&mut self) -> HostConnState {
         self.backoff.reset();
         self.transition(HostConnState::Disconnected(Disconnected {
             reason: "disconnected".into(),

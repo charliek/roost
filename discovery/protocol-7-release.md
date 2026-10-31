@@ -1408,6 +1408,30 @@ because these files churn (#568, #570, #597).
 - **Clean dependencies:** `roost-client` builds on its own and doesn't
   depend on `roost-iced`, iced or winit. `cargo metadata` checks this,
   the same way the `examples/ipc-consumer` check does.
+**Status: in review (plan 086)**
+
+*How it shipped (plan 086 departures from this section):*
+- **Two more supporting items moved** than named above: `Shutdown` and
+  `scale()` from `task.rs`, because `upload.rs` imports them. This is the
+  "minimal supporting-type extraction", just not a foreseen one.
+- **One attribute change in moved code.** `HostOps::queued_for_test`'s
+  `cfg` gains `feature = "test-support"`, so iced's own tests still see it
+  across the crate boundary without a copy or a change to what ships.
+  Charlie approved it.
+- **A small `roost_client::task` module** holds `Shutdown` and `scale()`
+  rather than the crate root, so `upload.rs`'s import stays identical.
+- **Log targets change.** The five log calls in the moved files now log
+  under `roost_client::...` instead of `roost_iced::host_conn::...`.
+  `RUST_LOG=roost_client=debug` shows the mirror's debug lines; the
+  default `info` filter is unchanged.
+- **The dependency check is wider than the three names above.** It also
+  denies the repo's existing UI-toolkit names and checks that `roost-client`
+  does not turn on `roost-vt`'s `ffi` feature. It runs in `rust-build`;
+  `make check-iced` repeats the name check but not the `ffi` one.
+- **Trial facts.** `roost-client` needs no libghostty archive: it reaches
+  `roost-vt` through `roost-ui-model` with the default (stub) features.
+  Its closure holds no iced, winit, wgpu or `roost-engine`.
+
 - **Gates green:** `make test-rust`, `make check-iced`, `make e2e-iced`
   and the host lanes. Every desktop user's local tabs run on this code
   under `local-backend = session`.

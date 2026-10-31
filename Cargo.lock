@@ -3025,6 +3025,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "roost-client"
+version = "0.0.26"
+dependencies = [
+ "roost-engine",
+ "roost-ipc",
+ "roost-ui-model",
+ "roost-vt",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "roost-engine"
 version = "0.0.26"
 dependencies = [
@@ -3063,6 +3076,7 @@ dependencies = [
  "png",
  "roost-agent",
  "roost-agent-install",
+ "roost-client",
  "roost-engine",
  "roost-ipc",
  "roost-ui-model",

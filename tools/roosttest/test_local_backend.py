@@ -162,7 +162,7 @@ SHORT_ROLLBACK = {"ROOST_TEST_ROLLBACK_BUDGET_MS": str(int(ROLLBACK_BUDGET_S * 1
 #: `SPAWN_CONFIRM_BUDGET`'s 10 s (`crates/roost-iced/src/host_conn/task.rs`):
 #: nothing binds behind the stub, so it too is spent whole.
 SHORT_CONFIRM = {"ROOST_TEST_SPAWN_CONFIRM_BUDGET_MS": "1000"}
-#: `BACKOFF_BASE` (`crates/roost-iced/src/host_conn/state.rs`), in seconds:
+#: `BACKOFF_BASE` (`crates/roost-client/src/state.rs`), in seconds:
 #: the first rung of a localhost slot's redial ladder, which doubles per
 #: rung. Jitter puts the first redial between half of it and all of it,
 #: so this is the latest that redial can come.

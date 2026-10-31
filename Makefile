@@ -542,6 +542,9 @@ check-iced: fmt-check test-iced  ## Iced formatting, lint, tests, and dependency
 	# edge exists at all.
 	@! cargo tree -p roost-engine | grep -E '(^| )roost-vt v' || \
 		( echo "roost-engine pulls roost-vt with default features"; exit 1 )
+	@t=$$(cargo tree -p roost-client -e normal,build --target all --prefix none) || exit 1; \
+		! printf '%s\n' "$$t" | grep -E '^(roost-iced|iced|iced_[^ ]*|winit|gtk4|libadwaita|pango|cairo-rs|wgpu|zbus|arboard|notify-rust) ' || \
+		( echo "roost-client depends on a UI crate"; exit 1 )
 	@cargo tree -p roost-iced | grep -q 'swash v0.2.10 (.*third_party/swash)' || \
 		( echo "swash [patch.crates-io] not applied"; exit 1 )
 

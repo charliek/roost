@@ -16,6 +16,9 @@
 #                    application commands/events, and IPC dispatch.
 #   * roost-ui-model — toolkit-neutral config, theme, palette, keybind,
 #                      provider, agent projection, and selection models.
+#   * roost-client — host-session client core: state machine, mirror,
+#                    reconnect, op queue, uploads. `roost-iced` is its
+#                    consumer.
 #   * roost-iced — the Linux UI, packaged as `/usr/bin/roost`.
 #   * roost-session — the headless host-session daemon; binary is
 #                     `roost-session`. Same engine as a UI, no toolkit.
@@ -37,6 +40,7 @@ members = [
     "crates/roost-engine",
     "crates/roost-ui-model",
     "crates/roost-cli",
+    "crates/roost-client",
     "crates/roost-iced",
     "crates/roost-session",
 ]

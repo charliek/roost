@@ -40,6 +40,7 @@ crates/
   roost-osc/              # OSC scanner + state machine
   roost-url/              # Shared URL detection for clickable links
   roost-cli/              # roostctl binary
+  roost-client/           # Host-session client core: state machine, mirror, reconnect, op queue, uploads
   roost-iced/             # iced UI — packaged .deb ships it as /usr/bin/roost;
                           #   src/macos/ holds the AppKit seams for Roost-Iced.app
   roost-session/          # opt-in headless host-session daemon (roost-session binary);

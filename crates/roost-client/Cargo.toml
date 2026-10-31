@@ -1,0 +1,26 @@
+[package]
+name        = "roost-client"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Roost host-session client core"
+
+[lints]
+workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+roost-ipc = { path = "../roost-ipc" }
+roost-ui-model = { path = "../roost-ui-model" }
+serde_json = "1"
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+roost-engine = { path = "../roost-engine", features = ["vt"] }
+roost-vt = { path = "../roost-vt", features = ["ffi"] }

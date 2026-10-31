@@ -61,7 +61,7 @@ const BASE_MS_ENV: &str = "ROOST_SSH_RECONNECT_BASE_MS";
 /// What dropped, in the one shape that keeps `family == None`'s two
 /// meanings apart.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum DropInput<'a> {
+pub enum DropInput<'a> {
     /// A session-level drop (`apply_state`'s `Disconnected` arm): the
     /// family the overlay just folded in, or `None` for a bare bridge
     /// EOF — the ordinary dropped link, and the headline case this whole
@@ -79,7 +79,7 @@ pub(crate) enum DropInput<'a> {
 /// different lines (§3.8) and an `Option` cannot tell "we gave up after
 /// ten tries" from "this was never eligible".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Decision {
+pub enum Decision {
     /// Dial again in `delay`. `attempt` is the 1-based human number
     /// §3.8 renders as `(3/10)`.
     Retry { delay: Duration, attempt: u32 },
@@ -127,7 +127,7 @@ pub(crate) enum Decision {
 /// The `match` has no wildcard arm, so a new [`SshFailure`] family
 /// breaks the build here as well as at `offer_for`. Deliberate: a family
 /// nobody decided about must not inherit a verdict.
-pub(crate) fn retryable(input: DropInput<'_>, truncated: bool) -> bool {
+pub fn retryable(input: DropInput<'_>, truncated: bool) -> bool {
     let carried = match input {
         DropInput::Session(_) => false,
         DropInput::Establish(failure) => failure.truncated,
@@ -160,7 +160,7 @@ pub(crate) fn retryable(input: DropInput<'_>, truncated: bool) -> bool {
 /// ladder never spans two outages, and the attempt number the band shows
 /// is the number of times *this* outage has dialed.
 #[derive(Debug)]
-pub(crate) struct ReconnectLadder {
+pub struct ReconnectLadder {
     backoff: Backoff,
     attempts: u32,
     budget: u32,
@@ -183,7 +183,7 @@ impl ReconnectLadder {
     /// [`Decision::NonRetryable`] even on an outage that had already
     /// spent its budget — "gave up trying" and "must not be tried" are
     /// different things to tell a user about a possible MITM.
-    pub(crate) fn next(&mut self, input: DropInput<'_>, truncated: bool, jitter: f64) -> Decision {
+    pub fn next(&mut self, input: DropInput<'_>, truncated: bool, jitter: f64) -> Decision {
         if !retryable(input, truncated) {
             return Decision::NonRetryable;
         }
@@ -201,19 +201,19 @@ impl ReconnectLadder {
     }
 
     /// Back to the base delay and attempt zero.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.backoff.reset();
         self.attempts = 0;
     }
 
     /// How many attempts this outage has spent.
-    pub(crate) fn attempts(&self) -> u32 {
+    pub fn attempts(&self) -> u32 {
         self.attempts
     }
 
     /// The budget this outage was built with — what §3.8's `(3/10)`
     /// renders as its denominator.
-    pub(crate) fn budget(&self) -> u32 {
+    pub fn budget(&self) -> u32 {
         self.budget
     }
 }
@@ -235,7 +235,7 @@ fn ssh_backoff_base() -> Duration {
 /// The gate is the same one every other test seam in the tree uses: a
 /// variable that shortens a security-relevant ladder must not be
 /// reachable by setting one name in a shipped build's environment.
-pub(crate) fn test_override(name: &str) -> Option<String> {
+pub fn test_override(name: &str) -> Option<String> {
     if !std::env::var("ROOST_TEST_MODE").is_ok_and(|value| value == "1") {
         return None;
     }
@@ -262,7 +262,7 @@ fn parse_backoff_base(raw: Option<&str>) -> Duration {
 /// A millisecond override's rule, over an already-read value. Zero falls
 /// back like any other nonsense: a zero base would spin, and a zero
 /// budget expires before the thing it bounds has started.
-pub(crate) fn parse_millis(raw: Option<&str>, shipped: Duration) -> Duration {
+pub fn parse_millis(raw: Option<&str>, shipped: Duration) -> Duration {
     raw.and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|millis| *millis > 0)
         .map(Duration::from_millis)

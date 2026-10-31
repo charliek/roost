@@ -5,7 +5,7 @@ and says why — never a retry ladder, never silence.
 
 `test_host_ssh.py` proves the *ssh* transport's launch-failure and
 retry-ladder behavior. This module is the twin for the *local* daemon
-spawn: `HostStateMachine::settled` (`host_conn/state.rs`) publishes
+spawn: `HostStateMachine::settled` (`roost-client`'s `state.rs`) publishes
 `Disconnected { reason, detail: Some(detail), retry_in: None }` after
 exactly one failed spawn attempt, whatever the transport — the
 localhost bool never consults it, so nothing here ever arms a retry.

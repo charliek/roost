@@ -34,13 +34,13 @@ use roost_ipc::messages::{
 /// the reorder events carry the full post-reorder order, which is what
 /// makes that possible.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct HostMirror {
-    pub(crate) projects: Vec<Project>,
-    pub(crate) active_project_id: i64,
-    pub(crate) active_tab_id: i64,
+pub struct HostMirror {
+    pub projects: Vec<Project>,
+    pub active_project_id: i64,
+    pub active_tab_id: i64,
     /// The last commit folded in. The fence at build time, then every
     /// applied batch's revision.
-    pub(crate) revision: u64,
+    pub revision: u64,
     /// The tabs whose `password_input` [`Self::suspend_password_input`]
     /// took down, for [`Self::resume_password_input`] to put back.
     suspended_password_input: Vec<i64>,
@@ -54,9 +54,9 @@ pub(crate) struct HostMirror {
 /// A tab's size owner as `tab.resized` last said it, and how many times
 /// it has said anything — the epoch a wave's refusal is stamped with.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct SizeEpoch {
-    pub(crate) epoch: u64,
-    pub(crate) owner: Option<SizeOwner>,
+pub struct SizeEpoch {
+    pub epoch: u64,
+    pub owner: Option<SizeOwner>,
 }
 
 impl HostMirror {
@@ -66,7 +66,7 @@ impl HostMirror {
     /// subscribe ack with the snapshot's own `revision`, and the higher
     /// of the two is the only safe reading when a session omits the
     /// snapshot's.
-    pub(crate) fn from_list(list: TabListResult, revision: u64) -> Self {
+    pub fn from_list(list: TabListResult, revision: u64) -> Self {
         let active = active_from(&list.projects);
         Self {
             projects: list.projects,
@@ -80,7 +80,7 @@ impl HostMirror {
 
     /// The tab's [`SizeEpoch`] — epoch 0, no owner, before any
     /// `tab.resized` this mirror has seen.
-    pub(crate) fn size_epoch(&self, tab_id: i64) -> SizeEpoch {
+    pub fn size_epoch(&self, tab_id: i64) -> SizeEpoch {
         self.size_owners.get(&tab_id).cloned().unwrap_or_default()
     }
 
@@ -88,7 +88,7 @@ impl HostMirror {
     /// that reported it is gone: a prompt nobody can type into is not
     /// one to guard. Remembered, not forgotten — see
     /// [`Self::resume_password_input`].
-    pub(crate) fn suspend_password_input(&mut self) {
+    pub fn suspend_password_input(&mut self) {
         for tab in self
             .projects
             .iter_mut()
@@ -105,7 +105,7 @@ impl HostMirror {
     /// the commits after the fence and no `tab.list`, so the values the
     /// fence describes are the snapshot it reconnects with; a fresh
     /// subscription rebuilds the mirror from `tab.list` instead.
-    pub(crate) fn resume_password_input(&mut self) {
+    pub fn resume_password_input(&mut self) {
         for tab_id in std::mem::take(&mut self.suspended_password_input) {
             self.with_tab(tab_id, |tab| tab.password_input = true);
         }
@@ -117,7 +117,7 @@ impl HostMirror {
     /// Discarding rather than skipping the whole stream matters: the
     /// snapshot is taken *after* the subscription, so the first few
     /// batches routinely describe commits the snapshot already contains.
-    pub(crate) fn apply_batch(&mut self, batch: &EventBatch) -> bool {
+    pub fn apply_batch(&mut self, batch: &EventBatch) -> bool {
         if batch.revision <= self.revision {
             return false;
         }
@@ -132,7 +132,7 @@ impl HostMirror {
     /// carry no workspace fact — are ignored here rather than rejected:
     /// a newer session's extra event must not break a mirror, and
     /// `tab.effect` is C5's to apply, not the mirror's to model.
-    pub(crate) fn apply_event(&mut self, envelope: &EventEnvelope) {
+    pub fn apply_event(&mut self, envelope: &EventEnvelope) {
         // Every arm decodes its own payload; a payload that does not
         // decode is a schema drift worth a log line, never a panic and
         // never a partially applied event.
@@ -272,11 +272,11 @@ impl HostMirror {
     }
 
     /// Every tab across every project, in display order.
-    pub(crate) fn tabs(&self) -> impl Iterator<Item = &Tab> {
+    pub fn tabs(&self) -> impl Iterator<Item = &Tab> {
         self.projects.iter().flat_map(|project| project.tabs.iter())
     }
 
-    pub(crate) fn tab(&self, tab_id: i64) -> Option<&Tab> {
+    pub fn tab(&self, tab_id: i64) -> Option<&Tab> {
         self.tabs().find(|tab| tab.id == tab_id)
     }
 
@@ -342,12 +342,12 @@ impl HostMirror {
 /// that must be exact per-commit (C5's `tab.effect`) rides the feed item
 /// itself, not this.
 #[derive(Debug, Default)]
-pub(crate) struct SharedMirror {
+pub struct SharedMirror {
     state: Mutex<HostMirror>,
 }
 
 impl SharedMirror {
-    pub(crate) fn new(mirror: HostMirror) -> Self {
+    pub fn new(mirror: HostMirror) -> Self {
         Self {
             state: Mutex::new(mirror),
         }
@@ -356,7 +356,7 @@ impl SharedMirror {
     /// The current state. Held for a render walk or an accessor and
     /// never across an await — the writer only ever holds it for one
     /// batch, so contention is a few microseconds at worst.
-    pub(crate) fn read(&self) -> MutexGuard<'_, HostMirror> {
+    pub fn read(&self) -> MutexGuard<'_, HostMirror> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -365,7 +365,7 @@ impl SharedMirror {
     /// A copy of the contents, detached from this handle — the workspace
     /// as of now, with no writer behind it. No connection is serving the
     /// copy, so its prompts are suspended until one resumes it.
-    pub(crate) fn detached(&self) -> Arc<SharedMirror> {
+    pub fn detached(&self) -> Arc<SharedMirror> {
         let mut copy = self.read().clone();
         copy.suspend_password_input();
         Arc::new(SharedMirror::new(copy))
@@ -373,13 +373,13 @@ impl SharedMirror {
 
     /// Replace the whole mirror: a fresh snapshot after a connect or a
     /// resync, which is purge-then-rebuild by contract.
-    pub(crate) fn reset(&self, mirror: HostMirror) {
+    pub fn reset(&self, mirror: HostMirror) {
         *self.read() = mirror;
     }
 
     /// Fold one batch in. `false` means it was at or below the fence and
     /// nothing changed.
-    pub(crate) fn apply_batch(&self, batch: &EventBatch) -> bool {
+    pub fn apply_batch(&self, batch: &EventBatch) -> bool {
         self.read().apply_batch(batch)
     }
 }
