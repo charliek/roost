@@ -284,6 +284,8 @@ note below.
 
 Two variables exist for the test harness. Both must be absolute, and
 **both are read by debug builds only**; a release build ignores them.
+(A third, `ROOST_TEST_USER_RUNTIME_DIR`, follows its own rule and is
+described with [`XDG_RUNTIME_DIR`](#xdg_runtime_dir-in-a-tab) below.)
 
 | Variable | Effect |
 |---|---|
@@ -472,6 +474,21 @@ variables below are set on top — the user's own values for
 `ROOST_SHELL_FEATURES` is the only one that defers to a pre-existing
 value (you can opt out of the default features by setting it in your
 rc — see [Feature flags](../guides/cwd-tracking.md#feature-flags)).
+
+### `XDG_RUNTIME_DIR` in a tab
+
+`XDG_RUNTIME_DIR` belongs to the machine and the user, not to whoever
+opened the tab. On Linux every tab gets `/run/user/<uid>` when that is a
+directory (not a symlink) owned by the process uid, whether a desk opener
+or a remote one opened it; this keeps `systemctl --user` and podman working
+in remote tabs. When it is not, the tab keeps the serving process's own
+value. It is computed at each spawn, because logind creates and removes the
+directory at login and logout. macOS has no `/run/user` and leaves the
+value alone.
+
+| Variable | Effect |
+|---|---|
+| `ROOST_TEST_USER_RUNTIME_DIR` | An absolute directory standing in for `/run/user/<uid>`; the same directory-and-owner check applies. Read by **debug builds, or any build with `ROOST_TEST_MODE=1`** (the release e2e lane sets it). An empty or relative value derives nothing, so the tab keeps the process's own `XDG_RUNTIME_DIR`. The harness sets it to each launched process's own runtime directory so no test tab points at the real `/run/user/<uid>`. |
 
 ### Terminal advertisement
 
