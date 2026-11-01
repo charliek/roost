@@ -799,6 +799,7 @@ impl TabVt {
             rows,
             max_scrollback: SERVER_VT_SCROLLBACK,
             continuation_max_bytes: SERVER_VT_CONTINUATION_MAX,
+            ..Default::default()
         })?;
         // A tab opened after `session.set_theme` starts on the client's
         // colors; one opened before any theme landed starts on the

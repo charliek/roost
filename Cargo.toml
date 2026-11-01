@@ -97,6 +97,9 @@ cc      = "1.0"
 # Hashing (release-asset checksums, roost-ipc's bootstrap download)
 sha2      = "0.10"
 
+# PNG: roost-vt's Kitty graphics decoder and roost-iced's clipboard images
+png = "=0.18.1"
+
 # Misc
 getrandom        = "0.4"
 percent-encoding = "2.3"

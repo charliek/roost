@@ -170,7 +170,14 @@ impl ServerVtWorkspace for TestWorkspace {
     }
 }
 
+/// A 1x1 RGB PNG, base64.
+const ONE_PIXEL_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+/// Every test here starts from this, so every tab task in the binary
+/// decodes PNGs the way the session binary does.
 fn enabled_supervisor(capture: bool) -> (PtySupervisor, Arc<TestWorkspace>) {
+    roost_vt::install_image_decoder().expect("install the PNG decoder");
     let workspace = Arc::new(TestWorkspace::default());
     let supervisor = PtySupervisor::new();
     supervisor
@@ -395,6 +402,40 @@ async fn terminal_queries_are_answered_exactly_once_with_no_client() {
 
     drop(commands);
     sup.close(912);
+}
+
+/// A Kitty PNG query is decoded and answered by the server terminal
+/// itself, once, with nothing attached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_png_query_is_answered_ok_exactly_once_with_no_client() {
+    let (sup, _workspace) = enabled_supervisor(true);
+    let _output = sup
+        .spawn(
+            913,
+            "/tmp",
+            &sh("exec sleep 30"),
+            80,
+            24,
+            &socket("png"),
+            &TabOpener::None,
+        )
+        .expect("spawn");
+    let commands = sup.tab_commands(913).expect("server-vt tab task");
+
+    feed(
+        &commands,
+        format!("\x1b_Gi=32,a=q,t=d,f=100;{ONE_PIXEL_PNG}\x1b\\").as_bytes(),
+    )
+    .await;
+    quiesce(&commands).await;
+
+    assert_eq!(
+        String::from_utf8_lossy(&capture(&commands, true).await),
+        "\x1b_Gi=32;OK\x1b\\"
+    );
+
+    drop(commands);
+    sup.close(913);
 }
 
 fn cell_at(dump: &ResolvedCellsData, row: u32, col: u16) -> &ResolvedCellData {

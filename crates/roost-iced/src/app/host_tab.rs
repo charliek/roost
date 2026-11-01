@@ -2009,6 +2009,7 @@ mod tests {
             rows: GEOMETRY.rows,
             max_scrollback: 200,
             continuation_max_bytes: 0,
+            ..Default::default()
         })
         .expect("terminal");
         terminal.vt_write(marker.as_bytes());
@@ -3760,6 +3761,7 @@ mod tests {
             rows: at.rows,
             max_scrollback: 200,
             continuation_max_bytes: 0,
+            ..Default::default()
         })
         .expect("terminal");
         terminal

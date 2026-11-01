@@ -67,7 +67,7 @@ arboard = { version = "3.6", default-features = false, features = [
     "image-data",
     "wayland-data-control",
 ] }
-png = "=0.18.1"
+png = { workspace = true }
 # The machine name this client puts in a host's agent-hooks record, so
 # two clients of one host are tellable apart (plan 046 §3.4). Already in
 # the workspace's graph (winit's x11rb pulls it), pure Rust, and one

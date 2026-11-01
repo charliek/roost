@@ -940,6 +940,7 @@ mod tests {
             rows: 24,
             max_scrollback: 0,
             continuation_max_bytes: 0,
+            ..Default::default()
         })
         .expect("test terminal");
         (KeyEncoder::new().expect("test key encoder"), terminal)

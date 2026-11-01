@@ -105,6 +105,7 @@ impl Vt {
                 rows,
                 max_scrollback: SCROLLBACK,
                 continuation_max_bytes: CONTINUATION_MAX,
+                ..Default::default()
             })
             .expect("terminal"),
             render: RenderState::new().expect("render state"),
@@ -945,6 +946,7 @@ fn a_continuation_past_the_retained_cap_defers_the_encode() {
         rows: ROWS,
         max_scrollback: SCROLLBACK,
         continuation_max_bytes: 4,
+        ..Default::default()
     })
     .expect("terminal");
     let mut render = RenderState::new().expect("render state");

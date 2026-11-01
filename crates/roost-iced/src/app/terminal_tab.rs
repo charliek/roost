@@ -686,6 +686,7 @@ impl TerminalTab {
             rows,
             max_scrollback: 2_000,
             continuation_max_bytes: 0,
+            ..Default::default()
         })?;
         terminal.set_color_foreground(theme.foreground)?;
         terminal.set_color_background(theme.background)?;

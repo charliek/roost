@@ -425,6 +425,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run(profile: &BundleProfile, bundle_id: Option<&str>) -> anyhow::Result<()> {
+    roost_vt::install_image_decoder().context("install the Kitty PNG decoder")?;
     tracing::info!(
         bundle_id = bundle_id.unwrap_or("unbundled"),
         profile = profile.kind.as_str(),

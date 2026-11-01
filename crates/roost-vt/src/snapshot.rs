@@ -246,6 +246,12 @@ pub struct SnapshotDecodeOptions {
     pub max_total_bytes: usize,
     /// Cap on a single record's declared payload length.
     pub max_record_bytes: usize,
+    /// `OPT_KITTY_IMAGE_STORAGE_LIMIT`, and the image policy the decoded
+    /// terminal gets at READY, as [`Terminal::new`] gives its own: the
+    /// writer's limit is not in the snapshot. The default is Roost's
+    /// [`crate::KITTY_IMAGE_STORAGE_LIMIT`]; `None` leaves both at
+    /// libghostty's defaults.
+    pub kitty_image_storage_limit: Option<u64>,
 }
 
 impl Default for SnapshotDecodeOptions {
@@ -255,6 +261,7 @@ impl Default for SnapshotDecodeOptions {
             retain_continuation: false,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
+            kitty_image_storage_limit: Some(crate::KITTY_IMAGE_STORAGE_LIMIT),
         }
     }
 }
@@ -610,7 +617,15 @@ impl SnapshotDecoder {
         // SAFETY: non-null, uniquely owned, straight out of a successful
         // `decoder_ready`; this decoder's `Drop`/`finish`/`abandon` free
         // the C decoder before the `Terminal`.
-        self.terminal = Some(unsafe { Terminal::from_decoded(handle) });
+        let terminal = self
+            .terminal
+            .insert(unsafe { Terminal::from_decoded(handle) });
+        if let Some(limit) = self.opts.kitty_image_storage_limit {
+            if let Err(err) = terminal.apply_image_policy(limit) {
+                self.state = State::Poisoned;
+                return Err(err);
+            }
+        }
         self.state = State::Ready;
         match self.read_ready_data(decoder) {
             Ok((primary, alternate, consumed)) => {
@@ -1017,6 +1032,17 @@ fn apply_options(decoder: sys::GhosttySnapshotDecoder, opts: &SnapshotDecodeOpti
                 decoder,
                 sys::GhosttySnapshotDecoderOption_GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_CONTINUATION_BYTES,
                 (&raw const max).cast(),
+            )
+        };
+        Error::from_result(rc)?;
+    }
+    if let Some(limit) = opts.kitty_image_storage_limit {
+        // SAFETY: same, with the `uint64_t` this option documents.
+        let rc = unsafe {
+            sys::ghostty_snapshot_decoder_set(
+                decoder,
+                sys::GhosttySnapshotDecoderOption_GHOSTTY_SNAPSHOT_DECODER_OPT_KITTY_IMAGE_STORAGE_LIMIT,
+                (&raw const limit).cast(),
             )
         };
         Error::from_result(rc)?;

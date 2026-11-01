@@ -123,5 +123,7 @@ fn run(foreground: bool, readiness: &mut Readiness) -> anyhow::Result<Outcome> {
     // fork, so no shell this session spawns inherits it (plan 063 §D8).
     let first_project = roost_session::capture_first_project();
     roost_session::set_process_umask();
+    // Libghostty's process globals survive the fork below.
+    roost_vt::install_image_decoder().context("install the Kitty PNG decoder")?;
     roost_session::start(&profile, foreground, &launch_cwd, first_project, readiness)
 }

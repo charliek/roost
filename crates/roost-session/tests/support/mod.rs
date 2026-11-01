@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 use roost_engine::single_instance::{self, InstanceLocks};
 use roost_ipc::messages::{
     ops, IdentifyParams, IdentifyResult, SessionIdentify, SessionIdentifyParams, SessionStopParams,
-    SessionStopResult, Tab, TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult,
-    TabDumpResult, TabFeedPtyBytesParams, TabListResult, TabOpenParams, TabOpenResult,
-    TabResizeParams, TabSetTitleParams, WireTabRef,
+    SessionStopResult, Tab, TabCapturePtyInputParams, TabCapturePtyInputResult, TabDumpParams,
+    TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult, TabFeedPtyBytesParams,
+    TabListResult, TabOpenParams, TabOpenResult, TabResizeParams, TabSetTitleParams, WireTabRef,
 };
 use roost_ipc::IpcClient;
 use roost_session::{Readiness, SessionConfig};
@@ -358,6 +358,22 @@ pub async fn feed_pty_bytes(client: &mut IpcClient, tab_id: i64, data: &[u8]) {
         )
         .await
         .expect("tab.feed_pty_bytes");
+}
+
+/// Drain every byte the session has queued toward the tab's child: the
+/// server terminal's own answers to queries [`feed_pty_bytes`] put there.
+pub async fn capture_pty_input(client: &mut IpcClient, tab_id: i64) -> Vec<u8> {
+    let captured: TabCapturePtyInputResult = client
+        .call(
+            ops::TAB_CAPTURE_PTY_INPUT,
+            TabCapturePtyInputParams {
+                tab_id: WireTabRef::Local(tab_id),
+                drain: true,
+            },
+        )
+        .await
+        .expect("tab.capture_pty_input");
+    captured.data
 }
 
 /// `tab.dump_resolved` — the same walk, through the production color
