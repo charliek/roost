@@ -37,6 +37,9 @@ from util import drain_until_match, wait_tab_attached
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
+#: A 1x1 RGB PNG, base64.
+ONE_PIXEL_PNG = b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+
 
 @pytest.mark.skipif(
     not TEST_MODE,
@@ -91,6 +94,21 @@ class TestDeviceQueries:
         roost.tab_feed_pty_bytes(tab, b"\x1b[>q")
         captured = drain_until_match(roost, tab, rb"libghostty")
         assert b"libghostty" in captured, captured
+
+    def test_kitty_png_query_is_answered_ok_once(self, roost, project, target):
+        """A Kitty graphics PNG query (`a=q,f=100`) is decoded by the PNG
+        decoder roost-iced installs at startup and answered `OK`, once.
+        DA1 behind it is the fence: its reply follows the answer. Iced
+        only: the frozen Swift app installs no decoder (plan 087 D2)."""
+        if target != "iced":
+            pytest.skip("only roost-iced installs a PNG decoder")
+        tab = roost.open_tab(project, cwd="/tmp")
+        wait_tab_attached(roost, tab)
+        query = b"\x1b_Gi=32,a=q,t=d,f=100;" + ONE_PIXEL_PNG + b"\x1b\\"
+        roost.tab_feed_pty_bytes(tab, query + b"\x1b[c")
+        captured = drain_until_match(roost, tab, rb"\x1b\[\?62;22c")
+        assert captured.count(b"\x1b_Gi=32;") == 1, captured
+        assert b"\x1b_Gi=32;OK\x1b\\" in captured, captured
 
     def test_kitty_keyboard_query_reports_flags(self, roost, project):
         """Kitty keyboard progressive-enhancement query (`ESC[?u`) —

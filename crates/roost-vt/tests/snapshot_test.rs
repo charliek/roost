@@ -141,6 +141,7 @@ fn iced_production_shapes_read_back_tracking_off() {
             rows,
             max_scrollback: 2000,
             continuation_max_bytes: 0,
+            ..Default::default()
         });
         assert_eq!(
             terminal.continuation_max_bytes().expect("read back"),
@@ -209,6 +210,7 @@ fn fixture_options() -> TerminalOptions {
         rows: ROWS,
         max_scrollback: SCROLLBACK,
         continuation_max_bytes: 0,
+        ..Default::default()
     }
 }
 

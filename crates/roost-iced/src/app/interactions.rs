@@ -3488,6 +3488,7 @@ mod tests {
             rows: 2,
             max_scrollback: 10,
             continuation_max_bytes: 0,
+            ..Default::default()
         })
         .unwrap();
         let mut calls = 0;
@@ -5596,6 +5597,7 @@ mod tests {
             rows: 24,
             max_scrollback: 100,
             continuation_max_bytes: 0,
+            ..Default::default()
         })
         .expect("terminal");
         assert!(paste_bytes(&terminal, None).is_empty());
@@ -5662,6 +5664,7 @@ mod tests {
             rows: 24,
             max_scrollback: 100,
             continuation_max_bytes: 0,
+            ..Default::default()
         })
         .expect("terminal");
         assert_eq!(paste_bytes(&terminal, value.as_deref()), b"mac paste");

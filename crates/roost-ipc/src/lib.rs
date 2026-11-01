@@ -44,6 +44,8 @@
 //!   `Handler`; the server crate drives the accept loop.
 //! * [`peer`] — peer-credential lookup ([`peer_uid`]) behind the
 //!   server's opt-in same-UID enforcement.
+//! * [`raise_open_file_limit`] — the startup raise of the soft
+//!   `RLIMIT_NOFILE` that a session and a UI make.
 //! * [`runtime_dir`] — create-or-validate the directory a socket is
 //!   bound in ([`validate_runtime_dir`]).
 //! * [`session_dir`] — the same for the Linux session socket's default
@@ -93,17 +95,21 @@ pub mod target;
 
 pub mod client;
 
+mod fd_limit;
 mod peer;
 mod runtime_dir;
 mod server;
 
 pub use client::{ClientError, IpcClient};
+pub use fd_limit::raise_open_file_limit;
 pub use local_route::{
     session_socket_path, LocalBackendCell, LocalBackendMode, LocalRoute, OpClass, SlotIds,
     SlotRequired,
 };
 pub use peer::{current_euid, peer_uid};
 pub use runtime_dir::validate_runtime_dir;
+#[doc(hidden)]
+pub use server::transient_accept_errors;
 pub use server::{
     CloseReason, ConnAction, ConnCloseWatch, ConnCloser, ConnCtx, DataConn, Handler, HandlerError,
     HandlerOutcome, IpcServer, PushSource, StopFinalizer, CLOSE_LABEL_DEADLINE,

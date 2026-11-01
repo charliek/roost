@@ -924,6 +924,33 @@ mod tests {
         );
     }
 
+    /// An owner's font change at the grid it already had is announced
+    /// too (plan 087 D1.3): its `tab.resized` repeats the grid, moves the
+    /// owner epoch as every one does, and still names an owner. A parked
+    /// tab stays parked, and a refusal sent before it is stale.
+    #[test]
+    fn a_cell_size_only_tab_resized_moves_the_epoch_and_unparks_nothing() {
+        let now = Instant::now();
+        let mut resize = connected(now);
+        assert_eq!(resize.poll(now), Poll::Wave);
+        let parked = resize.wave(SLOT, &[tab(1)], &none(), GRID, |_| 4);
+        resize.settle(SLOT, answered(&parked, &Err(owned())), now, |_| 4);
+        assert!(resize.parked(tab(1)));
+        resize.tab_resized(tab(1), (100, 40), false, now);
+        assert!(resize.parked(tab(1)), "an owned tab stays parked");
+        assert_eq!(resize.poll(now), Poll::Idle, "and is owed nothing");
+
+        let mut resize = connected(now);
+        assert_eq!(resize.poll(now), Poll::Wave);
+        let sent = resize.wave(SLOT, &[tab(1)], &none(), GRID, |_| 4);
+        resize.tab_resized(tab(1), (100, 40), false, now);
+        resize.settle(SLOT, answered(&sent, &Err(owned())), now, |_| 5);
+        assert!(
+            !resize.parked(tab(1)),
+            "a refusal from before the cell-size change parks nothing"
+        );
+    }
+
     /// A full queue's refusal is retried even when an event cleared what
     /// the wave gave the tab while the answer was on its way: another
     /// window's `owner: null` at its own grid parks nothing here and waves

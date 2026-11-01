@@ -3166,7 +3166,9 @@ dependencies = [
 name = "roost-vt"
 version = "0.0.26"
 dependencies = [
+ "base64",
  "bindgen",
+ "png",
  "thiserror 1.0.69",
  "tracing",
  "unicode-width",

@@ -9,9 +9,9 @@ which waits for a socket this UI can never bind.
 The abort hangs the shell up within a millisecond of spawning it — usually
 before the shell has run a single line — so nothing the shell writes can
 prove it was spawned. The persisted tab row can:
-`application::spawn_for_row` removes the row again when the spawn fails,
-so a tab in `state.json` after the exit means a shell was exec'd before
-the error.
+`application::open_and_spawn` writes the row only once the spawn has
+succeeded, so a tab in `state.json` after the exit means a shell was
+exec'd before the error.
 
 Every process the UI starts inherits a marker from its environment, so
 "no shell left behind" is a `/proc` sweep for that marker rather than a

@@ -21,12 +21,16 @@ default = []
 # Pulling bindgen in via the feature (rather than always) means the
 # default build doesn't pay bindgen's compile cost. Matches the runtime
 # gate in build.rs (CARGO_FEATURE_FFI).
-ffi     = ["dep:bindgen"]
+ffi     = ["dep:bindgen", "dep:png"]
 
 [dependencies]
+png = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 unicode-width = { workspace = true }
+
+[dev-dependencies]
+base64 = "0.22"
 
 [build-dependencies]
 bindgen = { workspace = true, optional = true }

@@ -141,6 +141,8 @@ pub const fn ffi_available() -> bool {
 #[cfg(feature = "ffi")]
 mod formatter;
 #[cfg(feature = "ffi")]
+mod image;
+#[cfg(feature = "ffi")]
 mod key_encoder;
 #[cfg(feature = "ffi")]
 mod memory;
@@ -167,6 +169,8 @@ mod vt_dump;
 
 #[cfg(feature = "ffi")]
 pub use formatter::{scrollback_rows, scrollback_text, UNWRAP_SOFT_WRAPPED_LINES};
+#[cfg(feature = "ffi")]
+pub use image::{install_image_decoder, KITTY_IMAGE_STORAGE_LIMIT};
 #[cfg(feature = "ffi")]
 pub use key_encoder::{key_action, mods, Key, KeyAction, KeyEncoder, KeyEvent, Mods};
 #[cfg(feature = "ffi")]
@@ -196,8 +200,8 @@ pub use snapshot::{
 };
 #[cfg(feature = "ffi")]
 pub use terminal::{
-    ActiveScreen, GridRef, Point, PointTag, ScrollViewport, Scrollbar, Terminal, TerminalColor,
-    TerminalOptions,
+    ActiveScreen, GridRef, KittyImagePolicy, Point, PointTag, ScrollViewport, Scrollbar, Terminal,
+    TerminalColor, TerminalOptions,
 };
 #[cfg(feature = "ffi")]
 pub use tracked_ref::TrackedRef;

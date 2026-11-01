@@ -17,11 +17,13 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use tokio::net::{UnixListener, UnixStream};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::codes;
 use crate::dataframe::DataFrameReader;
@@ -598,7 +600,8 @@ impl<H: Handler> IpcServer<H> {
         self
     }
 
-    /// Run the accept loop until the listener returns an error.
+    /// Run the accept loop until the listener returns an error that
+    /// [`accept_error_is_transient`] does not cover.
     /// Typical use: spawn this on a tokio task and let the
     /// application's lifecycle drive shutdown by dropping the server
     /// handle.
@@ -633,9 +636,10 @@ impl<H: Handler> IpcServer<H> {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
         let mut shutdown = Box::pin(shutdown);
+        let mut backoff = AcceptBackoff::new(self.socket_path.display().to_string());
         loop {
             let accepted = tokio::select! {
-                accepted = self.listener.accept() => accepted,
+                accepted = backoff.accept(&self.listener) => accepted,
                 () = &mut shutdown => {
                     let _ = cancel_tx.send(true);
                     break Ok(());
@@ -707,6 +711,120 @@ fn peer_is_allowed(conn: &UnixStream, expected_uid: u32) -> bool {
                 "dropping ipc connection: peer credential lookup failed"
             );
             false
+        }
+    }
+}
+
+/// Every transient accept error any accept loop in this process has
+/// backed off from.
+static TRANSIENT_ACCEPT_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// How many transient accept errors this process has backed off from.
+/// Lets a test tell "the accept failed and recovered" from "the accept
+/// was never tried while descriptors were short".
+#[doc(hidden)]
+pub fn transient_accept_errors() -> u64 {
+    TRANSIENT_ACCEPT_ERRORS.load(Ordering::Relaxed)
+}
+
+/// Is this `accept` error one the listener recovers from by itself?
+/// Descriptor or memory exhaustion clears when something closes, and an
+/// aborted or interrupted handshake is the peer's, not the listener's.
+pub(crate) fn accept_error_is_transient(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::ECONNABORTED
+                | libc::EINTR
+                | libc::EPROTO
+        )
+    )
+}
+
+const ACCEPT_BACKOFF_FIRST: Duration = Duration::from_millis(10);
+const ACCEPT_BACKOFF_CAP: Duration = Duration::from_secs(1);
+
+/// An `accept` that waits out transient errors with a doubling delay
+/// instead of handing them to the caller, shared by every production
+/// accept loop. One burst of errors logs twice: at its first error and
+/// at the accept that ends it.
+pub(crate) struct AcceptBackoff {
+    listener: String,
+    delay: Duration,
+    burst: u64,
+}
+
+impl AcceptBackoff {
+    pub(crate) fn new(listener: String) -> Self {
+        Self {
+            listener,
+            delay: ACCEPT_BACKOFF_FIRST,
+            burst: 0,
+        }
+    }
+
+    /// Cancel-safe: dropping it mid-delay loses nothing, so a caller
+    /// can race it against its shutdown.
+    pub(crate) async fn accept(
+        &mut self,
+        listener: &UnixListener,
+    ) -> std::io::Result<(UnixStream, tokio::net::unix::SocketAddr)> {
+        loop {
+            match listener.accept().await {
+                Ok(accepted) => {
+                    self.end_burst();
+                    return Ok(accepted);
+                }
+                Err(error) if accept_error_is_transient(&error) => {
+                    let delay = self.record(&error);
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn record(&mut self, error: &std::io::Error) -> Duration {
+        TRANSIENT_ACCEPT_ERRORS.fetch_add(1, Ordering::Relaxed);
+        self.burst += 1;
+        let delay = self.delay;
+        if self.burst == 1 {
+            warn!(
+                listener = %self.listener,
+                %error,
+                delay_ms = delay.as_millis(),
+                "accept failed transiently; backing off"
+            );
+        }
+        self.delay = (self.delay * 2).min(ACCEPT_BACKOFF_CAP);
+        delay
+    }
+
+    fn end_burst(&mut self) {
+        if self.burst > 0 {
+            info!(
+                listener = %self.listener,
+                errors = self.burst,
+                "accepting again after transient errors"
+            );
+        }
+        self.burst = 0;
+        self.delay = ACCEPT_BACKOFF_FIRST;
+    }
+}
+
+impl Drop for AcceptBackoff {
+    fn drop(&mut self) {
+        if self.burst > 0 {
+            info!(
+                listener = %self.listener,
+                errors = self.burst,
+                "accept loop ended during transient errors"
+            );
         }
     }
 }
@@ -1286,6 +1404,46 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
     use tokio::net::unix::OwnedReadHalf;
+
+    #[test]
+    fn exhaustion_and_peer_side_accept_errors_are_transient_and_nothing_else_is() {
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::ECONNABORTED,
+            libc::EINTR,
+            libc::EPROTO,
+        ] {
+            assert!(
+                accept_error_is_transient(&std::io::Error::from_raw_os_error(errno)),
+                "errno {errno}"
+            );
+        }
+        for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EOPNOTSUPP] {
+            assert!(
+                !accept_error_is_transient(&std::io::Error::from_raw_os_error(errno)),
+                "errno {errno}"
+            );
+        }
+        assert!(!accept_error_is_transient(&std::io::Error::other(
+            "no errno"
+        )));
+    }
+
+    #[test]
+    fn accept_backoff_doubles_to_its_cap_and_resets_on_an_accept() {
+        let mut backoff = AcceptBackoff::new("test".into());
+        let emfile = std::io::Error::from_raw_os_error(libc::EMFILE);
+        let delays: Vec<u128> = (0..9)
+            .map(|_| backoff.record(&emfile).as_millis())
+            .collect();
+        assert_eq!(delays, [10, 20, 40, 80, 160, 320, 640, 1000, 1000]);
+        backoff.end_burst();
+        assert_eq!(backoff.burst, 0);
+        assert_eq!(backoff.record(&emfile), ACCEPT_BACKOFF_FIRST);
+    }
 
     #[test]
     fn only_an_object_whose_sole_key_is_bridge_is_a_preamble() {

@@ -124,9 +124,11 @@ const BACKOFF_CAP_STEP: u32 = {
 /// to keep asking at the cap.
 const FULL_QUEUE_RETRIES: u32 = BACKOFF_CAP_STEP + 1;
 
-/// The grid + pixel geometry an attach negotiates.
+/// The grid + pixel geometry an attach negotiates — this window's, as
+/// the handshake and every RESIZE state it — or the session terminal's,
+/// as the accepted reply and every `GRID` state it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Geometry {
+pub(crate) struct Geometry {
     pub(crate) cols: u16,
     pub(crate) rows: u16,
     pub(crate) cell_w: u32,
@@ -185,22 +187,26 @@ pub(super) struct ResumePoint {
 /// the one the terminal was at. Replayed into a terminal at another grid,
 /// every absolute cursor move and every wrapped line lands somewhere the
 /// session's terminal did not put it, and nothing heals the primary
-/// screen or the scrollback afterwards (#564). Cell pixels move no cell,
-/// so only the grid counts.
-pub(super) fn resume_survives_regrid(before: (u16, u16), after: (u16, u16)) -> bool {
+/// screen or the scrollback afterwards (#564). The cell size counts too:
+/// a Kitty image moves the cursor by a cell span derived from it.
+pub(super) fn resume_survives_regrid(before: Geometry, after: Geometry) -> bool {
     before == after
 }
 
 /// Drop `key`'s resume point when its terminal was re-gridded from
 /// `before` to `after`, so the next attach is a snapshot. A detached tab
 /// is the only one with a point in `resumes`: an attach holds its own.
+///
+/// Only the grid is compared: the re-grids that land here — the
+/// window's and a background wave's — never move the session terminal's
+/// cell size.
 pub(super) fn forget_resume_on_regrid(
     resumes: &mut HashMap<TabKey, ResumePoint>,
     key: TabKey,
     before: (u16, u16),
     after: (u16, u16),
 ) {
-    if !resume_survives_regrid(before, after) {
+    if before != after {
         resumes.remove(&key);
     }
 }
@@ -218,9 +224,10 @@ pub(crate) enum HostTabFrame {
         fence: u64,
         server_epoch: u64,
         tab_generation: u64,
-        /// The tab's grid as the payload was composed — the PTY's, which
-        /// is this attach's own only when it took the tab.
-        grid: (u16, u16),
+        /// The tab's grid and the session terminal's cell size as the
+        /// payload was composed — the PTY's, which is this attach's own
+        /// only when it took the tab.
+        grid: Geometry,
         /// Who sizes the tab, as of the same moment.
         owner: Option<SizeOwner>,
     },
@@ -251,12 +258,13 @@ pub(crate) enum HostTabFrame {
         final_seq: u64,
         code: i32,
     },
-    /// A `GRID` frame: the tab's grid or size owner changed, after PTY
-    /// frame `seq` and before the next one.
+    /// A `GRID` frame: the tab's grid, its session terminal's cell size
+    /// or its size owner changed, after PTY frame `seq` and before the
+    /// next one.
     Grid {
         attempt: u64,
         seq: u64,
-        grid: (u16, u16),
+        grid: Geometry,
         owner: Option<SizeOwner>,
     },
     /// An `ERROR` frame: the connection closes after it.
@@ -381,17 +389,18 @@ struct Hydration {
     /// Bounded stepping left pages behind; a `StepDecoder` self-wake is
     /// in flight.
     stepping: bool,
-    /// The cols/rows the terminal being built here is at: the
-    /// snapshot's own (`AttachAccepted.snapshot_cols/rows`), then each
-    /// `GRID` the hydration applied. What [`HostAttach::finish_hydration`]
+    /// The geometry the terminal being built here is at, apart from the
+    /// rendered terminal's until the swap: the snapshot's own
+    /// (`AttachAccepted.snapshot_cols/rows/cell_*_px`), then each `GRID`
+    /// the hydration applied. What [`HostAttach::finish_hydration`]
     /// installs the terminal at.
-    built_at: (u16, u16),
+    built_at: Geometry,
 }
 
 /// One frame [`Hydration::deferred`] holds.
 enum Deferred {
     Pty(Vec<u8>),
-    Grid((u16, u16)),
+    Grid(Geometry),
 }
 
 impl Hydration {
@@ -453,10 +462,10 @@ pub(super) struct HostAttach {
     /// This window's grid and cells — what the handshake and every
     /// RESIZE carry. Never the mirror's: the tab's session sizes that.
     advisory: Geometry,
-    /// The grid the session last said the rendered terminal is at: an
-    /// accepted resume's, a finished hydration's, or a live `GRID`'s.
+    /// The geometry the session last said the rendered terminal is at:
+    /// an accepted resume's, a finished hydration's, or a live `GRID`'s.
     /// `None` until this attach has heard one.
-    pty_grid: Option<(u16, u16)>,
+    pty_grid: Option<Geometry>,
     /// Who sizes the tab, from the accepted handshake and every `GRID`
     /// since: the only source the marker reads.
     owner: Option<SizeOwner>,
@@ -814,7 +823,7 @@ impl HostAttach {
                 self.take_pending = false;
                 self.accepted = true;
                 self.trace(SizeTraceAction::AttachAccepted { resumed });
-                if resumed && !resume_survives_regrid(tab.grid(), grid) {
+                if resumed && !resume_survives_regrid(tab.host_geometry(), grid) {
                     return self.discard_resume();
                 }
                 self.kind = Some(kind);
@@ -852,7 +861,7 @@ impl HostAttach {
                         // payload carries only what the *program*
                         // changed, so the terminal it lands in is this
                         // client's — its scrollback, its theme.
-                        PayloadKind::Vt => match tab.hydration_terminal(built_at.0, built_at.1) {
+                        PayloadKind::Vt => match tab.hydration_terminal(built_at) {
                             Ok(terminal) => Hydrator::Vt(terminal),
                             Err(error) => {
                                 tracing::warn!(key = %self.key, %error, "vt hydration terminal build failed; re-attaching");
@@ -991,10 +1000,10 @@ impl HostAttach {
     /// aborted task, which is why the decoder lives here and not there.
     ///
     /// The resume point survives in the return value only while `kept`,
-    /// the grid of the terminal the tab keeps, is the one the session
+    /// the geometry of the terminal the tab keeps, is the one the session
     /// last said it is at: the records past the point were written for
-    /// that grid.
-    pub(super) fn detach(mut self, kept: Option<(u16, u16)>) -> Option<ResumePoint> {
+    /// that geometry.
+    pub(super) fn detach(mut self, kept: Option<Geometry>) -> Option<ResumePoint> {
         if matches!(self.phase, Phase::Ended) {
             self.abort_tasks();
         } else {
@@ -1140,7 +1149,6 @@ impl HostAttach {
         tab: &mut super::terminal_tab::TerminalTab,
         feed: &EngineFeedSender,
     ) -> AttachStep {
-        let cells = self.advisory;
         let Phase::Hydrating(hydration) = &mut self.phase else {
             // SNAP outside hydration — including a non-empty one after a
             // `vt` terminator: the stream is confused. Rebuild.
@@ -1160,12 +1168,9 @@ impl HostAttach {
                     match deferred {
                         Deferred::Pty(bytes) => terminal.vt_write(&bytes),
                         Deferred::Grid(grid) => {
-                            if let Err(error) = terminal.resize(
-                                grid.0,
-                                grid.1,
-                                cells.cell_w.max(1),
-                                cells.cell_h.max(1),
-                            ) {
+                            if let Err(error) =
+                                terminal.resize(grid.cols, grid.rows, grid.cell_w, grid.cell_h)
+                            {
                                 tracing::debug!(key = %self.key, %error, "deferred GRID failed; re-attaching");
                                 return self.schedule_reattach();
                             }
@@ -1196,7 +1201,12 @@ impl HostAttach {
                                     Deferred::Grid(grid) => {
                                         hydration.built_at = grid;
                                         trace_grid(self.trace.as_ref(), grid);
-                                        decoder.resize(grid.0, grid.1, cells.cell_w, cells.cell_h)
+                                        decoder.resize(
+                                            grid.cols,
+                                            grid.rows,
+                                            grid.cell_w,
+                                            grid.cell_h,
+                                        )
                                     }
                                 };
                                 if let Err(error) = applied {
@@ -1293,7 +1303,7 @@ impl HostAttach {
     fn apply_grid(
         &mut self,
         seq: u64,
-        grid: (u16, u16),
+        grid: Geometry,
         owner: Option<SizeOwner>,
         tab: &mut super::terminal_tab::TerminalTab,
     ) -> AttachStep {
@@ -1301,7 +1311,6 @@ impl HostAttach {
             return step;
         }
         self.owner = owner;
-        let cells = self.advisory;
         match &mut self.phase {
             Phase::Hydrating(hydration) => {
                 let Some(decoder) = hydration.live_decoder() else {
@@ -1310,7 +1319,7 @@ impl HostAttach {
                 };
                 // A resize mid-history forfeits the pages still to come,
                 // which the decoder reports as zero-row pages.
-                if let Err(error) = decoder.resize(grid.0, grid.1, cells.cell_w, cells.cell_h) {
+                if let Err(error) = decoder.resize(grid.cols, grid.rows, grid.cell_w, grid.cell_h) {
                     tracing::debug!(key = %self.key, %error, "decoder GRID failed; re-attaching");
                     return self.schedule_reattach();
                 }
@@ -1319,8 +1328,7 @@ impl HostAttach {
                 AttachStep::Refresh
             }
             Phase::Live => {
-                if let Err(error) = tab.resize_for_host(grid.0, grid.1, cells.cell_w, cells.cell_h)
-                {
+                if let Err(error) = tab.resize_for_host(grid) {
                     tracing::warn!(key = %self.key, %error, "mirror GRID failed; re-attaching");
                     return self.schedule_reattach();
                 }
@@ -1391,7 +1399,7 @@ impl HostAttach {
         // At the grid the payload ended at — its own, or the last GRID
         // the hydration applied. The mirror is the tab's grid; the
         // window draws it at whatever offset that takes.
-        if let Err(error) = tab.swap_terminal(terminal, built_at.0, built_at.1) {
+        if let Err(error) = tab.swap_terminal(terminal, built_at) {
             tracing::warn!(key = %self.key, %error, "hydrated terminal swap failed; re-attaching");
             return self.schedule_reattach();
         }
@@ -1417,8 +1425,14 @@ fn record(trace: Option<&SizeTrace>, action: SizeTraceAction) {
     }
 }
 
-fn trace_grid(trace: Option<&SizeTrace>, (cols, rows): (u16, u16)) {
-    record(trace, SizeTraceAction::GridApplied { cols, rows });
+fn trace_grid(trace: Option<&SizeTrace>, grid: Geometry) {
+    record(
+        trace,
+        SizeTraceAction::GridApplied {
+            cols: grid.cols,
+            rows: grid.rows,
+        },
+    );
 }
 
 /// Put `frame` on the feed after `delay`. Must be called inside the app
@@ -1632,7 +1646,12 @@ async fn run_attempt(
                     fence: accepted.seq,
                     server_epoch: accepted.server_epoch,
                     tab_generation: accepted.tab_generation,
-                    grid: (accepted.snapshot_cols, accepted.snapshot_rows),
+                    grid: Geometry {
+                        cols: accepted.snapshot_cols,
+                        rows: accepted.snapshot_rows,
+                        cell_w: u32::from(accepted.snapshot_cell_w_px),
+                        cell_h: u32::from(accepted.snapshot_cell_h_px),
+                    },
                     owner: accepted.owner.clone(),
                 });
             }
@@ -1803,7 +1822,12 @@ fn lift_frame(attempt: u64, frame: ServerFrame) -> HostTabFrame {
         ServerFrame::Grid(grid) => HostTabFrame::Grid {
             attempt,
             seq: grid.seq,
-            grid: (grid.cols, grid.rows),
+            grid: Geometry {
+                cols: grid.cols,
+                rows: grid.rows,
+                cell_w: u32::from(grid.cell_w_px),
+                cell_h: u32::from(grid.cell_h_px),
+            },
             owner: grid.owner,
         },
     }
@@ -1830,6 +1854,16 @@ mod tests {
     impl Geometry {
         fn grid(&self) -> (u16, u16) {
             (self.cols, self.rows)
+        }
+    }
+
+    /// `grid` at [`GEOMETRY`]'s cells: what the session states when this
+    /// window's cell size is the one its terminal is at.
+    fn at(grid: (u16, u16)) -> Geometry {
+        Geometry {
+            cols: grid.0,
+            rows: grid.1,
+            ..GEOMETRY
         }
     }
 
@@ -1897,11 +1931,15 @@ mod tests {
         // attempt they carry, and it attaches as this client.
         attach.attempt = 1;
         attach.client_id = ME.into();
-        let (tab, _capture) = crate::app::terminal_tab::attach_test_host_terminal(
+        let (mut tab, _capture) = crate::app::terminal_tab::attach_test_host_terminal(
             GEOMETRY.cols,
             GEOMETRY.rows,
             attach.input_tx(),
         );
+        // At the session's geometry, as a tab that has hydrated once is:
+        // the hand-fed resumes below are for that terminal.
+        tab.resize_for_host(GEOMETRY)
+            .expect("the stand-in at GEOMETRY");
         (attach, tab, feed_tx, feed_rx)
     }
 
@@ -1929,7 +1967,7 @@ mod tests {
             fence,
             server_epoch: 11,
             tab_generation: 2,
-            grid,
+            grid: at(grid),
             owner,
         }
     }
@@ -1938,7 +1976,7 @@ mod tests {
         HostTabFrame::Grid {
             attempt: 1,
             seq,
-            grid,
+            grid: at(grid),
             owner,
         }
     }
@@ -1971,6 +2009,7 @@ mod tests {
             rows: GEOMETRY.rows,
             max_scrollback: 200,
             continuation_max_bytes: 0,
+            ..Default::default()
         })
         .expect("terminal");
         terminal.vt_write(marker.as_bytes());
@@ -2045,9 +2084,23 @@ mod tests {
 
     #[test]
     fn a_resume_survives_only_a_regrid_that_moves_no_cell() {
-        assert!(resume_survives_regrid((80, 24), (80, 24)));
-        assert!(!resume_survives_regrid((80, 24), (120, 24)), "wider");
-        assert!(!resume_survives_regrid((80, 24), (80, 30)), "taller");
+        assert!(resume_survives_regrid(at((80, 24)), at((80, 24))));
+        assert!(
+            !resume_survives_regrid(at((80, 24)), at((120, 24))),
+            "wider"
+        );
+        assert!(
+            !resume_survives_regrid(at((80, 24)), at((80, 30))),
+            "taller"
+        );
+        let larger_cells = Geometry {
+            cell_w: GEOMETRY.cell_w + 2,
+            ..at((80, 24))
+        };
+        assert!(
+            !resume_survives_regrid(at((80, 24)), larger_cells),
+            "other cells"
+        );
 
         let moved = key();
         let other = TabKey::new(HostId::new(3), 8);
@@ -2098,17 +2151,17 @@ mod tests {
         let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
         attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
         assert_eq!(
-            attach.detach(Some(tab.grid())),
+            attach.detach(Some(tab.host_geometry())),
             Some(POINT),
             "the kept terminal is at the session's grid"
         );
 
         let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
         attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
-        tab.resize_for_host(WIDER.cols, WIDER.rows, WIDER.cell_w, WIDER.cell_h)
+        tab.resize_for_host(WIDER)
             .expect("re-grid the kept terminal");
         assert_eq!(
-            attach.detach(Some(tab.grid())),
+            attach.detach(Some(tab.host_geometry())),
             None,
             "a kept terminal at a grid the session never named"
         );
@@ -2116,7 +2169,7 @@ mod tests {
         let (attach, mut tab, _feed_tx, _feed_rx) = rig();
         let attach = attach.with_resume(Some(POINT));
         assert_eq!(
-            attach.detach(Some(tab.grid())),
+            attach.detach(Some(tab.host_geometry())),
             Some(POINT),
             "an attach that never heard a grid hands the point back untouched"
         );
@@ -2138,7 +2191,7 @@ mod tests {
             "the mirror keeps the tab's grid"
         );
         assert_eq!(
-            attach.detach(Some(tab.grid())),
+            attach.detach(Some(tab.host_geometry())),
             Some(POINT),
             "resized live: the refocus still resumes"
         );
@@ -2152,7 +2205,7 @@ mod tests {
         );
         assert_eq!(tab.grid(), WIDER.grid());
         assert_eq!(
-            attach.detach(Some(tab.grid())),
+            attach.detach(Some(tab.host_geometry())),
             Some(ResumePoint {
                 next_seq: 43,
                 ..POINT
@@ -2505,11 +2558,7 @@ mod tests {
         let Phase::Hydrating(hydration) = &attach.phase else {
             panic!("still hydrating");
         };
-        assert_eq!(
-            hydration.built_at,
-            GEOMETRY.grid(),
-            "the decoder is untouched"
-        );
+        assert_eq!(hydration.built_at, GEOMETRY, "the decoder is untouched");
     }
 
     /// The same before READY: the RESIZE goes, the stream stays — there
@@ -2632,7 +2681,7 @@ mod tests {
                 fence: 0,
                 server_epoch: 11,
                 tab_generation: 2,
-                grid: GEOMETRY.grid(),
+                grid: GEOMETRY,
                 owner: owner(ME),
             },
             &mut tab,
@@ -2725,7 +2774,7 @@ mod tests {
         attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
         attach.on_frame(pty(101, b"progress"), &mut tab, &feed_tx);
         assert_eq!(
-            attach.detach(Some(tab.grid())),
+            attach.detach(Some(tab.host_geometry())),
             None,
             "no fence was ever true of the rendered terminal"
         );
@@ -2749,7 +2798,7 @@ mod tests {
             AttachStep::Reattach { .. }
         ));
         assert_eq!(
-            attach.detach(Some(tab.grid())),
+            attach.detach(Some(tab.host_geometry())),
             Some(ResumePoint {
                 server_epoch: 11,
                 tab_generation: 2,
@@ -2790,7 +2839,7 @@ mod tests {
         assert!(text.contains("fresh-host-screen"), "{text:?}");
         assert!(!text.contains("old-screen"));
         assert_eq!(
-            attach.detach(Some(tab.grid())),
+            attach.detach(Some(tab.host_geometry())),
             Some(ResumePoint {
                 server_epoch: 11,
                 tab_generation: 2,
@@ -2819,7 +2868,7 @@ mod tests {
         };
         assert_eq!(
             hydration.built_at,
-            (100, 30),
+            at((100, 30)),
             "the terminal the payload replays into is the payload's size"
         );
 
@@ -2850,7 +2899,7 @@ mod tests {
         let Phase::Hydrating(hydration) = &attach.phase else {
             panic!("a fresh vt payload hydrates");
         };
-        assert_eq!(hydration.built_at, (GEOMETRY.cols, GEOMETRY.rows));
+        assert_eq!(hydration.built_at, GEOMETRY);
 
         attach.on_frame(snap(b"taken"), &mut tab, &feed_tx);
         attach.on_frame(snap(b""), &mut tab, &feed_tx);
@@ -3466,6 +3515,8 @@ mod tests {
                 tab_generation: 1,
                 snapshot_cols: GEOMETRY.cols,
                 snapshot_rows: GEOMETRY.rows,
+                snapshot_cell_w_px: cell_px(GEOMETRY.cell_w),
+                snapshot_cell_h_px: cell_px(GEOMETRY.cell_h),
                 owner: None,
             },
         );
@@ -3541,7 +3592,7 @@ mod tests {
                 fence: 41,
                 server_epoch: 11,
                 tab_generation: 2,
-                grid: GEOMETRY.grid(),
+                grid: GEOMETRY,
                 owner: owner(ME),
             },
             &mut tab,
@@ -3651,7 +3702,7 @@ mod tests {
         let Phase::Hydrating(hydration) = &attach.phase else {
             panic!("still hydrating");
         };
-        assert_eq!(hydration.built_at, (100, 30));
+        assert_eq!(hydration.built_at, at((100, 30)));
         assert_eq!(
             tab.grid(),
             GEOMETRY.grid(),
@@ -3667,6 +3718,244 @@ mod tests {
         assert!(matches!(attach.phase, Phase::Live));
         assert_eq!(tab.grid(), (100, 30), "FINISH kept the GRID's grid");
         assert!(attach.test_drain_input().is_empty());
+    }
+
+    /// The session terminal at `grid` with a desk's cells — unlike this
+    /// window's [`GEOMETRY`], which is what makes the mirror's own visible.
+    fn session_at(grid: (u16, u16)) -> Geometry {
+        Geometry {
+            cols: grid.0,
+            rows: grid.1,
+            cell_w: 11,
+            cell_h: 23,
+        }
+    }
+
+    fn accepted_with(kind: PayloadKind, fence: u64, at: Geometry) -> HostTabFrame {
+        HostTabFrame::Accepted {
+            attempt: 1,
+            resumed: false,
+            kind,
+            fence,
+            server_epoch: 11,
+            tab_generation: 2,
+            grid: at,
+            owner: owner(DESK),
+        }
+    }
+
+    fn grid_with(seq: u64, at: Geometry) -> HostTabFrame {
+        HostTabFrame::Grid {
+            attempt: 1,
+            seq,
+            grid: at,
+            owner: owner(DESK),
+        }
+    }
+
+    /// What the session's own snapshot of its terminal at `at` encodes,
+    /// cell size included.
+    fn session_snapshot(at: Geometry, marker: &str) -> Vec<u8> {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: at.cols,
+            rows: at.rows,
+            max_scrollback: 200,
+            continuation_max_bytes: 0,
+            ..Default::default()
+        })
+        .expect("terminal");
+        terminal
+            .resize(at.cols, at.rows, at.cell_w, at.cell_h)
+            .expect("the session's cells");
+        terminal.vt_write(marker.as_bytes());
+        terminal.snapshot().expect("encode snapshot")
+    }
+
+    /// A one-row RGB image `width_px` wide placed at the cursor with no
+    /// `c`/`r` and the default `C=0`: libghostty moves the cursor past it
+    /// by its width in the terminal's own cells.
+    fn image(width_px: u32) -> Vec<u8> {
+        let pixels = "/wAA".repeat(width_px as usize);
+        format!("\x1b_Ga=T,f=24,s={width_px},v=1,i=5,q=2;{pixels}\x1b\\").into_bytes()
+    }
+
+    fn cursor_col(tab: &mut TerminalTab) -> u32 {
+        tab.refresh_snapshot().expect("refresh");
+        tab.dump(0).expect("dump").cursor.expect("a cursor").1
+    }
+
+    fn mirror_px(tab: &TerminalTab) -> (u32, u32) {
+        tab.terminal.cell_px().expect("the mirror's cell size")
+    }
+
+    /// A live `GRID` sizes the mirror with the cells the session states,
+    /// so an image moves the mirror's cursor as far as the session's.
+    #[tokio::test]
+    async fn a_live_grid_sizes_the_mirror_with_the_sessions_cells() {
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
+        hydrate_fully(
+            &mut attach,
+            &mut tab,
+            &feed_tx,
+            &mut feed_rx,
+            snapshot_with("live"),
+        );
+        assert!(matches!(attach.phase, Phase::Live));
+        attach.on_frame(grid_with(100, session_at((100, 30))), &mut tab, &feed_tx);
+        assert_eq!(tab.grid(), (100, 30));
+        assert_eq!(mirror_px(&tab), (11, 23));
+
+        let mut bytes = b"\x1b[H".to_vec();
+        bytes.extend(image(33));
+        attach.on_frame(pty(101, &bytes), &mut tab, &feed_tx);
+        assert_eq!(
+            cursor_col(&mut tab),
+            3,
+            "33 px is three of the session's cells"
+        );
+    }
+
+    /// An accepted reply with no `GRID` after it: the hydrated terminal
+    /// is at the reply's cells, whichever payload built it — the decoded
+    /// snapshot's own header, or the `vt` terminal built for the replay.
+    #[tokio::test]
+    async fn an_accepted_reply_alone_sizes_the_hydrated_mirror_with_the_sessions_cells() {
+        let at = session_at(GEOMETRY.grid());
+
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(
+            accepted_with(PayloadKind::GhosttySnapshot, 100, at),
+            &mut tab,
+            &feed_tx,
+        );
+        hydrate_fully(
+            &mut attach,
+            &mut tab,
+            &feed_tx,
+            &mut feed_rx,
+            session_snapshot(at, "snapshot"),
+        );
+        assert!(matches!(attach.phase, Phase::Live));
+        assert_eq!(mirror_px(&tab), (11, 23), "GHOSTSNP");
+        assert_eq!(tab.host_geometry(), at);
+
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted_with(PayloadKind::Vt, 100, at), &mut tab, &feed_tx);
+        attach.on_frame(snap(b"\x1b[H"), &mut tab, &feed_tx);
+        attach.on_frame(snap(&image(22)), &mut tab, &feed_tx);
+        attach.on_frame(snap(b""), &mut tab, &feed_tx);
+        assert!(matches!(attach.phase, Phase::Live));
+        assert_eq!(mirror_px(&tab), (11, 23), "vt");
+        assert_eq!(tab.host_geometry(), at);
+        assert_eq!(
+            cursor_col(&mut tab),
+            2,
+            "the replay ran at the session's cells"
+        );
+    }
+
+    /// `GRID → PTY → GRID → PTY` held behind a payload: each `GRID`
+    /// resizes the terminal being built with its own cells before the
+    /// bytes behind it are written, for both payload kinds.
+    #[tokio::test]
+    async fn deferred_grids_size_the_hydrating_terminal_with_their_own_cells() {
+        let at = session_at(GEOMETRY.grid());
+        let first = Geometry {
+            cell_w: 12,
+            cell_h: 24,
+            ..at
+        };
+        let second = Geometry {
+            cell_w: 20,
+            cell_h: 40,
+            ..at
+        };
+        let mut before = b"\x1b[H".to_vec();
+        before.extend(image(36));
+        before.extend(b"A");
+        let mut after = image(40);
+        after.extend(b"B");
+
+        for kind in [PayloadKind::GhosttySnapshot, PayloadKind::Vt] {
+            let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+            attach.on_frame(accepted_with(kind, 100, at), &mut tab, &feed_tx);
+            attach.on_frame(grid_with(100, first), &mut tab, &feed_tx);
+            attach.on_frame(pty(101, &before), &mut tab, &feed_tx);
+            attach.on_frame(grid_with(101, second), &mut tab, &feed_tx);
+            attach.on_frame(pty(102, &after), &mut tab, &feed_tx);
+            match kind {
+                PayloadKind::GhosttySnapshot => {
+                    hydrate_fully(
+                        &mut attach,
+                        &mut tab,
+                        &feed_tx,
+                        &mut feed_rx,
+                        session_snapshot(at, ""),
+                    );
+                }
+                PayloadKind::Vt => {
+                    attach.on_frame(snap(b""), &mut tab, &feed_tx);
+                }
+            }
+            assert!(matches!(attach.phase, Phase::Live), "{kind:?}");
+            assert_eq!(mirror_px(&tab), (20, 40), "{kind:?}");
+            assert_eq!(tab.host_geometry(), second, "{kind:?}");
+            assert_eq!(
+                screen(&mut tab).lines().next().map(str::trim_end),
+                Some("   A  B"),
+                "36 px at 12 is three cells, 40 px at 20 two ({kind:?})"
+            );
+        }
+    }
+
+    /// A local font change re-sizes this window, not the session: the
+    /// terminal being hydrated keeps the reply's cells, and the mirror
+    /// keeps the session's after the swap too.
+    #[tokio::test]
+    async fn a_local_font_change_keeps_the_sessions_cells_during_and_after_hydration() {
+        use crate::terminal_widget::TerminalMetrics;
+
+        let regrid = |tab: &mut TerminalTab, size: f64, generation: u64| {
+            let metrics = TerminalMetrics::measure(size).expect("metrics");
+            let change = tab
+                .apply_geometry(GEOMETRY.cols, GEOMETRY.rows, metrics, generation)
+                .expect("re-grid")
+                .expect("new metrics are a change");
+            tab.commit_geometry(change);
+        };
+        let at = session_at(GEOMETRY.grid());
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        regrid(&mut tab, 13.0, 1);
+        attach.on_frame(accepted_with(PayloadKind::Vt, 100, at), &mut tab, &feed_tx);
+        attach.on_frame(snap(b"payload"), &mut tab, &feed_tx);
+
+        regrid(&mut tab, 17.0, 2);
+        let Phase::Hydrating(hydration) = &attach.phase else {
+            panic!("still hydrating");
+        };
+        let Hydrator::Vt(building) = &hydration.hydrator else {
+            panic!("a vt hydration");
+        };
+        assert_eq!(
+            building.cell_px().expect("cell_px"),
+            (11, 23),
+            "the terminal being built keeps its own cells"
+        );
+
+        attach.on_frame(snap(b""), &mut tab, &feed_tx);
+        assert!(matches!(attach.phase, Phase::Live));
+        assert_eq!(
+            mirror_px(&tab),
+            (11, 23),
+            "the swap installed the session's"
+        );
+        regrid(&mut tab, 21.0, 3);
+        assert_eq!(
+            mirror_px(&tab),
+            (11, 23),
+            "and a later font change keeps them"
+        );
     }
 
     /// Short of READY a `GRID` has no screen to apply to, so it waits
@@ -3874,7 +4163,7 @@ mod tests {
         tab.session
             .send_input(b"last".to_vec(), roost_ipc::dataframe::InputTake::Before);
         let queue = Arc::clone(&attach.input_rx);
-        attach.detach(Some(tab.grid()));
+        attach.detach(Some(tab.host_geometry()));
         let mut rx = queue.try_lock().expect("no writer task in tests");
         assert!(matches!(rx.try_recv(), Ok(HostDataMsg::Input { .. })));
         assert_eq!(rx.try_recv(), Ok(HostDataMsg::Detach));
@@ -3933,6 +4222,8 @@ mod tests {
                     tab_generation: 1,
                     snapshot_cols: GEOMETRY.cols,
                     snapshot_rows: GEOMETRY.rows,
+                    snapshot_cell_w_px: cell_px(GEOMETRY.cell_w),
+                    snapshot_cell_h_px: cell_px(GEOMETRY.cell_h),
                     owner: owner(ME),
                 },
             );
@@ -4267,7 +4558,7 @@ mod tests {
             snapshot_with("done"),
         );
         assert_eq!(
-            attach.detach(Some(tab.grid())),
+            attach.detach(Some(tab.host_geometry())),
             Some(ResumePoint {
                 server_epoch: 11,
                 tab_generation: 2,

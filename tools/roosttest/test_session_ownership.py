@@ -233,7 +233,10 @@ def captured_until(client: Roost, tab: int, *markers: bytes) -> bytes:
         seen.extend(client.tab_capture_pty_input(tab))
         return all(marker in seen for marker in markers)
 
-    sessionlib.wait_until(arrived, 30.0, f"{markers!r} queued toward the child")
+    try:
+        sessionlib.wait_until(arrived, 30.0, f"{markers!r} queued toward the child")
+    except TimeoutError as err:
+        raise TimeoutError(f"{err}; saw {bytes(seen)!r}") from err
     return bytes(seen)
 
 
@@ -935,6 +938,8 @@ def _scripted(frames: list[tuple[int, bytes]]) -> DataPlane:
         "tab_generation": 1,
         "snapshot_cols": COLS,
         "snapshot_rows": ROWS,
+        "snapshot_cell_w_px": 0,
+        "snapshot_cell_h_px": 0,
         "owner": None,
     }
     out = json.dumps(reply).encode() + b"\n" + dataplane.PREAMBLE
@@ -951,7 +956,14 @@ def _pty(seq: int) -> tuple[int, bytes]:
 
 
 def _grid(seq: int) -> tuple[int, bytes]:
-    body = {"seq": seq, "cols": COLS, "rows": ROWS, "owner": None}
+    body = {
+        "seq": seq,
+        "cols": COLS,
+        "rows": ROWS,
+        "cell_w_px": 0,
+        "cell_h_px": 0,
+        "owner": None,
+    }
     return dataplane.FRAME_GRID, json.dumps(body).encode()
 
 

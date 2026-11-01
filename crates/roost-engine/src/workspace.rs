@@ -679,6 +679,38 @@ pub struct Workspace {
     replay_bounds: Option<ReplayBounds>,
 }
 
+/// A tab [`Workspace::reserve_tab`] has numbered and
+/// [`Workspace::publish_tab`] has not listed yet. Nothing outside it knows
+/// the tab exists.
+#[derive(Debug)]
+pub struct PendingTab {
+    id: i64,
+    project_id: i64,
+    cwd: String,
+    title: String,
+    derived: bool,
+    opener: TabOpener,
+}
+
+impl PendingTab {
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    /// Where the shell will really start. A title the opener supplied
+    /// stays; one derived from the cwd follows it.
+    pub fn start_in(&mut self, cwd: String) {
+        if self.derived {
+            self.title = derive_title(&cwd);
+        }
+        self.cwd = cwd;
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
     #[error("project {0} not found")]
@@ -1582,6 +1614,22 @@ impl Workspace {
     /// is the caller's responsibility — the workspace doesn't own
     /// a `PtySupervisor` reference.
     pub fn delete_project(&self, project_id: i64) -> Result<Vec<i64>, WorkspaceError> {
+        self.remove_project(project_id, false)
+    }
+
+    /// Delete `project_id` if it lists no tab, in one critical section —
+    /// what a failed open into an empty project leaves, so a project made
+    /// to hold that tab does not linger without one (closing a project's
+    /// last tab deletes it the same way).
+    pub fn delete_project_if_empty(&self, project_id: i64) {
+        let _ = self.remove_project(project_id, true);
+    }
+
+    fn remove_project(
+        &self,
+        project_id: i64,
+        only_if_empty: bool,
+    ) -> Result<Vec<i64>, WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let Some(anchor) = inner
             .projects
@@ -1596,6 +1644,9 @@ impl Workspace {
             .filter(|t| t.project_id == project_id)
             .map(|t| t.id)
             .collect();
+        if only_if_empty && !tab_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         for tid in &tab_ids {
             inner.tabs.remove(tid);
         }
@@ -1634,19 +1685,10 @@ impl Workspace {
         Ok(tab_ids)
     }
 
-    /// Open a new tab in `project_id`. Returns the wire-format
-    /// `Tab`. Caller spawns the PTY.
-    ///
-    /// An empty `cwd` is resolved here, not stored verbatim:
-    /// requested → the project's cwd → `$HOME` → `/`. Every path
-    /// (`ops::TAB_OPEN`, the facade, `LocalClient::open_tab`) reaches
-    /// this method, so title derivation below sees the resolved
-    /// value too.
-    ///
-    /// With `activate` false the selection, each project's remembered
-    /// tab included, is left as it was and only `TabOpened` is emitted.
-    ///
-    /// `opener` is stored on the row, so the write this commits saves it.
+    /// Open a new tab in `project_id`: [`Self::reserve_tab`] then
+    /// [`Self::publish_tab`], for a caller that only needs the row. A tab
+    /// that gets a PTY goes through [`crate::application::open_and_spawn`]
+    /// instead, so it is never listed before its PTY exists (#640).
     pub fn open_tab(
         &self,
         project_id: i64,
@@ -1655,6 +1697,26 @@ impl Workspace {
         activate: bool,
         opener: TabOpener,
     ) -> Result<Tab, WorkspaceError> {
+        let pending = self.reserve_tab(project_id, cwd, title, opener)?;
+        self.publish_tab(pending, activate)
+    }
+
+    /// The first half of opening a tab: check the project, resolve the
+    /// row's cwd and title and allocate its id — and nothing else. No row
+    /// is inserted, nothing is emitted and nothing is written, so a spawn
+    /// that fails after this leaves no trace but the id, which is never
+    /// reused.
+    ///
+    /// An empty `cwd` is resolved here, not stored verbatim: requested →
+    /// the project's cwd → `$HOME`, so title derivation sees the resolved
+    /// value too.
+    pub fn reserve_tab(
+        &self,
+        project_id: i64,
+        cwd: &str,
+        title: &str,
+        opener: TabOpener,
+    ) -> Result<PendingTab, WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let project_cwd = match inner.projects.get(&project_id) {
             Some(p) => p.cwd.clone(),
@@ -1667,18 +1729,49 @@ impl Workspace {
         } else {
             crate::home_dir()
         };
-        let id = inner.alloc_id();
-        let now = unix_now();
-        let position = inner.next_tab_position(project_id);
-        let derived_title = if title.is_empty() {
+        let derived = title.is_empty();
+        let title = if derived {
             derive_title(&cwd)
         } else {
             title.to_string()
         };
+        Ok(PendingTab {
+            id: inner.alloc_id(),
+            project_id,
+            cwd,
+            title,
+            derived,
+            opener,
+        })
+    }
+
+    /// The second half: list the reserved tab, in one critical section.
+    /// The project is checked again, since it may have been deleted since
+    /// the reservation, and the position is taken now, so two opens in
+    /// flight at once never share one — they may publish, and be placed,
+    /// in a different order from their reservations.
+    ///
+    /// With `activate` false the selection, each project's remembered
+    /// tab included, is left as it was and only `TabOpened` is emitted.
+    pub fn publish_tab(&self, pending: PendingTab, activate: bool) -> Result<Tab, WorkspaceError> {
+        let PendingTab {
+            id,
+            project_id,
+            cwd,
+            title,
+            derived: _,
+            opener,
+        } = pending;
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.projects.contains_key(&project_id) {
+            return Err(WorkspaceError::ProjectNotFound(project_id));
+        }
+        let now = unix_now();
+        let position = inner.next_tab_position(project_id);
         let row = TabRow {
             id,
             project_id,
-            title: derived_title.clone(),
+            title,
             cwd,
             agent: AgentTabState::default(),
             has_notification: false,
@@ -1860,30 +1953,12 @@ impl Workspace {
     }
 
     pub fn set_tab_cwd(&self, tab_id: i64, cwd: &str) -> Result<(), WorkspaceError> {
-        self.update_tab_cwd(tab_id, cwd, false)
-    }
-
-    /// Where a tab's shell really starts, when that is not the cwd its
-    /// row was opened with ([`crate::application::spawn_for_row`]).
-    /// Unlike [`Self::set_tab_cwd`], a title the opener supplied stays:
-    /// only a title derived from the old cwd follows the move.
-    pub fn set_tab_start_cwd(&self, tab_id: i64, cwd: &str) -> Result<(), WorkspaceError> {
-        self.update_tab_cwd(tab_id, cwd, true)
-    }
-
-    fn update_tab_cwd(
-        &self,
-        tab_id: i64,
-        cwd: &str,
-        keep_supplied_title: bool,
-    ) -> Result<(), WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let row = inner
             .tabs
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        let title_follows =
-            !row.user_titled && (!keep_supplied_title || row.title == derive_title(&row.cwd));
+        let title_follows = !row.user_titled;
         let cwd_owned = cwd.to_string();
         row.cwd = cwd_owned.clone();
         // Shell-driven (OSC 7 fires per `cd`) but write-through: each
@@ -1987,6 +2062,12 @@ impl Workspace {
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     pub(crate) fn publish_tab_effect(&self, tab_id: i64, effect: TabEffectKind) {
         self.publish_for_live_tab(tab_id, WorkspaceEvent::TabEffect { tab_id, effect });
+    }
+
+    #[cfg(all(test, feature = "server-vt"))]
+    pub(crate) fn tab_pipeline_generation(&self, tab_id: i64) -> Option<u64> {
+        let inner = self.inner.lock().unwrap();
+        inner.tabs.get(&tab_id).map(|row| row.pipeline_generation)
     }
 
     /// A server-VT pipeline of `generation` now serves `tab_id`. Called
@@ -4528,23 +4609,54 @@ mod tests {
     }
 
     #[test]
-    fn set_tab_start_cwd_keeps_a_supplied_title_and_moves_a_derived_one() {
+    fn a_pending_tab_moved_keeps_a_supplied_title_and_moves_a_derived_one() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
-        let supplied = ws
-            .open_tab(pid, "/gone", "build", true, TabOpener::None)
-            .unwrap()
-            .id;
-        let derived = ws
-            .open_tab(pid, "/gone", "", true, TabOpener::None)
-            .unwrap()
-            .id;
-        for tid in [supplied, derived] {
-            ws.set_tab_start_cwd(tid, "/usr").unwrap();
-            assert_eq!(ws.tab(tid).unwrap().cwd, "/usr");
-        }
-        assert_eq!(ws.tab(supplied).unwrap().title, "build");
-        assert_eq!(ws.tab(derived).unwrap().title, "usr");
+        let mut supplied = ws
+            .reserve_tab(pid, "/gone", "build", TabOpener::None)
+            .unwrap();
+        let mut derived = ws.reserve_tab(pid, "/gone", "", TabOpener::None).unwrap();
+        supplied.start_in("/usr".into());
+        derived.start_in("/usr".into());
+        let supplied = ws.publish_tab(supplied, true).unwrap();
+        let derived = ws.publish_tab(derived, true).unwrap();
+        assert_eq!(
+            (supplied.cwd.as_str(), supplied.title.as_str()),
+            ("/usr", "build")
+        );
+        assert_eq!(
+            (derived.cwd.as_str(), derived.title.as_str()),
+            ("/usr", "usr")
+        );
+    }
+
+    /// A reservation lists nothing, says nothing and writes nothing; the
+    /// publish takes its position then, so two in flight never share one,
+    /// and it refuses a project deleted in between.
+    #[test]
+    fn a_reserved_tab_is_invisible_until_it_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Workspace::open(path.clone());
+        let pid = ws.create_project("p", "/tmp").unwrap().id;
+        let on_disk = std::fs::read(&path).unwrap();
+        let mut rx = ws.subscribe();
+        let first = ws.reserve_tab(pid, "/tmp", "", TabOpener::None).unwrap();
+        let second = ws.reserve_tab(pid, "/tmp", "", TabOpener::None).unwrap();
+        assert!(ws.tab(first.id()).is_err(), "no row");
+        assert!(rx.try_recv().is_err(), "no event");
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk, "no write");
+
+        let second = ws.publish_tab(second, true).unwrap();
+        let first = ws.publish_tab(first, true).unwrap();
+        assert_eq!((second.position, first.position), (0, 1));
+
+        let doomed = ws.reserve_tab(pid, "/tmp", "", TabOpener::None).unwrap();
+        ws.delete_project(pid).unwrap();
+        assert!(matches!(
+            ws.publish_tab(doomed, true),
+            Err(WorkspaceError::ProjectNotFound(id)) if id == pid
+        ));
     }
 
     /// `set_tab_cwd` does NOT touch the title when the user has

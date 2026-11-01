@@ -696,6 +696,7 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
         r#"{"ok":true,"kind":"ghostty-snapshot","mode":"snapshot","seq":900,"#,
         r#""server_epoch":6032428321756423947,"tab_generation":3,"#,
         r#""snapshot_cols":100,"snapshot_rows":30,"#,
+        r#""snapshot_cell_w_px":9,"snapshot_cell_h_px":18,"#,
         r#""owner":{"client_id":"5d0c7e21a9f3b846","label":"charlie-laptop"}}"#,
     );
     const REJECTED: &str = concat!(
@@ -711,6 +712,8 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
         tab_generation: 3,
         snapshot_cols: 100,
         snapshot_rows: 30,
+        snapshot_cell_w_px: 9,
+        snapshot_cell_h_px: 18,
         owner: Some(SizeOwner {
             client_id: "5d0c7e21a9f3b846".into(),
             label: "charlie-laptop".into(),
@@ -742,16 +745,18 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
     );
 }
 
-/// The snapshot geometry and the size owner ride **every** accepted
-/// arm: under protocol equality there is no session that leaves either
-/// out, so a reply without one is a truncated reply and not an older
-/// peer. An unowned tab says so with a present `null`.
+/// The snapshot geometry, its cell size and the size owner ride
+/// **every** accepted arm: under protocol equality there is no session
+/// that leaves one out, so a reply without one is a truncated reply and
+/// not an older peer. An unowned tab says so with a present `null`, and a
+/// terminal no client has stated a cell size to with `0`.
 #[test]
 fn an_accepted_handshake_reply_without_the_snapshot_geometry_is_refused() {
     const WITH: &str = concat!(
         r#"{"ok":true,"kind":"vt","mode":"snapshot","seq":900,"#,
         r#""server_epoch":6032428321756423947,"tab_generation":3,"#,
-        r#""snapshot_cols":100,"snapshot_rows":30,"owner":null}"#,
+        r#""snapshot_cols":100,"snapshot_rows":30,"#,
+        r#""snapshot_cell_w_px":0,"snapshot_cell_h_px":0,"owner":null}"#,
     );
 
     let sized = AttachHandshakeReply::Accepted(AttachAccepted {
@@ -762,6 +767,8 @@ fn an_accepted_handshake_reply_without_the_snapshot_geometry_is_refused() {
         tab_generation: 3,
         snapshot_cols: 100,
         snapshot_rows: 30,
+        snapshot_cell_w_px: 0,
+        snapshot_cell_h_px: 0,
         owner: None,
     });
     round_trip(&sized);
@@ -784,7 +791,19 @@ fn an_accepted_handshake_reply_without_the_snapshot_geometry_is_refused() {
     let error = serde_json::from_str::<AttachHandshakeReply>(concat!(
         r#"{"ok":true,"kind":"vt","mode":"snapshot","seq":900,"#,
         r#""server_epoch":6032428321756423947,"tab_generation":3,"#,
-        r#""snapshot_cols":100,"snapshot_rows":30}"#,
+        r#""snapshot_cols":100,"snapshot_rows":30,"owner":null}"#,
+    ))
+    .expect_err("an accepted reply that states no cell size is truncated");
+    assert!(
+        error.to_string().contains("snapshot_cell_w_px"),
+        "the error names the missing field: {error}"
+    );
+
+    let error = serde_json::from_str::<AttachHandshakeReply>(concat!(
+        r#"{"ok":true,"kind":"vt","mode":"snapshot","seq":900,"#,
+        r#""server_epoch":6032428321756423947,"tab_generation":3,"#,
+        r#""snapshot_cols":100,"snapshot_rows":30,"#,
+        r#""snapshot_cell_w_px":0,"snapshot_cell_h_px":0}"#,
     ))
     .expect_err("an accepted reply that does not say who sizes the tab is truncated");
     assert!(

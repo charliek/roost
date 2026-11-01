@@ -403,7 +403,12 @@ with the new code `owned`; and the session gains `tab.take_size`,
 test-mode seams). `attach.handshake.unfocused.request.json` was re-cut
 as `attach.handshake.watch.request.json` (`take: false`), the other
 handshake vectors gained `take` and `client_id`, the accepted reply
-gained `owner`, and the ops vector lists the two new ops. The identify
+gained `owner`, and the ops vector lists the two new ops. The accepted
+reply then gained the required `snapshot_cell_w_px`/`snapshot_cell_h_px`
+and `GRID` the required `cell_w_px`/`cell_h_px` — the session
+terminal's cell size, which a client's copy must share for a Kitty
+image to move its cursor as far (plan 087) — with
+`attach.handshake.accepted.json` re-cut once more. The identify
 vectors were re-cut at `7`
 (`session.identify{,.ops,.persist_error}.response.v7.json`) beside the
 frozen `v6` files, and the attach handshake vectors carry `7`.

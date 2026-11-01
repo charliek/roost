@@ -1,3 +1,4 @@
+use super::host_tab::Geometry as HostGeometry;
 use super::*;
 use crate::terminal_widget::next_press_seq;
 use roost_ipc::dataframe::InputTake;
@@ -556,6 +557,12 @@ pub(super) struct TerminalTab {
     /// a keystroke lets the cursor anchor it again; a new grid keeps it,
     /// with the line at the top of the view.
     top_pinned: bool,
+    /// A host tab's session terminal cell size, as the last `GRID` or
+    /// accepted reply stated it: what this terminal is sized with, never
+    /// the window's own metrics, because libghostty derives a Kitty
+    /// image's cell span — and the cursor's move past it — from it. An
+    /// in-process tab never reads it.
+    host_cell_px: (u32, u32),
     pub(super) applied_metrics: Option<TerminalMetrics>,
     pub(super) metric_generation: u64,
     pub(super) render_stats: crate::perf::TabRenderStats,
@@ -663,6 +670,7 @@ impl TerminalTab {
             view: (cols, rows),
             grid_offset: 0,
             top_pinned: false,
+            host_cell_px: (0, 0),
             applied_metrics: None,
             metric_generation: 0,
             render_stats: crate::perf::TabRenderStats::default(),
@@ -678,6 +686,7 @@ impl TerminalTab {
             rows,
             max_scrollback: 2_000,
             continuation_max_bytes: 0,
+            ..Default::default()
         })?;
         terminal.set_color_foreground(theme.foreground)?;
         terminal.set_color_background(theme.background)?;
@@ -695,8 +704,10 @@ impl TerminalTab {
     /// the moment this terminal becomes the one being rendered, and a
     /// hydration that never finishes must never have been able to write
     /// to the wire.
-    pub(super) fn hydration_terminal(&self, cols: u16, rows: u16) -> Result<Terminal> {
-        Self::new_terminal(cols, rows, &self.theme)
+    pub(super) fn hydration_terminal(&self, at: HostGeometry) -> Result<Terminal> {
+        let mut terminal = Self::new_terminal(at.cols, at.rows, &self.theme)?;
+        terminal.resize(at.cols, at.rows, at.cell_w, at.cell_h)?;
+        Ok(terminal)
     }
 
     /// Attach the UI to a tab that lives on a connected host. No local
@@ -724,12 +735,10 @@ impl TerminalTab {
     /// policy), the selection drops (its grid refs pointed into the old
     /// terminal), and the render caches reset so the next
     /// `refresh_snapshot` rebuilds every row.
-    pub(super) fn swap_terminal(
-        &mut self,
-        mut terminal: Terminal,
-        cols: u16,
-        rows: u16,
-    ) -> Result<()> {
+    ///
+    /// `at` is the geometry the attach built `terminal` at, the cell size
+    /// included; the tab adopts it as the session's.
+    pub(super) fn swap_terminal(&mut self, mut terminal: Terminal, at: HostGeometry) -> Result<()> {
         self.reply_buffer
             .lock()
             .map(|mut buffer| buffer.clear())
@@ -738,8 +747,9 @@ impl TerminalTab {
             .set_write_pty_buffer(Arc::clone(&self.reply_buffer))
             .context("install libghostty PTY reply buffer")?;
         self.terminal = terminal;
-        self.cols = cols;
-        self.rows = rows;
+        self.cols = at.cols;
+        self.rows = at.rows;
+        self.host_cell_px = (at.cell_w, at.cell_h);
         self.selection = TerminalSelection::new();
         self.scroll = TerminalScroll::new();
         self.top_pinned = false;
@@ -760,13 +770,7 @@ impl TerminalTab {
     /// A viewport scrolled back into history keeps the line drawn at its
     /// top there (plan 084 D6): the reflow would otherwise move the
     /// reader somewhere else in the history they were reading.
-    pub(super) fn resize_for_host(
-        &mut self,
-        cols: u16,
-        rows: u16,
-        cell_w: u32,
-        cell_h: u32,
-    ) -> Result<()> {
+    pub(super) fn resize_for_host(&mut self, grid: HostGeometry) -> Result<()> {
         let anchor = if self.scroll.is_scrolled_back() || self.top_pinned {
             self.terminal
                 .track(roost_vt::Point::viewport(0, self.grid_offset))
@@ -775,9 +779,10 @@ impl TerminalTab {
             None
         };
         self.terminal
-            .resize(cols, rows, cell_w.max(1), cell_h.max(1))?;
+            .resize(grid.cols, grid.rows, grid.cell_w, grid.cell_h)?;
         let _ = self.take_terminal_replies();
-        self.adopt_grid(cols, rows);
+        self.host_cell_px = (grid.cell_w, grid.cell_h);
+        self.adopt_grid(grid.cols, grid.rows);
         if let Some(anchor) = anchor {
             self.restore_top_line(&anchor);
         }
@@ -867,6 +872,16 @@ impl TerminalTab {
         (self.cols, self.rows)
     }
 
+    /// A host tab's grid with the session cell size it is sized with.
+    pub(super) fn host_geometry(&self) -> HostGeometry {
+        HostGeometry {
+            cols: self.cols,
+            rows: self.rows,
+            cell_w: self.host_cell_px.0,
+            cell_h: self.host_cell_px.1,
+        }
+    }
+
     /// Lay the tab out in a `cols`×`rows` view with `metrics`. A host
     /// tab's grid stays ([`TerminalGeometry::view`]): the window's grid
     /// reaches its session through the attach and comes back as `GRID`.
@@ -896,12 +911,8 @@ impl TerminalTab {
             metric_generation: self.metric_generation,
         });
         let resize = if previous_grid != grid || metrics_changed {
-            self.terminal.resize(
-                grid.0,
-                grid.1,
-                metrics.cell_width.round().max(1.0) as u32,
-                metrics.cell_height.round().max(1.0) as u32,
-            )
+            let (cell_w, cell_h) = self.terminal_cell_px(metrics);
+            self.terminal.resize(grid.0, grid.1, cell_w, cell_h)
         } else {
             Ok(())
         };
@@ -926,13 +937,24 @@ impl TerminalTab {
         }))
     }
 
+    /// A host mirror's terminal keeps the session's cell px; only an
+    /// in-process tab's terminal takes the local font's.
+    fn terminal_cell_px(&self, metrics: TerminalMetrics) -> (u32, u32) {
+        if self.session.is_host() {
+            self.host_cell_px
+        } else {
+            (
+                metrics.cell_width.round().max(1.0) as u32,
+                metrics.cell_height.round().max(1.0) as u32,
+            )
+        }
+    }
+
     pub(super) fn rollback_geometry(&mut self, previous: TerminalGeometry) -> Result<()> {
-        let resize = self.terminal.resize(
-            previous.cols,
-            previous.rows,
-            previous.metrics.cell_width.round().max(1.0) as u32,
-            previous.metrics.cell_height.round().max(1.0) as u32,
-        );
+        let (cell_w, cell_h) = self.terminal_cell_px(previous.metrics);
+        let resize = self
+            .terminal
+            .resize(previous.cols, previous.rows, cell_w, cell_h);
         // The candidate report was staged in `GeometryChange`; the rollback
         // report describes an internal transition the PTY never observed.
         // Neither may escape a failed all-tab transaction.
@@ -1849,6 +1871,15 @@ mod tests {
     use super::*;
     use roost_ipc::program_status::{ProgramStatusState, PromptMark};
 
+    fn host_at(cols: u16, rows: u16, cell_w: u32, cell_h: u32) -> HostGeometry {
+        HostGeometry {
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+        }
+    }
+
     const WORKING: &[u8] = b"\x1b]7501;state=working:app=pi\x1b\\";
 
     /// Plan 082 D4.2/D4.3: an in-process tab's terminal is the tab's
@@ -1885,8 +1916,11 @@ mod tests {
         let (mut tab, _capture) = attach_test_host_terminal(80, 24, input_tx);
         assert!(tab.write_vt(WORKING).is_empty());
 
-        let hydrated = tab.hydration_terminal(80, 24).expect("hydration terminal");
-        tab.swap_terminal(hydrated, 80, 24).expect("swap");
+        let hydrated = tab
+            .hydration_terminal(host_at(80, 24, 9, 18))
+            .expect("hydration terminal");
+        tab.swap_terminal(hydrated, host_at(80, 24, 9, 18))
+            .expect("swap");
         assert!(tab.write_vt(WORKING).is_empty());
     }
 
@@ -1911,11 +1945,14 @@ mod tests {
         ));
         assert_eq!(tab.grid_offset(), 0, "pinned to the grid's top");
 
-        let mut hydrated = tab.hydration_terminal(80, 30).expect("hydration terminal");
+        let mut hydrated = tab
+            .hydration_terminal(host_at(80, 30, 9, 18))
+            .expect("hydration terminal");
         for line in 0..25 {
             hydrated.vt_write(format!("line {line:03}\r\n").as_bytes());
         }
-        tab.swap_terminal(hydrated, 80, 30).expect("swap");
+        tab.swap_terminal(hydrated, host_at(80, 30, 9, 18))
+            .expect("swap");
         tab.refresh_snapshot().expect("refresh");
         assert_eq!(tab.grid_offset(), 16, "anchored on the new cursor");
     }
@@ -2088,7 +2125,7 @@ mod tests {
         let before = top(&mut tab);
         assert!(before.starts_with("line"), "{before:?}");
 
-        tab.resize_for_host(80, 10, 9, 18).expect("GRID");
+        tab.resize_for_host(host_at(80, 10, 9, 18)).expect("GRID");
         tab.refresh_snapshot().expect("refresh");
         assert_eq!(tab.grid_offset(), 0);
         assert_eq!(top(&mut tab), before);
@@ -2218,13 +2255,14 @@ mod tests {
         ));
         assert!(drawn_top(&mut tab).starts_with("line 000"));
 
-        tab.resize_for_host(80, 30, 9, 18)
+        tab.resize_for_host(host_at(80, 30, 9, 18))
             .expect("an owner-only GRID");
         tab.refresh_snapshot().expect("refresh");
         assert_eq!(tab.grid_offset(), 0, "still pinned");
         assert!(drawn_top(&mut tab).starts_with("line 000"));
 
-        tab.resize_for_host(80, 10, 9, 18).expect("the take's GRID");
+        tab.resize_for_host(host_at(80, 10, 9, 18))
+            .expect("the take's GRID");
         tab.refresh_snapshot().expect("refresh");
         let top = drawn_top(&mut tab);
         assert!(top.starts_with("line 000"), "{top:?}");

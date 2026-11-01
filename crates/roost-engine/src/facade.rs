@@ -340,41 +340,25 @@ impl Engine {
 
     async fn open_tab(
         &self,
-        mut params: TabOpenParams,
+        params: TabOpenParams,
         opener: &TabOpener,
     ) -> Result<Tab, EngineError> {
-        validate_dimension(params.cols, "cols")?;
-        validate_dimension(params.rows, "rows")?;
-        let activate = params.activate != Some(false);
-        crate::application::resolve_open_target(
+        let dim = |value, default, field| {
+            crate::application::pty_dim(value, default, field)
+                .map_err(|error| EngineError::InvalidArgument(error.to_string()))
+        };
+        let cols = dim(params.cols, 80, "cols")?;
+        let rows = dim(params.rows, 24, "rows")?;
+        crate::application::open_requested(
             &self.workspace,
             &self.supervisor,
-            &mut params,
-            activate,
-        );
-        let cols =
-            crate::application::pty_dim(params.cols, 80, "cols").map_err(application_error)?;
-        let rows =
-            crate::application::pty_dim(params.rows, 24, "rows").map_err(application_error)?;
-        let mut tab = self.workspace.open_tab(
-            params.project_id,
-            &params.cwd,
-            &params.title,
-            activate,
-            opener.clone(),
-        )?;
-        crate::application::spawn_for_row(
-            &self.workspace,
-            &self.supervisor,
-            &mut tab,
-            &params.argv,
+            &self.client.socket_path,
+            params,
+            opener,
             cols,
             rows,
-            &self.client.socket_path,
-            opener,
         )
-        .map_err(|error| application_error(error.context("pty spawn failed")))?;
-        Ok(tab)
+        .map_err(application_error)
     }
 
     async fn resize_tab(&self, params: TabResizeParams) -> Result<(), EngineError> {

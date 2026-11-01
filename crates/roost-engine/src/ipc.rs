@@ -3702,22 +3702,14 @@ async fn dispatch(
             encode(&result)
         }
         ops::TAB_OPEN => {
-            let mut p: TabOpenParams = decode(params)?;
+            let p: TabOpenParams = decode(params)?;
             // Before `resolve_open_target`, which can create the default
             // project: a refused opener must leave nothing behind.
             let opener = crate::opener::opener_for(bridge, p.env.as_ref(), p.origin.as_ref())
                 .map_err(|refused| HandlerError::invalid_param(refused.to_string()))?;
-            let activate = p.activate != Some(false);
-            crate::application::resolve_open_target(&h.workspace, &h.supervisor, &mut p, activate);
-            let mut tab = h
-                .workspace
-                .open_tab(p.project_id, &p.cwd, &p.title, activate, opener.clone())
-                .map_err(ws_err)?;
-            // Spawn the PTY. Use the tab's cwd, the requested argv,
-            // and a sensible default winsize when the caller doesn't
-            // provide one. Reject out-of-range cols/rows with
-            // `invalid-param` instead of silently truncating —
-            // CR-flagged on PR #78.
+            // Before `resolve_open_target` too, for the same reason.
+            // Out-of-range cols/rows are `invalid-param`, never silently
+            // truncated (CR-flagged on PR #78).
             let (default_cols, default_rows) = h
                 .session
                 .as_ref()
@@ -3734,19 +3726,21 @@ async fn dispatch(
                 u16::try_from(p.rows)
                     .map_err(|_| HandlerError::invalid_param("rows out of u16 range"))?
             };
-            crate::application::spawn_for_row(
+            let tab = crate::application::open_requested(
                 &h.workspace,
                 &h.supervisor,
-                &mut tab,
-                &p.argv,
+                &h.socket_path,
+                p,
+                &opener,
                 cols,
                 rows,
-                &h.socket_path,
-                &opener,
             )
-            .map_err(|err| match err.downcast_ref::<PtyError>() {
-                Some(pty) => pty_err(pty),
-                None => HandlerError::new(codes::INTERNAL, format!("pty spawn failed: {err}")),
+            .map_err(|err| match err.downcast::<WorkspaceError>() {
+                Ok(error) => ws_err(error),
+                Err(err) => match err.downcast_ref::<PtyError>() {
+                    Some(pty) => pty_err(pty),
+                    None => HandlerError::new(codes::INTERNAL, format!("{err:#}")),
+                },
             })?;
             encode(&TabOpenResult { tab })
         }
@@ -5821,6 +5815,32 @@ mod tests {
         assert_eq!(bare.workspace.snapshot().len(), 1, "the default project");
         assert_eq!(bare.workspace.active(), (0, 0));
         assert!(!tab.is_active && !moved);
+    }
+
+    /// A size `tab.open` refuses is refused before anything is made: no
+    /// row, and not the default project an empty workspace would get.
+    #[tokio::test]
+    async fn a_tab_open_with_an_impossible_size_leaves_nothing_behind() {
+        let empty = tempfile::tempdir().unwrap();
+        let h = IpcHandler::new(
+            Arc::new(Workspace::open(empty.path().join("state.json"))),
+            Arc::new(PtySupervisor::new()),
+            empty.path().join("roost.sock"),
+            "Roost-test",
+            "ai.stridelabs.Roost.test",
+        );
+        let mut events = h.workspace.subscribe();
+        for params in [
+            serde_json::json!({"project_id": "0", "cols": 70000}),
+            serde_json::json!({"project_id": "0", "rows": 70000}),
+        ] {
+            let error = dispatch(&h, None, ops::TAB_OPEN, params.clone())
+                .await
+                .expect_err("out of range");
+            assert_eq!(error.code, codes::INVALID_PARAM, "{params}: {error:?}");
+        }
+        assert!(h.workspace.snapshot().is_empty(), "no project, no row");
+        assert!(events.try_recv().is_err(), "nothing announced");
     }
 
     /// The fixture's project, plus a tab (no child) whose tracked cwd is

@@ -119,6 +119,8 @@ pub enum PtyOutputEvent {
         gen: u64,
         cols: u16,
         rows: u16,
+        cell_w_px: u16,
+        cell_h_px: u16,
         owner: Option<roost_ipc::messages::SizeOwner>,
     },
 }
@@ -146,6 +148,15 @@ pub struct Geometry {
     pub rows: u16,
     pub cell_w: u32,
     pub cell_h: u32,
+}
+
+impl Geometry {
+    /// The cell size as the wire carries it. Every source of it is a
+    /// `u16` on the wire already, so the clamp never bites in practice.
+    pub fn cell_px(&self) -> (u16, u16) {
+        let narrow = |px: u32| u16::try_from(px).unwrap_or(u16::MAX);
+        (narrow(self.cell_w), narrow(self.cell_h))
+    }
 }
 
 /// A tab's output channel plus its sequence counter.
@@ -542,6 +553,35 @@ pub struct PtySupervisor {
     /// feeds the publisher directly, exactly as it always has.
     #[cfg(feature = "server-vt")]
     server_vt: std::sync::OnceLock<Arc<crate::tab_task::ServerVtState>>,
+    /// [`PtySupervisor::set_promotion_hook`]'s seam.
+    promotion_hook: std::sync::OnceLock<PromotionHook>,
+}
+
+type PromotionHook = Box<dyn Fn(i64) + Send + Sync>;
+
+/// What [`PtySupervisor::spawn_gated`] hands back beside the receiver:
+/// the tab's server task (server-VT) waits on it before it registers its
+/// pipeline, parses a byte or handles the exit, so a child's earliest
+/// OSC and its exit find the row its opener publishes after the spawn
+/// (#640). Output waits in the task's bounded channel meanwhile; a full
+/// one stalls only the reader, then the child.
+///
+/// Dropping it opens the gate too, so every early return releases the
+/// task: one whose row was never published then runs into a lookup that
+/// finds nothing, as an exit after a close always has. With no task to
+/// hold (server-VT off) it holds nothing.
+#[must_use = "the tab's server task waits until this is opened or dropped"]
+pub struct StartGate(oneshot::Sender<()>);
+
+impl StartGate {
+    fn new() -> (Self, oneshot::Receiver<()>) {
+        let (open, opened) = oneshot::channel();
+        (Self(open), opened)
+    }
+
+    pub fn open(self) {
+        let _ = self.0.send(());
+    }
 }
 
 struct Session {
@@ -825,6 +865,7 @@ impl PtySupervisor {
             password_watch,
             #[cfg(feature = "server-vt")]
             server_vt: std::sync::OnceLock::new(),
+            promotion_hook: std::sync::OnceLock::new(),
         }
     }
 
@@ -880,6 +921,19 @@ impl PtySupervisor {
         self.server_vt
             .set(Arc::new(crate::tab_task::ServerVtState::new(config)))
             .map_err(|_| anyhow::anyhow!("server-vt is already enabled on this supervisor"))
+    }
+
+    /// Does every tab here have a server tab task, which closes its own
+    /// row when the child exits (after it has drained the child's output)?
+    pub fn runs_tab_tasks(&self) -> bool {
+        #[cfg(feature = "server-vt")]
+        {
+            self.server_vt.get().is_some()
+        }
+        #[cfg(not(feature = "server-vt"))]
+        {
+            false
+        }
     }
 
     /// The random per-supervisor epoch tab streams are scoped by, or
@@ -1124,7 +1178,43 @@ impl PtySupervisor {
         socket_path: &std::path::Path,
         opener: &TabOpener,
     ) -> anyhow::Result<broadcast::Receiver<PtyOutputEvent>> {
-        self.spawn_with(tab_id, cwd, argv, cols, rows, socket_path, opener, || {})
+        self.spawn_gated(tab_id, cwd, argv, cols, rows, socket_path, opener)
+            .map(|(rx, gate)| {
+                gate.open();
+                rx
+            })
+    }
+
+    /// [`Self::spawn`] with the tab's server task held at a [`StartGate`]
+    /// until the caller opens it — for a spawn whose row is published
+    /// after it ([`crate::application::open_and_spawn`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_gated(
+        &self,
+        tab_id: i64,
+        cwd: &str,
+        argv: &[String],
+        cols: u16,
+        rows: u16,
+        socket_path: &std::path::Path,
+        opener: &TabOpener,
+    ) -> anyhow::Result<(broadcast::Receiver<PtyOutputEvent>, StartGate)> {
+        self.spawn_with(tab_id, cwd, argv, cols, rows, socket_path, opener, || {
+            if let Some(hook) = self.promotion_hook.get() {
+                hook(tab_id);
+            }
+        })
+    }
+
+    /// A test seam: `hook` runs inside every later spawn at the
+    /// `before_promote` point of [`Self::spawn_with`], given the tab id —
+    /// after the child exists, before the promotion, outside every lock.
+    /// A test stands a close, a project's deletion or a delay there.
+    /// Set once; nothing but a test ever sets it.
+    pub fn set_promotion_hook(&self, hook: impl Fn(i64) + Send + Sync + 'static) {
+        if self.promotion_hook.set(Box::new(hook)).is_err() {
+            panic!("the promotion hook is already set");
+        }
     }
 
     /// [`Self::spawn`], plus a seam for the one window nothing else can
@@ -1144,7 +1234,7 @@ impl PtySupervisor {
         socket_path: &std::path::Path,
         opener: &TabOpener,
         before_promote: impl FnOnce(),
-    ) -> anyhow::Result<broadcast::Receiver<PtyOutputEvent>> {
+    ) -> anyhow::Result<(broadcast::Receiver<PtyOutputEvent>, StartGate)> {
         // Reserve the slot atomically. Two concurrent
         // `spawn(tab_id, ...)` calls used to be racy: the first
         // would `contains_key` and the second would do the same
@@ -1200,13 +1290,13 @@ impl PtySupervisor {
         };
 
         let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pair = open_with_retry(|| pty_system.openpty(size), std::thread::sleep)
             .context("openpty failed")?;
 
         // Acquire everything derived from the master BEFORE spawning
@@ -1297,8 +1387,11 @@ impl PtySupervisor {
         // Server-VT: the tab task becomes the single authority for this
         // tab's seq, tee, replies and exit. Started before the reader so
         // no byte can be read before there is somewhere to put it.
+        let (gate, opened) = StartGate::new();
         #[cfg(feature = "server-vt")]
-        let tab_pipe = tab_vt.map(|vt| vt.start(tab_id, output.sender(), cmd_tx.clone()));
+        let tab_pipe = tab_vt.map(|vt| vt.start(tab_id, output.sender(), cmd_tx.clone(), opened));
+        #[cfg(not(feature = "server-vt"))]
+        drop(opened);
         #[cfg(feature = "server-vt")]
         let reader_bytes_tx = tab_pipe.as_ref().map(|pipe| pipe.bytes_tx.clone());
         #[cfg(feature = "server-vt")]
@@ -1592,7 +1685,7 @@ impl PtySupervisor {
             return Err(err.into());
         }
 
-        Ok(early_rx)
+        Ok((early_rx, gate))
     }
 
     /// Under server-VT the tab task is the one authority ordering input
@@ -2800,6 +2893,65 @@ async fn write_all_nonblocking(fd: &AsyncFd<File>, mut data: &[u8]) -> std::io::
     Ok(())
 }
 
+/// The waits before each retry of a transient `openpty` failure.
+const OPENPTY_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+    Duration::from_millis(40),
+    Duration::from_millis(80),
+];
+
+/// `open`, retried on a transient `openpty` failure ([`is_transient_openpty`])
+/// after each of [`OPENPTY_RETRY_DELAYS`]; any other error, or the last
+/// transient one, is returned as it came.
+///
+/// Bounded recovery, not a fix: macOS answers `openpty` with `ENXIO` now
+/// and then under concurrent pty open/close in one process, far from any
+/// pty or descriptor ceiling (#628's census), and the kernel-side cause is
+/// unknown. A restore of many tabs at once is exactly that load.
+fn open_with_retry<T>(
+    mut open: impl FnMut() -> anyhow::Result<T>,
+    mut sleep: impl FnMut(Duration),
+) -> anyhow::Result<T> {
+    let mut delays = OPENPTY_RETRY_DELAYS.iter();
+    loop {
+        match open() {
+            Ok(opened) => return Ok(opened),
+            Err(err) if is_transient_openpty(&err) => {
+                let Some(&delay) = delays.next() else {
+                    return Err(err);
+                };
+                warn!(
+                    error = %format!("{err:#}"),
+                    retry_in_ms = delay.as_millis() as u64,
+                    "openpty failed transiently; retrying"
+                );
+                sleep(delay);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Whether `err` is an `openpty` `ENXIO`. portable-pty 0.8.1 keeps no typed
+/// error: it `bail!`s `"failed to openpty: {:?}"` of the errno
+/// (`portable-pty/src/unix.rs:41-43`), so the text is matched against the
+/// same `{:?}` rendered here. If that message ever changes, this stops
+/// matching and nothing is retried. A typed `io::Error` in the chain is
+/// matched too, for a portable-pty that keeps it.
+fn is_transient_openpty(err: &anyhow::Error) -> bool {
+    let enxio = format!("{:?}", std::io::Error::from_raw_os_error(libc::ENXIO));
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.raw_os_error() == Some(libc::ENXIO))
+            || {
+                let text = cause.to_string();
+                text.starts_with("failed to openpty:") && text.contains(&enxio)
+            }
+    })
+}
+
 fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
     // SAFETY: plain `fcntl` calls on a valid fd the caller owns.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -2829,11 +2981,8 @@ pub enum PtyError {
     Closed(i64),
     #[error("tab {0} already has a live pty session")]
     DuplicateTab(i64),
-    /// The spawn lost its tab. Either a `close()` took the reservation
-    /// back between the `pending` insert and the promotion, or the
-    /// workspace row vanished *before* the reservation and the opener's
-    /// re-check ([`crate::application::spawn_for_row`]) caught it after
-    /// the fact. Both mean the same thing to a caller: the tab is gone.
+    /// The spawn lost its tab: a `close()` took the reservation back
+    /// between the `pending` insert and the promotion.
     #[error("spawn for tab {0} cancelled by close()")]
     Cancelled(i64),
     #[error("supervisor is shutting down; refused to spawn tab {0}")]
@@ -2978,6 +3127,85 @@ async fn wait_for_output(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    // ---- a transient openpty failure (#628) ----------------------------
+
+    /// An opener that fails `failures` times the way portable-pty 0.8.1
+    /// does (`bail!` of the formatted errno), then succeeds.
+    fn portable_pty_opener(
+        errno: i32,
+        failures: usize,
+        attempts: &mut usize,
+    ) -> impl FnMut() -> anyhow::Result<&'static str> + '_ {
+        move || {
+            *attempts += 1;
+            if *attempts <= failures {
+                anyhow::bail!(
+                    "failed to openpty: {:?}",
+                    std::io::Error::from_raw_os_error(errno)
+                );
+            }
+            Ok("pair")
+        }
+    }
+
+    #[test]
+    fn up_to_four_enxio_failures_are_retried_through_to_the_pty() {
+        for failures in 0..=4 {
+            let mut attempts = 0;
+            let mut slept = Vec::new();
+            let opened = open_with_retry(
+                portable_pty_opener(libc::ENXIO, failures, &mut attempts),
+                |delay| slept.push(delay),
+            );
+            assert_eq!(opened.expect("a retried openpty"), "pair");
+            assert_eq!(attempts, failures + 1);
+            assert_eq!(slept, OPENPTY_RETRY_DELAYS[..failures]);
+        }
+    }
+
+    #[test]
+    fn a_fifth_enxio_surfaces_the_original_error() {
+        let mut attempts = 0;
+        let mut slept = Vec::new();
+        let err = open_with_retry(
+            portable_pty_opener(libc::ENXIO, 5, &mut attempts),
+            |delay| slept.push(delay),
+        )
+        .expect_err("five ENXIOs exhaust the retries");
+        assert_eq!(attempts, 5);
+        assert_eq!(slept, OPENPTY_RETRY_DELAYS);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "failed to openpty: {:?}",
+                std::io::Error::from_raw_os_error(libc::ENXIO)
+            )
+        );
+    }
+
+    #[test]
+    fn emfile_is_never_retried() {
+        let mut attempts = 0;
+        let mut slept = Vec::new();
+        let err = open_with_retry(
+            portable_pty_opener(libc::EMFILE, 1, &mut attempts),
+            |delay| slept.push(delay),
+        )
+        .expect_err("EMFILE is final");
+        assert_eq!(attempts, 1);
+        assert!(slept.is_empty(), "{slept:?}");
+        assert!(!is_transient_openpty(&err), "{err:#}");
+    }
+
+    #[test]
+    fn a_typed_enxio_is_transient_too() {
+        let typed = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENXIO))
+            .context("openpty failed");
+        assert!(is_transient_openpty(&typed), "{typed:#}");
+        let typed_emfile = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EMFILE));
+        assert!(!is_transient_openpty(&typed_emfile), "{typed_emfile:#}");
+    }
 
     // ---- the tab environment (plan 085 D1, D3) ------------------------
 

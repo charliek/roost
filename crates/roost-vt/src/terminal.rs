@@ -52,6 +52,11 @@ pub struct TerminalOptions {
     /// [`Terminal::set_continuation_max_bytes`] for the post-hoc setter
     /// and its caveats.
     pub continuation_max_bytes: usize,
+    /// Bytes of Kitty image data each screen may hold; `0` turns the
+    /// Kitty graphics protocol off. The default is Roost's
+    /// [`crate::KITTY_IMAGE_STORAGE_LIMIT`], so a new call site gets the
+    /// policy without naming it ([`Terminal::apply_image_policy`]).
+    pub kitty_image_storage_limit: u64,
 }
 
 impl Default for TerminalOptions {
@@ -61,8 +66,21 @@ impl Default for TerminalOptions {
             rows: 24,
             max_scrollback: 0,
             continuation_max_bytes: 0,
+            kitty_image_storage_limit: crate::KITTY_IMAGE_STORAGE_LIMIT,
         }
     }
+}
+
+/// A terminal's Kitty image policy as libghostty reports it for the
+/// active screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyImagePolicy {
+    pub storage_limit: u64,
+    pub medium_file: bool,
+    /// The directory a temporary-file transmission may name; `None` when
+    /// that medium is off.
+    pub medium_temp_file: Option<String>,
+    pub medium_shared_mem: bool,
 }
 
 /// Tag for `Terminal::scroll_viewport`. Mirrors the C-side
@@ -466,7 +484,94 @@ impl Terminal {
         // scrollback limit above: leaving the `set` out would take
         // libghostty's own default rather than the caller's choice.
         terminal.set_continuation_max_bytes(options.continuation_max_bytes)?;
+        terminal.apply_image_policy(options.kitty_image_storage_limit)?;
         Ok(terminal)
+    }
+
+    /// Roost's Kitty image policy: `storage_limit` bytes per screen, and
+    /// direct (in-band) transmission only. A file, temporary-file or
+    /// shared-memory transmission names a resource on the session's host
+    /// that a client's copy of the terminal cannot read, so its image
+    /// store would drift from the session's. The media are set even
+    /// though they match libghostty's default, so an upstream default
+    /// change cannot turn one on. A later alternate screen inherits all
+    /// four from the primary.
+    pub(crate) fn apply_image_policy(&mut self, storage_limit: u64) -> Result<()> {
+        let off = false;
+        let options: [(sys::GhosttyTerminalOption, *const c_void); 4] = [
+            (
+                sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT,
+                (&raw const storage_limit).cast(),
+            ),
+            (
+                sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE,
+                (&raw const off).cast(),
+            ),
+            // NULL is the documented "disabled" for this one.
+            (
+                sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE,
+                ptr::null(),
+            ),
+            (
+                sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM,
+                (&raw const off).cast(),
+            ),
+        ];
+        for (option, value) in options {
+            // SAFETY: handle non-null; each value is NULL or a live local
+            // of the type its option documents (`uint64_t*`, `bool*`),
+            // which libghostty reads before returning.
+            let rc = unsafe { sys::ghostty_terminal_set(self.handle, option, value) };
+            Error::from_result(rc)?;
+        }
+        Ok(())
+    }
+
+    /// Read back the active screen's Kitty image policy.
+    pub fn kitty_image_policy(&self) -> Result<KittyImagePolicy> {
+        let mut storage_limit: u64 = 0;
+        let mut medium_file = false;
+        let mut medium_shared_mem = false;
+        let mut temp_dir = sys::GhosttyString {
+            ptr: ptr::null(),
+            len: 0,
+        };
+        let reads: [(sys::GhosttyTerminalData, *mut c_void); 4] = [
+            (
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_STORAGE_LIMIT,
+                (&raw mut storage_limit).cast(),
+            ),
+            (
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE,
+                (&raw mut medium_file).cast(),
+            ),
+            (
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_TEMP_FILE,
+                (&raw mut temp_dir).cast(),
+            ),
+            (
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_SHARED_MEM,
+                (&raw mut medium_shared_mem).cast(),
+            ),
+        ];
+        for (data, out) in reads {
+            // SAFETY: handle non-null; each `out` is a live local of the
+            // type its data kind documents.
+            let rc = unsafe { sys::ghostty_terminal_get(self.handle, data, out) };
+            Error::from_result(rc)?;
+        }
+        let medium_temp_file = (!temp_dir.ptr.is_null() && temp_dir.len > 0).then(|| {
+            // SAFETY: libghostty's borrowed string, valid until the next
+            // mutating call; copied out here.
+            let bytes = unsafe { std::slice::from_raw_parts(temp_dir.ptr, temp_dir.len) };
+            String::from_utf8_lossy(bytes).into_owned()
+        });
+        Ok(KittyImagePolicy {
+            storage_limit,
+            medium_file,
+            medium_temp_file,
+            medium_shared_mem,
+        })
     }
 
     /// Adopt a terminal handle produced by
@@ -772,6 +877,42 @@ impl Terminal {
         };
         Error::from_result(rc)?;
         Ok(out as u64)
+    }
+
+    /// The cell size libghostty holds, in pixels: the last
+    /// [`Self::resize`]'s, or a decoded snapshot's. What it derives a
+    /// Kitty image's cell span from.
+    pub fn cell_px(&self) -> Result<(u32, u32)> {
+        let width = self.get_u32(sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_WIDTH_PX)?;
+        let height = self.get_u32(sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_HEIGHT_PX)?;
+        let cols = self.get_u16(sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLS)?;
+        let rows = self.get_u16(sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_ROWS)?;
+        Ok((
+            width / u32::from(cols.max(1)),
+            height / u32::from(rows.max(1)),
+        ))
+    }
+
+    fn get_u32(&self, data: sys::GhosttyTerminalData) -> Result<u32> {
+        let mut out: u32 = 0;
+        // SAFETY: handle non-null; `out` is a `uint32_t` local, the type
+        // the `*_PX` data kinds document as their out parameter.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(self.handle, data, (&mut out) as *mut u32 as *mut _)
+        };
+        Error::from_result(rc)?;
+        Ok(out)
+    }
+
+    fn get_u16(&self, data: sys::GhosttyTerminalData) -> Result<u16> {
+        let mut out: u16 = 0;
+        // SAFETY: handle non-null; `out` is a `uint16_t` local, the type
+        // COLS and ROWS document as their out parameter.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(self.handle, data, (&mut out) as *mut u16 as *mut _)
+        };
+        Error::from_result(rc)?;
+        Ok(out)
     }
 
     /// Read a DEC-private mode bit (e.g. mode 2004 for bracketed paste).

@@ -136,6 +136,7 @@ libghostty-vt, it runs on the main thread.
 | swash (vendored patch) | `third_party/swash` via `[patch.crates-io]`                  | Pristine 0.2.10 pinned, plus a small set of malformed-font guards (issues #292 + #299 — debug SIGABRTs, an unbounded name-table read, and a hang when iced/cosmic-text shapes such a font), plus one non-safety rendering delta: hinting off on macOS (plan 073 D8). `README.roost.md` enumerates the deltas + removal condition. |
 | zbus (Linux notifications) | iced-side `org.freedesktop.Notifications` (`crates/roost-iced`) | Spec session-bus client, not a DE-specific stack. macOS notifications use a separate, native `UNUserNotificationCenter` backend instead (`crates/roost-iced/src/macos/notifications.rs`, issue #303 closed), not zbus. |
 | arboard                | iced-side clipboard image read on paste (`crates/roost-iced`) | `image-data` + `wayland-data-control` with X11 fallback; PNG encoding stays on the existing `png` crate. |
+| png                    | roost-vt's Kitty PNG decoder (`crates/roost-vt/src/image.rs`, behind `ffi`) + iced's clipboard images | Pure Rust, `=0.18.1` in `[workspace.dependencies]`. `roost-session` and `roost-iced` install the one decoder (`install_image_decoder`) at startup, so every copy of a tab decodes alike (the frozen Swift app installs none). |
 | Inter (bundled font)   | `third_party/inter` (`include_bytes!` via `roost-iced`)       | v4.1 static Regular/Medium/SemiBold, SIL OFL 1.1; iced chrome font only (terminal cells keep the configured monospace); single `chrome_font()` seam so a future config swap is small. `README.roost.md` has provenance + removal condition. |
 | JetBrains Mono (bundled font) | `third_party/jetbrains-mono` (`include_bytes!` via `roost-iced`'s `fonts.rs`) | v2.304 static Regular/Bold/Italic/BoldItalic, SIL OFL 1.1; the iced terminal font's default and the generic `Monospace`, so an unset or unresolved `font-family` never depends on what is installed. Loaded straight into iced's font database as the first statement of `App::bootstrap` (before the one-shot `font_registry` scan), not through `.font()`. OFL stanza in `packaging/copyright`; `bundle-iced.sh` copies both font licenses into `Contents/Resources/`. `README.roost.md` has provenance + removal condition. |
 
@@ -278,7 +279,14 @@ wrapper small.
     on the main thread at startup, `=thread` panics from a named
     background thread. It fires right after the panic hook is installed
     and before the single-instance lock, so it never touches a running
-    instance.
+    instance. `ROOST_TEST_EVENT_DELAY_MS=<ms>` (read only under
+    `ROOST_TEST_MODE=1`) holds each workspace event that long before the
+    iced UI's event pump forwards it, so a request overtakes the event of
+    the mutation it follows (#640's window 2) every time; it is for that
+    proof, not the curated lanes. `ROOST_TEST_EVENT_PUSH_DELAY_MS=<ms>`
+    (same gate) holds each batch in `roost-engine`'s event relay before it
+    is queued for the socket, so a session's stop overtakes it every time
+    (#602).
 
 ## Docs
 

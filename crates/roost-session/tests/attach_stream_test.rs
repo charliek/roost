@@ -1484,6 +1484,7 @@ fn hydrate_vt(payload: &[u8], cols: u16) -> Terminal {
         rows: ROWS,
         max_scrollback: roost_engine::tab_task::SERVER_VT_SCROLLBACK,
         continuation_max_bytes: 0,
+        ..Default::default()
     })
     .expect("build the client terminal");
     terminal.vt_write(payload);

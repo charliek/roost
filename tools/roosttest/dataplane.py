@@ -202,11 +202,12 @@ class Frame:
         return json.loads(self.payload.decode())
 
     def grid(self) -> dict:
-        """`{seq, cols, rows, owner}` — the tab's grid and size owner as
-        of PTY frame `seq`; `owner` is `{client_id, label}` or `None`."""
+        """`{seq, cols, rows, cell_w_px, cell_h_px, owner}` — the tab's
+        grid, its session terminal's cell size and its size owner as of
+        PTY frame `seq`; `owner` is `{client_id, label}` or `None`."""
         assert self.frame_type == FRAME_GRID, f"not a GRID frame: {self.name}"
         grid = json.loads(self.payload.decode())
-        assert set(grid) >= {"seq", "cols", "rows", "owner"}, grid
+        assert set(grid) >= {"seq", "cols", "rows", "cell_w_px", "cell_h_px", "owner"}, grid
         return grid
 
 
@@ -503,6 +504,10 @@ class Reply:
     #: is the only statement of what the bytes say.
     snapshot_cols: int | None = None
     snapshot_rows: int | None = None
+    #: The session terminal's cell size in the same instant (0 until a
+    #: client has stated one): what a client's copy is sized with.
+    snapshot_cell_w_px: int = 0
+    snapshot_cell_h_px: int = 0
     #: The tab's size owner in the same instant: `{client_id, label}`,
     #: or `None` for a tab nobody owns.
     owner: dict | None = None
@@ -735,6 +740,9 @@ class DataPlane:
         deadline = time.monotonic() + scaled_timeout(timeout)
         raw = json.loads(self._readline(deadline))
         if raw.get("ok"):
+            # Required on every accepted reply: a superset check alone
+            # would accept a session that left them out.
+            assert {"snapshot_cell_w_px", "snapshot_cell_h_px"} <= set(raw), raw
             reply = Reply(
                 ok=True,
                 raw=raw,
@@ -745,6 +753,8 @@ class DataPlane:
                 tab_generation=int(raw["tab_generation"]),
                 snapshot_cols=_optional_int(raw, "snapshot_cols"),
                 snapshot_rows=_optional_int(raw, "snapshot_rows"),
+                snapshot_cell_w_px=int(raw["snapshot_cell_w_px"]),
+                snapshot_cell_h_px=int(raw["snapshot_cell_h_px"]),
                 owner=raw["owner"],
             )
             assert self.kind in (ANY_KIND, reply.kind), (

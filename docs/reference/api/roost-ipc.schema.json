@@ -1168,6 +1168,24 @@
                 "null"
               ]
             },
+            "snapshot_cell_h_px": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "snapshot_cell_w_px": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "snapshot_cols": {
               "format": "uint16",
               "maximum": 65535,
@@ -1204,6 +1222,8 @@
             "tab_generation",
             "snapshot_cols",
             "snapshot_rows",
+            "snapshot_cell_w_px",
+            "snapshot_cell_h_px",
             "owner"
           ],
           "type": "object"
@@ -1263,6 +1283,24 @@
             },
             "server_epoch": {
               "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "snapshot_cell_h_px": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "snapshot_cell_w_px": {
+              "format": "uint16",
+              "maximum": 65535,
               "minimum": 0,
               "type": [
                 "integer",

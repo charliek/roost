@@ -130,18 +130,7 @@ mod sidecar {
         } else {
             command.env_remove("ROOST_TEST_MODE");
         }
-        // A copy written a moment ago can still be open for writing in
-        // a child some parallel test forked meanwhile; Linux refuses to
-        // exec it (ETXTBSY) until that child execs or exits.
-        for _ in 0..100 {
-            match command.output() {
-                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                result => return result.expect("run roost-session identify"),
-            }
-        }
-        panic!("roost-session identify stayed busy for 2s");
+        command.output().expect("run roost-session identify")
     }
 
     fn parse(output: &std::process::Output) -> SessionBinaryIdentity {
@@ -150,10 +139,16 @@ mod sidecar {
         serde_json::from_str(stdout.trim()).expect("stdout parses as SessionBinaryIdentity")
     }
 
+    /// The built binary, hard-linked into a dir of its own. A link, not
+    /// a copy: a copy is a write fd that a child some parallel test
+    /// forks meanwhile inherits, and Linux refuses to exec the file
+    /// (ETXTBSY) until that child execs or exits. A symlink would not do
+    /// either, since the sidecar is looked for beside the canonicalized
+    /// exe. `CARGO_TARGET_TMPDIR` is on the binary's filesystem.
     fn planted(sidecar: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
         let exe = dir.path().join("roost-session");
-        std::fs::copy(env!("CARGO_BIN_EXE_roost-session"), &exe).expect("copy the binary");
+        std::fs::hard_link(env!("CARGO_BIN_EXE_roost-session"), &exe).expect("link the binary");
         std::fs::write(dir.path().join("roost-session.test-identity"), sidecar)
             .expect("write the sidecar");
         (dir, exe)

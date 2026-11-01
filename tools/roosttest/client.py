@@ -176,6 +176,14 @@ class Roost:
     def close_tab(self, tab_id: int) -> None:
         self.call("tab.close", {"tab_id": str(tab_id)})
 
+    def close_tab_if_present(self, tab_id: int) -> None:
+        """Cleanup close: a tab that is already gone is closed (#656)."""
+        try:
+            self.close_tab(tab_id)
+        except RoostError as err:
+            if err.code != "not-found":
+                raise
+
     def focus(self, tab_id: int) -> None:
         self.call("tab.focus", {"tab_id": str(tab_id)})
 

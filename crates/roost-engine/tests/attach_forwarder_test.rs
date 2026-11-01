@@ -685,7 +685,8 @@ fn split_pty(frame: &DataFrame) -> (u64, Vec<u8>) {
 
 fn grid_of(frame: &DataFrame) -> GridFrame {
     assert_eq!(frame.frame_type, FRAME_GRID, "expected a GRID frame");
-    serde_json::from_slice(&frame.payload).expect("a GRID frame carries {seq, cols, rows, owner}")
+    serde_json::from_slice(&frame.payload)
+        .expect("a GRID frame carries {seq, cols, rows, cell_w_px, cell_h_px, owner}")
 }
 
 fn error_of(frame: &DataFrame) -> ResponseError {
@@ -1402,6 +1403,45 @@ async fn same_grid_different_cell_metrics_still_counts_as_a_change() {
         1,
         "the same grid at other cell metrics is still a resize ({:?})",
         String::from_utf8_lossy(&captured)
+    );
+}
+
+/// The session terminal's cell size rides the wire: every accepted
+/// reply states it — the session's, not the attaching client's — and an
+/// owner's change of it alone reaches a watcher as a `GRID`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_session_terminals_cell_size_rides_the_reply_and_the_grid() {
+    let h = harness().await;
+    let (_client, tab_id) = h.live_tab().await;
+
+    let (desk_reply, mut desk) = h
+        .attached_as("desk", tab_id, (100, 30), (9, 18), true)
+        .await;
+    assert_eq!(
+        (desk_reply.snapshot_cell_w_px, desk_reply.snapshot_cell_h_px),
+        (9, 18)
+    );
+    let (phone_reply, mut phone) = h
+        .attached_as("phone", tab_id, (60, 20), (7, 14), false)
+        .await;
+    assert_eq!(
+        (
+            phone_reply.snapshot_cell_w_px,
+            phone_reply.snapshot_cell_h_px
+        ),
+        (9, 18),
+        "a watcher is told the session's cell size, not its own"
+    );
+
+    desk.resize((100, 30), (10, 20), true).await;
+    let grid = phone.next_grid().await;
+    assert_eq!(
+        (grid.cols, grid.rows, grid.cell_w_px, grid.cell_h_px),
+        (100, 30, 10, 20)
+    );
+    assert_eq!(
+        grid.owner.map(|owner| owner.client_id).as_deref(),
+        Some("desk")
     );
 }
 
@@ -2485,27 +2525,33 @@ async fn the_session_serves_only_so_many_data_connections() {
 /// the snapshot cannot answer until something closes it. Closing the tab
 /// instead is what turns the parked fence into a rejection — the
 /// sequence can never be closed now, which is exactly `snapshot-failed`.
+///
+/// The close waits for the fence's snapshot to reach the tab task
+/// (#642): a registered connection proves nothing about where its fence
+/// is, and a close that beats the snapshot there is answered `not-found`.
+/// The unfinished DCS is still what parks it once the seam lets go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rejection_after_registration_releases_the_slot() {
-    let h = harness().await;
+    let (h, mut releases) = harness_pausing_handoffs().await;
     let (mut client, tab_id) = h.live_tab().await;
 
     let mut unfinished = Vec::from(&b"\x1bP"[..]);
     unfinished.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
     feed(&mut client, tab_id, unfinished).await;
 
-    let mut parked = h.handshake(tab_id);
-    parked["kinds"] = serde_json::json!([AttachPayloadKind::VT]);
+    let mut parked_vt = h.handshake(tab_id);
+    parked_vt["kinds"] = serde_json::json!([AttachPayloadKind::VT]);
     let socket = h.socket.clone();
-    let dialing = tokio::spawn(async move { dial(&socket, parked).await });
+    let dialing = tokio::spawn(async move { dial(&socket, parked_vt).await });
 
-    // Registered at step 8, long before the fence it is now stuck in.
+    let release = parked(&mut releases).await;
     h.wait_for_data_conns(1).await;
 
     client
         .call::<_, serde_json::Value>(ops::TAB_CLOSE, TabCloseParams { tab_id })
         .await
         .expect("tab.close");
+    let _ = release.send(());
 
     let error = timeout(BUDGET, dialing)
         .await

@@ -1064,12 +1064,21 @@ mod tests {
     fn a_grid_frame_decodes_its_owner_or_its_absence() {
         let owned = DataFrame {
             frame_type: FRAME_GRID,
-            payload: br#"{"seq":9,"cols":100,"rows":30,"owner":{"client_id":"a1","label":"desk"}}"#
+            payload: br#"{"seq":9,"cols":100,"rows":30,"cell_w_px":9,"cell_h_px":18,"owner":{"client_id":"a1","label":"desk"}}"#
                 .to_vec(),
         };
         match ServerFrame::decode(owned).unwrap() {
             ServerFrame::Grid(grid) => {
-                assert_eq!((grid.seq, grid.cols, grid.rows), (9, 100, 30));
+                assert_eq!(
+                    (
+                        grid.seq,
+                        grid.cols,
+                        grid.rows,
+                        grid.cell_w_px,
+                        grid.cell_h_px
+                    ),
+                    (9, 100, 30, 9, 18)
+                );
                 let owner = grid.owner.expect("an owner");
                 assert_eq!(
                     (owner.client_id.as_str(), owner.label.as_str()),
@@ -1080,7 +1089,8 @@ mod tests {
         }
         let unowned = DataFrame {
             frame_type: FRAME_GRID,
-            payload: br#"{"seq":0,"cols":80,"rows":24,"owner":null}"#.to_vec(),
+            payload: br#"{"seq":0,"cols":80,"rows":24,"cell_w_px":0,"cell_h_px":0,"owner":null}"#
+                .to_vec(),
         };
         assert!(matches!(
             ServerFrame::decode(unowned).unwrap(),
@@ -1200,6 +1210,8 @@ mod tests {
             tab_generation: 1,
             snapshot_cols: 80,
             snapshot_rows: 24,
+            snapshot_cell_w_px: 9,
+            snapshot_cell_h_px: 18,
             owner: None,
         });
         let body = serde_json::to_vec(&reply).expect("encode the reply");

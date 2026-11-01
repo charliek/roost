@@ -3271,6 +3271,12 @@ pub enum AttachMode {
 /// Never absent: under protocol equality every session that answers an
 /// accepted handshake states the geometry its bytes were written for.
 ///
+/// `snapshot_cell_w_px`/`snapshot_cell_h_px` are the session
+/// terminal's cell size at that same instant (0 until a client has
+/// stated one). A client's copy of the tab is sized with them, not with
+/// its own font: libghostty derives a Kitty image's cell span — and so
+/// the cursor's move past it — from the terminal's cell size.
+///
 /// `owner` is the tab's size owner at that same instant (`None`: nobody
 /// owns it), read in the tab task's turn that encoded the snapshot or
 /// cut the resume, so the grid and the owner describe one moment.
@@ -3285,6 +3291,8 @@ pub struct AttachAccepted {
     pub tab_generation: u64,
     pub snapshot_cols: u16,
     pub snapshot_rows: u16,
+    pub snapshot_cell_w_px: u16,
+    pub snapshot_cell_h_px: u16,
     pub owner: Option<SizeOwner>,
 }
 
@@ -3298,14 +3306,18 @@ pub struct SizeOwner {
     pub label: String,
 }
 
-/// A `GRID` frame's JSON payload: the tab's grid and size owner as of
-/// PTY frame `seq`, applied after that frame and before `seq + 1`.
-/// Several may share one `seq`; they apply in arrival order.
+/// A `GRID` frame's JSON payload: the tab's grid, the session
+/// terminal's cell size (as [`AttachAccepted::snapshot_cell_w_px`]) and
+/// the size owner as of PTY frame `seq`, applied after that frame and
+/// before `seq + 1`. Several may share one `seq`; they apply in arrival
+/// order.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GridFrame {
     pub seq: u64,
     pub cols: u16,
     pub rows: u16,
+    pub cell_w_px: u16,
+    pub cell_h_px: u16,
     pub owner: Option<SizeOwner>,
 }
 
@@ -3367,6 +3379,10 @@ struct RawAttachHandshakeReply {
     snapshot_cols: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     snapshot_rows: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_cell_w_px: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_cell_h_px: Option<u16>,
     #[serde(
         default,
         deserialize_with = "present",
@@ -3402,6 +3418,12 @@ impl TryFrom<RawAttachHandshakeReply> for AttachHandshakeReply {
                 snapshot_rows: raw
                     .snapshot_rows
                     .ok_or("accepted handshake reply is missing `snapshot_rows`")?,
+                snapshot_cell_w_px: raw
+                    .snapshot_cell_w_px
+                    .ok_or("accepted handshake reply is missing `snapshot_cell_w_px`")?,
+                snapshot_cell_h_px: raw
+                    .snapshot_cell_h_px
+                    .ok_or("accepted handshake reply is missing `snapshot_cell_h_px`")?,
                 owner: raw
                     .owner
                     .ok_or("accepted handshake reply is missing `owner`")?,
@@ -3448,6 +3470,8 @@ impl JsonSchema for AttachHandshakeReply {
                 "tab_generation",
                 "snapshot_cols",
                 "snapshot_rows",
+                "snapshot_cell_w_px",
+                "snapshot_cell_h_px",
                 "owner",
             ],
         });
@@ -3476,6 +3500,8 @@ impl From<AttachHandshakeReply> for RawAttachHandshakeReply {
                 tab_generation: Some(a.tab_generation),
                 snapshot_cols: Some(a.snapshot_cols),
                 snapshot_rows: Some(a.snapshot_rows),
+                snapshot_cell_w_px: Some(a.snapshot_cell_w_px),
+                snapshot_cell_h_px: Some(a.snapshot_cell_h_px),
                 owner: Some(a.owner),
                 error: None,
             },

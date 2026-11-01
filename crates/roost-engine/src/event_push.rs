@@ -425,6 +425,22 @@ enum Step {
     Stop,
 }
 
+/// `ROOST_TEST_EVENT_PUSH_DELAY_MS`, read only under `ROOST_TEST_MODE=1`:
+/// how long [`push_batch`] holds each batch, so a test can make a
+/// session's stop overtake an event still queued behind it (#602) every
+/// time instead of now and then.
+fn test_push_delay() -> Option<Duration> {
+    if std::env::var_os("ROOST_TEST_MODE").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return None;
+    }
+    std::env::var("ROOST_TEST_EVENT_PUSH_DELAY_MS")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .map(Duration::from_millis)
+}
+
 /// Put one batch on the queue, waiting up to [`PushLimits::stall`] for
 /// room.
 async fn push_batch(
@@ -432,6 +448,9 @@ async fn push_batch(
     tx: &mpsc::Sender<serde_json::Value>,
     limits: PushLimits,
 ) -> Step {
+    if let Some(delay) = test_push_delay() {
+        tokio::time::sleep(delay).await;
+    }
     let permit = match tokio::time::timeout(limits.stall, tx.reserve()).await {
         Ok(Ok(permit)) => permit,
         // Receiver gone: the connection is already down.

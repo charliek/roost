@@ -311,6 +311,11 @@ fn the_attach_handshake_vectors_decode_into_their_typed_shapes() {
         "the geometry the bytes were written for rides every accepted reply",
     );
     assert_eq!(
+        (accepted.snapshot_cell_w_px, accepted.snapshot_cell_h_px),
+        (9, 18),
+        "with the session terminal's cell size",
+    );
+    assert_eq!(
         accepted.owner.map(|owner| owner.label).as_deref(),
         Some("charlie-laptop"),
         "and so does the size owner at the same instant",
