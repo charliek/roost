@@ -3788,6 +3788,157 @@ mod tests {
         tab.terminal.cell_px().expect("the mirror's cell size")
     }
 
+    /// A window that moves to a display at another scale advertises its
+    /// cells to the session in the new device px — `App::window_rescaled`
+    /// notes the grid at them, then re-grids — while its mirror keeps the
+    /// session's px until a `GRID` says otherwise.
+    #[tokio::test]
+    async fn a_rescale_advertises_device_px_and_keeps_the_sessions_cells() {
+        use crate::app::terminal_tab::device_cell_px;
+        use crate::terminal_widget::TerminalMetrics;
+
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(
+            accepted_at(
+                PayloadKind::GhosttySnapshot,
+                false,
+                100,
+                GEOMETRY.grid(),
+                owner(ME),
+            ),
+            &mut tab,
+            &feed_tx,
+        );
+        hydrate_fully(
+            &mut attach,
+            &mut tab,
+            &feed_tx,
+            &mut feed_rx,
+            snapshot_with("x"),
+        );
+        let metrics = TerminalMetrics::fixed(7.8, 15.6);
+        let advertised = |scale_factor| {
+            let (cell_w, cell_h) = device_cell_px(metrics, scale_factor);
+            Geometry {
+                cell_w,
+                cell_h,
+                ..GEOMETRY
+            }
+        };
+        let mut tabs = HashMap::from([(key(), tab)]);
+        super::super::regrid_window(
+            &mut tabs,
+            &mut HashMap::new(),
+            GEOMETRY.grid(),
+            metrics,
+            1,
+            1.0,
+        );
+        attach.note_resize(advertised(1.0), true);
+        let _ = attach.test_drain_input();
+
+        attach.note_resize(advertised(2.0), true);
+        super::super::regrid_window(
+            &mut tabs,
+            &mut HashMap::new(),
+            GEOMETRY.grid(),
+            metrics,
+            1,
+            2.0,
+        );
+        let sent = attach.test_drain_input();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [HostDataMsg::Resize {
+                    cols: 80,
+                    rows: 24,
+                    cell_w: 16,
+                    cell_h: 31,
+                    focused: true,
+                }]
+            ),
+            "the RESIZE must carry the cells in device px at 2x: {sent:?}"
+        );
+        assert_eq!(
+            mirror_px(&tabs[&key()]),
+            (GEOMETRY.cell_w, GEOMETRY.cell_h),
+            "the mirror keeps the session's cells"
+        );
+    }
+
+    /// The scale a window opened at arrives after its first layout, but
+    /// learning it is not a resize anybody made: in a focused, laid-out
+    /// window it reaches a tab another client sizes as advice only, so a
+    /// launch never takes that tab. A move to another display does take
+    /// it, as a resize of the window would.
+    #[tokio::test]
+    async fn the_opening_scale_only_advises_and_a_display_move_takes() {
+        use super::super::ScaleSource;
+        use crate::app::terminal_tab::device_cell_px;
+        use crate::terminal_widget::TerminalMetrics;
+
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(
+            accepted_at(
+                PayloadKind::GhosttySnapshot,
+                false,
+                100,
+                GEOMETRY.grid(),
+                owner(DESK),
+            ),
+            &mut tab,
+            &feed_tx,
+        );
+        hydrate_fully(
+            &mut attach,
+            &mut tab,
+            &feed_tx,
+            &mut feed_rx,
+            snapshot_with("x"),
+        );
+        let _ = attach.test_drain_input();
+        let metrics = TerminalMetrics::fixed(7.8, 15.6);
+        let at = |scale_factor| {
+            let (cell_w, cell_h) = device_cell_px(metrics, scale_factor);
+            Geometry {
+                cell_w,
+                cell_h,
+                ..GEOMETRY
+            }
+        };
+        let mut layout = super::super::WindowLayout::default();
+        layout.resized();
+
+        attach.note_resize(at(2.0), layout.rescale_focused(ScaleSource::Opened, true));
+        let sent = attach.test_drain_input();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [HostDataMsg::Resize {
+                    cell_w: 16,
+                    focused: false,
+                    ..
+                }]
+            ),
+            "the opening scale must only advise: {sent:?}"
+        );
+
+        attach.note_resize(at(1.0), layout.rescale_focused(ScaleSource::Moved, true));
+        let sent = attach.test_drain_input();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [HostDataMsg::Resize {
+                    cell_w: 8,
+                    focused: true,
+                    ..
+                }]
+            ),
+            "a display move resizes like the window does: {sent:?}"
+        );
+    }
+
     /// A live `GRID` sizes the mirror with the cells the session states,
     /// so an image moves the mirror's cursor as far as the session's.
     #[tokio::test]
@@ -3919,7 +4070,7 @@ mod tests {
         let regrid = |tab: &mut TerminalTab, size: f64, generation: u64| {
             let metrics = TerminalMetrics::measure(size).expect("metrics");
             let change = tab
-                .apply_geometry(GEOMETRY.cols, GEOMETRY.rows, metrics, generation)
+                .apply_geometry(GEOMETRY.cols, GEOMETRY.rows, metrics, generation, 1.0)
                 .expect("re-grid")
                 .expect("new metrics are a change");
             tab.commit_geometry(change);

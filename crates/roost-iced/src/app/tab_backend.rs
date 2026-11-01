@@ -265,9 +265,9 @@ impl TabHandle {
         matches!(self.kind, TabHandleKind::Host(_))
     }
 
-    pub(super) fn send_resize(&self, cols: u16, rows: u16) {
+    pub(super) fn send_resize(&self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
         match &self.kind {
-            TabHandleKind::InProcess(session) => session.send_resize(cols, rows),
+            TabHandleKind::InProcess(session) => session.send_resize(cols, rows, cell_w, cell_h),
             // A host tab's resize is the attach machine's to send — it
             // owns the pre-FINISH withhold and the pixel dimensions the
             // RESIZE frame carries (plan 037 §3.4). Nothing routes here.
@@ -275,6 +275,8 @@ impl TabHandle {
                 tracing::debug!(
                     cols,
                     rows,
+                    cell_w,
+                    cell_h,
                     "host tab resize must go through the attach state"
                 );
             }
@@ -452,7 +454,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_resize_reaches_the_pty() {
         let (_backend, handle, mut feed, supervisor) = attached(8_604, &["/bin/sh".into()], true);
-        handle.send_resize(90, 40);
+        handle.send_resize(90, 40, 9, 18);
         handle.send_input(b"stty size\nexit\n".to_vec(), InputTake::None);
         let seen = feed_text_until(
             &mut feed,
@@ -467,6 +469,47 @@ mod tests {
         );
         drop(handle);
         supervisor.close(8_604);
+    }
+
+    /// The cell px a `send_resize` states reach the PTY as its pixel size,
+    /// and a later plain `PtySupervisor::resize` — what `tab.resize`
+    /// drives — keeps them for its new grid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plain_resize_keeps_the_cell_px_send_resize_stated() {
+        let (_backend, handle, mut feed, supervisor) = attached(8_606, &["/bin/sh".into()], true);
+        handle.send_resize(90, 40, 9, 18);
+        // Output of a command queued behind the resize: the drain applied
+        // it, and stored its px, before the shell read the command.
+        handle.send_input(b"echo READY$((1+1))\n".to_vec(), InputTake::None);
+        feed_text_until(
+            &mut feed,
+            TabKey::local(8_606),
+            "READY2",
+            Duration::from_secs(10),
+        )
+        .await;
+        supervisor
+            .resize(8_606, 100, 30)
+            .await
+            .expect("plain resize");
+        handle.send_input(
+            b"python3 -c 'import fcntl,termios,struct; print(\"WS=%d,%d,%d,%d=\" % struct.unpack(\"HHHH\", fcntl.ioctl(0, termios.TIOCGWINSZ, b\"\\0\"*8)))'\nexit\n"
+                .to_vec(),
+            InputTake::None,
+        );
+        let seen = feed_text_until(
+            &mut feed,
+            TabKey::local(8_606),
+            "WS=30,100,900,540=",
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            seen.contains("WS=30,100,900,540="),
+            "the plain resize lost the cell px: {seen:?}"
+        );
+        drop(handle);
+        supervisor.close(8_606);
     }
 
     /// `scan_osc` runs the drain's real router: a color query is silent

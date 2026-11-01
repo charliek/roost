@@ -5317,6 +5317,13 @@
             "null"
           ]
         },
+        "scale_factor": {
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "sidebar_collapsed": {
           "type": "boolean"
         },

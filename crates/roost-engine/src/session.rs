@@ -56,7 +56,12 @@ pub enum TabOutput {
 /// resize share one channel so they apply in submission order.
 enum PtyCommand {
     Input(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+        cell_w: u32,
+        cell_h: u32,
+    },
 }
 
 /// The drain-side OSC scan, shared by the forwarding task and the
@@ -266,8 +271,16 @@ impl TabSession {
                             tracing::warn!(?err, tab_id, "pty write failed");
                         }
                     }
-                    PtyCommand::Resize { cols, rows } => {
-                        if let Err(err) = supervisor.resize(tab_id, cols, rows).await {
+                    PtyCommand::Resize {
+                        cols,
+                        rows,
+                        cell_w,
+                        cell_h,
+                    } => {
+                        if let Err(err) = supervisor
+                            .resize_with_px(tab_id, cols, rows, cell_w, cell_h)
+                            .await
+                        {
                             tracing::warn!(?err, tab_id, "pty resize failed");
                         }
                     }
@@ -386,8 +399,15 @@ impl TabSession {
         enqueue_input(&self.cmd_tx, self.input_capture.as_ref(), data);
     }
 
-    pub fn send_resize(&self, cols: u16, rows: u16) {
-        let _ = self.cmd_tx.send(PtyCommand::Resize { cols, rows });
+    /// Size the PTY at `cols`×`rows` cells of `cell_w`×`cell_h` px, in
+    /// order with the input around it.
+    pub fn send_resize(&self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
+        let _ = self.cmd_tx.send(PtyCommand::Resize {
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+        });
     }
 }
 

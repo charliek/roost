@@ -157,6 +157,21 @@ impl Geometry {
         let narrow = |px: u32| u16::try_from(px).unwrap_or(u16::MAX);
         (narrow(self.cell_w), narrow(self.cell_h))
     }
+
+    /// The child's winsize: the grid, and its pixel size as the grid
+    /// times the cell, saturated to the `u16` the kernel stores. A cell
+    /// of 0 px gives 0, the "unknown" a program reading it must allow.
+    pub(crate) fn winsize(&self) -> PtySize {
+        let span = |cells: u16, px: u32| {
+            u16::try_from(u32::from(cells).saturating_mul(px)).unwrap_or(u16::MAX)
+        };
+        PtySize {
+            rows: self.rows,
+            cols: self.cols,
+            pixel_width: span(self.cols, self.cell_w),
+            pixel_height: span(self.rows, self.cell_h),
+        }
+    }
 }
 
 /// A tab's output channel plus its sequence counter.
@@ -624,6 +639,9 @@ struct Session {
     tab_task: Option<(mpsc::Sender<crate::tab_task::TabCmd>, u64)>,
     /// This spawn's number, unique for the supervisor's life.
     incarnation: u64,
+    /// The cell px the last [`PtySupervisor::resize_with_px`] stated,
+    /// which a plain [`PtySupervisor::resize`] keeps.
+    cell_px: (u32, u32),
     /// The password poller's CLOEXEC dup of the master, held weakly. The
     /// writer task owns it beside the PTY's other master handles, so it
     /// closes exactly when they do. A session can outlive them: a reap
@@ -1500,6 +1518,7 @@ impl PtySupervisor {
                 .as_ref()
                 .map(|pipe| (pipe.cmd_tx.clone(), pipe.tab_generation)),
             incarnation: self.next_incarnation.fetch_add(1, Ordering::Relaxed),
+            cell_px: (0, 0),
             password_fd: password_watch_fd,
         };
         before_promote();
@@ -1733,7 +1752,35 @@ impl PtySupervisor {
     /// It waits for the task's decision and its server-terminal apply —
     /// a tab another client sizes refuses ([`PtyError::Owned`]) — but not
     /// for the child's winsize, which is queued ahead of any later input.
+    ///
+    /// The child's pixel size is the grid times the cell px the last
+    /// [`Self::resize_with_px`] stated.
     pub async fn resize(&self, tab_id: i64, cols: u16, rows: u16) -> Result<(), PtyError> {
+        self.resize_at(tab_id, cols, rows, None).await
+    }
+
+    /// [`Self::resize`] at a cell size, which later plain resizes keep:
+    /// the UI that lays the tab out knows it, `tab.resize` does not. A
+    /// server-VT tab's task owns its cell size, so it ignores `cell_px`.
+    pub async fn resize_with_px(
+        &self,
+        tab_id: i64,
+        cols: u16,
+        rows: u16,
+        cell_w: u32,
+        cell_h: u32,
+    ) -> Result<(), PtyError> {
+        self.resize_at(tab_id, cols, rows, Some((cell_w, cell_h)))
+            .await
+    }
+
+    async fn resize_at(
+        &self,
+        tab_id: i64,
+        cols: u16,
+        rows: u16,
+        cell_px: Option<(u32, u32)>,
+    ) -> Result<(), PtyError> {
         #[cfg(feature = "server-vt")]
         let task_tx = {
             let sessions = self.sessions.lock().unwrap();
@@ -1757,24 +1804,26 @@ impl PtySupervisor {
                 }),
             };
         }
-        let tx = {
-            let sessions = self.sessions.lock().unwrap();
-            sessions
-                .get(&tab_id)
-                .map(|s| s.cmd_tx.clone())
-                .ok_or(PtyError::NotFound(tab_id))?
+        let (tx, (cell_w, cell_h)) = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let session = sessions
+                .get_mut(&tab_id)
+                .ok_or(PtyError::NotFound(tab_id))?;
+            if let Some(cell_px) = cell_px {
+                session.cell_px = cell_px;
+            }
+            (session.cmd_tx.clone(), session.cell_px)
         };
-        tx.send(WriterCmd::Resize(
-            PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            None,
-        ))
-        .await
-        .map_err(|_| PtyError::Closed(tab_id))?;
+        let size = Geometry {
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+        }
+        .winsize();
+        tx.send(WriterCmd::Resize(size, None))
+            .await
+            .map_err(|_| PtyError::Closed(tab_id))?;
         Ok(())
     }
 
@@ -3127,6 +3176,24 @@ async fn wait_for_output(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn a_winsize_is_the_grid_times_the_cell_saturated() {
+        let at = |cols, rows, cell_w, cell_h| {
+            let size = Geometry {
+                cols,
+                rows,
+                cell_w,
+                cell_h,
+            }
+            .winsize();
+            (size.cols, size.rows, size.pixel_width, size.pixel_height)
+        };
+        assert_eq!(at(80, 24, 9, 18), (80, 24, 720, 432));
+        assert_eq!(at(80, 24, 0, 0), (80, 24, 0, 0));
+        assert_eq!(at(1000, 500, 70, 140), (1000, 500, u16::MAX, u16::MAX));
+        assert_eq!(at(u16::MAX, 1, u32::MAX, 1), (u16::MAX, 1, u16::MAX, 1));
+    }
 
     // ---- a transient openpty failure (#628) ----------------------------
 

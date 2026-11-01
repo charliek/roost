@@ -871,6 +871,13 @@ re-applied. This op states the grid only and leaves the cell metrics
 where the last owner left them; before any client has declared them
 they are unset, and the size report quotes `0x0` pixels.
 
+The child's winsize states pixels as well as cells: the grid times the
+cell size, `0` while the cell size is unset. A session tab's cell size
+is its owner's; an in-process tab's is the window's cell in device
+pixels (see [`app.window_metrics`](#appwindow_metrics)'s
+`scale_factor`). Either way this op keeps the cell size and moves only
+the grid.
+
 ### `tab.dump`
 
 Read the tab's live terminal *viewport* as text — the determinism
@@ -1784,7 +1791,7 @@ Request: `{"params": {}}`.
 {"window_width":1100.0,"window_height":700.0,"sidebar_width":220.0,
  "sidebar_collapsed":false,"terminal_top":34.0,"terminal_font_family":"Berkeley Mono",
  "terminal_left":220.0,"terminal_padding":0.0,"cell_width":8.0,"cell_height":16.0,
- "window_focused":true,"native_focus_losses":0}
+ "scale_factor":2.0,"window_focused":true,"native_focus_losses":0}
 ```
 
 `terminal_top` and `terminal_font_family` are optional for wire compatibility
@@ -1812,6 +1819,14 @@ terminal_padding + row × cell_height)`. The Mac real-input harness
 (`tools/input/mac/coords.py`) turns that into a screen point with the window's
 Accessibility frame, so a real click lands on a known cell without measuring
 pixels.
+
+`scale_factor` is the window's device pixels per logical point (`2.0` on a
+Retina display), optional in the same way: the iced UI always reports it, the
+Mac UI does not. A terminal's cell size in pixels is `round(cell_width ×
+scale_factor)` by `round(cell_height × scale_factor)`, at least 1. That is the
+size an in-process tab's terminal and PTY winsize state, what the terminal's
+size reports (CSI 14t/16t, mode 2048) quote, and the cell size the window
+advertises to a session whose tabs it sizes.
 
 `window_focused` and `native_focus_losses` are optional in the same way: the
 iced UI always reports them and the Mac UI does not. `window_focused` is the
@@ -4707,8 +4722,8 @@ degraded-but-equivalent one:
   freeze rendering mid-frame. A program that set two members of one
   mouse-tracking or mouse-format family replays as the last of them,
   since libghostty collapses each family onto a single field;
-* **Kitty images** — `ghostty-snapshot` carries their state, `vt`
-  does not (Roost doesn't draw Kitty images yet either way, #645);
+* **Kitty images** — `ghostty-snapshot` carries their state, so a
+  hydrated mirror draws the images on screen again; `vt` does not;
 * **pending-wrap under origin mode** — restoring `DECOM` homes the
   cursor in libghostty, so the repositioning that follows clears the
   flag. This is the one cursor state `vt` cannot reproduce;

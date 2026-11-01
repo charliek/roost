@@ -6184,7 +6184,7 @@ mod tests {
 
         let larger = TerminalMetrics::measure(14.0).expect("larger metrics");
         let change = tab
-            .apply_geometry(92, 29, larger, 2)
+            .apply_geometry(92, 29, larger, 2, 1.0)
             .expect("stage candidate geometry")
             .expect("candidate changes geometry");
         assert!(
@@ -6200,7 +6200,7 @@ mod tests {
         clear_captured_input(&tab);
         let smaller = TerminalMetrics::measure(13.0).expect("smaller metrics");
         let change = tab
-            .apply_geometry(100, 32, smaller, 3)
+            .apply_geometry(100, 32, smaller, 3, 1.0)
             .expect("stage rollback candidate")
             .expect("rollback candidate changes geometry");
         tab.rollback_geometry(change.previous.expect("installed prior geometry"))
@@ -6229,7 +6229,7 @@ mod tests {
         clear_captured_input(&tab);
 
         let grid_change = tab
-            .apply_geometry(99, 31, original, 1)
+            .apply_geometry(99, 31, original, 1, 1.0)
             .expect("resize grid")
             .expect("grid changed");
         assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
@@ -6262,7 +6262,7 @@ mod tests {
         clear_captured_input(&tab);
         let larger = TerminalMetrics::measure(14.0).expect("larger metrics");
         let metric_change = tab
-            .apply_geometry(92, 28, larger, 2)
+            .apply_geometry(92, 28, larger, 2, 1.0)
             .expect("apply metric change")
             .expect("metrics changed");
         assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
@@ -6296,7 +6296,7 @@ mod tests {
         );
         clear_captured_input(&tab);
         let rollback = tab
-            .apply_geometry(99, 31, original, 3)
+            .apply_geometry(99, 31, original, 3, 1.0)
             .expect("stage failed metric candidate")
             .expect("rollback candidate changes metrics");
         tab.rollback_geometry(rollback.previous.expect("prior geometry"))
@@ -6708,7 +6708,7 @@ mod tests {
         assert_eq!(viewport_offset(&tab), 164, "at most five rows a tick");
 
         let metrics = tab.applied_metrics.expect("installed metrics");
-        tab.apply_geometry(DEFAULT_COLS, DEFAULT_ROWS - 4, metrics, 1)
+        tab.apply_geometry(DEFAULT_COLS, DEFAULT_ROWS - 4, metrics, 1, 1.0)
             .expect("resize")
             .expect("the grid changed");
         assert!(
@@ -6838,7 +6838,14 @@ mod tests {
             tab.metric_generation,
         );
 
-        super::super::regrid_window(&mut tabs, &mut HashMap::new(), grid, metrics, generation);
+        super::super::regrid_window(
+            &mut tabs,
+            &mut HashMap::new(),
+            grid,
+            metrics,
+            generation,
+            1.0,
+        );
 
         let tab = &tabs[&key];
         assert_eq!(tab.grid(), grid, "the cell grid did not change");
@@ -7510,6 +7517,7 @@ mod tests {
             focused: true,
             view: tab.view(),
             row_offset: tab.grid_offset(),
+            scale_factor: 1.0,
         }
     }
 

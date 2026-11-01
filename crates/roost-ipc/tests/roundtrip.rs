@@ -737,6 +737,7 @@ fn both_window_metrics_vectors_decode_as_the_current_typed_result() {
         (result.cell_width, result.cell_height),
         (Some(8.0), Some(16.0))
     );
+    assert_eq!(result.scale_factor, Some(2.0));
     assert_eq!(
         serde_json::to_value(&result).unwrap(),
         geometry["result"],

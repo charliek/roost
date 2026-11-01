@@ -2146,6 +2146,12 @@ pub struct WindowMetricsResult {
     pub cell_width: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cell_height: Option<f64>,
+    /// The window's device pixels per logical point. A terminal's cells
+    /// are `round(cell_width × scale_factor)` by `round(cell_height ×
+    /// scale_factor)` device px, the size its PTY winsize and size
+    /// reports state and the size this window advertises to a session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_factor: Option<f32>,
     /// The window focus the UI acts on: the last native focus event, or a
     /// later `app.set_window_focus`. A selection auto-scroll runs only
     /// while it is true.
@@ -6184,6 +6190,7 @@ mod tests {
             terminal_padding: Some(0.0),
             cell_width: Some(7.8),
             cell_height: Some(15.6),
+            scale_factor: Some(2.0),
             window_focused: Some(false),
             native_focus_losses: Some(2),
             grid_offset_rows: Some(6),
@@ -6208,6 +6215,7 @@ mod tests {
             terminal_padding: None,
             cell_width: None,
             cell_height: None,
+            scale_factor: None,
             window_focused: None,
             native_focus_losses: None,
             grid_offset_rows: None,
@@ -6221,6 +6229,7 @@ mod tests {
             "terminal_padding",
             "cell_width",
             "cell_height",
+            "scale_factor",
             "window_focused",
             "native_focus_losses",
             "grid_offset_rows",
@@ -6250,6 +6259,7 @@ mod tests {
             (None, None, None, None)
         );
         assert_eq!((old.window_focused, old.native_focus_losses), (None, None));
+        assert_eq!(old.scale_factor, None);
     }
 
     #[test]

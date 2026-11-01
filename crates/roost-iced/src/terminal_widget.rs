@@ -222,7 +222,7 @@ impl TerminalMetrics {
     }
 
     #[cfg(test)]
-    fn fixed(cell_width: f32, cell_height: f32) -> Self {
+    pub(crate) fn fixed(cell_width: f32, cell_height: f32) -> Self {
         let font_pixels = 13.5;
         Self {
             font: Font::MONOSPACE,
@@ -777,6 +777,9 @@ pub struct TerminalWidget {
     /// tab's view is its grid and its offset 0.
     pub view: (u16, u16),
     pub row_offset: u32,
+    /// The window's device pixels per logical point, which image edges
+    /// snap to.
+    pub scale_factor: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -942,10 +945,6 @@ pub(crate) fn drawn_rows(grid_rows: u16, row_offset: u32, view_rows: u16) -> u16
     let below = u32::from(grid_rows).saturating_sub(row_offset);
     u16::try_from(below).unwrap_or(u16::MAX).min(view_rows)
 }
-
-/// The window's scale factor isn't tracked yet, so image edges snap to
-/// logical pixels.
-const UNTRACKED_SCALE_FACTOR: f32 = 1.0;
 
 /// Where the grid lands this frame: what [`plan_bands`] positions and
 /// clips images with.
@@ -1391,7 +1390,7 @@ impl TerminalWidget {
             cols: self.snapshot.cols,
             first_row: self.row_offset,
             drawn_rows: self.drawn_rows(),
-            scale_factor: UNTRACKED_SCALE_FACTOR,
+            scale_factor: self.scale_factor,
         }
     }
 
@@ -1994,6 +1993,7 @@ mod tests {
             ime_active: false,
             focused: true,
             row_offset: 0,
+            scale_factor: 1.0,
         }
     }
 

@@ -48,6 +48,7 @@ from test_host_client import (  # noqa: F401  (fixtures)
     wait_until,
     window_restored,
 )
+from test_kitty_images import cell_px
 from test_session_ownership import (
     COLS,
     ROWS,
@@ -551,7 +552,7 @@ def test_a21_an_owner_change_in_a_resume_gap_arrives_with_the_accept(host, roost
         other_key = sibling_key(key, other)
         focus(roost, other_key)
         wait_mine(roost, "the other tab")
-        metrics = roost.window_metrics()
+        window_w_px, window_h_px = cell_px(roost.window_metrics())
         desk, _ = attached(
             host.env,
             session,
@@ -559,10 +560,8 @@ def test_a21_an_owner_change_in_a_resume_gap_arrives_with_the_accept(host, roost
             "desk-a21",
             True,
             view,
-            # Rust's `.round()` takes halves away from zero; Python's
-            # `round` takes them to even, so 8.5 would differ.
-            cell_w_px=max(1, int(metrics["cell_width"] + 0.5)),
-            cell_h_px=max(1, int(metrics["cell_height"] + 0.5)),
+            cell_w_px=window_w_px,
+            cell_h_px=window_h_px,
         )
         session.close_tab(other)
 
@@ -779,7 +778,7 @@ def test_a23_an_image_moves_the_mirrors_cursor_as_far_as_the_sessions(host, roos
     with connected(host) as session:
         tab = quiet_tab(host.env, session)
         key = shown(roost, tab)
-        window_px = round(roost.window_metrics()["cell_width"])
+        window_px, _ = cell_px(roost.window_metrics())
         desk_px = 2 * window_px + 3
         desk, _ = attached(
             host.env,

@@ -1824,6 +1824,7 @@ impl App {
                             rows,
                             self.terminal_metrics,
                             self.metric_generation,
+                            self.scale_factor,
                         ) {
                             Ok(Some(change)) => tab.commit_geometry(change),
                             Ok(None) => {
@@ -1849,14 +1850,15 @@ impl App {
         self.host_begin_attach(key);
     }
 
-    /// The grid plus the cell pixel size an attach negotiates, from the
-    /// metrics the local tabs are already laid out with.
+    /// The grid plus the cell pixel size an attach negotiates: the cells
+    /// the local tabs are laid out with, in this window's device px.
     pub(super) fn host_geometry(&self, cols: u16, rows: u16) -> host_tab::Geometry {
+        let (cell_w, cell_h) = super::device_cell_px(self.terminal_metrics, self.scale_factor);
         host_tab::Geometry {
             cols,
             rows,
-            cell_w: self.terminal_metrics.cell_width.round().max(1.0) as u32,
-            cell_h: self.terminal_metrics.cell_height.round().max(1.0) as u32,
+            cell_w,
+            cell_h,
         }
     }
 
@@ -1867,9 +1869,15 @@ impl App {
     /// ([`super::WindowLayout`]). The machine decides when (immediately while
     /// live; withheld during hydration, where a mid-snapshot resize
     /// forfeits history).
-    pub(super) fn note_host_grid(&mut self, (cols, rows): (u16, u16), regrid: super::Regrid) {
-        let geometry = self.host_geometry(cols, rows);
+    pub(super) fn note_host_grid(&mut self, grid: (u16, u16), regrid: super::Regrid) {
         let focused = self.window_layout.focused(regrid, self.window_focused);
+        self.advertise_host_grid(grid, focused);
+    }
+
+    /// The attached host tabs' sessions hear `grid` at this window's cell
+    /// px, as a focused resize or only as advice.
+    pub(super) fn advertise_host_grid(&mut self, (cols, rows): (u16, u16), focused: bool) {
+        let geometry = self.host_geometry(cols, rows);
         for attach in self.host_attach.values_mut() {
             attach.note_resize(geometry, focused);
         }
@@ -2467,7 +2475,13 @@ impl App {
             }
         };
         let (cols, rows) = self.current_grid();
-        match tab.apply_geometry(cols, rows, self.terminal_metrics, self.metric_generation) {
+        match tab.apply_geometry(
+            cols,
+            rows,
+            self.terminal_metrics,
+            self.metric_generation,
+            self.scale_factor,
+        ) {
             Ok(Some(change)) => {
                 tab.commit_geometry(change);
                 // A fresh tab's snapshot is the blank default until
@@ -4099,6 +4113,7 @@ impl App {
                     terminal_padding: Some(f64::from(TERMINAL_PADDING)),
                     cell_width: Some(f64::from(metrics.cell_width)),
                     cell_height: Some(f64::from(metrics.cell_height)),
+                    scale_factor: Some(self.scale_factor),
                     window_focused: Some(self.window_focused),
                     native_focus_losses: Some(self.native_focus_losses),
                     grid_offset_rows: readout.map(TerminalTab::grid_offset),
@@ -8081,6 +8096,7 @@ mod tests {
                 DEFAULT_ROWS,
                 metrics,
                 tab.metric_generation + 1,
+                1.0,
             )
             .expect("apply a width-only geometry change")
             .expect("cols moved, so this is a real geometry change");

@@ -137,9 +137,9 @@ pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
 use self::tab_backend::{ReplyPolicy, TabBackend, TabHandle};
 use self::terminal_tab::{
     apply_geometry_batch, autoscroll_selections, cancel_tab_pointers, clear_preedit_or_warn,
-    pointer_origin_tab, refresh_or_warn, refuse_stale_press, release_host_pointer_before_detach,
-    terminal_grid, terminal_viewport, GeometryBatchOperation, GeometryChange,
-    NativePointerDispatch, PressGate, TerminalTab,
+    device_cell_px, pointer_origin_tab, refresh_or_warn, refuse_stale_press,
+    release_host_pointer_before_detach, terminal_grid, terminal_viewport, GeometryBatchOperation,
+    GeometryChange, NativePointerDispatch, PressGate, TerminalTab,
 };
 #[cfg(test)]
 use self::terminal_tab::{
@@ -1904,13 +1904,14 @@ fn regrid_window(
     (cols, rows): (u16, u16),
     metrics: TerminalMetrics,
     metric_generation: u64,
+    scale_factor: f32,
 ) {
     for (key, tab) in tabs {
         // The grid's edges moved under a pointer that may be holding still,
         // so a held drag's overshoot is stale even when the cell count is
         // not (#342).
         tab.disarm_autoscroll();
-        match tab.apply_geometry(cols, rows, metrics, metric_generation) {
+        match tab.apply_geometry(cols, rows, metrics, metric_generation, scale_factor) {
             Ok(Some(change)) => {
                 host_tab::forget_resume_on_regrid(
                     host_resume,
@@ -3050,6 +3051,16 @@ pub(super) enum Regrid {
     User,
 }
 
+/// Where a new scale factor came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScaleSource {
+    /// The scale the window opened at, which iced reports a moment after
+    /// the window exists: not a change anybody made.
+    Opened,
+    /// The window moved to a display with another scale.
+    Moved,
+}
+
 /// Whether the window has been laid out, which a re-grid needs to be a
 /// resize somebody made — one a focused window's host tabs hear as a take
 /// (plan 084 D6). The window's first layout, and anything that moves its
@@ -3078,6 +3089,17 @@ impl WindowLayout {
             self.laid_out = true;
         }
         focused && self.laid_out
+    }
+
+    /// Whether a scale change from `source` goes out focused. Learning the
+    /// scale the window opened at only advises: a launch must not take
+    /// another client's tab, and the session applies its owner's px either
+    /// way. Moving to another display is a resize like the window's own.
+    pub(super) fn rescale_focused(&mut self, source: ScaleSource, focused: bool) -> bool {
+        match source {
+            ScaleSource::Opened => false,
+            ScaleSource::Moved => self.focused(Regrid::Window, focused),
+        }
     }
 }
 
@@ -3458,6 +3480,10 @@ pub struct App {
     font_registry: &'static FontRegistry,
     terminal_metrics: TerminalMetrics,
     metric_generation: u64,
+    /// Device pixels per logical point on the window's display: what
+    /// turns `terminal_metrics` into the cell px terminals are sized with
+    /// ([`device_cell_px`]). 1.0 until the window reports its own.
+    scale_factor: f32,
     /// See [`PressGate::press_floor`].
     press_floor: u64,
     keybindings: HashMap<Accel, KeybindAction>,
@@ -3989,6 +4015,7 @@ impl App {
             font_registry,
             terminal_metrics,
             metric_generation: 1,
+            scale_factor: 1.0,
             press_floor: 0,
             keybindings,
             active_theme_name,
@@ -4974,6 +5001,35 @@ impl App {
         refresh_pill_label_map(&mut self.pill_labels, &keys);
     }
 
+    /// The window's display scale, as it opened or as it moved to another
+    /// display. The grid stays; every terminal's cell px follow, and so
+    /// do the px this window advertises to the sessions it sizes.
+    pub fn window_rescaled(&mut self, scale_factor: f32, source: ScaleSource) {
+        if !scale_factor.is_finite() || scale_factor <= 0.0 || scale_factor == self.scale_factor {
+            return;
+        }
+        tracing::info!(
+            from = self.scale_factor,
+            to = scale_factor,
+            ?source,
+            "window scale factor changed"
+        );
+        self.scale_factor = scale_factor;
+        let grid = self.current_grid();
+        let focused = self
+            .window_layout
+            .rescale_focused(source, self.window_focused);
+        self.advertise_host_grid(grid, focused);
+        regrid_window(
+            &mut self.tabs,
+            &mut self.host_resume,
+            grid,
+            self.terminal_metrics,
+            self.metric_generation,
+            self.scale_factor,
+        );
+    }
+
     pub fn window_resized(&mut self, id: window::Id, size: Size) -> UiTask {
         let opened = prepare_window_opened(
             &mut self.window_id,
@@ -5561,6 +5617,7 @@ impl App {
             grid,
             self.terminal_metrics,
             self.metric_generation,
+            self.scale_factor,
         );
         self.background_resize.resized(Instant::now());
         if changed && self.palette.is_some() {
@@ -7213,6 +7270,7 @@ impl App {
                 focused: terminal_cursor_focused(self.keyboard_route(), self.window_focused),
                 view: tab.view(),
                 row_offset: tab.grid_offset(),
+                scale_factor: self.scale_factor,
             }
             .into(),
             // No frame to draw yet (the tab is spawning, or attached but
@@ -11919,7 +11977,7 @@ mod tests {
         let mut resumes = HashMap::from([(key, point)]);
 
         let other_pixels = TerminalMetrics::measure(14.0).expect("other test metrics");
-        regrid_window(&mut tabs, &mut resumes, (120, 30), other_pixels, 2);
+        regrid_window(&mut tabs, &mut resumes, (120, 30), other_pixels, 2, 1.0);
         assert_eq!(tabs[&key].grid(), (80, 24), "the session's grid");
         assert_eq!(tabs[&key].view(), (120, 30), "drawn in the window's view");
         assert_eq!(
@@ -15105,6 +15163,7 @@ mod tests {
             view: (100, 32),
             metrics: original_metrics,
             metric_generation: 4,
+            cell_px: (8, 16),
         };
         let seven = TabKey::local(7);
         let eleven = TabKey::local(11);
@@ -15112,14 +15171,21 @@ mod tests {
         let mut operations = Vec::new();
         let mut persisted = false;
 
-        let result = apply_geometry_batch(&[seven, eleven], 92, 29, next_metrics, 5, |operation| {
-            match operation {
+        let result = apply_geometry_batch(
+            &[seven, eleven],
+            92,
+            29,
+            next_metrics,
+            5,
+            2.0,
+            |operation| match operation {
                 GeometryBatchOperation::Apply {
                     tab,
                     cols,
                     rows,
                     metrics,
                     metric_generation,
+                    scale_factor,
                 } => {
                     operations.push(format!("apply:{}", tab.tab));
                     if tab == eleven {
@@ -15133,6 +15199,7 @@ mod tests {
                             view: (cols, rows),
                             metrics,
                             metric_generation,
+                            cell_px: device_cell_px(metrics, scale_factor),
                         },
                     );
                     Ok(Some(GeometryChange {
@@ -15148,8 +15215,8 @@ mod tests {
                     states.insert(tab, previous);
                     Ok(None)
                 }
-            }
-        });
+            },
+        );
         if result.is_ok() {
             persisted = true;
         }

@@ -1537,17 +1537,7 @@ impl TabTask {
             // it, since the FIFO is ordered, and costs the child
             // nothing: `TIOCSWINSZ` signals it only on a real change.
             return Ok(acked
-                .then(|| {
-                    self.queue_resize(
-                        PtySize {
-                            rows: geometry.rows,
-                            cols: geometry.cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        },
-                        true,
-                    )
-                })
+                .then(|| self.queue_resize(geometry.winsize(), true))
                 .flatten());
         }
         let Geometry {
@@ -1578,18 +1568,7 @@ impl TabTask {
         let queued = if applied.is_ok() {
             self.grid_changed_at = self.next_seq;
             self.vt.geometry = geometry;
-            // Pixel geometry stays 0 on the PTY winsize, matching
-            // `PtySupervisor::resize`; libghostty gets the real cell
-            // metrics above, which is what its size reports read.
-            self.queue_resize(
-                PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                },
-                acked,
-            )
+            self.queue_resize(geometry.winsize(), acked)
         } else {
             None
         };

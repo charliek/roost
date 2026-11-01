@@ -1736,6 +1736,86 @@ async fn a_take_waits_for_the_childs_winsize_outside_the_tab_task() {
     sup.close(933);
 }
 
+/// A child that answers each input line `tag` with `tag rows cols
+/// xpixel ypixel`, its own `TIOCGWINSZ` as it reads it.
+const WINSIZE_REPORTER: &str = r#"while read tag; do python3 -c 'import fcntl,termios,struct,sys; print(sys.argv[1], *struct.unpack("HHHH", fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0"*8)))' "$tag"; done"#;
+
+/// The line the child answered `tag` with, once it has.
+async fn reported_winsize(commands: &mpsc::Sender<TabCmd>, tag: &str) -> String {
+    commands
+        .send(TabCmd::Input {
+            data: format!("{tag}\n").into_bytes(),
+            from: None,
+            take: InputTake::None,
+        })
+        .await
+        .expect("tab task is alive");
+    let prefix = format!("{tag} ");
+    let deadline = std::time::Instant::now() + BUDGET;
+    loop {
+        let dump = quiesce(commands).await;
+        if let Some(line) = dump
+            .rows_text
+            .iter()
+            .map(|row| row.trim_end())
+            .find(|row| row.starts_with(&prefix))
+        {
+            return line.to_string();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never answered {tag:?}; rows were {:?}",
+            dump.rows_text
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The child's winsize carries pixels once an owner states its cell
+/// size: the grid times the cell, which `kitten icat` and friends size
+/// images from. Before that they are 0 (no cell size is known), and a
+/// second client taking at the same geometry — the fence that re-queues
+/// the winsize — keeps them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_childs_winsize_carries_the_owners_pixels() {
+    let (sup, _workspace) = enabled_supervisor(false);
+    let _output = sup
+        .spawn(
+            934,
+            "/tmp",
+            &sh(WINSIZE_REPORTER),
+            20,
+            6,
+            &socket("winsize-px"),
+            &TabOpener::None,
+        )
+        .expect("spawn");
+    let commands = sup.tab_commands(934).expect("server-vt tab task");
+
+    assert_eq!(
+        reported_winsize(&commands, "unowned").await,
+        "unowned 6 20 0 0"
+    );
+
+    attached(&commands, 934, 1, "a", true, geometry(40, 12, 8, 16)).await;
+    assert_eq!(
+        reported_winsize(&commands, "owned").await,
+        "owned 12 40 320 192"
+    );
+
+    assert!(
+        attached(&commands, 934, 2, "b", true, geometry(40, 12, 8, 16)).await,
+        "the second client takes the tab"
+    );
+    assert_eq!(
+        reported_winsize(&commands, "retaken").await,
+        "retaken 12 40 320 192"
+    );
+
+    drop(commands);
+    sup.close(934);
+}
+
 /// Once the tab has exited its size is frozen: an attach that asks to
 /// take answers at once, and nothing about the tab moves (plan 084 D3:
 /// "no GRID after EXIT").

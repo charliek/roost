@@ -8,6 +8,9 @@ last snapshot refresh stored. The session half (a host tab's list equals
 its session's, live and after a snapshot attach) is the host-client lane's
 (`test_host_client.py`).
 
+The PTY's winsize carries the same cell size in pixels (plan 088 D4), which
+is what `kitten icat` sizes an image from.
+
 Iced only: the frozen Swift app neither stores nor lists images.
 
 Condition waits only.
@@ -18,11 +21,12 @@ from __future__ import annotations
 import base64
 import math
 import os
+import re
 import time
 
 import pytest
 from client import scaled_timeout
-from util import wait_tab_attached
+from util import wait_shell_ready, wait_tab_attached
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
@@ -66,7 +70,7 @@ def cell_px(metrics: dict) -> tuple[int, int]:
     """The terminal cell size a window gives its terminals and advertises
     as a session owner: its cell metrics in device px, rounded half away
     from zero as Rust's `f32::round` does."""
-    scale = metrics.get("scale_factor", 1.0)
+    scale = metrics["scale_factor"]
     return (
         max(1, math.floor(metrics["cell_width"] * scale + 0.5)),
         max(1, math.floor(metrics["cell_height"] * scale + 0.5)),
@@ -152,3 +156,37 @@ def test_a_hidden_tab_keeps_its_list(roost, project):
     # `tab.dump` refreshes the tab's snapshot before it reads it.
     roost.dump(tab)
     assert read() == want
+
+
+#: Prints the shell's own `TIOCGWINSZ`, `rows,cols,xpixel,ypixel`, between
+#: markers the echoed command line itself cannot match.
+WINSIZE_PROBE = (
+    "python3 -c 'import fcntl,termios,struct; "
+    'print("WINSIZE=%d,%d,%d,%d=" % struct.unpack("HHHH", '
+    'fcntl.ioctl(0, termios.TIOCGWINSZ, b"\\0"*8)))\''
+)
+WINSIZE_LINE = re.compile(r"WINSIZE=(\d+),(\d+),(\d+),(\d+)=")
+
+
+def test_an_in_process_tabs_winsize_states_its_cells_in_device_px(roost, project):
+    """The tab's first layout sets the PTY's pixel size even though the
+    tab was spawned at the window's grid, so a program asking the kernel
+    is told the grid times the terminal's cell, in device px."""
+    tab = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, tab)
+    wait_shell_ready(roost, tab)
+    roost.run(tab, WINSIZE_PROBE)
+    deadline = time.monotonic() + scaled_timeout(10.0)
+    found = WINSIZE_LINE.search(roost.dump_text(tab))
+    while found is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+        found = WINSIZE_LINE.search(roost.dump_text(tab))
+    assert found is not None, roost.dump_text(tab)
+    dumped = roost.dump(tab)
+    cell = cell_px(roost.window_metrics())
+    assert tuple(int(value) for value in found.groups()) == (
+        dumped["rows"],
+        dumped["cols"],
+        dumped["cols"] * cell[0],
+        dumped["rows"] * cell[1],
+    )
