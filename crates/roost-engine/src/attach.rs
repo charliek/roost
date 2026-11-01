@@ -325,6 +325,7 @@ async fn attach_tab(
         tab_generation: live_generation,
         snapshot,
         reported_size,
+        reported_cell_px,
         owner,
         grid_gen,
         ready_end,
@@ -362,6 +363,8 @@ async fn attach_tab(
         tab_generation: live_generation,
         snapshot_cols: reported_size.0,
         snapshot_rows: reported_size.1,
+        snapshot_cell_w_px: reported_cell_px.0,
+        snapshot_cell_h_px: reported_cell_px.1,
         owner,
     });
     let Ok(body) = serde_json::to_vec(&accepted) else {
@@ -560,6 +563,8 @@ struct Attached {
     /// `Option` the way the wire fields are — those are absent only from
     /// a session that predates them.
     reported_size: (u16, u16),
+    /// The session terminal's cell size in that same turn.
+    reported_cell_px: (u16, u16),
     /// The size owner in that same turn, and the generation every `GRID`
     /// at or below which the reply already covers.
     owner: Option<SizeOwner>,
@@ -668,6 +673,7 @@ async fn fence_tab(
         server_epoch: snapshot.server_epoch,
         tab_generation: snapshot.tab_generation,
         reported_size: (snapshot.cols, snapshot.rows),
+        reported_cell_px: (snapshot.cell_w_px, snapshot.cell_h_px),
         owner: snapshot.owner,
         grid_gen: snapshot.grid_gen,
         snapshot: snapshot.bytes,
@@ -790,6 +796,7 @@ async fn resume_tab(
         // a resize landing in between would describe records this reply
         // does not carry.
         reported_size: (resumed.cols, resumed.rows),
+        reported_cell_px: (resumed.cell_w_px, resumed.cell_h_px),
         owner: resumed.owner,
         grid_gen: resumed.grid_gen,
         ready_end: 0,
@@ -1594,6 +1601,8 @@ impl TeeState {
                 gen,
                 cols,
                 rows,
+                cell_w_px,
+                cell_h_px,
                 owner,
             } => {
                 if gen <= self.grid_gen {
@@ -1604,6 +1613,8 @@ impl TeeState {
                     seq,
                     cols,
                     rows,
+                    cell_w_px,
+                    cell_h_px,
                     owner,
                 })
                 .map_err(|error| Ending::Fault {
@@ -1882,6 +1893,8 @@ mod tests {
             gen,
             cols: 100,
             rows: 30,
+            cell_w_px: 9,
+            cell_h_px: 18,
             owner: None,
         }
     }

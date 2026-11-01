@@ -935,6 +935,8 @@ def _scripted(frames: list[tuple[int, bytes]]) -> DataPlane:
         "tab_generation": 1,
         "snapshot_cols": COLS,
         "snapshot_rows": ROWS,
+        "snapshot_cell_w_px": 0,
+        "snapshot_cell_h_px": 0,
         "owner": None,
     }
     out = json.dumps(reply).encode() + b"\n" + dataplane.PREAMBLE
@@ -951,7 +953,14 @@ def _pty(seq: int) -> tuple[int, bytes]:
 
 
 def _grid(seq: int) -> tuple[int, bytes]:
-    body = {"seq": seq, "cols": COLS, "rows": ROWS, "owner": None}
+    body = {
+        "seq": seq,
+        "cols": COLS,
+        "rows": ROWS,
+        "cell_w_px": 0,
+        "cell_h_px": 0,
+        "owner": None,
+    }
     return dataplane.FRAME_GRID, json.dumps(body).encode()
 
 

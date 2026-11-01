@@ -4332,6 +4332,7 @@ The reply is one JSON line. Accepted:
 {"ok": true, "kind": "ghostty-snapshot", "mode": "snapshot",
  "seq": 8813, "server_epoch": 6032428321756423947, "tab_generation": 3,
  "snapshot_cols": 100, "snapshot_rows": 30,
+ "snapshot_cell_w_px": 9, "snapshot_cell_h_px": 18,
  "owner": {"client_id": "5d0c7e21a9f3b846", "label": "charlie-laptop"}}
 ```
 
@@ -4393,13 +4394,24 @@ ring into the terminal it kept, and a watching one may not be at the
 tab's grid (a served resume never straddles a grid change — see
 [Resume](#resume)).
 
+`snapshot_cell_w_px` and `snapshot_cell_h_px` are **the session
+terminal's cell size** in that same instant: the owner's, once an owner
+has stated one, and `0` before any client has. They are not the
+attaching client's. A client sizes its copy of the tab with them —
+passing `0` as `0` — and not with its own font, because libghostty
+derives a Kitty image's cell span, and so how far the cursor moves past
+an image placed without explicit `c`/`r`, from the terminal's cell size:
+a copy at other cells puts every byte after such an image in other
+cells. What a client renders with, and the cell size it sends in its
+handshake and on `RESIZE`, stay its own.
+
 `owner` is the tab's size owner **in the same instant** — read in the
 session's turn that encoded the snapshot or cut the resume, so grid and
 owner describe one moment: `{client_id, label}`, or `null` for a tab
 nobody owns. A taking attach is its own owner here. Anything that changes
-either afterwards reaches this connection as a `GRID` frame. An accepted
-reply missing the geometry or `owner` is a truncated reply, and a client
-refuses it.
+any of these afterwards reaches this connection as a `GRID` frame. An
+accepted reply missing the geometry, the cell size or `owner` is a
+truncated reply, and a client refuses it.
 
 #### Preamble and frames
 
@@ -4419,7 +4431,7 @@ frame := u32-LE payload length | u8 type | payload
 | `0x01` `SNAP` | S→C | the next bytes of the encoded snapshot stream |
 | `0x02` `PTY` | S→C | `u64-LE seq` \| raw PTY bytes |
 | `0x03` `EXIT` | S→C | `u64-LE final_seq` \| `i32-LE` exit code |
-| `0x04` `GRID` | S→C | JSON `{"seq": u64, "cols": u16, "rows": u16, "owner": {"client_id", "label"} \| null}` |
+| `0x04` `GRID` | S→C | JSON `{"seq": u64, "cols": u16, "rows": u16, "cell_w_px": u16, "cell_h_px": u16, "owner": {"client_id", "label"} \| null}` |
 | `0x0F` `ERROR` | S→C | JSON `{code, message}`; the connection closes after it |
 | `0x11` `INPUT` | C→S | `u8 flags` \| raw encoded key/paste/mouse bytes (at least one), ordered and unacknowledged. bit 0 `TAKE_BEFORE`, bit 1 `TAKE_AFTER` |
 | `0x12` `RESIZE` | C→S | `u16-LE cols` \| `rows` \| `cell_w_px` \| `cell_h_px` \| `u8 flags`. bit 0 `FOCUSED` |
@@ -4466,8 +4478,12 @@ the [handshake](#the-handshake) refuses a zero-sized grid and the two
 state the same client's geometry, so they have to agree about what a
 grid is.
 
-**`GRID` consumes no seq.** Its `seq` is the last `PTY` seq written
-before the change (`0` if none), so several may share one; a client
+**`GRID` consumes no seq.** It states the tab's grid, the session
+terminal's cell size (as the accepted reply's `snapshot_cell_w_px` /
+`snapshot_cell_h_px`, all fields required) and the owner, and is sent
+when any of them changes — a change of cell size alone included. Its
+`seq` is the last `PTY` seq written before the change (`0` if none), so
+several may share one; a client
 applies a `GRID` after `PTY` frame `seq` and before `seq + 1`, in
 arrival order. It sits outside the contiguity rule `PTY` is under, it is
 held with `PTY` frames until the ready prefix is out (rule 1 below), it
@@ -4545,9 +4561,9 @@ answered with a rejection line, and cancels the attach. A frame already
 sent behind a `DETACH` gets the same answer before the reply as after
 it.
 
-Every change of the tab's grid or owner is announced twice: in band, as
-a `GRID` on every attachment, and to every subscriber, as
-[`tab.resized`](#events). A background [`tab.resize`](#tabresize) of an
+Every change of the tab's grid, its terminal's cell size or its owner
+is announced twice: in band, as a `GRID` on every attachment, and to
+every subscriber, as [`tab.resized`](#events). A background [`tab.resize`](#tabresize) of an
 owned tab is refused `owned`.
 
 Ordering, once the stream is running:
@@ -4684,16 +4700,17 @@ Resume is honored only when **all** of these hold:
 * `ring_front <= resume_from_seq <= last_assigned + 1`. The upper bound
   is inclusive: `last_assigned + 1` is a valid **empty-slice** resume —
   the client missed nothing and simply carries on.
-* The tab's grid has not changed since `resume_from_seq` (#564) —
-  whoever changed it, this attach's own `take: true` resize included.
-  The ring holds records written for the grid the tab had, and replayed
-  into a terminal the client kept at another width they land in the
-  wrong cells. The rule is conservative: a resize with no output after
+* The tab's grid and its terminal's cell size have not changed since
+  `resume_from_seq` (#564) — whoever changed them, this attach's own
+  `take: true` resize included. The ring holds records written for the
+  geometry the tab had, not the `GRID`s between them, and replayed into
+  a terminal the client kept at another width — or at other cells, which
+  move an image's cell span — they land in the wrong cells. The rule is conservative: a resize with no output after
   it refuses every resume point before it, since the seqs cannot say
   whether the client saw it.
 
 Every miss — `resume_from_seq` of `0`, a seq past the end, an evicted
-range, an identity mismatch, a grid change inside the range, a tab task
+range, an identity mismatch, a grid or cell-size change inside the range, a tab task
 that went away — falls back to `mode: "snapshot"` and a full attach
 **in the same reply**. A session older than the grid rule can still
 answer `resume` across a grid change, which is why Roost's own client
@@ -4844,7 +4861,8 @@ discipline, the last frame before the stream closes. See
 * `tab.resized` — `{"tab_id": "<id>", "cols": <int>, "rows": <int>, "owner": {"client_id": "<id>", "label": "<string>"} | null}`.
   A session tab's grid or [size owner](#size-ownership) changed —
   emitted with every `GRID` frame its attachments get, to **every**
-  subscriber, attached or not; `owner` is always present, `null` for a
+  subscriber, attached or not. It can fire with unchanged `cols`/`rows`
+  and owner, when only the session terminal's cell size changed; `owner` is always present, `null` for a
   tab nobody owns. For sidebar and UI state (a "sized by" marker, a
   resize wave that waits for a tab's owner to go): a client attached to
   the tab follows the `GRID` frame, which is ordered with the output.

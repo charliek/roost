@@ -774,6 +774,42 @@ impl Terminal {
         Ok(out as u64)
     }
 
+    /// The cell size libghostty holds, in pixels: the last
+    /// [`Self::resize`]'s, or a decoded snapshot's. What it derives a
+    /// Kitty image's cell span from.
+    pub fn cell_px(&self) -> Result<(u32, u32)> {
+        let width = self.get_u32(sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_WIDTH_PX)?;
+        let height = self.get_u32(sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_HEIGHT_PX)?;
+        let cols = self.get_u16(sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLS)?;
+        let rows = self.get_u16(sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_ROWS)?;
+        Ok((
+            width / u32::from(cols.max(1)),
+            height / u32::from(rows.max(1)),
+        ))
+    }
+
+    fn get_u32(&self, data: sys::GhosttyTerminalData) -> Result<u32> {
+        let mut out: u32 = 0;
+        // SAFETY: handle non-null; `out` is a `uint32_t` local, the type
+        // the `*_PX` data kinds document as their out parameter.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(self.handle, data, (&mut out) as *mut u32 as *mut _)
+        };
+        Error::from_result(rc)?;
+        Ok(out)
+    }
+
+    fn get_u16(&self, data: sys::GhosttyTerminalData) -> Result<u16> {
+        let mut out: u16 = 0;
+        // SAFETY: handle non-null; `out` is a `uint16_t` local, the type
+        // COLS and ROWS document as their out parameter.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(self.handle, data, (&mut out) as *mut u16 as *mut _)
+        };
+        Error::from_result(rc)?;
+        Ok(out)
+    }
+
     /// Read a DEC-private mode bit (e.g. mode 2004 for bracketed paste).
     /// Returns `false` if the mode is not currently set or if the mode
     /// number is unknown to libghostty. [`Self::ansi_mode_get`] is the

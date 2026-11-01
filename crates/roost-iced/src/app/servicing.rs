@@ -1957,7 +1957,7 @@ impl App {
     pub(super) fn host_detach_tab(&mut self, key: TabKey) {
         if let Some(attach) = self.host_attach.remove(&key) {
             self.background_resize.detached(key, Instant::now());
-            let kept = self.tabs.get(&key).map(TerminalTab::grid);
+            let kept = self.tabs.get(&key).map(TerminalTab::host_geometry);
             // The detach leaves its data task a moment to say so on the
             // wire, which needs the app runtime ambient.
             let _guard = self.runtime.enter();

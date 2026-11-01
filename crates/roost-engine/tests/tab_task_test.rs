@@ -1186,7 +1186,7 @@ async fn a_take_at_the_grid_already_applied_is_still_answered() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grid_resize_keeps_the_cell_metrics_the_tab_holds() {
     let (sup, _workspace) = enabled_supervisor(true);
-    let _output = sup
+    let mut tee = sup
         .spawn(
             922,
             "/tmp",
@@ -1226,9 +1226,309 @@ async fn a_grid_resize_keeps_the_cell_metrics_the_tab_holds() {
         text.contains("48;24;80;432;720"),
         "expected the report to quote 24x18 by 80x9 pixels, got {text:?}"
     );
+    assert_eq!(
+        grids(&mut tee).last().map(|grid| grid.geometry),
+        Some((80, 24, 9, 18)),
+        "and its GRID carries the cell size the tab kept"
+    );
 
     drop(commands);
     sup.close(922);
+}
+
+/// One teed `GRID`, flattened: cols, rows and cell px, and the owner's
+/// client id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TeedGrid {
+    geometry: (u16, u16, u16, u16),
+    owner: Option<String>,
+}
+
+/// Every `GRID` teed since the last call. Read after a `quiesce`, so the
+/// task has already sent whatever its decisions announced.
+fn grids(tee: &mut tokio::sync::broadcast::Receiver<PtyOutputEvent>) -> Vec<TeedGrid> {
+    std::iter::from_fn(|| tee.try_recv().ok())
+        .filter_map(|event| match event {
+            PtyOutputEvent::Grid {
+                cols,
+                rows,
+                cell_w_px,
+                cell_h_px,
+                owner,
+                ..
+            } => Some(TeedGrid {
+                geometry: (cols, rows, cell_w_px, cell_h_px),
+                owner: owner.map(|owner| owner.client_id),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The owner changing its font at the same grid changes no cell count,
+/// but it changes the session terminal's cell size, and with it how far
+/// an image moves the cursor: one `GRID` and one `tab.resized` carry it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owners_cell_size_change_alone_is_announced_once() {
+    let (sup, workspace) = enabled_supervisor(false);
+    let mut tee = sup
+        .spawn(
+            940,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("px-owner"),
+            &TabOpener::None,
+        )
+        .expect("spawn");
+    let commands = sup.tab_commands(940).expect("server-vt tab task");
+
+    attached(&commands, 940, 1, "a", true, geometry(80, 24, 8, 16)).await;
+    quiesce(&commands).await;
+    let _ = grids(&mut tee);
+    let announced = workspace.resized().len();
+
+    commands
+        .send(TabCmd::Resize {
+            id: 1,
+            geometry: geometry(80, 24, 10, 20),
+            focused: true,
+        })
+        .await
+        .expect("tab task is alive");
+    quiesce(&commands).await;
+    assert_eq!(
+        grids(&mut tee),
+        vec![TeedGrid {
+            geometry: (80, 24, 10, 20),
+            owner: Some("a".into()),
+        }]
+    );
+    let resized = workspace.resized();
+    assert_eq!(resized.len(), announced + 1, "and one tab.resized");
+    let (_, cols, rows, _) = resized.last().cloned().expect("announced");
+    assert_eq!((cols, rows), (80, 24), "at the grid it already had");
+
+    drop(commands);
+    sup.close(940);
+}
+
+/// A same-grid handoff to a client with other cells moves the session
+/// terminal to that client's cell size, and the one `GRID` that names
+/// the new owner names it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_same_grid_handoff_announces_the_new_owners_cell_size() {
+    let (sup, _workspace) = enabled_supervisor(false);
+    let mut tee = sup
+        .spawn(
+            941,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("px-handoff"),
+            &TabOpener::None,
+        )
+        .expect("spawn");
+    let commands = sup.tab_commands(941).expect("server-vt tab task");
+
+    attached(&commands, 941, 1, "a", true, geometry(80, 24, 8, 16)).await;
+    attached(&commands, 941, 2, "b", false, geometry(80, 24, 10, 20)).await;
+    quiesce(&commands).await;
+    let _ = grids(&mut tee);
+
+    commands
+        .send(TabCmd::TakeFrom { id: 2 })
+        .await
+        .expect("tab task is alive");
+    quiesce(&commands).await;
+    assert_eq!(
+        grids(&mut tee),
+        vec![TeedGrid {
+            geometry: (80, 24, 10, 20),
+            owner: Some("b".into()),
+        }]
+    );
+    let snapshot = ask(&commands, |reply| TabCmd::Snapshot {
+        kind: AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
+        reply,
+    })
+    .await
+    .expect("a snapshot");
+    assert_eq!(
+        (snapshot.cell_w_px, snapshot.cell_h_px),
+        (10, 20),
+        "an accepted reply from here on says so too"
+    );
+
+    drop(commands);
+    sup.close(941);
+}
+
+/// A watcher's own cell size is advisory: its `RESIZE` moves neither the
+/// session terminal nor the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watchers_cell_size_change_announces_nothing() {
+    let (sup, workspace) = enabled_supervisor(false);
+    let mut tee = sup
+        .spawn(
+            942,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("px-watcher"),
+            &TabOpener::None,
+        )
+        .expect("spawn");
+    let commands = sup.tab_commands(942).expect("server-vt tab task");
+
+    attached(&commands, 942, 1, "a", true, geometry(80, 24, 8, 16)).await;
+    attached(&commands, 942, 2, "b", false, geometry(80, 24, 8, 16)).await;
+    quiesce(&commands).await;
+    let _ = grids(&mut tee);
+    let announced = workspace.resized().len();
+
+    commands
+        .send(TabCmd::Resize {
+            id: 2,
+            geometry: geometry(80, 24, 10, 20),
+            focused: false,
+        })
+        .await
+        .expect("tab task is alive");
+    quiesce(&commands).await;
+    assert_eq!(grids(&mut tee), vec![]);
+    assert_eq!(workspace.resized().len(), announced);
+
+    drop(commands);
+    sup.close(942);
+}
+
+/// The owner's client reconnects into its own grace at the grid and cell
+/// size it left, and that attach is cancelled before its reply: the
+/// grace comes back with the geometry it kept, and neither step moved
+/// anything a client could be told about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_reclaim_that_restores_grace_announces_nothing() {
+    let (sup, workspace) = enabled_supervisor(false);
+    let mut tee = sup
+        .spawn(
+            943,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("px-grace"),
+            &TabOpener::None,
+        )
+        .expect("spawn");
+    let commands = sup.tab_commands(943).expect("server-vt tab task");
+
+    attached(&commands, 943, 1, "a", true, geometry(80, 24, 9, 18)).await;
+    commands
+        .send(TabCmd::Detach {
+            id: 1,
+            deliberate: false,
+        })
+        .await
+        .expect("tab task is alive");
+    quiesce(&commands).await;
+    assert!(sup.holds_grace("a"), "a's grace holds the tab");
+    let _ = grids(&mut tee);
+    let announced = workspace.resized().len();
+
+    let decision = decide(&commands, 2, "a", false, geometry(80, 24, 9, 18)).await;
+    assert!(decision.provisional, "a reclaims its own grace");
+    decision.settled(943).await.expect("the child half settled");
+    commands
+        .send(TabCmd::Detach {
+            id: 2,
+            deliberate: false,
+        })
+        .await
+        .expect("tab task is alive");
+    quiesce(&commands).await;
+    assert!(sup.holds_grace("a"), "the cancel restored the grace");
+    assert_eq!(grids(&mut tee), vec![]);
+    assert_eq!(workspace.resized().len(), announced);
+    let snapshot = ask(&commands, |reply| TabCmd::Snapshot {
+        kind: AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
+        reply,
+    })
+    .await
+    .expect("a snapshot");
+    assert_eq!(
+        (
+            snapshot.cols,
+            snapshot.rows,
+            snapshot.cell_w_px,
+            snapshot.cell_h_px
+        ),
+        (80, 24, 9, 18)
+    );
+
+    drop(commands);
+    sup.close(943);
+}
+
+/// The ring holds bytes, not the `GRID`s between them, so a resume that
+/// straddles a cell-size change would replay bytes the session parsed at
+/// one cell size into a terminal at another: it is refused like a grid
+/// change, and with no change in between the same resume is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_across_a_cell_size_change_is_refused_as_regridded() {
+    let (sup, _workspace) = enabled_supervisor(false);
+    let _output = sup
+        .spawn(
+            944,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("px-resume"),
+            &TabOpener::None,
+        )
+        .expect("spawn");
+    let commands = sup.tab_commands(944).expect("server-vt tab task");
+
+    attached(&commands, 944, 1, "a", true, geometry(80, 24, 8, 16)).await;
+    feed(&commands, b"after-the-take").await;
+    let seen = quiesce(&commands).await;
+    assert_eq!((seen.cols, seen.rows), (80, 24));
+    let Err(TabError::RingMiss { last_assigned, .. }) = ask(&commands, |reply| TabCmd::Resume {
+        from_seq: u64::MAX,
+        reply,
+    })
+    .await
+    else {
+        panic!("a seq past the ring is a miss that names the last one");
+    };
+    // The empty slice past everything written since the take.
+    let from_seq = last_assigned + 1;
+
+    ask(&commands, |reply| TabCmd::Resume { from_seq, reply })
+        .await
+        .expect("nothing changed since: the resume is served");
+
+    commands
+        .send(TabCmd::Resize {
+            id: 1,
+            geometry: geometry(80, 24, 10, 20),
+            focused: true,
+        })
+        .await
+        .expect("tab task is alive");
+    quiesce(&commands).await;
+    let refused = ask(&commands, |reply| TabCmd::Resume { from_seq, reply }).await;
+    assert!(
+        matches!(refused, Err(TabError::Regridded { .. })),
+        "a cell-size change is a regrid: {refused:?}"
+    );
+
+    drop(commands);
+    sup.close(944);
 }
 
 /// A resize the terminal refuses records nothing, so the next attempt at

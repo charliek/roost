@@ -24,6 +24,7 @@ Condition waits only.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import sys
 import time
@@ -528,9 +529,9 @@ def test_a16_a_dropped_owner_reclaims_within_its_grace_without_a_reflow(roost, s
 
 def test_a21_an_owner_change_in_a_resume_gap_arrives_with_the_accept(host, roost):
     """The window leaves the tab and the desk takes it at the window's own
-    grid — an owner change and no geometry change. The window's fallback
-    attach resumes, and learns the new owner from the accepted reply: no
-    `GRID` ever tells it."""
+    grid and cell size — an owner change and no geometry change. The
+    window's fallback attach resumes, and learns the new owner from the
+    accepted reply: no `GRID` ever tells it."""
     require_test_mode(roost)
     with connected(host) as session:
         tab, other = quiet_tab(host.env, session), quiet_tab(host.env, session)
@@ -549,7 +550,17 @@ def test_a21_an_owner_change_in_a_resume_gap_arrives_with_the_accept(host, roost
         other_key = sibling_key(key, other)
         focus(roost, other_key)
         wait_mine(roost, "the other tab")
-        desk = raw(host.env, session, tab, "desk-a21", True, view)
+        metrics = roost.window_metrics()
+        desk, _ = attached(
+            host.env,
+            session,
+            tab,
+            "desk-a21",
+            True,
+            view,
+            cell_w_px=max(1, round(metrics["cell_width"])),
+            cell_h_px=max(1, round(metrics["cell_height"])),
+        )
         session.close_tab(other)
 
         wait_sized_by(roost, "desk-a21", "the resumed attach")
@@ -739,4 +750,55 @@ def test_a22_a_grid_taller_than_the_view_is_drawn_and_addressed_through_its_offs
         roost.tab_dispatch_mouse_event(key, "press", "left", 5, row)
         roost.tab_dispatch_mouse_event(key, "release", "left", 5, row)
         child_says(desk, on_desk, f";6;{row + 1}M".encode())
+        desk.close()
+
+
+# ---------------------------------------------------------------------------
+# A23: the session's cell size, on the mirror
+# ---------------------------------------------------------------------------
+
+
+def kitty_rgb_strip(width_px: int) -> bytes:
+    """A one-row RGB image placed at the cursor with no `c`/`r` and the
+    default `C=0`: the cursor moves past it by as many cells as its width
+    spans at the terminal's cell width. `q=2` keeps the session's reply
+    out of the stream."""
+    pixels = base64.b64encode(b"\xff\x00\x00" * width_px).decode()
+    return f"\x1b_Ga=T,f=24,s={width_px},v=1,i=7,q=2;{pixels}\x1b\\".encode()
+
+
+def test_a23_an_image_moves_the_mirrors_cursor_as_far_as_the_sessions(host, roost):
+    """The desk takes the tab with a cell width unlike the window's. An
+    image sized in pixels moves the session's cursor by its width in the
+    desk's cells, and the window's mirror must move it the same: every
+    byte after it lands where the session put it."""
+    require_test_mode(roost)
+    with connected(host) as session:
+        tab = quiet_tab(host.env, session)
+        key = shown(roost, tab)
+        window_px = round(roost.window_metrics()["cell_width"])
+        desk_px = 2 * window_px + 3
+        desk, _ = attached(
+            host.env,
+            session,
+            tab,
+            "desk-a23",
+            True,
+            DESK,
+            cell_w_px=desk_px,
+            cell_h_px=2 * desk_px,
+        )
+        wait_sized_by(roost, "desk-a23", "the desk's take")
+        wait_mirror(roost, DESK, "the desk's take")
+
+        session.tab_feed_pty_bytes(tab, b"\x1b[H" + kitty_rgb_strip(4 * desk_px) + b"after")
+        wait_until(
+            lambda: any("after" in row for row in dump(roost, key)["rows_text"]),
+            30.0,
+            "the window to show the text behind the image",
+        )
+        assert session.dump(tab)["cursor"]["col"] == 4 + len("after"), session.dump(tab)
+        assert dump(roost, key)["cursor"] == session.dump(tab)["cursor"], (
+            f"window cell {window_px}px, desk cell {desk_px}px"
+        )
         desk.close()

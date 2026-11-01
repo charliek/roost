@@ -735,6 +735,8 @@ mod tests {
         ("RawAttachHandshakeReply", "tab_generation"),
         ("RawAttachHandshakeReply", "snapshot_cols"),
         ("RawAttachHandshakeReply", "snapshot_rows"),
+        ("RawAttachHandshakeReply", "snapshot_cell_w_px"),
+        ("RawAttachHandshakeReply", "snapshot_cell_h_px"),
         ("RawAttachHandshakeReply", "owner"),
         ("RawAttachHandshakeReply", "error"),
         ("AttachAccepted", "owner"),

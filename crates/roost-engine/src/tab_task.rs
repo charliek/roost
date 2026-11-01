@@ -470,6 +470,10 @@ pub struct SnapshotAt {
     /// not at the size the client asked for.
     pub cols: u16,
     pub rows: u16,
+    /// The session terminal's cell size in that same turn: what a
+    /// client's copy is sized with.
+    pub cell_w_px: u16,
+    pub cell_h_px: u16,
     /// The size owner and its generation, read in the same turn: the
     /// accepted reply's `owner`, and the floor below which a `GRID` this
     /// attach's tee carries is already in the reply.
@@ -500,7 +504,10 @@ pub struct ResumeAt {
     /// this one rather than leaving it to guess.
     pub cols: u16,
     pub rows: u16,
-    /// As [`SnapshotAt::owner`] and [`SnapshotAt::grid_gen`].
+    /// As [`SnapshotAt::cell_w_px`], [`SnapshotAt::owner`] and
+    /// [`SnapshotAt::grid_gen`].
+    pub cell_w_px: u16,
+    pub cell_h_px: u16,
     pub owner: Option<SizeOwner>,
     pub grid_gen: u64,
 }
@@ -855,7 +862,7 @@ impl TabVt {
         let tab_generation = self.tab_generation;
         let capture = self.state.capture_pty_input;
         let sizes = SizeOwnership::new(
-            (self.geometry.cols, self.geometry.rows),
+            self.geometry,
             u64::try_from(self.state.owner_grace.as_millis()).unwrap_or(u64::MAX),
             self.state.frozen_owner_clock,
         );
@@ -955,8 +962,11 @@ struct TabTask {
     /// `next_seq - 1`: `Exit` consumes an ordinal too, and a resume
     /// window that counted it would call `final_seq` a byte record.
     last_byte_seq: u64,
-    /// The seq the next PTY record would carry when the grid last
-    /// changed: every record below it was written for an older grid.
+    /// The seq the next PTY record would carry when the geometry —
+    /// grid or cell size — last changed: every record below it was
+    /// written for an older one. The cell size counts because a Kitty
+    /// image's cell span, and the cursor move past it, are derived from
+    /// it, and the ring holds bytes, not the `GRID`s between them.
     ///
     /// A client that resumes from at or below it would replay records
     /// composed for one width into a terminal it kept at another — a
@@ -1178,13 +1188,16 @@ impl TabTask {
     /// changed, and the grace label hold moved with it.
     fn announce(&mut self) {
         let geometry = self.vt.geometry;
-        if let Some(gen) = self.sizes.announce((geometry.cols, geometry.rows)) {
+        if let Some(gen) = self.sizes.announce(geometry) {
             let owner = self.sizes.owner();
+            let (cell_w_px, cell_h_px) = geometry.cell_px();
             let _ = self.tee.send(PtyOutputEvent::Grid {
                 seq: self.last_byte_seq,
                 gen,
                 cols: geometry.cols,
                 rows: geometry.rows,
+                cell_w_px,
+                cell_h_px,
                 owner: owner.clone(),
             });
             self.vt.state.workspace.tab_resized(
@@ -1231,6 +1244,7 @@ impl TabTask {
     }
 
     fn snapshot_at(&self, seq: u64, bytes: Vec<u8>) -> SnapshotAt {
+        let (cell_w_px, cell_h_px) = self.vt.geometry.cell_px();
         SnapshotAt {
             seq,
             server_epoch: self.vt.state.server_epoch,
@@ -1238,6 +1252,8 @@ impl TabTask {
             bytes,
             cols: self.vt.geometry.cols,
             rows: self.vt.geometry.rows,
+            cell_w_px,
+            cell_h_px,
             owner: self.sizes.owner(),
             grid_gen: self.sizes.grid_gen(),
         }
@@ -1553,9 +1569,7 @@ impl TabTask {
         // program that reads the report and then asks `TIOCGWINSZ` must
         // not be told two different sizes.
         let queued = if applied.is_ok() {
-            if (cols, rows) != (self.vt.geometry.cols, self.vt.geometry.rows) {
-                self.grid_changed_at = self.next_seq;
-            }
+            self.grid_changed_at = self.next_seq;
             self.vt.geometry = geometry;
             // Pixel geometry stays 0 on the PTY winsize, matching
             // `PtySupervisor::resize`; libghostty gets the real cell
@@ -1817,6 +1831,7 @@ impl TabTask {
             .filter(|(seq, _)| *seq >= from_seq)
             .map(|(seq, data)| (*seq, data.clone()))
             .collect();
+        let (cell_w_px, cell_h_px) = self.vt.geometry.cell_px();
         Ok(ResumeAt {
             slice,
             receiver: self.tee.subscribe(),
@@ -1825,6 +1840,8 @@ impl TabTask {
             stored_exit: self.stored_exit,
             cols: self.vt.geometry.cols,
             rows: self.vt.geometry.rows,
+            cell_w_px,
+            cell_h_px,
             owner: self.sizes.owner(),
             grid_gen: self.sizes.grid_gen(),
         })

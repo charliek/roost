@@ -119,6 +119,8 @@ pub enum PtyOutputEvent {
         gen: u64,
         cols: u16,
         rows: u16,
+        cell_w_px: u16,
+        cell_h_px: u16,
         owner: Option<roost_ipc::messages::SizeOwner>,
     },
 }
@@ -146,6 +148,15 @@ pub struct Geometry {
     pub rows: u16,
     pub cell_w: u32,
     pub cell_h: u32,
+}
+
+impl Geometry {
+    /// The cell size as the wire carries it. Every source of it is a
+    /// `u16` on the wire already, so the clamp never bites in practice.
+    pub fn cell_px(&self) -> (u16, u16) {
+        let narrow = |px: u32| u16::try_from(px).unwrap_or(u16::MAX);
+        (narrow(self.cell_w), narrow(self.cell_h))
+    }
 }
 
 /// A tab's output channel plus its sequence counter.

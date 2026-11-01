@@ -93,20 +93,21 @@ pub struct SizeOwnership {
     /// Every `updated_at` reads the same instant, so the tie rule decides
     /// every handoff (a test knob).
     frozen_stamps: bool,
-    /// Bumps on every announced change of grid or owner.
+    /// Bumps on every announced change of geometry — grid or cell size
+    /// — or owner.
     grid_gen: u64,
-    announced: ((u16, u16), Option<SizeOwner>),
+    announced: (Geometry, Option<SizeOwner>),
 }
 
 impl Default for SizeOwnership {
     fn default() -> Self {
-        Self::new((0, 0), 0, false)
+        Self::new(Geometry::default(), 0, false)
     }
 }
 
 impl SizeOwnership {
     /// A tab at `grid` that nobody owns.
-    pub fn new(grid: (u16, u16), grace_ms: u64, frozen_stamps: bool) -> Self {
+    pub fn new(grid: Geometry, grace_ms: u64, frozen_stamps: bool) -> Self {
         Self {
             attachments: BTreeMap::new(),
             owner: Owner::None,
@@ -149,10 +150,10 @@ impl SizeOwnership {
         self.grid_gen
     }
 
-    /// Record the tab's state after a decision. `Some(gen)` when its grid
-    /// or its wire owner differs from the last one announced — one `GRID`
-    /// and one `tab.resized` are owed, at that generation.
-    pub fn announce(&mut self, grid: (u16, u16)) -> Option<u64> {
+    /// Record the tab's state after a decision. `Some(gen)` when its
+    /// geometry or its wire owner differs from the last one announced —
+    /// one `GRID` and one `tab.resized` are owed, at that generation.
+    pub fn announce(&mut self, grid: Geometry) -> Option<u64> {
         let (announced_grid, announced_owner) = &self.announced;
         let announced_names = announced_owner
             .as_ref()
@@ -534,7 +535,7 @@ mod tests {
         }
         fn with(frozen: bool) -> Self {
             Self {
-                owner: SizeOwnership::new((80, 24), GRACE, frozen),
+                owner: SizeOwnership::new(geo(80, 24), GRACE, frozen),
                 tab: Tab::at(80, 24),
                 now: 1_000,
             }
@@ -1190,15 +1191,15 @@ mod tests {
     #[test]
     fn every_change_of_grid_or_owner_is_announced_once() {
         let mut f = Fixture::new();
-        assert_eq!(f.owner.announce(f.tab.grid()), None, "nothing changed yet");
+        assert_eq!(f.owner.announce(f.tab.at), None, "nothing changed yet");
         f.attached(1, "a", false, (80, 24));
-        assert_eq!(f.owner.announce(f.tab.grid()), Some(1), "an owner change");
-        assert_eq!(f.owner.announce(f.tab.grid()), None);
+        assert_eq!(f.owner.announce(f.tab.at), Some(1), "an owner change");
+        assert_eq!(f.owner.announce(f.tab.at), None);
         f.resize(1, (100, 30), false);
-        assert_eq!(f.owner.announce(f.tab.grid()), Some(2), "a grid change");
+        assert_eq!(f.owner.announce(f.tab.at), Some(2), "a grid change");
         f.attached(2, "a", false, (100, 30));
         assert_eq!(
-            f.owner.announce(f.tab.grid()),
+            f.owner.announce(f.tab.at),
             None,
             "the same client at the same grid is not a change on the wire"
         );
@@ -1206,10 +1207,27 @@ mod tests {
         f.detach(2, false);
         assert_eq!(f.owner.graced_client(), Some(("a", "a-label")));
         assert_eq!(
-            f.owner.announce(f.tab.grid()),
+            f.owner.announce(f.tab.at),
             None,
             "a grace record names the owner it replaced"
         );
         assert_eq!(f.owner.grid_gen(), 2);
+    }
+
+    #[test]
+    fn a_cell_size_change_at_the_same_grid_is_announced() {
+        let mut f = Fixture::new();
+        f.attached(1, "a", false, (80, 24));
+        assert_eq!(f.owner.announce(f.tab.at), Some(1));
+        let larger_cells = Geometry {
+            cell_w: 10,
+            cell_h: 20,
+            ..f.tab.at
+        };
+        f.tick(1);
+        f.owner.resize(1, larger_cells, false, f.now, &mut f.tab);
+        assert_eq!(f.tab.grid(), (80, 24), "the grid did not move");
+        assert_eq!(f.owner.announce(f.tab.at), Some(2), "its cells did");
+        assert_eq!(f.owner.announce(f.tab.at), None);
     }
 }

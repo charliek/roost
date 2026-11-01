@@ -685,7 +685,8 @@ fn split_pty(frame: &DataFrame) -> (u64, Vec<u8>) {
 
 fn grid_of(frame: &DataFrame) -> GridFrame {
     assert_eq!(frame.frame_type, FRAME_GRID, "expected a GRID frame");
-    serde_json::from_slice(&frame.payload).expect("a GRID frame carries {seq, cols, rows, owner}")
+    serde_json::from_slice(&frame.payload)
+        .expect("a GRID frame carries {seq, cols, rows, cell_w_px, cell_h_px, owner}")
 }
 
 fn error_of(frame: &DataFrame) -> ResponseError {
@@ -1402,6 +1403,45 @@ async fn same_grid_different_cell_metrics_still_counts_as_a_change() {
         1,
         "the same grid at other cell metrics is still a resize ({:?})",
         String::from_utf8_lossy(&captured)
+    );
+}
+
+/// The session terminal's cell size rides the wire: every accepted
+/// reply states it — the session's, not the attaching client's — and an
+/// owner's change of it alone reaches a watcher as a `GRID`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_session_terminals_cell_size_rides_the_reply_and_the_grid() {
+    let h = harness().await;
+    let (_client, tab_id) = h.live_tab().await;
+
+    let (desk_reply, mut desk) = h
+        .attached_as("desk", tab_id, (100, 30), (9, 18), true)
+        .await;
+    assert_eq!(
+        (desk_reply.snapshot_cell_w_px, desk_reply.snapshot_cell_h_px),
+        (9, 18)
+    );
+    let (phone_reply, mut phone) = h
+        .attached_as("phone", tab_id, (60, 20), (7, 14), false)
+        .await;
+    assert_eq!(
+        (
+            phone_reply.snapshot_cell_w_px,
+            phone_reply.snapshot_cell_h_px
+        ),
+        (9, 18),
+        "a watcher is told the session's cell size, not its own"
+    );
+
+    desk.resize((100, 30), (10, 20), true).await;
+    let grid = phone.next_grid().await;
+    assert_eq!(
+        (grid.cols, grid.rows, grid.cell_w_px, grid.cell_h_px),
+        (100, 30, 10, 20)
+    );
+    assert_eq!(
+        grid.owner.map(|owner| owner.client_id).as_deref(),
+        Some("desk")
     );
 }
 
