@@ -214,7 +214,17 @@ fn sleeper_secs(budget: Duration) -> u64 {
     (budget.as_secs_f64() + 15.0).ceil() as u64
 }
 
-async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+async fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    wait_for_explained(what, ready, String::new).await;
+}
+
+/// [`wait_for`], with `explain`'s account of the state appended to the
+/// timeout panic.
+async fn wait_for_explained(
+    what: &str,
+    mut ready: impl FnMut() -> bool,
+    explain: impl FnOnce() -> String,
+) {
     // A poll ceiling only ever grows: a scale below 1 is for shrinking
     // budgets under test, not for shortening how long we wait on one.
     let scale = roost_ipc::session_launch::timeout_scale().max(1.0);
@@ -223,10 +233,9 @@ async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
         if ready() {
             return;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out waiting for {what}{}", explain());
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -287,9 +296,20 @@ async fn concurrent_connections_are_served_while_idle_ones_are_held_open() {
     let idle_two = UnixStream::connect(&bridge)
         .await
         .expect("second idle dial");
-    wait_for("two idle connections to reach their own ssh exec", || {
-        harness.count(is_exec) >= 2
-    })
+    // #635: this wait has timed out on macOS with one of the two execs
+    // never logged. The panic carries the raw invocation log and the
+    // tunnel's own verdict, so the next occurrence says which side lost it.
+    wait_for_explained(
+        "two idle connections to reach their own ssh exec",
+        || harness.count(is_exec) >= 2,
+        || {
+            format!(
+                "\ninvocation log: {:#?}\nlast_error: {:?}",
+                harness.lines(),
+                tunnel.last_error()
+            )
+        },
+    )
     .await;
 
     let third = echo_through(&bridge, b"hello\n").await;

@@ -1290,13 +1290,13 @@ impl PtySupervisor {
         };
 
         let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pair = open_with_retry(|| pty_system.openpty(size), std::thread::sleep)
             .context("openpty failed")?;
 
         // Acquire everything derived from the master BEFORE spawning
@@ -2893,6 +2893,65 @@ async fn write_all_nonblocking(fd: &AsyncFd<File>, mut data: &[u8]) -> std::io::
     Ok(())
 }
 
+/// The waits before each retry of a transient `openpty` failure.
+const OPENPTY_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+    Duration::from_millis(40),
+    Duration::from_millis(80),
+];
+
+/// `open`, retried on a transient `openpty` failure ([`is_transient_openpty`])
+/// after each of [`OPENPTY_RETRY_DELAYS`]; any other error, or the last
+/// transient one, is returned as it came.
+///
+/// Bounded recovery, not a fix: macOS answers `openpty` with `ENXIO` now
+/// and then under concurrent pty open/close in one process, far from any
+/// pty or descriptor ceiling (#628's census), and the kernel-side cause is
+/// unknown. A restore of many tabs at once is exactly that load.
+fn open_with_retry<T>(
+    mut open: impl FnMut() -> anyhow::Result<T>,
+    mut sleep: impl FnMut(Duration),
+) -> anyhow::Result<T> {
+    let mut delays = OPENPTY_RETRY_DELAYS.iter();
+    loop {
+        match open() {
+            Ok(opened) => return Ok(opened),
+            Err(err) if is_transient_openpty(&err) => {
+                let Some(&delay) = delays.next() else {
+                    return Err(err);
+                };
+                warn!(
+                    error = %format!("{err:#}"),
+                    retry_in_ms = delay.as_millis() as u64,
+                    "openpty failed transiently; retrying"
+                );
+                sleep(delay);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Whether `err` is an `openpty` `ENXIO`. portable-pty 0.8.1 keeps no typed
+/// error: it `bail!`s `"failed to openpty: {:?}"` of the errno
+/// (`portable-pty/src/unix.rs:41-43`), so the text is matched against the
+/// same `{:?}` rendered here. If that message ever changes, this stops
+/// matching and nothing is retried. A typed `io::Error` in the chain is
+/// matched too, for a portable-pty that keeps it.
+fn is_transient_openpty(err: &anyhow::Error) -> bool {
+    let enxio = format!("{:?}", std::io::Error::from_raw_os_error(libc::ENXIO));
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.raw_os_error() == Some(libc::ENXIO))
+            || {
+                let text = cause.to_string();
+                text.starts_with("failed to openpty:") && text.contains(&enxio)
+            }
+    })
+}
+
 fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
     // SAFETY: plain `fcntl` calls on a valid fd the caller owns.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -3068,6 +3127,85 @@ async fn wait_for_output(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    // ---- a transient openpty failure (#628) ----------------------------
+
+    /// An opener that fails `failures` times the way portable-pty 0.8.1
+    /// does (`bail!` of the formatted errno), then succeeds.
+    fn portable_pty_opener(
+        errno: i32,
+        failures: usize,
+        attempts: &mut usize,
+    ) -> impl FnMut() -> anyhow::Result<&'static str> + '_ {
+        move || {
+            *attempts += 1;
+            if *attempts <= failures {
+                anyhow::bail!(
+                    "failed to openpty: {:?}",
+                    std::io::Error::from_raw_os_error(errno)
+                );
+            }
+            Ok("pair")
+        }
+    }
+
+    #[test]
+    fn up_to_four_enxio_failures_are_retried_through_to_the_pty() {
+        for failures in 0..=4 {
+            let mut attempts = 0;
+            let mut slept = Vec::new();
+            let opened = open_with_retry(
+                portable_pty_opener(libc::ENXIO, failures, &mut attempts),
+                |delay| slept.push(delay),
+            );
+            assert_eq!(opened.expect("a retried openpty"), "pair");
+            assert_eq!(attempts, failures + 1);
+            assert_eq!(slept, OPENPTY_RETRY_DELAYS[..failures]);
+        }
+    }
+
+    #[test]
+    fn a_fifth_enxio_surfaces_the_original_error() {
+        let mut attempts = 0;
+        let mut slept = Vec::new();
+        let err = open_with_retry(
+            portable_pty_opener(libc::ENXIO, 5, &mut attempts),
+            |delay| slept.push(delay),
+        )
+        .expect_err("five ENXIOs exhaust the retries");
+        assert_eq!(attempts, 5);
+        assert_eq!(slept, OPENPTY_RETRY_DELAYS);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "failed to openpty: {:?}",
+                std::io::Error::from_raw_os_error(libc::ENXIO)
+            )
+        );
+    }
+
+    #[test]
+    fn emfile_is_never_retried() {
+        let mut attempts = 0;
+        let mut slept = Vec::new();
+        let err = open_with_retry(
+            portable_pty_opener(libc::EMFILE, 1, &mut attempts),
+            |delay| slept.push(delay),
+        )
+        .expect_err("EMFILE is final");
+        assert_eq!(attempts, 1);
+        assert!(slept.is_empty(), "{slept:?}");
+        assert!(!is_transient_openpty(&err), "{err:#}");
+    }
+
+    #[test]
+    fn a_typed_enxio_is_transient_too() {
+        let typed = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENXIO))
+            .context("openpty failed");
+        assert!(is_transient_openpty(&typed), "{typed:#}");
+        let typed_emfile = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EMFILE));
+        assert!(!is_transient_openpty(&typed_emfile), "{typed_emfile:#}");
+    }
 
     // ---- the tab environment (plan 085 D1, D3) ------------------------
 

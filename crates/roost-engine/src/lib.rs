@@ -32,6 +32,8 @@ pub mod pointer;
 pub mod process;
 pub mod program_status;
 pub mod pty;
+#[cfg(test)]
+pub(crate) mod pty_census;
 pub mod reconcile;
 pub mod session;
 pub mod single_instance;

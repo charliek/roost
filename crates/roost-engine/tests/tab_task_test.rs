@@ -1748,11 +1748,13 @@ async fn a_take_waits_for_the_childs_winsize_outside_the_tab_task() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_take_after_the_tab_exited_answers_at_once_and_changes_nothing() {
     let (sup, _workspace) = enabled_supervisor(false);
+    // Parked at `read` until the handle is held, as in
+    // `a_resume_after_the_exit_replays_the_stored_exit` (#634).
     let mut output = sup
         .spawn(
             934,
             "/tmp",
-            &sh("exit 0"),
+            &sh("read _; exit 0"),
             20,
             6,
             &socket("writer-gone"),
@@ -1760,6 +1762,14 @@ async fn a_take_after_the_tab_exited_answers_at_once_and_changes_nothing() {
         )
         .expect("spawn");
     let commands = sup.tab_commands(934).expect("server-vt tab task");
+    commands
+        .send(TabCmd::Input {
+            data: b"\n".to_vec(),
+            from: None,
+            take: InputTake::None,
+        })
+        .await
+        .expect("tab task is alive");
 
     loop {
         match timeout(BUDGET, output.recv()).await {

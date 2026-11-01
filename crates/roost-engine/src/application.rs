@@ -825,7 +825,12 @@ pub(crate) fn spawn_in(
             socket,
             &TabOpener::None,
         )
-        .expect("spawn");
+        .unwrap_or_else(|err| {
+            panic!(
+                "spawn of tab {tab_id} failed: {err:#}\n{}",
+                crate::pty_census::pty_census(None).render()
+            )
+        });
     guard
 }
 

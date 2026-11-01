@@ -2525,27 +2525,33 @@ async fn the_session_serves_only_so_many_data_connections() {
 /// the snapshot cannot answer until something closes it. Closing the tab
 /// instead is what turns the parked fence into a rejection — the
 /// sequence can never be closed now, which is exactly `snapshot-failed`.
+///
+/// The close waits for the fence's snapshot to reach the tab task
+/// (#642): a registered connection proves nothing about where its fence
+/// is, and a close that beats the snapshot there is answered `not-found`.
+/// The unfinished DCS is still what parks it once the seam lets go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rejection_after_registration_releases_the_slot() {
-    let h = harness().await;
+    let (h, mut releases) = harness_pausing_handoffs().await;
     let (mut client, tab_id) = h.live_tab().await;
 
     let mut unfinished = Vec::from(&b"\x1bP"[..]);
     unfinished.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
     feed(&mut client, tab_id, unfinished).await;
 
-    let mut parked = h.handshake(tab_id);
-    parked["kinds"] = serde_json::json!([AttachPayloadKind::VT]);
+    let mut parked_vt = h.handshake(tab_id);
+    parked_vt["kinds"] = serde_json::json!([AttachPayloadKind::VT]);
     let socket = h.socket.clone();
-    let dialing = tokio::spawn(async move { dial(&socket, parked).await });
+    let dialing = tokio::spawn(async move { dial(&socket, parked_vt).await });
 
-    // Registered at step 8, long before the fence it is now stuck in.
+    let release = parked(&mut releases).await;
     h.wait_for_data_conns(1).await;
 
     client
         .call::<_, serde_json::Value>(ops::TAB_CLOSE, TabCloseParams { tab_id })
         .await
         .expect("tab.close");
+    let _ = release.send(());
 
     let error = timeout(BUDGET, dialing)
         .await
