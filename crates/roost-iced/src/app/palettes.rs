@@ -779,6 +779,7 @@ impl App {
             rows,
             metrics,
             metric_generation,
+            self.scale_factor,
             |batch_operation| match batch_operation {
                 GeometryBatchOperation::Apply {
                     tab,
@@ -786,13 +787,14 @@ impl App {
                     rows,
                     metrics,
                     metric_generation,
+                    scale_factor,
                 } => self
                     .tabs
                     .get_mut(&tab)
                     .ok_or_else(|| {
                         format!("tab {} disappeared during {operation} application", tab.tab)
                     })?
-                    .apply_geometry(cols, rows, metrics, metric_generation)
+                    .apply_geometry(cols, rows, metrics, metric_generation, scale_factor)
                     .map_err(|error| error.to_string()),
                 GeometryBatchOperation::Rollback { tab, previous } => self
                     .tabs
@@ -3550,7 +3552,7 @@ mod tests {
         let change = tabs
             .get_mut(&key)
             .expect("tab")
-            .apply_geometry(58, 17, bigger, 2)
+            .apply_geometry(58, 17, bigger, 2, 1.0)
             .expect("apply the new font")
             .expect("new metrics are a change");
         assert!(!change.grid_changed(), "the grid is the session's");

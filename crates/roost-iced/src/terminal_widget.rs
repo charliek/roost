@@ -1,6 +1,7 @@
 //! Renderer-neutral Iced terminal widget.
 
 use iced::advanced::graphics::text::{font_system, Paragraph};
+use iced::advanced::image::{self, Renderer as _};
 use iced::advanced::text::{Paragraph as _, Renderer as _};
 use iced::advanced::widget::{self, Widget};
 use iced::advanced::{
@@ -16,7 +17,9 @@ use roost_engine::pointer::{PointerAction, PointerButton};
 use roost_ui_model::keys::TabKey;
 use roost_ui_model::sprite::{sprite_geometry, tessellate, SpriteGeometry, SpritePrimitive};
 use roost_ui_model::theme::Theme as AppTheme;
-use roost_vt::{ColorRgb, CursorInfo, CursorVisualStyle, SelectionSpan};
+use roost_vt::{
+    ColorRgb, CursorInfo, CursorVisualStyle, ImageLayer, ImagePlacement, SelectionSpan,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
@@ -219,7 +222,7 @@ impl TerminalMetrics {
     }
 
     #[cfg(test)]
-    fn fixed(cell_width: f32, cell_height: f32) -> Self {
+    pub(crate) fn fixed(cell_width: f32, cell_height: f32) -> Self {
         let font_pixels = 13.5;
         Self {
             font: Font::MONOSPACE,
@@ -440,6 +443,20 @@ pub struct TerminalSnapshot {
     pub link_hover: Option<SelectionSpan>,
     pub pointer_shape: String,
     pub preedit: Option<ImePreedit>,
+    /// The Kitty image placements to draw, in draw order.
+    pub images: Arc<[DrawImage]>,
+    /// The terminal's cell size in its own pixels, the unit of every
+    /// `images` position and size; `(0, 0)` while it has none.
+    pub terminal_cell_px: (u32, u32),
+}
+
+/// One Kitty image placement as the widget draws it: the placement with
+/// its pixels.
+#[derive(Debug, Clone)]
+pub struct DrawImage {
+    pub placement: ImagePlacement,
+    pub handle: image::Handle,
+    pub image_size: (u32, u32),
 }
 
 impl TerminalSnapshot {
@@ -484,6 +501,8 @@ impl TerminalSnapshot {
             link_hover: None,
             pointer_shape: "default".into(),
             preedit: None,
+            images: Arc::from([]),
+            terminal_cell_px: (0, 0),
         }
     }
 
@@ -758,6 +777,9 @@ pub struct TerminalWidget {
     /// tab's view is its grid and its offset 0.
     pub view: (u16, u16),
     pub row_offset: u32,
+    /// The window's device pixels per logical point, which image edges
+    /// snap to.
+    pub scale_factor: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -922,6 +944,163 @@ impl PointerOutcome {
 pub(crate) fn drawn_rows(grid_rows: u16, row_offset: u32, view_rows: u16) -> u16 {
     let below = u32::from(grid_rows).saturating_sub(row_offset);
     u16::try_from(below).unwrap_or(u16::MAX).min(view_rows)
+}
+
+/// Where the grid lands this frame: what [`plan_bands`] positions and
+/// clips images with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GridGeometry {
+    /// The widget's bounds ∩ the viewport.
+    clip: Rectangle,
+    /// Where viewport row 0, column 0 sits ([`TerminalWidget::grid_origin`]).
+    origin: Point,
+    metrics: TerminalMetrics,
+    cols: u16,
+    /// The first viewport row drawn, and how many are.
+    first_row: u32,
+    drawn_rows: u16,
+    scale_factor: f32,
+}
+
+impl GridGeometry {
+    /// The drawn cells, never the padding around them or the chrome.
+    fn grid_clip(&self) -> Option<Rectangle> {
+        let metrics = self.metrics;
+        Rectangle::new(
+            cell_position(self.origin, 0, self.first_row, metrics),
+            Size::new(
+                f32::from(self.cols) * metrics.cell_width,
+                f32::from(self.drawn_rows) * metrics.cell_height,
+            ),
+        )
+        .intersection(&self.clip)
+    }
+
+    /// The span from `start` to `end`, its edges rounded to the nearest
+    /// device pixel, and at least one device pixel long when it had any
+    /// length: a thin placement rounds to a sliver, never to nothing.
+    fn snap_span(&self, start: f32, end: f32) -> (f32, f32) {
+        let snap = |value: f32| (value * self.scale_factor).round() / self.scale_factor;
+        let (low, high) = (snap(start), snap(end));
+        if high <= low && end > start {
+            (low, low + 1.0 / self.scale_factor)
+        } else {
+            (low, high)
+        }
+    }
+}
+
+/// One iced layer of a terminal frame, in [`plan_bands`]' order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DrawOp {
+    /// A band of the grid's own drawing, in a layer at the widget's clip.
+    Band(Band),
+    /// `snapshot.images[index]`, drawn at `bounds` in a layer of its own
+    /// clipped to `clip`.
+    Image {
+        index: usize,
+        bounds: Rectangle,
+        clip: Rectangle,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Band {
+    /// The default background over the whole widget, padding included.
+    Background,
+    /// Explicit cell backgrounds and the selection.
+    CellBackgrounds,
+    /// The block cursor, glyphs, sprites, link underline and other cursors.
+    Text,
+    /// The IME composition, above everything.
+    Preedit,
+}
+
+/// A frame's layers, bottom first: libghostty's order (below-background
+/// images, cell backgrounds, below-text images, text, above-text images)
+/// with the composition on top.
+///
+/// iced renders a layer's quads, then its images, then its text, and
+/// merges two adjacent layers only when their bounds are equal and the
+/// lower one ends where the upper starts. Each image gets its own layer,
+/// clipped to its placement and the grid, whose bounds differ from the
+/// bands': it never merges, so the order is exact on both renderers, and
+/// the clip is what crops it (tiny-skia ignores a per-image clip). With
+/// no image between them wgpu merges the bands back into one layer;
+/// tiny-skia never merges layers.
+fn plan_bands(snapshot: &TerminalSnapshot, grid: &GridGeometry) -> Vec<DrawOp> {
+    let images = |layer: ImageLayer| {
+        snapshot
+            .images
+            .iter()
+            .enumerate()
+            .filter(move |(_, image)| image.placement.layer == layer)
+            .filter_map(|(index, image)| {
+                let (bounds, clip) = image_rects(image, grid, snapshot.terminal_cell_px)?;
+                Some(DrawOp::Image {
+                    index,
+                    bounds,
+                    clip,
+                })
+            })
+    };
+    let mut ops = vec![DrawOp::Band(Band::Background)];
+    ops.extend(images(ImageLayer::BelowBackground));
+    ops.push(DrawOp::Band(Band::CellBackgrounds));
+    ops.extend(images(ImageLayer::BelowText));
+    ops.push(DrawOp::Band(Band::Text));
+    ops.extend(images(ImageLayer::AboveText));
+    if snapshot.preedit.is_some() {
+        ops.push(DrawOp::Band(Band::Preedit));
+    }
+    ops
+}
+
+/// Where `image` draws: the whole image, scaled and offset so its source
+/// rect fills the placement's destination, and the layer clip, which is
+/// that destination within the grid. `None` when nothing of it shows.
+///
+/// The image's pixels are the terminal's, `terminal_cell_px` to a cell;
+/// the widget's cells are `metrics` large, so a host mirror sized in its
+/// session's pixels scales to this window's cells.
+fn image_rects(
+    image: &DrawImage,
+    grid: &GridGeometry,
+    terminal_cell_px: (u32, u32),
+) -> Option<(Rectangle, Rectangle)> {
+    let (cell_w, cell_h) = terminal_cell_px;
+    let placement = &image.placement;
+    let source = placement.source;
+    if cell_w == 0 || cell_h == 0 || source.width == 0 || source.height == 0 {
+        return None;
+    }
+    let metrics = grid.metrics;
+    let scale_x = metrics.cell_width / cell_w as f32;
+    let scale_y = metrics.cell_height / cell_h as f32;
+    // `cell_position` takes an unsigned cell; a placement's can be negative.
+    let cell_0 = cell_position(grid.origin, 0, 0, metrics);
+    let x =
+        cell_0.x + placement.col as f32 * metrics.cell_width + placement.offset_x as f32 * scale_x;
+    let y =
+        cell_0.y + placement.row as f32 * metrics.cell_height + placement.offset_y as f32 * scale_y;
+    let (left, right) = grid.snap_span(x, x + placement.pixel_width as f32 * scale_x);
+    let (top, bottom) = grid.snap_span(y, y + placement.pixel_height as f32 * scale_y);
+    let dest = Rectangle::new(Point::new(left, top), Size::new(right - left, bottom - top));
+    let clip = dest.intersection(&grid.grid_clip()?)?;
+
+    let k_x = dest.width / source.width as f32;
+    let k_y = dest.height / source.height as f32;
+    let bounds = Rectangle::new(
+        Point::new(
+            dest.x - source.x as f32 * k_x,
+            dest.y - source.y as f32 * k_y,
+        ),
+        Size::new(
+            image.image_size.0 as f32 * k_x,
+            image.image_size.1 as f32 * k_y,
+        ),
+    );
+    Some((bounds, clip))
 }
 
 impl TerminalWidget {
@@ -1203,6 +1382,165 @@ impl TerminalWidget {
         )
     }
 
+    fn grid_geometry(&self, bounds: Rectangle, clip: Rectangle) -> GridGeometry {
+        GridGeometry {
+            clip,
+            origin: self.grid_origin(bounds),
+            metrics: self.metrics,
+            cols: self.snapshot.cols,
+            first_row: self.row_offset,
+            drawn_rows: self.drawn_rows(),
+            scale_factor: self.scale_factor,
+        }
+    }
+
+    /// Explicit cell backgrounds, then the selection.
+    fn draw_cell_backgrounds(&self, renderer: &mut Renderer, origin: Point) {
+        let metrics = self.metrics;
+        for (row_idx, row) in self.snapshot.grid.iter().enumerate() {
+            let row_y = row_idx as u32;
+            if !self.draws_row(row_y) {
+                continue;
+            }
+            for cell in row.cells.iter().filter(|cell| cell.explicit_background) {
+                fill_quad(
+                    renderer,
+                    // Preserve the Canvas path's overdraw policy. Adjacent
+                    // antialiased quads can otherwise expose hairlines of
+                    // the default background under tiny-skia.
+                    cells_rect(origin, row_y, cell.col, 1, metrics),
+                    color(cell.background),
+                );
+            }
+        }
+
+        for span in self
+            .snapshot
+            .selection_backgrounds()
+            .filter(|span| self.draws_row(u32::from(span.row)))
+        {
+            fill_quad(
+                renderer,
+                cells_rect(
+                    origin,
+                    u32::from(span.row),
+                    span.col0,
+                    span.col1.saturating_sub(span.col0),
+                    metrics,
+                ),
+                color(self.snapshot.selection_background),
+            );
+        }
+    }
+
+    /// The block cursor, glyphs and sprites, the link underline and the
+    /// outline cursors. Returns the glyph draws it made.
+    fn draw_text(&self, renderer: &mut Renderer, origin: Point, clip: Rectangle) -> u64 {
+        let metrics = self.metrics;
+        let shown = |row: u32| self.draws_row(row);
+        let mut fill_text_calls = 0;
+
+        // iced paints a layer's quads in submission order and all of its
+        // text after every quad, so the block cursor sits under the
+        // glyphs. Each glyph's color says what it sits on (`cell_ink`).
+        let block = self.snapshot.block_cursor(self.focused);
+        if let Some(block) = block.filter(|block| shown(block.row)) {
+            fill_quad(renderer, block.rect(origin, metrics), color(block.color));
+        }
+
+        for inked in inked_cells(&self.snapshot, block, metrics).filter(|inked| shown(inked.row)) {
+            let position = cell_position(origin, inked.cell.col, inked.row, metrics);
+            let ink = color(inked.ink);
+            match &inked.sprite {
+                Some(geometry) => draw_sprite(renderer, position, geometry, ink),
+                None => renderer.fill_text(
+                    cell_text(
+                        inked.cell.text.clone(),
+                        draw_font(
+                            metrics.font,
+                            &inked.cell.text,
+                            inked.cell.bold,
+                            inked.cell.italic,
+                        ),
+                        metrics,
+                    ),
+                    metrics.glyph_origin(position),
+                    ink,
+                    clip,
+                ),
+            }
+            // A sprite *replaces* a glyph draw, so it counts as one —
+            // same semantics the now-removed GTK UI used.
+            fill_text_calls += 1;
+        }
+
+        if let Some(link) = self
+            .snapshot
+            .link_hover
+            .filter(|link| shown(u32::from(link.row)))
+        {
+            for (col, cells, ink) in link_underline(&self.snapshot, link, block) {
+                let point = cell_position(origin, col, u32::from(link.row), metrics);
+                fill_quad(
+                    renderer,
+                    Rectangle::new(
+                        Point::new(point.x, point.y + metrics.cell_height - 1.0),
+                        Size::new(f32::from(cells) * metrics.cell_width, 1.0),
+                    ),
+                    color(ink),
+                );
+            }
+        }
+
+        if let Some(cursor) = self
+            .snapshot
+            .cursor
+            .filter(|cursor| cursor.visible && shown(cursor.row))
+        {
+            let point = cell_position(origin, cursor.col as u16, cursor.row, metrics);
+            let cursor_color = color(effective_cursor_color(&cursor, &self.snapshot));
+            let visual_style = if self.focused {
+                cursor.visual_style
+            } else {
+                CursorVisualStyle::BlockHollow
+            };
+            match visual_style {
+                // Painted solid under the glyphs, which ink it by role.
+                CursorVisualStyle::Block => {}
+                CursorVisualStyle::BlockHollow => renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: Rectangle::new(
+                            point,
+                            Size::new(metrics.cell_width, metrics.cell_height),
+                        ),
+                        border: Border {
+                            color: cursor_color,
+                            width: 1.0,
+                            ..Border::default()
+                        },
+                        snap: false,
+                        ..renderer::Quad::default()
+                    },
+                    Color::TRANSPARENT,
+                ),
+                CursorVisualStyle::Bar => fill_quad(
+                    renderer,
+                    Rectangle::new(point, Size::new(1.5, metrics.cell_height)),
+                    cursor_color,
+                ),
+                CursorVisualStyle::Underline => fill_quad(
+                    renderer,
+                    Rectangle::new(
+                        Point::new(point.x, point.y + metrics.cell_height - 2.0),
+                        Size::new(metrics.cell_width, 2.0),
+                    ),
+                    cursor_color,
+                ),
+            }
+        }
+        fill_text_calls
+    }
+
     /// Overlay the live composition on the cursor row. Returns the glyph
     /// draws it contributed. Nothing here touches the grid — a preedit is
     /// pixels only (see [`ImePreedit`]).
@@ -1387,153 +1725,55 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
             return;
         };
 
+        let grid = self.grid_geometry(bounds, clip);
         let mut fill_text_calls: u64 = 0;
-        renderer.with_layer(clip, |renderer| {
-            fill_quad(renderer, bounds, color(self.snapshot.background));
-            let metrics = self.metrics;
-            let origin = self.grid_origin(bounds);
-            let shown = |row: u32| self.draws_row(row);
-
-            // iced paints a layer's quads in submission order and all of
-            // its text after every quad, so the order that matters is the
-            // quads': cell backgrounds, then the selection, then the block
-            // cursor, then sprites. Each glyph's color says which of them
-            // it sits on (`cell_ink`).
-            for (row_idx, row) in self.snapshot.grid.iter().enumerate() {
-                let row_y = row_idx as u32;
-                if !shown(row_y) {
-                    continue;
+        let mut draw_band = |renderer: &mut Renderer, band: Band| match band {
+            Band::Background => fill_quad(renderer, bounds, color(self.snapshot.background)),
+            Band::CellBackgrounds => self.draw_cell_backgrounds(renderer, grid.origin),
+            Band::Text => fill_text_calls += self.draw_text(renderer, grid.origin, clip),
+            Band::Preedit => fill_text_calls += self.draw_preedit(renderer, bounds, clip),
+        };
+        let mut ops = plan_bands(&self.snapshot, &grid).into_iter().peekable();
+        while let Some(op) = ops.next() {
+            match op {
+                // Bands with no image between them share one layer, so a
+                // frame without images costs what it did before images: a
+                // layer quads-then-text keeps their order, and tiny-skia
+                // never merges layers itself. The preedit keeps its own,
+                // so the grid's glyphs never cover a composition.
+                DrawOp::Band(band) if band != Band::Preedit => {
+                    renderer.with_layer(clip, |renderer| {
+                        draw_band(renderer, band);
+                        while let Some(DrawOp::Band(next)) = ops.peek().copied() {
+                            if next == Band::Preedit {
+                                break;
+                            }
+                            ops.next();
+                            draw_band(renderer, next);
+                        }
+                    });
                 }
-                for cell in row.cells.iter().filter(|cell| cell.explicit_background) {
-                    fill_quad(
-                        renderer,
-                        // Preserve the Canvas path's overdraw policy. Adjacent
-                        // antialiased quads can otherwise expose hairlines of
-                        // the default background under tiny-skia.
-                        cells_rect(origin, row_y, cell.col, 1, metrics),
-                        color(cell.background),
-                    );
+                DrawOp::Band(band) => {
+                    renderer.with_layer(clip, |renderer| draw_band(renderer, band))
                 }
-            }
-
-            for span in self
-                .snapshot
-                .selection_backgrounds()
-                .filter(|span| shown(u32::from(span.row)))
-            {
-                fill_quad(
-                    renderer,
-                    cells_rect(
-                        origin,
-                        u32::from(span.row),
-                        span.col0,
-                        span.col1.saturating_sub(span.col0),
-                        metrics,
-                    ),
-                    color(self.snapshot.selection_background),
-                );
-            }
-
-            let block = self.snapshot.block_cursor(self.focused);
-            if let Some(block) = block.filter(|block| shown(block.row)) {
-                fill_quad(renderer, block.rect(origin, metrics), color(block.color));
-            }
-
-            for inked in
-                inked_cells(&self.snapshot, block, metrics).filter(|inked| shown(inked.row))
-            {
-                let position = cell_position(origin, inked.cell.col, inked.row, metrics);
-                let ink = color(inked.ink);
-                match &inked.sprite {
-                    Some(geometry) => draw_sprite(renderer, position, geometry, ink),
-                    None => renderer.fill_text(
-                        cell_text(
-                            inked.cell.text.clone(),
-                            draw_font(
-                                metrics.font,
-                                &inked.cell.text,
-                                inked.cell.bold,
-                                inked.cell.italic,
-                            ),
-                            metrics,
-                        ),
-                        metrics.glyph_origin(position),
-                        ink,
-                        clip,
-                    ),
-                }
-                // A sprite *replaces* a glyph draw, so it counts as one —
-                // same semantics the now-removed GTK UI used.
-                fill_text_calls += 1;
-            }
-
-            if let Some(link) = self
-                .snapshot
-                .link_hover
-                .filter(|link| shown(u32::from(link.row)))
-            {
-                for (col, cells, ink) in link_underline(&self.snapshot, link, block) {
-                    let point = cell_position(origin, col, u32::from(link.row), metrics);
-                    fill_quad(
-                        renderer,
-                        Rectangle::new(
-                            Point::new(point.x, point.y + metrics.cell_height - 1.0),
-                            Size::new(f32::from(cells) * metrics.cell_width, 1.0),
-                        ),
-                        color(ink),
-                    );
-                }
-            }
-
-            if let Some(cursor) = self
-                .snapshot
-                .cursor
-                .filter(|cursor| cursor.visible && shown(cursor.row))
-            {
-                let point = cell_position(origin, cursor.col as u16, cursor.row, metrics);
-                let cursor_color = color(effective_cursor_color(&cursor, &self.snapshot));
-                let visual_style = if self.focused {
-                    cursor.visual_style
-                } else {
-                    CursorVisualStyle::BlockHollow
-                };
-                match visual_style {
-                    // Painted solid under the glyphs, which ink it by role.
-                    CursorVisualStyle::Block => {}
-                    CursorVisualStyle::BlockHollow => renderer.fill_quad(
-                        renderer::Quad {
-                            bounds: Rectangle::new(
-                                point,
-                                Size::new(metrics.cell_width, metrics.cell_height),
-                            ),
-                            border: Border {
-                                color: cursor_color,
-                                width: 1.0,
-                                ..Border::default()
-                            },
-                            snap: false,
-                            ..renderer::Quad::default()
+                DrawOp::Image {
+                    index,
+                    bounds: image_bounds,
+                    clip: image_clip,
+                } => renderer.with_layer(image_clip, |renderer| {
+                    let handle = self.snapshot.images[index].handle.clone();
+                    renderer.draw_image(
+                        image::Image {
+                            filter_method: image::FilterMethod::Linear,
+                            snap: true,
+                            ..image::Image::new(handle)
                         },
-                        Color::TRANSPARENT,
-                    ),
-                    CursorVisualStyle::Bar => fill_quad(
-                        renderer,
-                        Rectangle::new(point, Size::new(1.5, metrics.cell_height)),
-                        cursor_color,
-                    ),
-                    CursorVisualStyle::Underline => fill_quad(
-                        renderer,
-                        Rectangle::new(
-                            Point::new(point.x, point.y + metrics.cell_height - 2.0),
-                            Size::new(metrics.cell_width, 2.0),
-                        ),
-                        cursor_color,
-                    ),
-                }
+                        image_bounds,
+                        image_clip,
+                    );
+                }),
             }
-
-            fill_text_calls += self.draw_preedit(renderer, bounds, clip);
-        });
+        }
         crate::perf::record_draw(draw_started_at.elapsed(), fill_text_calls);
     }
 }
@@ -1734,6 +1974,7 @@ pub fn color(value: ColorRgb) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roost_vt::{PixelRect, PlacementKind};
 
     const CELL_WIDTH: f32 = 8.4;
     const CELL_HEIGHT: f32 = 18.0;
@@ -1752,6 +1993,7 @@ mod tests {
             ime_active: false,
             focused: true,
             row_offset: 0,
+            scale_factor: 1.0,
         }
     }
 
@@ -3631,5 +3873,260 @@ mod tests {
             mouse::Interaction::Crosshair
         );
         assert_eq!(pointer_interaction("unknown"), mouse::Interaction::Text);
+    }
+
+    fn draw_image(layer: ImageLayer, col: i32, row: i32, size: (u32, u32)) -> DrawImage {
+        DrawImage {
+            placement: ImagePlacement {
+                image_id: 1,
+                generation: 1,
+                layer,
+                z: 0,
+                col,
+                row,
+                grid_cols: 1,
+                grid_rows: 1,
+                offset_x: 0,
+                offset_y: 0,
+                pixel_width: size.0,
+                pixel_height: size.1,
+                source: PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+                placement_id: 0,
+                kind: PlacementKind::Fixed,
+            },
+            handle: image::Handle::from_rgba(1, 1, vec![0; 4]),
+            image_size: (4, 4),
+        }
+    }
+
+    fn offset(mut image: DrawImage, x: u32, y: u32) -> DrawImage {
+        (image.placement.offset_x, image.placement.offset_y) = (x, y);
+        image
+    }
+
+    fn cropped(mut image: DrawImage, source: PixelRect) -> DrawImage {
+        image.placement.source = source;
+        image
+    }
+
+    /// A 10×5 grid of 9×18 cells at (100, 50), every row drawn, in a
+    /// widget that is wider and taller than the grid (padding right and
+    /// below), at `scale_factor`.
+    fn image_grid(scale_factor: f32) -> GridGeometry {
+        GridGeometry {
+            clip: Rectangle::new(Point::new(100.0, 50.0), Size::new(95.0, 100.0)),
+            origin: Point::new(100.0, 50.0),
+            metrics: TerminalMetrics::fixed(9.0, 18.0),
+            cols: 10,
+            first_row: 0,
+            drawn_rows: 5,
+            scale_factor,
+        }
+    }
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Rectangle {
+        Rectangle::new(Point::new(x, y), Size::new(width, height))
+    }
+
+    #[test]
+    fn the_bands_and_images_stack_in_libghosttys_order_with_the_preedit_on_top() {
+        let mut snapshot = TerminalSnapshot::blank(10, 5);
+        snapshot.terminal_cell_px = (9, 18);
+        snapshot.images = Arc::from([
+            draw_image(ImageLayer::BelowBackground, 0, 0, (9, 18)),
+            draw_image(ImageLayer::BelowText, 1, 0, (9, 18)),
+            draw_image(ImageLayer::BelowText, 2, 0, (9, 18)),
+            draw_image(ImageLayer::AboveText, 3, 0, (9, 18)),
+        ]);
+        snapshot.preedit = Some(ImePreedit {
+            text: "a".into(),
+            cursor: None,
+        });
+        let layers: Vec<_> = plan_bands(&snapshot, &image_grid(1.0))
+            .into_iter()
+            .map(|op| match op {
+                DrawOp::Band(band) => Err(band),
+                DrawOp::Image { index, .. } => Ok(index),
+            })
+            .collect();
+        assert_eq!(
+            layers,
+            [
+                Err(Band::Background),
+                Ok(0),
+                Err(Band::CellBackgrounds),
+                Ok(1),
+                Ok(2),
+                Err(Band::Text),
+                Ok(3),
+                Err(Band::Preedit),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_frame_without_images_or_a_composition_is_the_three_bands() {
+        let mut snapshot = TerminalSnapshot::blank(10, 5);
+        snapshot.terminal_cell_px = (9, 18);
+        assert_eq!(
+            plan_bands(&snapshot, &image_grid(1.0)),
+            [
+                DrawOp::Band(Band::Background),
+                DrawOp::Band(Band::CellBackgrounds),
+                DrawOp::Band(Band::Text),
+            ]
+        );
+    }
+
+    /// The layer clip is the drawn grid, never the widget's padding: a
+    /// placement running past the last column and the last row stops at
+    /// the grid's edges, and one wholly in the padding is dropped.
+    #[test]
+    fn an_images_layer_is_clipped_to_the_drawn_grid() {
+        let mut snapshot = TerminalSnapshot::blank(10, 5);
+        snapshot.terminal_cell_px = (9, 18);
+        snapshot.images = Arc::from([
+            draw_image(ImageLayer::AboveText, 8, 4, (36, 36)),
+            draw_image(ImageLayer::AboveText, 10, 0, (9, 18)),
+        ]);
+        let ops = plan_bands(&snapshot, &image_grid(1.0));
+        let images: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match *op {
+                DrawOp::Image {
+                    index,
+                    bounds,
+                    clip,
+                } => Some((index, bounds, clip)),
+                DrawOp::Band(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            images,
+            [(
+                0,
+                rect(172.0, 122.0, 36.0, 36.0),
+                rect(172.0, 122.0, 18.0, 18.0),
+            )]
+        );
+    }
+
+    /// A grid drawn from a row offset (a mirror taller than the window)
+    /// clips images to the rows it shows.
+    #[test]
+    fn the_grid_clip_starts_at_the_first_drawn_row() {
+        let grid = GridGeometry {
+            origin: Point::new(100.0, 50.0 - 2.0 * 18.0),
+            first_row: 2,
+            drawn_rows: 3,
+            ..image_grid(1.0)
+        };
+        assert_eq!(grid.grid_clip(), Some(rect(100.0, 50.0, 90.0, 54.0)));
+        let image = draw_image(ImageLayer::BelowText, 0, 1, (9, 36));
+        assert_eq!(
+            image_rects(&image, &grid, (9, 18)),
+            Some((rect(100.0, 32.0, 9.0, 36.0), rect(100.0, 50.0, 9.0, 18.0)))
+        );
+    }
+
+    #[test]
+    fn an_image_lands_on_its_cell_and_offset_at_scale_1() {
+        let image = offset(draw_image(ImageLayer::AboveText, 2, 1, (18, 18)), 3, 4);
+        let dest = rect(100.0 + 18.0 + 3.0, 50.0 + 18.0 + 4.0, 18.0, 18.0);
+        assert_eq!(
+            image_rects(&image, &image_grid(1.0), (9, 18)),
+            Some((dest, dest))
+        );
+    }
+
+    /// A host mirror's terminal counts twice this window's pixels to a
+    /// cell: its offset and size halve, and on a scale-2 display the
+    /// half-pixel edges they land on are device pixels, so they stay.
+    #[test]
+    fn a_mirror_in_its_sessions_pixels_scales_to_the_windows_cells_at_scale_2() {
+        let image = offset(draw_image(ImageLayer::AboveText, 2, 1, (27, 36)), 3, 5);
+        let dest = rect(100.0 + 18.0 + 1.5, 50.0 + 18.0 + 2.5, 13.5, 18.0);
+        assert_eq!(
+            image_rects(&image, &image_grid(2.0), (18, 36)),
+            Some((dest, dest))
+        );
+
+        let (_, at_scale_1) = image_rects(&image, &image_grid(1.0), (18, 36)).unwrap();
+        assert_eq!(
+            at_scale_1,
+            rect(120.0, 71.0, 13.0, 18.0),
+            "edges round to whole pixels at scale 1"
+        );
+    }
+
+    /// A crop draws the whole image scaled so the source rect fills the
+    /// destination, and the clip cuts it to that destination.
+    #[test]
+    fn a_crop_offsets_the_whole_image_and_clips_to_the_destination() {
+        let image = cropped(
+            draw_image(ImageLayer::AboveText, 4, 2, (18, 36)),
+            PixelRect {
+                x: 2,
+                y: 1,
+                width: 2,
+                height: 2,
+            },
+        );
+        let dest = rect(136.0, 86.0, 18.0, 36.0);
+        assert_eq!(
+            image_rects(&image, &image_grid(1.0), (9, 18)),
+            Some((rect(136.0 - 18.0, 86.0 - 18.0, 36.0, 72.0), dest))
+        );
+        assert_eq!(
+            image_rects(&image, &image_grid(2.0), (18, 36)),
+            Some((
+                rect(136.0 - 9.0, 86.0 - 9.0, 18.0, 36.0),
+                rect(136.0, 86.0, 9.0, 18.0)
+            )),
+            "a mirror's at scale 2"
+        );
+    }
+
+    /// A placement whose top rows scrolled off keeps its size and draws
+    /// from above the grid, clipped at the top row.
+    #[test]
+    fn an_image_above_the_viewport_is_clipped_at_the_grids_top() {
+        let image = draw_image(ImageLayer::AboveText, 1, -2, (9, 54));
+        assert_eq!(
+            image_rects(&image, &image_grid(1.0), (9, 18)),
+            Some((rect(109.0, 14.0, 9.0, 54.0), rect(109.0, 50.0, 9.0, 18.0)))
+        );
+        let gone = draw_image(ImageLayer::AboveText, 1, -3, (9, 54));
+        assert_eq!(image_rects(&gone, &image_grid(1.0), (9, 18)), None);
+    }
+
+    #[test]
+    fn nothing_draws_without_cell_pixels_or_a_source() {
+        let image = draw_image(ImageLayer::AboveText, 0, 0, (9, 18));
+        assert_eq!(image_rects(&image, &image_grid(1.0), (0, 18)), None);
+        let empty = cropped(image, PixelRect::default());
+        assert_eq!(image_rects(&empty, &image_grid(1.0), (9, 18)), None);
+    }
+
+    /// A placement narrower than a device pixel after scaling keeps one:
+    /// a session's 30 px cells drawn in 9 px ones make a 1 px wide image
+    /// 0.3 px, whose edges here round to the same pixel.
+    #[test]
+    fn a_sliver_of_a_placement_keeps_one_device_pixel() {
+        let image = offset(draw_image(ImageLayer::AboveText, 2, 1, (1, 60)), 2, 0);
+        let clip = |scale_factor| {
+            image_rects(&image, &image_grid(scale_factor), (30, 60)).map(|(_, clip)| clip)
+        };
+        assert_eq!(clip(1.0), Some(rect(119.0, 68.0, 1.0, 18.0)));
+        assert_eq!(
+            clip(2.0),
+            Some(rect(118.5, 68.0, 0.5, 18.0)),
+            "half a pixel at scale 2"
+        );
     }
 }

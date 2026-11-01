@@ -1,7 +1,9 @@
 use super::host_tab::Geometry as HostGeometry;
 use super::*;
-use crate::terminal_widget::next_press_seq;
+use crate::terminal_widget::{next_press_seq, DrawImage};
+use iced::advanced::image;
 use roost_ipc::dataframe::InputTake;
+use std::collections::hash_map::Entry;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct NativePointerOutcome {
@@ -252,6 +254,8 @@ pub(super) struct TerminalGeometry {
     pub(super) view: (u16, u16),
     pub(super) metrics: TerminalMetrics,
     pub(super) metric_generation: u64,
+    /// The cell px the terminal was sized with ([`TerminalTab::cell_px`]).
+    pub(super) cell_px: (u32, u32),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -273,6 +277,24 @@ impl GeometryChange {
     pub(super) fn grid_changed(&self) -> bool {
         self.previous_grid != self.grid()
     }
+
+    /// Whether the PTY has to hear this change: its grid or its pixel
+    /// size moved, or it is the tab's first layout, which a tab spawned
+    /// at the window's grid would otherwise never report px for.
+    fn resizes_pty(&self) -> bool {
+        self.grid_changed()
+            || self
+                .previous
+                .is_none_or(|previous| previous.cell_px != self.current.cell_px)
+    }
+}
+
+/// A cell `metrics` (logical points) wide and tall in device pixels at
+/// `scale_factor`, never under 1 px: the cell size a window gives its
+/// in-process terminals and advertises to a session it sizes.
+pub(super) fn device_cell_px(metrics: TerminalMetrics, scale_factor: f32) -> (u32, u32) {
+    let px = |logical: f32| (logical * scale_factor).round().max(1.0) as u32;
+    (px(metrics.cell_width), px(metrics.cell_height))
 }
 
 /// One step of a geometry batch, addressed by the SAME key the caller's
@@ -287,6 +309,7 @@ pub(super) enum GeometryBatchOperation {
         rows: u16,
         metrics: TerminalMetrics,
         metric_generation: u64,
+        scale_factor: f32,
     },
     Rollback {
         tab: TabKey,
@@ -307,6 +330,7 @@ pub(super) fn apply_geometry_batch(
     rows: u16,
     metrics: TerminalMetrics,
     metric_generation: u64,
+    scale_factor: f32,
     mut transition: impl FnMut(
         GeometryBatchOperation,
     ) -> std::result::Result<Option<GeometryChange>, String>,
@@ -319,6 +343,7 @@ pub(super) fn apply_geometry_batch(
             rows,
             metrics,
             metric_generation,
+            scale_factor,
         };
         match transition(operation) {
             Ok(Some(change)) => applied.push((*key, change)),
@@ -380,7 +405,7 @@ pub(super) fn attach_test_terminal(
     )
     .expect("attach test terminal");
     let metrics = TerminalMetrics::measure(13.0).expect("test terminal metrics");
-    tab.apply_geometry(DEFAULT_COLS, DEFAULT_ROWS, metrics, 1)
+    tab.apply_geometry(DEFAULT_COLS, DEFAULT_ROWS, metrics, 1, 1.0)
         .expect("install test terminal metrics")
         .expect("new test terminal changes geometry");
     (tab, supervisor)
@@ -420,7 +445,7 @@ pub(super) fn laid_out_host_terminal(
     let (input, _input_rx) = tokio::sync::mpsc::unbounded_channel();
     let (mut tab, _capture) = attach_test_host_terminal(cols, rows, input);
     let installed = tab
-        .apply_geometry(cols, rows, metrics, 1)
+        .apply_geometry(cols, rows, metrics, 1, 1.0)
         .expect("install host terminal metrics")
         .expect("a new host terminal takes its first metrics");
     tab.commit_geometry(installed);
@@ -539,6 +564,18 @@ pub(super) struct TerminalTab {
     cached_grid_size: Option<(u16, u16)>,
     cached_defaults: Option<(ColorRgb, ColorRgb)>,
     cached_theme_generation: Option<u64>,
+    /// The Kitty placements as of the last `refresh_snapshot`, in draw
+    /// order, and each placed image's pixel size (see
+    /// [`roost_engine::images::sizes`]).
+    image_list: Arc<[roost_vt::ImagePlacement]>,
+    image_sizes: HashMap<u32, (u32, u32)>,
+    /// `image_list` as the widget draws it, and the textures it draws with.
+    draw_images: Arc<[DrawImage]>,
+    image_textures: ImageTextures,
+    /// The placements generation `image_list` was read at; `None` until
+    /// the first read. The inner value is `None` while libghostty reports
+    /// 0, which is why the first read cannot be keyed on it.
+    listed_placements_generation: Option<Option<u64>>,
     /// Bumped whenever a theme lands on this tab. It is the cache key
     /// for the theme's `bold_color`, the one theme input
     /// `RenderedRow::build` reads besides the default fg/bg pair:
@@ -557,15 +594,68 @@ pub(super) struct TerminalTab {
     /// a keystroke lets the cursor anchor it again; a new grid keeps it,
     /// with the line at the top of the view.
     top_pinned: bool,
-    /// A host tab's session terminal cell size, as the last `GRID` or
-    /// accepted reply stated it: what this terminal is sized with, never
-    /// the window's own metrics, because libghostty derives a Kitty
-    /// image's cell span — and the cursor's move past it — from it. An
-    /// in-process tab never reads it.
-    host_cell_px: (u32, u32),
+    /// The cell px this terminal is sized with, which libghostty derives
+    /// a Kitty image's cell span — and the cursor's move past it — from,
+    /// and which the size reports quote. An in-process tab's are the
+    /// window's cells in device px ([`device_cell_px`]); a host tab's are
+    /// its session's, as the last `GRID` or accepted reply stated them,
+    /// never the window's own.
+    cell_px: (u32, u32),
     pub(super) applied_metrics: Option<TerminalMetrics>,
     pub(super) metric_generation: u64,
     pub(super) render_stats: crate::perf::TabRenderStats,
+}
+
+/// An iced texture for each placed image's current pixels, keyed by
+/// `(image_id, generation)`: `Handle::from_rgba` mints a new texture id
+/// per call, so a handle built per refresh would upload every frame.
+#[derive(Debug, Default)]
+struct ImageTextures {
+    textures: HashMap<(u32, u64), (image::Handle, (u32, u32))>,
+}
+
+impl ImageTextures {
+    /// `placements` with their textures, uploading the new ones and
+    /// dropping every texture they no longer reference. A placement whose
+    /// image isn't stored at the placement's generation is left out; the
+    /// change that stores it moves the placements generation, which lists
+    /// it again.
+    fn draw_list(
+        &mut self,
+        terminal: &Terminal,
+        placements: &[roost_vt::ImagePlacement],
+    ) -> roost_vt::Result<Vec<DrawImage>> {
+        let mut referenced = HashSet::new();
+        let mut list = Vec::with_capacity(placements.len());
+        for placement in placements {
+            let key = (placement.image_id, placement.generation);
+            let (handle, image_size) = match self.textures.entry(key) {
+                Entry::Occupied(texture) => texture.get().clone(),
+                Entry::Vacant(slot) => {
+                    let Some(image) = terminal
+                        .kitty_image(placement.image_id)?
+                        .filter(|image| image.generation() == placement.generation)
+                    else {
+                        continue;
+                    };
+                    let size = (image.width(), image.height());
+                    slot.insert((
+                        image::Handle::from_rgba(size.0, size.1, image.to_rgba()),
+                        size,
+                    ))
+                    .clone()
+                }
+            };
+            referenced.insert(key);
+            list.push(DrawImage {
+                placement: *placement,
+                handle,
+                image_size,
+            });
+        }
+        self.textures.retain(|key, _| referenced.contains(key));
+        Ok(list)
+    }
 }
 
 /// The drain-side scanner's color seed for a theme.
@@ -664,13 +754,18 @@ impl TerminalTab {
             cached_grid_size: None,
             cached_defaults: None,
             cached_theme_generation: None,
+            image_list: Arc::from([]),
+            image_sizes: HashMap::new(),
+            draw_images: Arc::from([]),
+            image_textures: ImageTextures::default(),
+            listed_placements_generation: None,
             theme_generation: 0,
             cols,
             rows,
             view: (cols, rows),
             grid_offset: 0,
             top_pinned: false,
-            host_cell_px: (0, 0),
+            cell_px: (0, 0),
             applied_metrics: None,
             metric_generation: 0,
             render_stats: crate::perf::TabRenderStats::default(),
@@ -749,7 +844,7 @@ impl TerminalTab {
         self.terminal = terminal;
         self.cols = at.cols;
         self.rows = at.rows;
-        self.host_cell_px = (at.cell_w, at.cell_h);
+        self.cell_px = (at.cell_w, at.cell_h);
         self.selection = TerminalSelection::new();
         self.scroll = TerminalScroll::new();
         self.top_pinned = false;
@@ -758,6 +853,12 @@ impl TerminalTab {
         self.cached_grid_size = None;
         self.cached_defaults = None;
         self.cached_theme_generation = None;
+        // The new terminal can report the generation the old one was
+        // listed at while holding other placements. None of the old
+        // terminal's textures can be the new one's, so they go now rather
+        // than at its first rebuild.
+        self.listed_placements_generation = None;
+        self.image_textures = ImageTextures::default();
         Ok(())
     }
 
@@ -781,7 +882,7 @@ impl TerminalTab {
         self.terminal
             .resize(grid.cols, grid.rows, grid.cell_w, grid.cell_h)?;
         let _ = self.take_terminal_replies();
-        self.host_cell_px = (grid.cell_w, grid.cell_h);
+        self.cell_px = (grid.cell_w, grid.cell_h);
         self.adopt_grid(grid.cols, grid.rows);
         if let Some(anchor) = anchor {
             self.restore_top_line(&anchor);
@@ -877,20 +978,22 @@ impl TerminalTab {
         HostGeometry {
             cols: self.cols,
             rows: self.rows,
-            cell_w: self.host_cell_px.0,
-            cell_h: self.host_cell_px.1,
+            cell_w: self.cell_px.0,
+            cell_h: self.cell_px.1,
         }
     }
 
-    /// Lay the tab out in a `cols`×`rows` view with `metrics`. A host
-    /// tab's grid stays ([`TerminalGeometry::view`]): the window's grid
-    /// reaches its session through the attach and comes back as `GRID`.
+    /// Lay the tab out in a `cols`×`rows` view with `metrics`, on a
+    /// window at `scale_factor`. A host tab's grid stays
+    /// ([`TerminalGeometry::view`]): the window's grid reaches its session
+    /// through the attach and comes back as `GRID`.
     pub(super) fn apply_geometry(
         &mut self,
         cols: u16,
         rows: u16,
         metrics: TerminalMetrics,
         metric_generation: u64,
+        scale_factor: f32,
     ) -> Result<Option<GeometryChange>> {
         let previous_grid = self.grid();
         let view = (cols, rows);
@@ -900,7 +1003,9 @@ impl TerminalTab {
             view
         };
         let metrics_changed = self.applied_metrics != Some(metrics);
-        if previous_grid == grid && self.view == view && !metrics_changed {
+        let cell_px = self.terminal_cell_px(metrics, scale_factor);
+        if previous_grid == grid && self.view == view && !metrics_changed && cell_px == self.cell_px
+        {
             return Ok(None);
         }
         let previous = self.applied_metrics.map(|metrics| TerminalGeometry {
@@ -909,10 +1014,10 @@ impl TerminalTab {
             view: self.view,
             metrics,
             metric_generation: self.metric_generation,
+            cell_px: self.cell_px,
         });
-        let resize = if previous_grid != grid || metrics_changed {
-            let (cell_w, cell_h) = self.terminal_cell_px(metrics);
-            self.terminal.resize(grid.0, grid.1, cell_w, cell_h)
+        let resize = if previous_grid != grid || metrics_changed || cell_px != self.cell_px {
+            self.terminal.resize(grid.0, grid.1, cell_px.0, cell_px.1)
         } else {
             Ok(())
         };
@@ -922,6 +1027,7 @@ impl TerminalTab {
         self.view = view;
         self.applied_metrics = Some(metrics);
         self.metric_generation = metric_generation;
+        self.cell_px = cell_px;
         Ok(Some(GeometryChange {
             previous,
             previous_grid,
@@ -931,6 +1037,7 @@ impl TerminalTab {
                 view,
                 metrics,
                 metric_generation,
+                cell_px,
             },
             metrics_changed,
             deferred_replies,
@@ -938,20 +1045,19 @@ impl TerminalTab {
     }
 
     /// A host mirror's terminal keeps the session's cell px; only an
-    /// in-process tab's terminal takes the local font's.
-    fn terminal_cell_px(&self, metrics: TerminalMetrics) -> (u32, u32) {
+    /// in-process tab's terminal takes the window's.
+    fn terminal_cell_px(&self, metrics: TerminalMetrics, scale_factor: f32) -> (u32, u32) {
         if self.session.is_host() {
-            self.host_cell_px
+            self.cell_px
         } else {
-            (
-                metrics.cell_width.round().max(1.0) as u32,
-                metrics.cell_height.round().max(1.0) as u32,
-            )
+            device_cell_px(metrics, scale_factor)
         }
     }
 
+    /// Put the geometry `previous` recorded back, its cell px included:
+    /// they were applied at a scale factor the window may no longer have.
     pub(super) fn rollback_geometry(&mut self, previous: TerminalGeometry) -> Result<()> {
-        let (cell_w, cell_h) = self.terminal_cell_px(previous.metrics);
+        let (cell_w, cell_h) = previous.cell_px;
         let resize = self
             .terminal
             .resize(previous.cols, previous.rows, cell_w, cell_h);
@@ -964,6 +1070,7 @@ impl TerminalTab {
         self.view = previous.view;
         self.applied_metrics = Some(previous.metrics);
         self.metric_generation = previous.metric_generation;
+        self.cell_px = previous.cell_px;
         Ok(())
     }
 
@@ -982,13 +1089,17 @@ impl TerminalTab {
         crate::terminal_widget::drawn_rows(self.rows, self.grid_offset, self.view.1).max(1)
     }
 
+    /// Report a committed change to the PTY: the winsize first, then the
+    /// size reports the resize produced, as the session orders them, so a
+    /// program that reads a report and then asks `TIOCGWINSZ` is told one
+    /// size.
     pub(super) fn commit_geometry(&self, change: GeometryChange) {
-        let grid_changed = change.grid_changed();
-        self.session.send_replies(change.deferred_replies);
-        if grid_changed {
+        if change.resizes_pty() {
+            let (cell_w, cell_h) = change.current.cell_px;
             self.session
-                .send_resize(change.current.cols, change.current.rows);
+                .send_resize(change.current.cols, change.current.rows, cell_w, cell_h);
         }
+        self.session.send_replies(change.deferred_replies);
     }
 
     pub(super) fn prepare_pointer_cancel(&mut self) -> Result<Vec<u8>> {
@@ -1775,6 +1886,18 @@ impl TerminalTab {
             rows_rebuilt += 1;
         })?;
 
+        let placements_generation = self.render_state.image_placements_generation()?;
+        if self.listed_placements_generation != Some(placements_generation) {
+            let placements = self.render_state.image_placements()?;
+            self.image_sizes = roost_engine::images::sizes(&self.terminal, &placements)?;
+            self.draw_images = self
+                .image_textures
+                .draw_list(&self.terminal, &placements)?
+                .into();
+            self.image_list = placements.into();
+            self.listed_placements_generation = Some(placements_generation);
+        }
+
         self.snapshot = TerminalSnapshot {
             cols: self.cols,
             rows: self.rows,
@@ -1799,6 +1922,8 @@ impl TerminalTab {
                 }),
             pointer_shape: self.effective_pointer_shape().into(),
             preedit: self.preedit.clone(),
+            images: Arc::clone(&self.draw_images),
+            terminal_cell_px: self.terminal.cell_px()?,
         };
         let elapsed = refresh_started_at.elapsed();
         self.render_stats
@@ -1862,6 +1987,7 @@ impl TerminalTab {
             cols: self.cols,
             rows: self.rows,
             cells,
+            images: roost_engine::images::resolved(&self.image_list, &self.image_sizes),
         }
     }
 }
@@ -1931,7 +2057,7 @@ mod tests {
         let metrics = TerminalMetrics::measure(13.0).expect("metrics");
         let mut tab = laid_out_host_terminal(80, 30, metrics);
         let view = tab
-            .apply_geometry(80, 10, metrics, 2)
+            .apply_geometry(80, 10, metrics, 2, 1.0)
             .expect("view")
             .expect("a new view");
         tab.commit_geometry(view);
@@ -1999,7 +2125,7 @@ mod tests {
         let bigger = TerminalMetrics::measure(15.0).expect("bigger metrics");
         let mut host = laid_out_host_terminal(80, 24, metrics);
         let change = host
-            .apply_geometry(120, 30, bigger, 2)
+            .apply_geometry(120, 30, bigger, 2, 1.0)
             .expect("apply")
             .expect("a change");
         assert!(!change.grid_changed());
@@ -2007,7 +2133,7 @@ mod tests {
         assert_eq!(host.view(), (120, 30));
         assert_eq!(host.applied_metrics, Some(bigger));
         assert!(
-            host.apply_geometry(120, 30, bigger, 2)
+            host.apply_geometry(120, 30, bigger, 2, 1.0)
                 .expect("apply")
                 .is_none(),
             "nothing moved"
@@ -2019,12 +2145,70 @@ mod tests {
         let (feed_tx, _feed_rx) = engine_feed::channel();
         let (mut local, supervisor) = attach_test_terminal(42, feed_tx);
         let change = local
-            .apply_geometry(100, 30, metrics, 2)
+            .apply_geometry(100, 30, metrics, 2, 1.0)
             .expect("apply")
             .expect("a change");
         assert!(change.grid_changed());
         assert_eq!((local.grid(), local.view()), ((100, 30), (100, 30)));
         supervisor.close(42);
+    }
+
+    #[test]
+    fn device_cell_px_rounds_the_scaled_cell_and_never_reaches_zero() {
+        let metrics = TerminalMetrics::fixed(7.8, 15.6);
+        assert_eq!(device_cell_px(metrics, 1.0), (8, 16));
+        assert_eq!(
+            device_cell_px(metrics, 1.25),
+            (10, 20),
+            "9.75 and 19.5 round up"
+        );
+        assert_eq!(device_cell_px(metrics, 2.0), (16, 31), "15.6 and 31.2");
+        assert_eq!(
+            device_cell_px(TerminalMetrics::fixed(0.2, 0.4), 1.0),
+            (1, 1)
+        );
+    }
+
+    /// A change of scale alone is a geometry change: the grid and the
+    /// metrics stay, the terminal is re-sized to the new device px, the
+    /// PTY has to hear it, and a rollback puts back the px the previous
+    /// layout recorded rather than ones recomputed at the new scale.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scale_change_alone_resizes_to_device_px_and_rolls_back_to_the_old_px() {
+        let (feed_tx, _feed_rx) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(43, feed_tx);
+        let metrics = tab.applied_metrics.expect("installed metrics");
+        let generation = tab.metric_generation;
+        let logical = tab.terminal.cell_px().expect("cell px");
+        assert_eq!(logical, device_cell_px(metrics, 1.0));
+
+        let change = tab
+            .apply_geometry(DEFAULT_COLS, DEFAULT_ROWS, metrics, generation, 2.0)
+            .expect("apply");
+        assert_eq!(
+            tab.terminal.cell_px().expect("cell px"),
+            device_cell_px(metrics, 2.0),
+            "the terminal is at the device px"
+        );
+        let change = change.expect("a px change is a change");
+        assert!(!change.grid_changed() && !change.metrics_changed);
+        assert!(change.resizes_pty(), "the PTY's pixel size moved");
+        assert_eq!(change.current.cell_px, device_cell_px(metrics, 2.0));
+
+        tab.rollback_geometry(change.previous.expect("a previous layout"))
+            .expect("roll back");
+        assert_eq!(
+            tab.terminal.cell_px().expect("cell px"),
+            logical,
+            "the rollback restores the px it recorded"
+        );
+        assert!(
+            tab.apply_geometry(DEFAULT_COLS, DEFAULT_ROWS, metrics, generation, 1.0)
+                .expect("apply")
+                .is_none(),
+            "back at the recorded layout, nothing moved"
+        );
+        supervisor.close(43);
     }
 
     fn queued_takes(
@@ -2049,7 +2233,7 @@ mod tests {
         let (input, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (mut tab, _capture) = attach_test_host_terminal(80, 24, input);
         let installed = tab
-            .apply_geometry(80, 24, metrics, 1)
+            .apply_geometry(80, 24, metrics, 1, 1.0)
             .expect("metrics")
             .expect("installed");
         tab.commit_geometry(installed);
@@ -2107,7 +2291,7 @@ mod tests {
         let metrics = TerminalMetrics::measure(13.0).expect("metrics");
         let mut tab = laid_out_host_terminal(80, 30, metrics);
         let view = tab
-            .apply_geometry(80, 10, metrics, 2)
+            .apply_geometry(80, 10, metrics, 2, 1.0)
             .expect("view")
             .expect("a new view");
         tab.commit_geometry(view);
@@ -2140,7 +2324,7 @@ mod tests {
         let metrics = TerminalMetrics::measure(13.0).expect("metrics");
         let mut tab = laid_out_host_terminal(80, 30, metrics);
         let view = tab
-            .apply_geometry(80, 10, metrics, 2)
+            .apply_geometry(80, 10, metrics, 2, 1.0)
             .expect("view")
             .expect("a new view");
         tab.commit_geometry(view);
@@ -2188,7 +2372,7 @@ mod tests {
         let metrics = TerminalMetrics::measure(13.0).expect("metrics");
         let mut tab = laid_out_host_terminal(80, 30, metrics);
         let view = tab
-            .apply_geometry(80, 10, metrics, 2)
+            .apply_geometry(80, 10, metrics, 2, 1.0)
             .expect("view")
             .expect("a new view");
         tab.commit_geometry(view);
@@ -2312,5 +2496,105 @@ mod tests {
         };
         tab.set_theme(&theme).expect("apply the bold color");
         assert_eq!(bold_ink(&tab), bold_color);
+    }
+
+    /// Transmit a 1×1 RGBA image (`pixel`, base64) as `id` and place it
+    /// at the cursor, one cell large.
+    fn kitty_pixel(id: u32, pixel: &str) -> Vec<u8> {
+        format!("\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1,C=1,i={id},q=2;{pixel}\x1b\\").into_bytes()
+    }
+
+    const RED: &str = "/wAA/w==";
+    const GREEN: &str = "AP8A/w==";
+
+    fn imaged_host_tab() -> TerminalTab {
+        let (input, _input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut tab, _capture) = attach_test_host_terminal(10, 5, input);
+        tab.resize_for_host(host_at(10, 5, 9, 18)).expect("cell px");
+        tab
+    }
+
+    fn texture_ids(tab: &TerminalTab) -> Vec<image::Id> {
+        tab.snapshot
+            .images
+            .iter()
+            .map(|image| image.handle.id())
+            .collect()
+    }
+
+    /// Plan 088 D3.2: a texture lives as long as a placement shows its
+    /// image at its generation, across refreshes and list rebuilds.
+    #[test]
+    fn an_unchanged_image_keeps_its_texture_across_refreshes_and_rebuilds() {
+        let mut tab = imaged_host_tab();
+        tab.write_vt(&kitty_pixel(7, RED));
+        tab.refresh_snapshot().expect("refresh");
+        let [first] = texture_ids(&tab)[..] else {
+            panic!("one image: {:?}", tab.snapshot.images);
+        };
+        assert_eq!(tab.snapshot.terminal_cell_px, (9, 18));
+
+        tab.write_vt(b"text");
+        tab.refresh_snapshot().expect("refresh");
+        assert_eq!(texture_ids(&tab), [first]);
+
+        tab.write_vt(b"\x1b[3;1H");
+        tab.write_vt(&kitty_pixel(8, GREEN));
+        tab.refresh_snapshot().expect("refresh");
+        let ids = texture_ids(&tab);
+        assert_eq!(ids.len(), 2, "the second image is listed");
+        assert!(
+            ids.contains(&first),
+            "a rebuild reuses the first image's texture"
+        );
+        assert_eq!(tab.image_textures.textures.len(), 2);
+    }
+
+    /// Retransmitting an id stores new pixels at a new generation: a new
+    /// texture, and the old one is dropped with the last placement that
+    /// referenced it. Freeing the image drops its texture.
+    #[test]
+    fn new_pixels_get_a_new_texture_and_unreferenced_ones_are_dropped() {
+        let mut tab = imaged_host_tab();
+        tab.write_vt(&kitty_pixel(7, RED));
+        tab.refresh_snapshot().expect("refresh");
+        let first = texture_ids(&tab);
+
+        tab.write_vt(b"\x1b[H");
+        tab.write_vt(&kitty_pixel(7, GREEN));
+        tab.refresh_snapshot().expect("refresh");
+        let second = texture_ids(&tab);
+        assert_eq!(second.len(), 1, "{:?}", tab.snapshot.images);
+        assert_ne!(second, first, "a retransmit uploads the new pixels");
+        assert_eq!(
+            tab.image_textures.textures.len(),
+            1,
+            "the old texture is gone"
+        );
+
+        tab.write_vt(b"\x1b_Ga=d,d=I,i=7,q=2\x1b\\");
+        tab.refresh_snapshot().expect("refresh");
+        assert!(tab.snapshot.images.is_empty());
+        assert!(
+            tab.image_textures.textures.is_empty(),
+            "freed with the image"
+        );
+    }
+
+    #[test]
+    fn a_swapped_in_terminal_starts_with_no_textures() {
+        let mut tab = imaged_host_tab();
+        tab.write_vt(&kitty_pixel(7, RED));
+        tab.refresh_snapshot().expect("refresh");
+        assert_eq!(tab.image_textures.textures.len(), 1);
+
+        let hydrated = tab
+            .hydration_terminal(host_at(10, 5, 9, 18))
+            .expect("hydration terminal");
+        tab.swap_terminal(hydrated, host_at(10, 5, 9, 18))
+            .expect("swap");
+        assert!(tab.image_textures.textures.is_empty());
+        tab.refresh_snapshot().expect("refresh");
+        assert!(tab.snapshot.images.is_empty(), "the new terminal has none");
     }
 }

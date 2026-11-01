@@ -430,7 +430,7 @@ roostctl host status --id <id> --json
 
 - **The other screen is empty.** If you attach while a full-screen program (vim, `htop`, a TUI agent) is running, the shell underneath comes back blank when that program exits — the alternate screen is what was captured, and only one screen travels.
 - **Wrapped lines replay as separate lines**, so selecting or resizing re-flows them differently than the same tab does on the host.
-- **Kitty images do not survive** (the binary snapshot keeps them, though Roost doesn't draw Kitty images yet), and neither does a saved cursor position or a pushed kitty-keyboard stack.
+- **Kitty images do not survive** (the binary snapshot keeps them, so on a matched build an image on screen is drawn again after you attach; see [Images](images.md)), and neither does a saved cursor position or a pushed kitty-keyboard stack.
 
 The [IPC reference](../reference/ipc.md#payload-kinds) has the complete list, including the mode-by-mode reasoning. Everything else — the tab list, titles, agent status, notifications, typing, resizing, scrollback — behaves exactly as it does on a matched build.
 

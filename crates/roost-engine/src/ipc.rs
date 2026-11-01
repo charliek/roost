@@ -44,21 +44,21 @@ use roost_ipc::messages::{
     PaletteActivateParams, PaletteDismissParams, PaletteOpenParams, PalettePresentParams,
     PalettePresentResult, PaletteQueryParams, PaletteStateParams, PaletteStateResult,
     ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectEnsureParams,
-    ProjectEnsureResult, ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams,
-    ScreenshotResult, SelectionClearParams, SelectionDumpParams, SelectionDumpResult,
-    SelectionSetParams, SessionIdentify, SessionIdentifyParams, SessionPutFileParams,
-    SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams, SessionStopParams,
-    SessionStopResult, SidebarDumpParams, SidebarDumpResult, SidebarSetAgentsFractionParams,
-    SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
-    TabCapturePtyInputResult, TabClearNotificationParams, TabClearNotificationResult,
-    TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams,
-    TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams,
-    TabExpandSelectionAtResult, TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams,
-    TabFocusResult, TabListResult, TabMemoryUsageParams, TabMemoryUsageResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
-    WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef, WireTabRef,
-    MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
+    ProjectEnsureResult, ProjectRenameParams, ProjectReorderParams, ResolvedCell, ResolvedImage,
+    ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
+    SelectionDumpResult, SelectionSetParams, SessionIdentify, SessionIdentifyParams,
+    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams,
+    SessionStopParams, SessionStopResult, SidebarDumpParams, SidebarDumpResult,
+    SidebarSetAgentsFractionParams, SidebarSetWidthParams, TabAgentReportResult,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams,
+    TabClearNotificationResult, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
+    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabMemoryUsageParams,
+    TabMemoryUsageResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
+    TabSendFileParams, TabSendFileResult, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    WindowResizeParams, WireProjectRef, WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{AttachHandshake, SessionSetThemeResult};
@@ -240,6 +240,7 @@ pub struct ResolvedCellsData {
     pub cols: u16,
     pub rows: u16,
     pub cells: Vec<ResolvedCellData>,
+    pub images: Vec<ResolvedImage>,
 }
 
 /// One cell of [`ResolvedCellsData`]. Fields are normalized: `text`
@@ -4421,6 +4422,7 @@ async fn dispatch(
                 cols: dump.cols,
                 rows: dump.rows,
                 cells,
+                images: dump.images,
             })
         }
         ops::TAB_MEMORY_USAGE => {

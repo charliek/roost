@@ -284,6 +284,28 @@ fn agents_vector_file_decodes_as_typed_palette_state() {
     );
 }
 
+/// Plan 088 D2: `tab.dump_resolved` grew `images`. The vector that has
+/// them decodes into the typed list and re-encodes to itself; the one
+/// recorded before them still decodes, with no images, and re-encodes
+/// without the key.
+#[test]
+fn tab_dump_resolved_vectors_decode_with_and_without_images() {
+    let envelope = vector("tab.dump_resolved.images.response.json");
+    let result: TabDumpResolvedResult =
+        serde_json::from_value(envelope["result"].clone()).expect("vector decodes typed");
+    assert_eq!(result.images.len(), 2);
+    assert_eq!(result.images[0].layer, ResolvedImageLayer::BelowText);
+    assert_eq!(result.images[0].row, -1);
+    assert_eq!(result.images[0].source.y, 1);
+    assert_eq!(serde_json::to_value(&result).unwrap(), envelope["result"]);
+
+    let older = vector("tab.dump_resolved.response.json");
+    let result: TabDumpResolvedResult =
+        serde_json::from_value(older["result"].clone()).expect("older vector decodes typed");
+    assert!(result.images.is_empty());
+    assert_eq!(serde_json::to_value(&result).unwrap(), older["result"]);
+}
+
 /// The host connection ops, decoded as the types the engine and
 /// `roostctl` actually use. `deny_unknown_fields` on the params makes
 /// this a real check on both directions: a vector that grew a field the
@@ -715,6 +737,7 @@ fn both_window_metrics_vectors_decode_as_the_current_typed_result() {
         (result.cell_width, result.cell_height),
         (Some(8.0), Some(16.0))
     );
+    assert_eq!(result.scale_factor, Some(2.0));
     assert_eq!(
         serde_json::to_value(&result).unwrap(),
         geometry["result"],

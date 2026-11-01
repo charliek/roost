@@ -41,6 +41,7 @@ nav = [
     { "Agent Hooks" = "guides/agents.md" },
     { "Claude Code Hooks" = "guides/claude-code.md" },
     { "Working Directory Tracking" = "guides/cwd-tracking.md" },
+    { "Images" = "guides/images.md" },
     { "Extending Roost" = "guides/extending.md" },
     { "Automation" = "guides/automation.md" },
     { "Agent Skill" = "guides/agent-skill.md" },

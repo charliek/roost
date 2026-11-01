@@ -871,6 +871,13 @@ re-applied. This op states the grid only and leaves the cell metrics
 where the last owner left them; before any client has declared them
 they are unset, and the size report quotes `0x0` pixels.
 
+The child's winsize states pixels as well as cells: the grid times the
+cell size, `0` while the cell size is unset. A session tab's cell size
+is its owner's; an in-process tab's is the window's cell in device
+pixels (see [`app.window_metrics`](#appwindow_metrics)'s
+`scale_factor`). Either way this op keeps the cell size and moves only
+the grid.
+
 ### `tab.dump`
 
 Read the tab's live terminal *viewport* as text — the determinism
@@ -988,6 +995,43 @@ Response (truncated):
 distinguishes a default-bg cell (false) from an SGR-bg cell (true) so
 a test can pin paint behavior without reasoning about the canvas
 fallback. `text` is `" "` for blank cells.
+
+`images` lists the Kitty graphics placements the terminal would draw,
+in draw order, and is omitted when there are none:
+
+```json
+"images": [
+  {"image_id": 7, "placement_id": 0, "layer": "below-text", "z": -1,
+   "col": 4, "row": -1, "grid_cols": 2, "grid_rows": 2,
+   "offset_x": 0, "offset_y": 3, "pixel_width": 20, "pixel_height": 40,
+   "source": {"x": 0, "y": 1, "width": 2, "height": 1},
+   "image_width": 2, "image_height": 2}
+]
+```
+
+Each entry is one placement as libghostty's render state resolves it:
+fixed and relative placements, and one entry per placeholder row of a
+`U=1` virtual one. The order is `layer`, then `z`, then `image_id`, then
+the remaining fields, so a session and its mirror list the same
+placements identically.
+
+| Field | Meaning |
+|---|---|
+| `image_id` | The image's Kitty id. |
+| `placement_id` | The program's placement id, or `0` when it gave none. |
+| `layer` | `below-background` (`z` below −1073741824), `below-text` (other negative `z`, and every virtual placement) or `above-text`. |
+| `z` | The placement's z-index; orders entries within a layer. |
+| `col`, `row` | The top-left cell, relative to the viewport. Negative when the placement starts above or left of it: an entry is listed at full size while any of its cells is in view. |
+| `grid_cols`, `grid_rows` | The cells it covers. |
+| `offset_x`, `offset_y` | Its pixel offset inside the top-left cell. |
+| `pixel_width`, `pixel_height` | Its drawn size. |
+| `source` | The part of the image it shows, in image pixels. |
+| `image_width`, `image_height` | The stored image's size; `0` while its pixels have not arrived. |
+
+Pixel values other than `source` and the image size are the terminal's
+cell pixels, so a terminal with no cell size lists nothing. The image's
+generation is not on the wire: it is local to one process. The field is
+additive (no protocol bump), and the frozen Swift app never sends it.
 
 Also served on a **host-session socket**, from the server Terminal.
 Both sockets run the same resolver — the densifier and `resolve_colors`
@@ -1747,7 +1791,7 @@ Request: `{"params": {}}`.
 {"window_width":1100.0,"window_height":700.0,"sidebar_width":220.0,
  "sidebar_collapsed":false,"terminal_top":34.0,"terminal_font_family":"Berkeley Mono",
  "terminal_left":220.0,"terminal_padding":0.0,"cell_width":8.0,"cell_height":16.0,
- "window_focused":true,"native_focus_losses":0}
+ "scale_factor":2.0,"window_focused":true,"native_focus_losses":0}
 ```
 
 `terminal_top` and `terminal_font_family` are optional for wire compatibility
@@ -1775,6 +1819,14 @@ terminal_padding + row × cell_height)`. The Mac real-input harness
 (`tools/input/mac/coords.py`) turns that into a screen point with the window's
 Accessibility frame, so a real click lands on a known cell without measuring
 pixels.
+
+`scale_factor` is the window's device pixels per logical point (`2.0` on a
+Retina display), optional in the same way: the iced UI always reports it, the
+Mac UI does not. A terminal's cell size in pixels is `round(cell_width ×
+scale_factor)` by `round(cell_height × scale_factor)`, at least 1. That is the
+size an in-process tab's terminal and PTY winsize state, what the terminal's
+size reports (CSI 14t/16t, mode 2048) quote, and the cell size the window
+advertises to a session whose tabs it sizes.
 
 `window_focused` and `native_focus_losses` are optional in the same way: the
 iced UI always reports them and the Mac UI does not. `window_focused` is the
@@ -4670,8 +4722,8 @@ degraded-but-equivalent one:
   freeze rendering mid-frame. A program that set two members of one
   mouse-tracking or mouse-format family replays as the last of them,
   since libghostty collapses each family onto a single field;
-* **Kitty images** — `ghostty-snapshot` carries their state, `vt`
-  does not (Roost doesn't draw Kitty images yet either way, #645);
+* **Kitty images** — `ghostty-snapshot` carries their state, so a
+  hydrated mirror draws the images on screen again; `vt` does not;
 * **pending-wrap under origin mode** — restoring `DECOM` homes the
   cursor in libghostty, so the repositioning that follows clears the
   flag. This is the one cursor state `vt` cannot reproduce;

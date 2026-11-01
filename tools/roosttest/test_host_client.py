@@ -83,6 +83,7 @@ from agent_jail import (
 from client import Roost, RoostError, scaled_timeout
 from eventstream import EventStream
 from host_probe import host_key, sibling_key  # noqa: F401  (re-exported)
+from test_kitty_images import cell_px, images_of, place, placed, settled_images
 from test_program_status import PROBE, PROBE_REPLY, osc7501
 from util import (
     assert_opened_in,
@@ -785,10 +786,61 @@ def test_snapshot_attaches_with_deep_history_and_a_kitty_image_hydrate(host, roo
 
     # Matching builds, so both attaches were decoded as snapshots: a `vt`
     # fallback would match the text above without ever running the
-    # snapshot decoder. No op exposes Kitty image state, so this is what
-    # establishes the image tab went through the decoder's image step.
+    # snapshot decoder. The image has scrolled out of view, so no
+    # placement list shows it, and this is what establishes the image tab
+    # went through the decoder's image step.
     status = roost.host_status(id=host.saved_id)["hosts"][0]
     assert status.get("payload_kind") == "ghostty-snapshot", status
+
+
+def wait_mirror_lists_the_sessions_images(
+    roost: Roost, session: Roost, tab: int, key: str
+) -> list[dict]:
+    """Once the window's mirror and the session agree on a geometry,
+    the mirror lists the session's images; returns the session's list.
+    Neither side is scrolled, so the rows compare as they are."""
+
+    def same_geometry() -> bool:
+        served = session.tab_dump_resolved(tab)
+        mirrored = roost.call("tab.dump_resolved", {"tab_id": key})
+        return (served["cols"], served["rows"]) == (mirrored["cols"], mirrored["rows"])
+
+    wait_until(same_geometry, 30.0, "the session and the client to share a geometry")
+    served = images_of(session.tab_dump_resolved(tab))
+    settled_images(
+        lambda: images_of(roost.call("tab.dump_resolved", {"tab_id": key})), served, timeout=30.0
+    )
+    return served
+
+
+def test_a_host_tabs_images_are_the_sessions_after_a_snapshot_attach_and_live(host, roost):
+    """Plan 088 D2.3: a host tab's mirror lists the placements its
+    session's terminal does, whether the image came in the snapshot the
+    attach hydrated from or on the live stream after it.
+
+    The first image is fed before the first connect, so it reaches the
+    window only through the snapshot. It sits near the top of a quiet tab
+    and stays in view. The session's own list is checked against the
+    command first: an empty list on both sides would agree trivially.
+    """
+    with host.client() as session:
+        tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
+        session.tab_feed_pty_bytes(tab, place(51, row=1, col=2))
+
+        host.connect_and_wait()
+        key = host_key(roost, tab)
+        # The session's cells are the owner's, and this window owns the tab.
+        cell = cell_px(roost.window_metrics())
+        snapshot_image = placed(51, 1, 2, cell)
+        settled_images(lambda: images_of(session.tab_dump_resolved(tab)), [snapshot_image], 30.0)
+        assert wait_mirror_lists_the_sessions_images(roost, session, tab, key) == [snapshot_image]
+        status = roost.host_status(id=host.saved_id)["hosts"][0]
+        assert status.get("payload_kind") == "ghostty-snapshot", status
+
+        session.tab_feed_pty_bytes(tab, place(52, row=4, col=6))
+        both = [snapshot_image, placed(52, 4, 6, cell)]
+        settled_images(lambda: images_of(session.tab_dump_resolved(tab)), both, 30.0)
+        assert wait_mirror_lists_the_sessions_images(roost, session, tab, key) == both
 
 
 def test_a_refocus_resumes_without_blanking_or_duplicating(host, roost):

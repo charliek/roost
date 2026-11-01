@@ -2957,6 +2957,135 @@
       ],
       "type": "object"
     },
+    "ResolvedImage": {
+      "properties": {
+        "col": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "grid_cols": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "grid_rows": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "image_height": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "image_id": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "image_width": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "layer": {
+          "$ref": "#/$defs/ResolvedImageLayer"
+        },
+        "offset_x": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset_y": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pixel_height": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pixel_width": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "placement_id": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "row": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/$defs/ResolvedImageSource"
+        },
+        "z": {
+          "format": "int32",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "image_id",
+        "placement_id",
+        "layer",
+        "z",
+        "col",
+        "row",
+        "grid_cols",
+        "grid_rows",
+        "offset_x",
+        "offset_y",
+        "pixel_width",
+        "pixel_height",
+        "source",
+        "image_width",
+        "image_height"
+      ],
+      "type": "object"
+    },
+    "ResolvedImageLayer": {
+      "enum": [
+        "below-background",
+        "below-text",
+        "above-text"
+      ],
+      "type": "string"
+    },
+    "ResolvedImageSource": {
+      "properties": {
+        "height": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "width": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "x": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "y": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
+      "type": "object"
+    },
     "Response": {
       "properties": {
         "error": {
@@ -4351,6 +4480,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "images": {
+          "items": {
+            "$ref": "#/$defs/ResolvedImage"
+          },
+          "type": "array"
+        },
         "rows": {
           "format": "uint16",
           "maximum": 65535,
@@ -5179,6 +5314,13 @@
           "minimum": 0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "scale_factor": {
+          "format": "float",
+          "type": [
+            "number",
             "null"
           ]
         },

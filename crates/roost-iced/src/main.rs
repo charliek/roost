@@ -101,6 +101,9 @@ enum Message {
     BackgroundResizeDeadline,
     WindowOpened(window::Id),
     WindowResized(window::Id, Size),
+    /// The window's scale factor: asked for as it opens, then reported
+    /// whenever it moves to a display with another.
+    WindowRescaled(f32, app::ScaleSource),
     /// The window's outer top-left moved — macOS only, the one platform
     /// that remembers the frame.
     WindowMoved(Point),
@@ -641,8 +644,15 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             app.background_resize_deadline();
             Task::none()
         }
-        Message::WindowOpened(id) => app.window_opened(id).map_task(),
+        Message::WindowOpened(id) => app.window_opened(id).map_task().chain(
+            window::scale_factor(id)
+                .map(|scale| Message::WindowRescaled(scale, app::ScaleSource::Opened)),
+        ),
         Message::WindowResized(id, size) => app.window_resized(id, size).map_task(),
+        Message::WindowRescaled(scale_factor, source) => {
+            app.window_rescaled(scale_factor, source);
+            Task::none()
+        }
         Message::WindowMoved(outer) => app.window_moved(outer).map_task(),
         Message::WindowFrameChecked(observed) => app.window_frame_checked(observed).map_task(),
         Message::WindowFrameDue {
@@ -990,6 +1000,10 @@ fn subscription_with(wake: Arc<tokio::sync::Notify>, armed: ArmedTimers) -> Subs
 fn window_event_message(id: window::Id, event: window::Event) -> Option<Message> {
     match event {
         window::Event::Focused => Some(Message::WindowFocus(id, true)),
+        window::Event::Rescaled(scale_factor) => Some(Message::WindowRescaled(
+            scale_factor,
+            app::ScaleSource::Moved,
+        )),
         window::Event::Unfocused => Some(Message::WindowFocus(id, false)),
         window::Event::FileDropped(path) => Some(Message::WindowFileDropped {
             window_id: id,
@@ -1556,6 +1570,18 @@ mod tests {
         assert_eq!(window_id, id);
         assert_eq!(mapped, path);
         assert!(window_event_message(id, window::Event::FilesHoveredLeft).is_none());
+    }
+
+    #[test]
+    fn a_rescale_reaches_the_app_with_its_scale_factor() {
+        let message = window_event_message(window::Id::unique(), window::Event::Rescaled(1.5));
+        assert!(
+            matches!(
+                message,
+                Some(Message::WindowRescaled(scale, app::ScaleSource::Moved)) if scale == 1.5
+            ),
+            "a rescale must map to a display move at 1.5"
+        );
     }
 
     #[test]
