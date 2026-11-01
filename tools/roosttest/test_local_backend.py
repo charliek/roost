@@ -3763,6 +3763,27 @@ def window_grid(roost: Roost, tab: int) -> str:
     return f"{dumped['rows']} {dumped['cols']}"
 
 
+def settled_window_grid(roost: Roost, tab: int) -> str:
+    """`window_grid` once the window's terminal has taken the `GRID` for
+    the last `RESIZE` the window sent. A session tab's terminal follows
+    the session's `GRID`, a round trip behind the window's own re-grid,
+    so a read straight after one can still find the grid before it."""
+
+    def caught_up() -> bool:
+        actions = [
+            entry["action"]
+            for entry in roost.call("host.size_trace", {"tab_id": str(tab)})["actions"]
+        ]
+        last = {
+            action: max((i for i, a in enumerate(actions) if a == action), default=-1)
+            for action in ("resize-sent", "grid-applied")
+        }
+        return last["grid-applied"] > last["resize-sent"]
+
+    wait_until(caught_up, 30.0, f"tab {tab}'s terminal to take its last GRID")
+    return window_grid(roost, tab)
+
+
 def shell_grid(lane: Lane, tab: int, expected: str) -> str:
     """What the tab's own shell reads as its size, asked until it reads
     `expected` or the wait runs out: the last answer either way.
@@ -3808,7 +3829,7 @@ def test_a_session_tab_the_window_is_not_showing_follows_its_grid(lane: Lane):
         30.0,
         "the window to draw at its new grid",
     )
-    resized = window_grid(roost, shown)
+    resized = settled_window_grid(roost, shown)
     assert shell_grid(lane, quiet, resized) == resized
     assert roost.identify()["active_tab_id"] == shown, "the window never showed it"
 
@@ -3825,9 +3846,11 @@ def test_a_font_change_reaches_every_session_tabs_shell(lane: Lane):
     assert shell_grid(lane, shown, grid) == grid
 
     try:
+        # Settled after every step: the trace's RESIZE entries carry no
+        # grid, so only one may be outstanding when it is read.
         for _ in range(3):
             util.palette_command(roost, "font_increase")
-        enlarged = window_grid(roost, shown)
+            enlarged = settled_window_grid(roost, shown)
         assert enlarged != grid, "three font steps re-grid the window"
 
         assert shell_grid(lane, shown, enlarged) == enlarged
