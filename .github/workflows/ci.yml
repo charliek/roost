@@ -862,6 +862,7 @@ jobs:
           tools/roosttest/test_tab_dump_scrollback.py
           tools/roosttest/test_sprite_pixels.py
           tools/roosttest/test_cursor_pixels.py
+          tools/roosttest/test_kitty_pixels.py
           tools/roosttest/test_kitty_images.py
           tools/roosttest/test_ime.py
           tools/roosttest/test_selection.py
@@ -1149,6 +1150,7 @@ jobs:
           tools/roosttest/test_tab_dump_scrollback.py
           tools/roosttest/test_sprite_pixels.py
           tools/roosttest/test_cursor_pixels.py
+          tools/roosttest/test_kitty_pixels.py
           tools/roosttest/test_kitty_images.py
           tools/roosttest/test_ime.py
           tools/roosttest/test_selection.py
@@ -1378,6 +1380,7 @@ jobs:
           tools/roosttest/test_tab_dump_scrollback.py
           tools/roosttest/test_sprite_pixels.py
           tools/roosttest/test_cursor_pixels.py
+          tools/roosttest/test_kitty_pixels.py
           tools/roosttest/test_kitty_images.py
           tools/roosttest/test_ime.py
           tools/roosttest/test_selection.py

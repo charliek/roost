@@ -1,7 +1,9 @@
 use super::host_tab::Geometry as HostGeometry;
 use super::*;
-use crate::terminal_widget::next_press_seq;
+use crate::terminal_widget::{next_press_seq, DrawImage};
+use iced::advanced::image;
 use roost_ipc::dataframe::InputTake;
+use std::collections::hash_map::Entry;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct NativePointerOutcome {
@@ -544,6 +546,9 @@ pub(super) struct TerminalTab {
     /// [`roost_engine::images::sizes`]).
     image_list: Arc<[roost_vt::ImagePlacement]>,
     image_sizes: HashMap<u32, (u32, u32)>,
+    /// `image_list` as the widget draws it, and the textures it draws with.
+    draw_images: Arc<[DrawImage]>,
+    image_textures: ImageTextures,
     /// The placements generation `image_list` was read at; `None` until
     /// the first read. The inner value is `None` while libghostty reports
     /// 0, which is why the first read cannot be keyed on it.
@@ -575,6 +580,58 @@ pub(super) struct TerminalTab {
     pub(super) applied_metrics: Option<TerminalMetrics>,
     pub(super) metric_generation: u64,
     pub(super) render_stats: crate::perf::TabRenderStats,
+}
+
+/// An iced texture for each placed image's current pixels, keyed by
+/// `(image_id, generation)`: `Handle::from_rgba` mints a new texture id
+/// per call, so a handle built per refresh would upload every frame.
+#[derive(Debug, Default)]
+struct ImageTextures {
+    textures: HashMap<(u32, u64), (image::Handle, (u32, u32))>,
+}
+
+impl ImageTextures {
+    /// `placements` with their textures, uploading the new ones and
+    /// dropping every texture they no longer reference. A placement whose
+    /// image isn't stored at the placement's generation is left out; the
+    /// change that stores it moves the placements generation, which lists
+    /// it again.
+    fn draw_list(
+        &mut self,
+        terminal: &Terminal,
+        placements: &[roost_vt::ImagePlacement],
+    ) -> roost_vt::Result<Vec<DrawImage>> {
+        let mut referenced = HashSet::new();
+        let mut list = Vec::with_capacity(placements.len());
+        for placement in placements {
+            let key = (placement.image_id, placement.generation);
+            let (handle, image_size) = match self.textures.entry(key) {
+                Entry::Occupied(texture) => texture.get().clone(),
+                Entry::Vacant(slot) => {
+                    let Some(image) = terminal
+                        .kitty_image(placement.image_id)?
+                        .filter(|image| image.generation() == placement.generation)
+                    else {
+                        continue;
+                    };
+                    let size = (image.width(), image.height());
+                    slot.insert((
+                        image::Handle::from_rgba(size.0, size.1, image.to_rgba()),
+                        size,
+                    ))
+                    .clone()
+                }
+            };
+            referenced.insert(key);
+            list.push(DrawImage {
+                placement: *placement,
+                handle,
+                image_size,
+            });
+        }
+        self.textures.retain(|key, _| referenced.contains(key));
+        Ok(list)
+    }
 }
 
 /// The drain-side scanner's color seed for a theme.
@@ -675,6 +732,8 @@ impl TerminalTab {
             cached_theme_generation: None,
             image_list: Arc::from([]),
             image_sizes: HashMap::new(),
+            draw_images: Arc::from([]),
+            image_textures: ImageTextures::default(),
             listed_placements_generation: None,
             theme_generation: 0,
             cols,
@@ -771,8 +830,11 @@ impl TerminalTab {
         self.cached_defaults = None;
         self.cached_theme_generation = None;
         // The new terminal can report the generation the old one was
-        // listed at while holding other placements.
+        // listed at while holding other placements. None of the old
+        // terminal's textures can be the new one's, so they go now rather
+        // than at its first rebuild.
         self.listed_placements_generation = None;
+        self.image_textures = ImageTextures::default();
         Ok(())
     }
 
@@ -1794,6 +1856,10 @@ impl TerminalTab {
         if self.listed_placements_generation != Some(placements_generation) {
             let placements = self.render_state.image_placements()?;
             self.image_sizes = roost_engine::images::sizes(&self.terminal, &placements)?;
+            self.draw_images = self
+                .image_textures
+                .draw_list(&self.terminal, &placements)?
+                .into();
             self.image_list = placements.into();
             self.listed_placements_generation = Some(placements_generation);
         }
@@ -1822,6 +1888,8 @@ impl TerminalTab {
                 }),
             pointer_shape: self.effective_pointer_shape().into(),
             preedit: self.preedit.clone(),
+            images: Arc::clone(&self.draw_images),
+            terminal_cell_px: self.terminal.cell_px()?,
         };
         let elapsed = refresh_started_at.elapsed();
         self.render_stats
@@ -2336,5 +2404,105 @@ mod tests {
         };
         tab.set_theme(&theme).expect("apply the bold color");
         assert_eq!(bold_ink(&tab), bold_color);
+    }
+
+    /// Transmit a 1×1 RGBA image (`pixel`, base64) as `id` and place it
+    /// at the cursor, one cell large.
+    fn kitty_pixel(id: u32, pixel: &str) -> Vec<u8> {
+        format!("\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1,C=1,i={id},q=2;{pixel}\x1b\\").into_bytes()
+    }
+
+    const RED: &str = "/wAA/w==";
+    const GREEN: &str = "AP8A/w==";
+
+    fn imaged_host_tab() -> TerminalTab {
+        let (input, _input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut tab, _capture) = attach_test_host_terminal(10, 5, input);
+        tab.resize_for_host(host_at(10, 5, 9, 18)).expect("cell px");
+        tab
+    }
+
+    fn texture_ids(tab: &TerminalTab) -> Vec<image::Id> {
+        tab.snapshot
+            .images
+            .iter()
+            .map(|image| image.handle.id())
+            .collect()
+    }
+
+    /// Plan 088 D3.2: a texture lives as long as a placement shows its
+    /// image at its generation, across refreshes and list rebuilds.
+    #[test]
+    fn an_unchanged_image_keeps_its_texture_across_refreshes_and_rebuilds() {
+        let mut tab = imaged_host_tab();
+        tab.write_vt(&kitty_pixel(7, RED));
+        tab.refresh_snapshot().expect("refresh");
+        let [first] = texture_ids(&tab)[..] else {
+            panic!("one image: {:?}", tab.snapshot.images);
+        };
+        assert_eq!(tab.snapshot.terminal_cell_px, (9, 18));
+
+        tab.write_vt(b"text");
+        tab.refresh_snapshot().expect("refresh");
+        assert_eq!(texture_ids(&tab), [first]);
+
+        tab.write_vt(b"\x1b[3;1H");
+        tab.write_vt(&kitty_pixel(8, GREEN));
+        tab.refresh_snapshot().expect("refresh");
+        let ids = texture_ids(&tab);
+        assert_eq!(ids.len(), 2, "the second image is listed");
+        assert!(
+            ids.contains(&first),
+            "a rebuild reuses the first image's texture"
+        );
+        assert_eq!(tab.image_textures.textures.len(), 2);
+    }
+
+    /// Retransmitting an id stores new pixels at a new generation: a new
+    /// texture, and the old one is dropped with the last placement that
+    /// referenced it. Freeing the image drops its texture.
+    #[test]
+    fn new_pixels_get_a_new_texture_and_unreferenced_ones_are_dropped() {
+        let mut tab = imaged_host_tab();
+        tab.write_vt(&kitty_pixel(7, RED));
+        tab.refresh_snapshot().expect("refresh");
+        let first = texture_ids(&tab);
+
+        tab.write_vt(b"\x1b[H");
+        tab.write_vt(&kitty_pixel(7, GREEN));
+        tab.refresh_snapshot().expect("refresh");
+        let second = texture_ids(&tab);
+        assert_eq!(second.len(), 1, "{:?}", tab.snapshot.images);
+        assert_ne!(second, first, "a retransmit uploads the new pixels");
+        assert_eq!(
+            tab.image_textures.textures.len(),
+            1,
+            "the old texture is gone"
+        );
+
+        tab.write_vt(b"\x1b_Ga=d,d=I,i=7,q=2\x1b\\");
+        tab.refresh_snapshot().expect("refresh");
+        assert!(tab.snapshot.images.is_empty());
+        assert!(
+            tab.image_textures.textures.is_empty(),
+            "freed with the image"
+        );
+    }
+
+    #[test]
+    fn a_swapped_in_terminal_starts_with_no_textures() {
+        let mut tab = imaged_host_tab();
+        tab.write_vt(&kitty_pixel(7, RED));
+        tab.refresh_snapshot().expect("refresh");
+        assert_eq!(tab.image_textures.textures.len(), 1);
+
+        let hydrated = tab
+            .hydration_terminal(host_at(10, 5, 9, 18))
+            .expect("hydration terminal");
+        tab.swap_terminal(hydrated, host_at(10, 5, 9, 18))
+            .expect("swap");
+        assert!(tab.image_textures.textures.is_empty());
+        tab.refresh_snapshot().expect("refresh");
+        assert!(tab.snapshot.images.is_empty(), "the new terminal has none");
     }
 }
