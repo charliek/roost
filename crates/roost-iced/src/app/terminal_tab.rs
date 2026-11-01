@@ -539,6 +539,15 @@ pub(super) struct TerminalTab {
     cached_grid_size: Option<(u16, u16)>,
     cached_defaults: Option<(ColorRgb, ColorRgb)>,
     cached_theme_generation: Option<u64>,
+    /// The Kitty placements as of the last `refresh_snapshot`, in draw
+    /// order, and each placed image's pixel size (see
+    /// [`roost_engine::images::sizes`]).
+    image_list: Arc<[roost_vt::ImagePlacement]>,
+    image_sizes: HashMap<u32, (u32, u32)>,
+    /// The placements generation `image_list` was read at; `None` until
+    /// the first read. The inner value is `None` while libghostty reports
+    /// 0, which is why the first read cannot be keyed on it.
+    listed_placements_generation: Option<Option<u64>>,
     /// Bumped whenever a theme lands on this tab. It is the cache key
     /// for the theme's `bold_color`, the one theme input
     /// `RenderedRow::build` reads besides the default fg/bg pair:
@@ -664,6 +673,9 @@ impl TerminalTab {
             cached_grid_size: None,
             cached_defaults: None,
             cached_theme_generation: None,
+            image_list: Arc::from([]),
+            image_sizes: HashMap::new(),
+            listed_placements_generation: None,
             theme_generation: 0,
             cols,
             rows,
@@ -758,6 +770,9 @@ impl TerminalTab {
         self.cached_grid_size = None;
         self.cached_defaults = None;
         self.cached_theme_generation = None;
+        // The new terminal can report the generation the old one was
+        // listed at while holding other placements.
+        self.listed_placements_generation = None;
         Ok(())
     }
 
@@ -1775,6 +1790,14 @@ impl TerminalTab {
             rows_rebuilt += 1;
         })?;
 
+        let placements_generation = self.render_state.image_placements_generation()?;
+        if self.listed_placements_generation != Some(placements_generation) {
+            let placements = self.render_state.image_placements()?;
+            self.image_sizes = roost_engine::images::sizes(&self.terminal, &placements)?;
+            self.image_list = placements.into();
+            self.listed_placements_generation = Some(placements_generation);
+        }
+
         self.snapshot = TerminalSnapshot {
             cols: self.cols,
             rows: self.rows,
@@ -1862,6 +1885,7 @@ impl TerminalTab {
             cols: self.cols,
             rows: self.rows,
             cells,
+            images: roost_engine::images::resolved(&self.image_list, &self.image_sizes),
         }
     }
 }

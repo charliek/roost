@@ -1895,6 +1895,9 @@ impl TabTask {
 
     fn dump_resolved(&mut self) -> Result<ResolvedCellsData, TabError> {
         let (grid, colors, _) = self.render_grid()?;
+        let placements = self.vt.render.image_placements()?;
+        let sizes = crate::images::sizes(&self.vt.terminal, &placements)?;
+        let images = crate::images::resolved(&placements, &sizes);
         let (cols, rows) = (self.vt.geometry.cols, self.vt.geometry.rows);
         let mut cells = Vec::with_capacity(usize::from(cols) * usize::from(rows));
         for row in 0..u32::from(rows) {
@@ -1922,7 +1925,12 @@ impl TabTask {
                 });
             }
         }
-        Ok(ResolvedCellsData { cols, rows, cells })
+        Ok(ResolvedCellsData {
+            cols,
+            rows,
+            cells,
+            images,
+        })
     }
 }
 

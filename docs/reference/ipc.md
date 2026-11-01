@@ -989,6 +989,43 @@ distinguishes a default-bg cell (false) from an SGR-bg cell (true) so
 a test can pin paint behavior without reasoning about the canvas
 fallback. `text` is `" "` for blank cells.
 
+`images` lists the Kitty graphics placements the terminal would draw,
+in draw order, and is omitted when there are none:
+
+```json
+"images": [
+  {"image_id": 7, "placement_id": 0, "layer": "below-text", "z": -1,
+   "col": 4, "row": -1, "grid_cols": 2, "grid_rows": 2,
+   "offset_x": 0, "offset_y": 3, "pixel_width": 20, "pixel_height": 40,
+   "source": {"x": 0, "y": 1, "width": 2, "height": 1},
+   "image_width": 2, "image_height": 2}
+]
+```
+
+Each entry is one placement as libghostty's render state resolves it:
+fixed and relative placements, and one entry per placeholder row of a
+`U=1` virtual one. The order is `layer`, then `z`, then `image_id`, then
+the remaining fields, so a session and its mirror list the same
+placements identically.
+
+| Field | Meaning |
+|---|---|
+| `image_id` | The image's Kitty id. |
+| `placement_id` | The program's placement id, or `0` when it gave none. |
+| `layer` | `below-background` (`z` below −1073741824), `below-text` (other negative `z`, and every virtual placement) or `above-text`. |
+| `z` | The placement's z-index; orders entries within a layer. |
+| `col`, `row` | The top-left cell, relative to the viewport. Negative when the placement starts above or left of it: an entry is listed at full size while any of its cells is in view. |
+| `grid_cols`, `grid_rows` | The cells it covers. |
+| `offset_x`, `offset_y` | Its pixel offset inside the top-left cell. |
+| `pixel_width`, `pixel_height` | Its drawn size. |
+| `source` | The part of the image it shows, in image pixels. |
+| `image_width`, `image_height` | The stored image's size; `0` while its pixels have not arrived. |
+
+Pixel values other than `source` and the image size are the terminal's
+cell pixels, so a terminal with no cell size lists nothing. The image's
+generation is not on the wire: it is local to one process. The field is
+additive (no protocol bump), and the frozen Swift app never sends it.
+
 Also served on a **host-session socket**, from the server Terminal.
 Both sockets run the same resolver — the densifier and `resolve_colors`
 live in `roost-vt` and the iced UI imports them — so a session's answer

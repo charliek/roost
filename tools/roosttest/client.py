@@ -804,7 +804,8 @@ class Roost:
         resolver has run (including the theme's bold-color override).
         Returns `{cols, rows, cells: [{row, col, text, fg, bg,
         has_explicit_bg, bold, italic, inverse}, ...]}` with fg/bg as
-        `#RRGGBB` hex strings. Ungated — safe outside test mode."""
+        `#RRGGBB` hex strings, plus `images` (the Kitty placements, in
+        draw order) when there are any. Ungated — safe outside test mode."""
         return self.call("tab.dump_resolved", {"tab_id": str(tab_id)})
 
     def tab_memory_usage(self, tab_id: int | str) -> dict:

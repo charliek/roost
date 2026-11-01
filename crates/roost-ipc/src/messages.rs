@@ -1663,6 +1663,54 @@ pub struct TabDumpResolvedResult {
     pub cols: u16,
     pub rows: u16,
     pub cells: Vec<ResolvedCell>,
+    /// The Kitty image placements the terminal would draw, in draw
+    /// order. Absent when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ResolvedImage>,
+}
+
+/// One Kitty image placement on the visible grid, as libghostty's
+/// render state resolves it. Pixel values are the terminal's cell pixels;
+/// `col`/`row` are viewport-relative and negative when the placement
+/// starts above or left of the view. The image's generation is not on
+/// the wire: it is process-local, so a session and its mirror differ.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedImage {
+    pub image_id: u32,
+    /// The program's placement id, or 0 when it gave none.
+    pub placement_id: u32,
+    pub layer: ResolvedImageLayer,
+    pub z: i32,
+    pub col: i32,
+    pub row: i32,
+    pub grid_cols: u32,
+    pub grid_rows: u32,
+    pub offset_x: u32,
+    pub offset_y: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    /// The part of the image shown, in image pixels.
+    pub source: ResolvedImageSource,
+    /// 0 × 0 while the image's pixels have not arrived.
+    pub image_width: u32,
+    pub image_height: u32,
+}
+
+/// Where a [`ResolvedImage`] draws relative to the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResolvedImageLayer {
+    BelowBackground,
+    BelowText,
+    AboveText,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedImageSource {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

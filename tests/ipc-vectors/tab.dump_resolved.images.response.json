@@ -1,0 +1,67 @@
+{
+  "id": "13",
+  "ok": true,
+  "result": {
+    "cols": 80,
+    "rows": 24,
+    "cells": [
+      {
+        "row": 0,
+        "col": 0,
+        "text": " ",
+        "fg": "#ffffff",
+        "bg": "#1c1c1c",
+        "has_explicit_bg": false,
+        "bold": false,
+        "italic": false,
+        "inverse": false
+      }
+    ],
+    "images": [
+      {
+        "image_id": 7,
+        "placement_id": 0,
+        "layer": "below-text",
+        "z": -1,
+        "col": 4,
+        "row": -1,
+        "grid_cols": 2,
+        "grid_rows": 2,
+        "offset_x": 0,
+        "offset_y": 3,
+        "pixel_width": 20,
+        "pixel_height": 40,
+        "source": {
+          "x": 0,
+          "y": 1,
+          "width": 2,
+          "height": 1
+        },
+        "image_width": 2,
+        "image_height": 2
+      },
+      {
+        "image_id": 9,
+        "placement_id": 3,
+        "layer": "above-text",
+        "z": 5,
+        "col": 0,
+        "row": 10,
+        "grid_cols": 1,
+        "grid_rows": 1,
+        "offset_x": 0,
+        "offset_y": 0,
+        "pixel_width": 10,
+        "pixel_height": 20,
+        "source": {
+          "x": 0,
+          "y": 0,
+          "width": 1,
+          "height": 1
+        },
+        "image_width": 1,
+        "image_height": 1
+      }
+    ]
+  }
+}

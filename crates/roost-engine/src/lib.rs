@@ -22,6 +22,8 @@ pub mod events;
 #[cfg(feature = "facade")]
 pub mod facade;
 pub mod git_metrics;
+#[cfg(feature = "vt")]
+pub mod images;
 pub mod ipc;
 #[cfg(feature = "vt")]
 pub mod memory;
