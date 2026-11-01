@@ -1468,8 +1468,9 @@ async fn accept_loop(
     state: Arc<TunnelState>,
     connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
 ) {
+    let mut backoff = crate::server::AcceptBackoff::new(format!("ssh tunnel to {}", state.target));
     loop {
-        let stream = match listener.accept().await {
+        let stream = match backoff.accept(&listener).await {
             Ok((stream, _addr)) => stream,
             Err(error) => {
                 tracing::warn!(

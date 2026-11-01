@@ -133,6 +133,10 @@ pub fn start(
     prepare_directories(profile)?;
 
     logging::init(profile)?;
+    match roost_ipc::raise_open_file_limit() {
+        Ok((old, new)) => info!(old, new, "soft open-file limit"),
+        Err(error) => tracing::warn!(%error, "raising the soft open-file limit failed"),
+    }
     roost_engine::crash::install_panic_hook(
         profile.log_dir.clone(),
         profile.app_label,

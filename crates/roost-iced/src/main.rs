@@ -418,6 +418,10 @@ fn main() -> anyhow::Result<()> {
         bundle_id.as_deref(),
     ))?;
     init_logging(&profile)?;
+    match roost_ipc::raise_open_file_limit() {
+        Ok((old, new)) => tracing::info!(old, new, "soft open-file limit"),
+        Err(error) => tracing::warn!(%error, "raising the soft open-file limit failed"),
+    }
     // Everything past this point can log, so route its `Err` through
     // tracing before it reaches `main`'s return — without this, an error
     // from here on reaches stderr only, never the log file.

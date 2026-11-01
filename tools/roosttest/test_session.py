@@ -30,16 +30,19 @@ import base64
 import json
 import os
 import re
+import resource
 import shutil
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import uuid
+from pathlib import Path
 
 import pytest
 import session as sessionlib
-from client import RoostError
+from client import RoostError, scaled_timeout
 from eventstream import EventStream
 from relay import Relay
 
@@ -458,7 +461,7 @@ def test_a_second_daemonized_start_reports_already_running(env):
 
 
 # ---------------------------------------------------------------------------
-# 9. File modes (the umask posture)
+# 9. File modes (the umask posture) and the open-file limit
 # ---------------------------------------------------------------------------
 
 
@@ -475,6 +478,58 @@ def test_the_session_owns_its_files_alone(env):
     assert mode_of(env.log_file) == 0o600, oct(mode_of(env.log_file))
 
     env.stop_over_the_wire()
+
+
+def open_file_limits(pid: int) -> tuple[int, int]:
+    """`(soft, hard)` "Max open files" from `/proc/<pid>/limits`."""
+    text = (Path("/proc") / str(pid) / "limits").read_text()
+    match = re.search(r"^Max open files\s+(\S+)\s+(\S+)", text, re.MULTILINE)
+    assert match, text
+
+    def value(field: str) -> int:
+        return resource.RLIM_INFINITY if field == "unlimited" else int(field)
+
+    return value(match[1]), value(match[2])
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="reads /proc/<pid>/limits; macOS is the mac-mini's hand check (plan 087 §8)",
+)
+def test_a_session_started_under_a_low_soft_fd_limit_raises_it():
+    """Plan 087 D4: a session started from a shell whose soft
+    `RLIMIT_NOFILE` is macOS's 256 runs at `min(hard, 10240)`, never
+    lower than it started.
+
+    The limit is lowered by the shell that execs the daemon rather than
+    by a `preexec_fn`, which is unsafe in this threaded harness."""
+    started_soft = 256
+    _, runner_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if runner_hard < started_soft:
+        pytest.skip(f"the runner's hard open-file limit {runner_hard} is below {started_soft}")
+    made = sessionlib.make_env(explicit=True)
+    try:
+        proc = subprocess.run(
+            ["/bin/sh", "-c", f'ulimit -Sn {started_soft} && exec "$0" start', str(made.binary)],
+            cwd=str(made.launch_cwd),
+            env=made.command_env(),
+            capture_output=True,
+            text=True,
+            timeout=scaled_timeout(90),
+        )
+        verdict = sessionlib.Verdict.parse(proc.stdout.splitlines()[0] if proc.stdout else "")
+        assert proc.returncode == 0 and verdict.kind == "ready" and verdict.pid, (
+            proc.stdout,
+            proc.stderr,
+        )
+        made.track_pid(verdict.pid)
+        made.wait_answering()
+        assert os.path.realpath(f"/proc/{verdict.pid}/exe") == os.path.realpath(made.binary)
+
+        soft, hard = open_file_limits(verdict.pid)
+        assert soft == max(started_soft, min(hard, 10240)), (soft, hard)
+    finally:
+        made.teardown()
 
 
 # ---------------------------------------------------------------------------
