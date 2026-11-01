@@ -16,6 +16,7 @@
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Duration;
 
 use iced::futures::stream;
 use iced::Subscription;
@@ -360,11 +361,23 @@ impl EngineBatch {
     }
 
     /// Whether a workspace event has landed since the last reconcile.
-    /// The drain checks this before servicing an IPC request so a read op
-    /// answers from a cache that already contains the mutation that
+    /// The drain checks this before a menu or context-menu command
+    /// (macOS), and [`Self::request_behind`] before an IPC request, so
+    /// either acts on a cache that already contains the mutation that
     /// preceded it in this batch.
+    #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
     pub(crate) fn workspace_dirty(&self) -> bool {
         self.workspace_dirty
+    }
+
+    /// Whether a request must reconcile before it is served: a workspace
+    /// event (local or a host mirror's) has landed since the last
+    /// reconcile, or the local workspace has moved past the revision the
+    /// cache was read at — the event saying so may still be a hop behind
+    /// the request (#640). The second test adds to the first, never
+    /// replaces it: a host mirror moving leaves the local revision alone.
+    pub(crate) fn request_behind(&self, local_revision: u64, reconciled_revision: u64) -> bool {
+        self.workspace_dirty || local_revision > reconciled_revision
     }
 
     /// The drain reconciled: everything drained so far is folded into the
@@ -450,15 +463,37 @@ pub(crate) fn wake_subscription(wake: Arc<Notify>) -> Subscription<Message> {
 /// Adapter task: workspace broadcast → feed, through `roost_engine::events`'s
 /// UI-adapter bridge. `events::subscribe` owns the boot `Resync` and the
 /// `Lagged` → `Resync` conversion; this only re-tags its output.
-pub(crate) async fn pump_workspace_events(workspace: Arc<Workspace>, feed: EngineFeedSender) {
+///
+/// `delay` holds each event that long before forwarding it
+/// ([`test_event_delay`]).
+pub(crate) async fn pump_workspace_events(
+    workspace: Arc<Workspace>,
+    feed: EngineFeedSender,
+    delay: Option<Duration>,
+) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let bridge = tokio::spawn(roost_engine::events::subscribe(workspace, tx));
     while let Some(event) = rx.recv().await {
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if !feed.send(EngineFeed::Workspace(event)) {
             break;
         }
     }
     bridge.abort();
+}
+
+/// `ROOST_TEST_EVENT_DELAY_MS`, read only under `ROOST_TEST_MODE=1`: how
+/// long [`pump_workspace_events`] holds each workspace event, so a test
+/// can make a request overtake the event of the mutation it follows
+/// (#640's window 2) every time instead of now and then.
+pub(crate) fn test_event_delay() -> Option<Duration> {
+    crate::host_conn::reconnect::test_override("ROOST_TEST_EVENT_DELAY_MS")?
+        .trim()
+        .parse()
+        .ok()
+        .map(Duration::from_millis)
 }
 
 /// Adapter task: one tab's PTY output → feed, tagged with the tab it came
@@ -745,6 +780,40 @@ mod tests {
         }
     }
 
+    /// #640, window 2: a request reconciles when the local workspace moved
+    /// past the cache even though its event has not landed — and a host
+    /// mirror's event ahead of a request still does, with the local
+    /// revision unchanged.
+    #[tokio::test]
+    async fn a_request_reconciles_when_the_local_revision_or_a_host_mirror_moved() {
+        let (tx, mut rx) = channel();
+        assert!(tx.send(EngineFeed::UiRequest(UiRequest::Activate)));
+        let mut batch = EngineBatch::default();
+        assert!(rx.try_next(&mut batch).is_some());
+        assert!(!batch.request_behind(5, 5), "nothing moved");
+        assert!(
+            batch.request_behind(6, 5),
+            "a local commit whose event is still on its way"
+        );
+
+        assert!(tx.send(EngineFeed::HostWorkspace(
+            HostId::new(3),
+            crate::host_conn::HostWorkspaceEvent::Applied {
+                revision: 1,
+                events: Vec::new(),
+                became_empty_by_delete: false,
+            },
+        )));
+        assert!(tx.send(EngineFeed::UiRequest(UiRequest::Activate)));
+        let mut batch = EngineBatch::default();
+        assert!(rx.try_next(&mut batch).is_some());
+        assert!(rx.try_next(&mut batch).is_some());
+        assert!(
+            batch.request_behind(5, 5),
+            "the host's mirror moved; the local revision did not"
+        );
+    }
+
     /// The other half of the lifecycle: a reconcile clears the slate, and
     /// only what lands afterwards can dirty it again — PTY bytes never do.
     #[tokio::test]
@@ -898,7 +967,7 @@ mod tests {
     async fn a_lagged_broadcast_reaches_the_feed_as_a_resync() {
         let workspace = Arc::new(Workspace::new());
         let (tx, mut rx) = channel();
-        tokio::spawn(pump_workspace_events(Arc::clone(&workspace), tx));
+        tokio::spawn(pump_workspace_events(Arc::clone(&workspace), tx, None));
         // Wait for the boot `Resync` — it is sent AFTER the bridge
         // subscribes, so observing it proves the broadcast receiver
         // exists. Deterministic on the current-thread test runtime: the

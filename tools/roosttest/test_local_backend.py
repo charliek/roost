@@ -645,8 +645,8 @@ def test_a_tab_that_cannot_be_replayed_keeps_its_source_project(lane: Lane):
         switch(roost, USE_SESSION, "session")
 
         # The destination holds the two that landed whole, and nothing
-        # of the third: the engine closes a tab whose shell will not
-        # start, and closing a project's last tab deletes the project.
+        # of the third: a tab whose shell will not start is never listed,
+        # and a failed open into a project with no tab deletes the project.
         assert layout(lane.session_projects()) == want
         # **And its source is kept**, while the two that landed whole are
         # gone. That asymmetry is the whole fix: phase 5 deletes exactly

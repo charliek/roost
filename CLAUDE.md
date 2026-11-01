@@ -279,7 +279,11 @@ wrapper small.
     on the main thread at startup, `=thread` panics from a named
     background thread. It fires right after the panic hook is installed
     and before the single-instance lock, so it never touches a running
-    instance.
+    instance. `ROOST_TEST_EVENT_DELAY_MS=<ms>` (read only under
+    `ROOST_TEST_MODE=1`) holds each workspace event that long before the
+    iced UI's event pump forwards it, so a request overtakes the event of
+    the mutation it follows (#640's window 2) every time; it is for that
+    proof, not the curated lanes.
 
 ## Docs
 

@@ -24,8 +24,7 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::opener::{restore_opener, TabOpener};
 use crate::program_status::RawOscAuthority;
 use crate::{
-    AttentionSource, PtyError, PtySupervisor, RestoreTab, SupervisorEvent, Workspace,
-    WorkspaceError,
+    AttentionSource, PtySupervisor, RestoreTab, SupervisorEvent, Workspace, WorkspaceError,
 };
 
 /// The one `tab.close` sequence, shared by the served handler, the
@@ -101,9 +100,9 @@ pub fn usable_cwd_or(requested: &str, project_cwd: &str, home: &str) -> String {
 ///
 /// Restore-only. [`usable_cwd`] keeps a directory the shell cannot
 /// enter, so an interactive `tab.open` there fails as it should; a
-/// restore that failed would close the project's only tab, and closing a
-/// project's last tab deletes the project. Every saved tab opening also
-/// keeps the saved positions lined up for the tab each project remembers.
+/// restore that failed would leave the project without its only tab.
+/// Every saved tab opening also keeps the saved positions lined up for
+/// the tab each project remembers.
 fn restorable_cwd(saved: &str, project_cwd: &str) -> String {
     restorable_cwd_or(saved, project_cwd, &crate::home_dir())
 }
@@ -148,74 +147,125 @@ pub fn resolve_open_target(
     }
 }
 
-/// The one `tab.open` spawn sequence, shared by the served handler and
-/// the in-process client.
-///
-/// The row is in the workspace — and published — before `spawn` reserves
-/// the id in `pending`. A `tab.close` landing in that window removes the
-/// row and finds neither a live session nor a pending slot, so the
-/// teardown is a no-op and this spawn promotes a live PTY for a row
-/// nobody can see (#417). Closing that window is the caller's job and
-/// not `spawn`'s: `spawn` holds no workspace handle, and the window lies
-/// entirely between `open_tab` returning and the reservation. So re-read
-/// the row after the promotion and hang the child up if it went away.
-///
-/// The rollback is `let _ =` because the row may already be gone — that
-/// is exactly the race. And a close landing between the promotion and
-/// the re-check makes the re-check's `supervisor.close` a second close:
-/// once the waiter has taken the entry it finds nothing, but under a
-/// latched `shutting_down` the entry stays until the reap, so the
-/// hang-up is re-sent. That second SIGHUP is as narrow as every other
-/// double close in the tree and no narrower, and it cannot reach a
-/// recycled pid: `terminate_child` signals under the child's reap
-/// latch, which refuses once the child has been reaped (#470).
-///
-/// The shell starts in [`usable_cwd`], and a row that names anywhere
-/// else is moved there first, with `tab` refreshed to match: every
-/// spawn passes here, restores and in-process opens included, and none
-/// of them may leave a row that says where the shell did not start.
-///
-/// `pub` for the same reason [`close_tab`] is: the race test lives in
-/// `tests/` with a real PTY and a multi-thread runtime.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_for_row(
+/// A `tab.open` request, served: [`resolve_open_target`] then
+/// [`open_and_spawn`], for the served handler and the facade. `cols` and
+/// `rows` are the caller's, already validated, so a refused size never
+/// reaches the default project `resolve_open_target` can create.
+pub fn open_requested(
     workspace: &Workspace,
     supervisor: &PtySupervisor,
-    tab: &mut Tab,
-    argv: &[String],
+    socket_path: &Path,
+    mut params: TabOpenParams,
+    opener: &TabOpener,
     cols: u16,
     rows: u16,
-    socket_path: &std::path::Path,
-    opener: &TabOpener,
-) -> Result<()> {
-    let project_cwd = workspace.project_cwd(tab.project_id).unwrap_or_default();
-    let cwd = usable_cwd(&tab.cwd, &project_cwd);
-    if cwd != tab.cwd {
-        match workspace
-            .set_tab_start_cwd(tab.id, &cwd)
-            .and_then(|()| workspace.tab(tab.id))
-        {
-            Ok(row) => *tab = row,
-            Err(WorkspaceError::TabNotFound(_)) => return Err(PtyError::Cancelled(tab.id).into()),
-            Err(err) => return Err(err.into()),
+) -> Result<Tab> {
+    let activate = params.activate != Some(false);
+    resolve_open_target(workspace, supervisor, &mut params, activate);
+    open_and_spawn(
+        workspace,
+        supervisor,
+        socket_path,
+        NewTab {
+            project_id: params.project_id,
+            cwd: &params.cwd,
+            title: &params.title,
+            activate,
+            opener,
+            argv: &params.argv,
+            cols,
+            rows,
+        },
+    )
+}
+
+/// What [`open_and_spawn`] opens, its size already validated
+/// ([`open_requested`] says why first).
+#[derive(Clone, Copy)]
+pub struct NewTab<'a> {
+    pub project_id: i64,
+    pub cwd: &'a str,
+    pub title: &'a str,
+    pub activate: bool,
+    pub opener: &'a TabOpener,
+    pub argv: &'a [String],
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// The one `tab.open` sequence, shared by the served handler, the
+/// in-process client and the facade: a tab is listed only once its PTY
+/// exists (#640).
+///
+/// 1. Reserve the row ([`Workspace::reserve_tab`]): its id, cwd and title,
+///    with nothing listed, emitted or written.
+/// 2. Move the cwd to [`usable_cwd`], where the shell really starts, so
+///    the row never says where it did not.
+/// 3. Spawn, with the tab's server task held at its [`crate::StartGate`].
+///    A failure here returns having announced nothing about the tab — and
+///    deletes its project if that lists no tab, as closing the tab an
+///    older order had already listed used to.
+/// 4. Publish. If that fails (the project went away meanwhile) the child
+///    is hung up.
+/// 5. Open the gate, so the child's earliest output and its exit find the
+///    row.
+/// 6. Close the row if the supervisor no longer has the tab — the belt for
+///    a tab with no server task to close it. The reap takes a session out
+///    of the supervisor before it reports the exit, so a tab missing here
+///    has exited (or been closed). A server task closes its own row once
+///    it has drained the child's output, so a tab with one is left to it:
+///    closing first would drop what that output does (a notification, a
+///    clipboard write). Closing twice is a logged `TabNotFound`.
+///
+/// A child that exits at once still answers `Ok`: its events are
+/// `TabOpened` then `TabClosed`.
+///
+/// Workspace errors come back as [`WorkspaceError`], spawn errors with a
+/// `pty spawn failed` context, so each caller can map them.
+pub fn open_and_spawn(
+    workspace: &Workspace,
+    supervisor: &PtySupervisor,
+    socket_path: &Path,
+    new: NewTab<'_>,
+) -> Result<Tab> {
+    let mut pending =
+        workspace.reserve_tab(new.project_id, new.cwd, new.title, new.opener.clone())?;
+    let project_cwd = workspace.project_cwd(new.project_id).unwrap_or_default();
+    pending.start_in(usable_cwd(pending.cwd(), &project_cwd));
+    let id = pending.id();
+    // The pre-subscribed receiver is dropped; the supervisor's stashed
+    // twin (`take_initial_receiver`) is what an attach consumes, so early
+    // output survives however late that attach runs.
+    let spawned = supervisor.spawn_gated(
+        id,
+        pending.cwd(),
+        new.argv,
+        new.cols,
+        new.rows,
+        socket_path,
+        new.opener,
+    );
+    let (_rx, gate) = match spawned {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            workspace.delete_project_if_empty(new.project_id);
+            return Err(error.context("pty spawn failed"));
+        }
+    };
+    let tab = match workspace.publish_tab(pending, new.activate) {
+        Ok(tab) => tab,
+        Err(error) => {
+            supervisor.close(id);
+            return Err(error.into());
+        }
+    };
+    gate.open();
+    if !supervisor.runs_tab_tasks() && !supervisor.has(id) {
+        if let Err(error) = workspace.close_tab(id) {
+            tracing::debug!(tab_id = id, %error, "an exited tab's row was already closed");
         }
     }
-    match supervisor.spawn(tab.id, &tab.cwd, argv, cols, rows, socket_path, opener) {
-        // The pre-subscribed receiver `spawn` returns is dropped; the
-        // supervisor's stashed twin (`take_initial_receiver`) is what an
-        // attach consumes, so early output survives however late that
-        // attach runs.
-        Ok(_rx) => {}
-        Err(err) => {
-            let _ = workspace.close_tab(tab.id);
-            return Err(err);
-        }
-    }
-    if let Err(WorkspaceError::TabNotFound(_)) = workspace.tab(tab.id) {
-        supervisor.close(tab.id);
-        return Err(PtyError::Cancelled(tab.id).into());
-    }
-    Ok(())
+    Ok(tab)
 }
 
 /// In-process workspace + PTY supervisor handle.
@@ -292,13 +342,6 @@ impl LocalClient {
         rows: u32,
         opener: &TabOpener,
     ) -> Result<Tab> {
-        // An empty cwd resolves in `Workspace::open_tab` (project's cwd
-        // → $HOME → "/"), and one that is not a directory in
-        // `spawn_for_row`, so every caller (this, the facade,
-        // `ops::TAB_OPEN`) gets both once.
-        let mut tab = self
-            .workspace
-            .open_tab(project_id, cwd, title, true, opener.clone())?;
         // Clamp + validate PTY dims. Zero → terminal default; values
         // exceeding u16 surface as a clear error rather than
         // silently truncating via `as u16` (CR-flagged: a CLI
@@ -307,22 +350,21 @@ impl LocalClient {
         // `IPCHandlerImpl.ipcDim` validation.
         let cols = pty_dim(cols, 80, "cols")?;
         let rows = pty_dim(rows, 24, "rows")?;
-        // Spawn `tab.cwd` — the resolved value `open_tab` just
-        // returned — not the `cwd` parameter above, which may still
-        // be empty. Spawning the parameter regresses this path back
-        // to the UI's own cwd (#266).
-        spawn_for_row(
+        open_and_spawn(
             &self.workspace,
             &self.supervisor,
-            &mut tab,
-            argv,
-            cols,
-            rows,
             &self.socket_path,
-            opener,
+            NewTab {
+                project_id,
+                cwd,
+                title,
+                activate: true,
+                opener,
+                argv,
+                cols,
+                rows,
+            },
         )
-        .context("pty spawn failed")?;
-        Ok(tab)
     }
 
     pub async fn close_tab(&self, tab_id: i64) -> Result<()> {
@@ -789,7 +831,10 @@ pub(crate) fn spawn_in(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::{PtyError, WorkspaceEvent};
     use roost_ipc::agent::{AgentLifecycle, OwnershipAction, ShellState, TabAgentReportParams};
     use roost_ipc::messages::TabState;
     use roost_ipc::program_status::{PromptMark, StatusEvent};
@@ -1342,45 +1387,290 @@ mod tests {
         );
     }
 
-    /// The spawn half of #541: a row whose cwd is not a directory is
-    /// moved to where the shell really starts, and so is the caller's
-    /// copy of it.
+    /// The spawn half of #541: a tab asked to start somewhere that is not
+    /// a directory is listed where the shell really starts.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn spawn_for_row_records_where_the_shell_really_started() {
+    async fn open_and_spawn_lists_the_tab_where_the_shell_really_started() {
         let project_dir = tempfile::tempdir().unwrap();
         let project_cwd = string(project_dir.path());
         let gone = string(&project_dir.path().join("gone"));
         let workspace = Workspace::new();
         let project = workspace.create_project("p", &project_cwd).unwrap().id;
-        let mut tab = workspace
-            .open_tab(project, &gone, "", true, TabOpener::None)
-            .unwrap();
-        assert_eq!(tab.cwd, gone, "the precondition: the row names {gone}");
         let supervisor = Arc::new(PtySupervisor::new());
-        let _guard = HangUp(supervisor.clone(), vec![tab.id]);
-
         let argv = ["/bin/sh", "-c", "exec sleep 30"].map(String::from);
-        let socket = Path::new("/tmp/roost-spawn-for-row-test.sock");
-        spawn_for_row(
+        let mut events = workspace.subscribe();
+
+        let tab = open_and_spawn(
             &workspace,
             &supervisor,
-            &mut tab,
-            &argv,
-            80,
-            24,
-            socket,
-            &TabOpener::None,
+            Path::new("/tmp/roost-open-and-spawn-test.sock"),
+            new_tab(project, &gone, &argv),
         )
         .expect("spawn");
+        let _guard = HangUp(supervisor.clone(), vec![tab.id]);
 
-        assert_eq!(workspace.tab(tab.id).unwrap().cwd, project_cwd, "the row");
         assert_eq!(tab.cwd, project_cwd, "the caller's copy");
+        assert_eq!(workspace.tab(tab.id).unwrap().cwd, project_cwd, "the row");
+        assert!(
+            matches!(events.try_recv(), Ok(WorkspaceEvent::TabOpened(opened)) if opened.cwd == project_cwd),
+            "the tab is announced at the cwd it started in, with no move after"
+        );
         let started = string(&std::fs::canonicalize(project_dir.path()).unwrap());
         assert_eq!(
             supervisor.foreground_cwd(tab.id),
             Some(started),
             "the shell"
         );
+    }
+
+    /// What every `open_and_spawn` test opens: `argv` in `project`, at
+    /// `cwd`, selected, 80x24.
+    fn new_tab<'a>(project_id: i64, cwd: &'a str, argv: &'a [String]) -> NewTab<'a> {
+        NewTab {
+            project_id,
+            cwd,
+            title: "",
+            activate: true,
+            opener: &TabOpener::None,
+            argv,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    /// Long enough for anything that runs between a spawn's child and
+    /// its promotion to have run many times over.
+    const SPAWN_DELAY: Duration = Duration::from_millis(300);
+
+    /// Held at the spawn's promotion for [`SPAWN_DELAY`]: the window an
+    /// opener that announced first would list the tab in, PTY-less.
+    fn slow_supervisor() -> Arc<PtySupervisor> {
+        let supervisor = Arc::new(PtySupervisor::new());
+        supervisor.set_promotion_hook(|_| std::thread::sleep(SPAWN_DELAY));
+        supervisor
+    }
+
+    /// The tab's events, in order, through `last`.
+    #[cfg(feature = "server-vt")]
+    async fn tab_events_until(
+        events: &mut broadcast::Receiver<WorkspaceEvent>,
+        tab_id: i64,
+        last: impl Fn(&WorkspaceEvent) -> bool,
+    ) -> Vec<WorkspaceEvent> {
+        let mut seen = Vec::new();
+        wait_for("the tab's last event", || loop {
+            match events.try_recv() {
+                Ok(event) => {
+                    let ours = match &event {
+                        WorkspaceEvent::TabOpened(tab) => tab.id == tab_id,
+                        WorkspaceEvent::TabClosed { tab_id: id } => *id == tab_id,
+                        _ => false,
+                    };
+                    if ours {
+                        let done = last(&event);
+                        seen.push(event);
+                        if done {
+                            return true;
+                        }
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Empty) => return false,
+                Err(error) => panic!("workspace events: {error:?}"),
+            }
+        })
+        .await;
+        seen
+    }
+
+    /// #640, window 1: a client that reads `TabOpened` and asks about
+    /// the tab at once finds its PTY. The observer checks on its own
+    /// thread, the instant each event arrives, while the child is held
+    /// alive past the check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_tab_is_announced_with_its_pty_already_live() {
+        let workspace = Arc::new(Workspace::new());
+        let project = workspace.create_project("p", "/tmp").unwrap().id;
+        let supervisor = slow_supervisor();
+        let mut events = workspace.subscribe();
+        let observer = std::thread::spawn({
+            let supervisor = Arc::clone(&supervisor);
+            move || loop {
+                match events.blocking_recv() {
+                    Ok(WorkspaceEvent::TabOpened(tab)) => return (tab.id, supervisor.has(tab.id)),
+                    Ok(_) => {}
+                    Err(error) => panic!("workspace events: {error:?}"),
+                }
+            }
+        });
+        let argv = ["/bin/sh", "-c", "read _"].map(String::from);
+
+        let tab = open_and_spawn(
+            &workspace,
+            &supervisor,
+            Path::new("/tmp/roost-open-and-spawn-test.sock"),
+            new_tab(project, "/tmp", &argv),
+        )
+        .expect("open");
+        let _guard = HangUp(supervisor.clone(), vec![tab.id]);
+
+        let (announced, live) = observer.join().expect("the observer");
+        assert_eq!(announced, tab.id);
+        assert!(live, "tab {announced} was listed before its PTY existed");
+    }
+
+    /// A spawn that fails has announced nothing and written nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_spawn_leaves_no_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let workspace = Workspace::open(path.clone());
+        let project = workspace.create_project("p", "/tmp").unwrap().id;
+        let sibling = workspace
+            .open_tab(project, "/tmp", "", true, TabOpener::None)
+            .unwrap()
+            .id;
+        let supervisor = Arc::new(PtySupervisor::new());
+        // Ids are one counter, so the reservation takes the next one:
+        // squatting on it makes the spawn fail for real (`DuplicateTab`).
+        let squatted = sibling + 1;
+        let _squatter = spawn_in(&supervisor, squatted, Path::new("/tmp"), "exec sleep 30");
+        let on_disk = std::fs::read(&path).unwrap();
+        let mut events = workspace.subscribe();
+        let argv = ["/bin/sh", "-c", "exec sleep 30"].map(String::from);
+
+        let error = open_and_spawn(
+            &workspace,
+            &supervisor,
+            Path::new("/tmp/roost-open-and-spawn-test.sock"),
+            new_tab(project, "/tmp", &argv),
+        )
+        .expect_err("the id is taken");
+
+        assert!(
+            matches!(error.downcast_ref::<PtyError>(), Some(PtyError::DuplicateTab(id)) if *id == squatted),
+            "{error:#}"
+        );
+        assert!(workspace.tab(squatted).is_err(), "no row");
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "no event"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk, "no write");
+    }
+
+    /// A failed spawn into a project that lists no tab takes the project
+    /// with it, and nothing is said about the tab.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_spawn_into_an_empty_project_deletes_the_project() {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("p", "/tmp").unwrap().id;
+        let supervisor = Arc::new(PtySupervisor::new());
+        let _squatter = spawn_in(&supervisor, project + 1, Path::new("/tmp"), "exec sleep 30");
+        let mut events = workspace.subscribe();
+        let argv = ["/bin/sh", "-c", "exec sleep 30"].map(String::from);
+
+        open_and_spawn(
+            &workspace,
+            &supervisor,
+            Path::new("/tmp/roost-open-and-spawn-test.sock"),
+            new_tab(project, "/tmp", &argv),
+        )
+        .expect_err("the id is taken");
+
+        assert!(workspace.snapshot().is_empty(), "the project is gone");
+        let seen: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(
+            matches!(seen.as_slice(), [WorkspaceEvent::ProjectDeleted { project_id }, ..] if *project_id == project)
+                && !seen.iter().any(|event| matches!(
+                    event,
+                    WorkspaceEvent::TabOpened(_) | WorkspaceEvent::TabClosed { .. }
+                )),
+            "{seen:?}"
+        );
+    }
+
+    #[cfg(feature = "server-vt")]
+    fn server_vt_supervisor(workspace: &Arc<Workspace>) -> Arc<PtySupervisor> {
+        let supervisor = slow_supervisor();
+        supervisor
+            .enable_server_vt(crate::ServerVtConfig::new(Arc::clone(workspace) as _))
+            .expect("server-vt");
+        supervisor
+    }
+
+    /// A child that exits before anything attaches is closed by its exit,
+    /// after its publish: the `TabOpened` → `TabClosed` pair is expected,
+    /// and `tab.open` still answers with the tab.
+    #[cfg(feature = "server-vt")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_that_exits_at_once_is_opened_then_closed() {
+        let workspace = Arc::new(Workspace::new());
+        let project = workspace.create_project("p", "/tmp").unwrap().id;
+        // A sibling row, so the close does not take the project with it.
+        workspace
+            .open_tab(project, "/tmp", "", false, TabOpener::None)
+            .unwrap();
+        let supervisor = server_vt_supervisor(&workspace);
+        let mut events = workspace.subscribe();
+        let argv = ["/bin/sh", "-c", "exit 0"].map(String::from);
+
+        let tab = open_and_spawn(
+            &workspace,
+            &supervisor,
+            Path::new("/tmp/roost-open-and-spawn-test.sock"),
+            new_tab(project, "/tmp", &argv),
+        )
+        .expect("an exit is not a failed open");
+
+        let seen = tab_events_until(&mut events, tab.id, |event| {
+            matches!(event, WorkspaceEvent::TabClosed { .. })
+        })
+        .await;
+        assert!(
+            matches!(
+                seen.as_slice(),
+                [
+                    WorkspaceEvent::TabOpened(_),
+                    WorkspaceEvent::TabClosed { .. }
+                ]
+            ),
+            "{seen:?}"
+        );
+        assert!(workspace.tab(tab.id).is_err(), "no row is left");
+    }
+
+    /// The session's tab task waits for the row: a title the child sets
+    /// in its very first bytes lands on it, and so does the pipeline
+    /// generation the task registers before it decides anything.
+    #[cfg(feature = "server-vt")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_tab_task_waits_for_its_row() {
+        let workspace = Arc::new(Workspace::new());
+        let project = workspace.create_project("p", "/tmp").unwrap().id;
+        let supervisor = server_vt_supervisor(&workspace);
+        let argv = ["/bin/sh", "-c", r"printf '\033]2;early\007'; read _"].map(String::from);
+
+        let tab = open_and_spawn(
+            &workspace,
+            &supervisor,
+            Path::new("/tmp/roost-open-and-spawn-test.sock"),
+            new_tab(project, "/tmp", &argv),
+        )
+        .expect("open");
+        let _guard = HangUp(supervisor.clone(), vec![tab.id]);
+        let (_, serving) = supervisor.tab_task_handle(tab.id).expect("a live tab task");
+
+        wait_for(
+            "the child's first title and the serving pipeline on the row",
+            || {
+                workspace.tab(tab.id).is_ok_and(|row| row.title == "early")
+                    && workspace.tab_pipeline_generation(tab.id) == Some(serving)
+            },
+        )
+        .await;
     }
 
     #[test]
@@ -1400,22 +1690,21 @@ mod tests {
     }
 
     /// `LocalClient::open_tab` without the PTY: the row opens selected,
-    /// and one whose cwd ends in a name in `failing` closes again, as a
-    /// failed spawn leaves it.
+    /// and one whose cwd ends in a name in `failing` is reserved and never
+    /// published, as a failed spawn leaves it.
     fn open_rows<'a>(
         workspace: &'a Workspace,
         failing: &'a [&'a str],
     ) -> impl FnMut(i64, RestoreTab, TabOpener) -> std::future::Ready<Result<Tab>> + 'a {
         move |project_id, spec, opener| {
             let opened = workspace
-                .open_tab(project_id, &spec.cwd, &spec.title, true, opener)
+                .reserve_tab(project_id, &spec.cwd, &spec.title, opener)
                 .map_err(anyhow::Error::from)
-                .and_then(|tab| {
+                .and_then(|pending| {
                     if failing.iter().any(|name| spec.cwd.ends_with(name)) {
-                        let _ = workspace.close_tab(tab.id);
                         anyhow::bail!("the spawn at {} failed", spec.cwd);
                     }
-                    Ok(tab)
+                    Ok(workspace.publish_tab(pending, true)?)
                 });
             std::future::ready(opened)
         }

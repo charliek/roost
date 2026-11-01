@@ -553,6 +553,35 @@ pub struct PtySupervisor {
     /// feeds the publisher directly, exactly as it always has.
     #[cfg(feature = "server-vt")]
     server_vt: std::sync::OnceLock<Arc<crate::tab_task::ServerVtState>>,
+    /// [`PtySupervisor::set_promotion_hook`]'s seam.
+    promotion_hook: std::sync::OnceLock<PromotionHook>,
+}
+
+type PromotionHook = Box<dyn Fn(i64) + Send + Sync>;
+
+/// What [`PtySupervisor::spawn_gated`] hands back beside the receiver:
+/// the tab's server task (server-VT) waits on it before it registers its
+/// pipeline, parses a byte or handles the exit, so a child's earliest
+/// OSC and its exit find the row its opener publishes after the spawn
+/// (#640). Output waits in the task's bounded channel meanwhile; a full
+/// one stalls only the reader, then the child.
+///
+/// Dropping it opens the gate too, so every early return releases the
+/// task: one whose row was never published then runs into a lookup that
+/// finds nothing, as an exit after a close always has. With no task to
+/// hold (server-VT off) it holds nothing.
+#[must_use = "the tab's server task waits until this is opened or dropped"]
+pub struct StartGate(oneshot::Sender<()>);
+
+impl StartGate {
+    fn new() -> (Self, oneshot::Receiver<()>) {
+        let (open, opened) = oneshot::channel();
+        (Self(open), opened)
+    }
+
+    pub fn open(self) {
+        let _ = self.0.send(());
+    }
 }
 
 struct Session {
@@ -836,6 +865,7 @@ impl PtySupervisor {
             password_watch,
             #[cfg(feature = "server-vt")]
             server_vt: std::sync::OnceLock::new(),
+            promotion_hook: std::sync::OnceLock::new(),
         }
     }
 
@@ -891,6 +921,19 @@ impl PtySupervisor {
         self.server_vt
             .set(Arc::new(crate::tab_task::ServerVtState::new(config)))
             .map_err(|_| anyhow::anyhow!("server-vt is already enabled on this supervisor"))
+    }
+
+    /// Does every tab here have a server tab task, which closes its own
+    /// row when the child exits (after it has drained the child's output)?
+    pub fn runs_tab_tasks(&self) -> bool {
+        #[cfg(feature = "server-vt")]
+        {
+            self.server_vt.get().is_some()
+        }
+        #[cfg(not(feature = "server-vt"))]
+        {
+            false
+        }
     }
 
     /// The random per-supervisor epoch tab streams are scoped by, or
@@ -1135,7 +1178,43 @@ impl PtySupervisor {
         socket_path: &std::path::Path,
         opener: &TabOpener,
     ) -> anyhow::Result<broadcast::Receiver<PtyOutputEvent>> {
-        self.spawn_with(tab_id, cwd, argv, cols, rows, socket_path, opener, || {})
+        self.spawn_gated(tab_id, cwd, argv, cols, rows, socket_path, opener)
+            .map(|(rx, gate)| {
+                gate.open();
+                rx
+            })
+    }
+
+    /// [`Self::spawn`] with the tab's server task held at a [`StartGate`]
+    /// until the caller opens it — for a spawn whose row is published
+    /// after it ([`crate::application::open_and_spawn`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_gated(
+        &self,
+        tab_id: i64,
+        cwd: &str,
+        argv: &[String],
+        cols: u16,
+        rows: u16,
+        socket_path: &std::path::Path,
+        opener: &TabOpener,
+    ) -> anyhow::Result<(broadcast::Receiver<PtyOutputEvent>, StartGate)> {
+        self.spawn_with(tab_id, cwd, argv, cols, rows, socket_path, opener, || {
+            if let Some(hook) = self.promotion_hook.get() {
+                hook(tab_id);
+            }
+        })
+    }
+
+    /// A test seam: `hook` runs inside every later spawn at the
+    /// `before_promote` point of [`Self::spawn_with`], given the tab id —
+    /// after the child exists, before the promotion, outside every lock.
+    /// A test stands a close, a project's deletion or a delay there.
+    /// Set once; nothing but a test ever sets it.
+    pub fn set_promotion_hook(&self, hook: impl Fn(i64) + Send + Sync + 'static) {
+        if self.promotion_hook.set(Box::new(hook)).is_err() {
+            panic!("the promotion hook is already set");
+        }
     }
 
     /// [`Self::spawn`], plus a seam for the one window nothing else can
@@ -1155,7 +1234,7 @@ impl PtySupervisor {
         socket_path: &std::path::Path,
         opener: &TabOpener,
         before_promote: impl FnOnce(),
-    ) -> anyhow::Result<broadcast::Receiver<PtyOutputEvent>> {
+    ) -> anyhow::Result<(broadcast::Receiver<PtyOutputEvent>, StartGate)> {
         // Reserve the slot atomically. Two concurrent
         // `spawn(tab_id, ...)` calls used to be racy: the first
         // would `contains_key` and the second would do the same
@@ -1308,8 +1387,11 @@ impl PtySupervisor {
         // Server-VT: the tab task becomes the single authority for this
         // tab's seq, tee, replies and exit. Started before the reader so
         // no byte can be read before there is somewhere to put it.
+        let (gate, opened) = StartGate::new();
         #[cfg(feature = "server-vt")]
-        let tab_pipe = tab_vt.map(|vt| vt.start(tab_id, output.sender(), cmd_tx.clone()));
+        let tab_pipe = tab_vt.map(|vt| vt.start(tab_id, output.sender(), cmd_tx.clone(), opened));
+        #[cfg(not(feature = "server-vt"))]
+        drop(opened);
         #[cfg(feature = "server-vt")]
         let reader_bytes_tx = tab_pipe.as_ref().map(|pipe| pipe.bytes_tx.clone());
         #[cfg(feature = "server-vt")]
@@ -1603,7 +1685,7 @@ impl PtySupervisor {
             return Err(err.into());
         }
 
-        Ok(early_rx)
+        Ok((early_rx, gate))
     }
 
     /// Under server-VT the tab task is the one authority ordering input
@@ -2840,11 +2922,8 @@ pub enum PtyError {
     Closed(i64),
     #[error("tab {0} already has a live pty session")]
     DuplicateTab(i64),
-    /// The spawn lost its tab. Either a `close()` took the reservation
-    /// back between the `pending` insert and the promotion, or the
-    /// workspace row vanished *before* the reservation and the opener's
-    /// re-check ([`crate::application::spawn_for_row`]) caught it after
-    /// the fact. Both mean the same thing to a caller: the tab is gone.
+    /// The spawn lost its tab: a `close()` took the reservation back
+    /// between the `pending` insert and the promotion.
     #[error("spawn for tab {0} cancelled by close()")]
     Cancelled(i64),
     #[error("supervisor is shutting down; refused to spawn tab {0}")]

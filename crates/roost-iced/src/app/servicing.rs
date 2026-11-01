@@ -1378,7 +1378,7 @@ impl App {
         // path for a slow consumer — a lagged broadcast arrives as a
         // `Resync` and this rebuild is what heals it: deltas are an
         // optimization, never UI truth.
-        self.projects = self.workspace.snapshot();
+        (self.reconciled_revision, self.projects) = self.workspace.snapshot_with_revision();
         // The host sections are the other half of that snapshot, and
         // they come first for the same reason: everything below re-
         // resolves a key against the rows of whichever instance owns it,
@@ -2593,18 +2593,7 @@ impl App {
                     collect_tab_output(&mut self.tabs, &mut pty, key, output);
                 }
                 EngineFeed::UiRequest(request) => {
-                    // IPC reads (`tab.dump`, `palette.state`,
-                    // `sidebar.dump`) answer from `self.projects`, which is
-                    // only as fresh as the last reconcile. Replies are
-                    // eventually consistent by design — every client in
-                    // `tools/roosttest` condition-waits rather than
-                    // asserting on the first reply — but when a mutation
-                    // event already landed in THIS batch there is no
-                    // reason to make a caller wait for it: fold it in
-                    // first. At most one extra reconcile per mixed batch,
-                    // and none for the pure-request and pure-PTY batches
-                    // that dominate.
-                    if batch.workspace_dirty() {
+                    if batch.request_behind(self.workspace.revision(), self.reconciled_revision) {
                         self.reconcile();
                         batch.mark_reconciled();
                     }

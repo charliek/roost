@@ -853,10 +853,8 @@ impl TabVt {
         tab_id: i64,
         tee: broadcast::Sender<PtyOutputEvent>,
         writer: mpsc::Sender<WriterCmd>,
+        opened: oneshot::Receiver<()>,
     ) -> TabPipe {
-        self.state
-            .workspace
-            .tab_pipeline(tab_id, self.tab_generation);
         let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(TAB_CHANNEL_CHUNKS);
         let (exit_tx, exit_rx) = mpsc::unbounded_channel::<ExitSignal>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<TabCmd>(TAB_CMD_CAPACITY);
@@ -892,7 +890,7 @@ impl TabVt {
             ingested: 0,
         };
         let theme_generation = task.vt.theme_generation;
-        tokio::spawn(task.run(bytes_rx, exit_rx, cmd_rx));
+        tokio::spawn(task.run(opened, bytes_rx, exit_rx, cmd_rx));
         TabPipe {
             bytes_tx,
             exit_tx,
@@ -1024,12 +1022,20 @@ struct TabTask {
 }
 
 impl TabTask {
+    /// Waits for `opened` ([`crate::pty::StartGate`]) before it touches
+    /// the workspace at all.
     async fn run(
         mut self,
+        opened: oneshot::Receiver<()>,
         mut bytes_rx: mpsc::Receiver<Vec<u8>>,
         mut exit_rx: mpsc::UnboundedReceiver<ExitSignal>,
         mut cmd_rx: mpsc::Receiver<TabCmd>,
     ) {
+        let _ = opened.await;
+        self.vt
+            .state
+            .workspace
+            .tab_pipeline(self.tab_id, self.vt.tab_generation);
         let mut exit_code: Option<i32> = None;
         let mut bytes_open = true;
         let mut cmd_open = true;

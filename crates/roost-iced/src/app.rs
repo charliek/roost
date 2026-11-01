@@ -1415,10 +1415,10 @@ impl EngineOpResult {
 /// between them.
 ///
 /// A tab-open failure after the create committed rolls the project back
-/// too: `LocalClient::open_tab`'s spawn-failure path closes the tab it
-/// opened, and closing a project's last tab deletes the project. The
-/// error is reported and the completion's reconcile shows the rollback,
-/// exactly as the blocking version behaved when its second call failed.
+/// too: a failed open into a project that lists no tab deletes the
+/// project (`open_and_spawn`). The error is reported and the completion's
+/// reconcile shows the rollback, exactly as the blocking version behaved
+/// when its second call failed.
 async fn create_project_flow(client: &LocalClient, grid: (u16, u16)) -> Result<(i64, i64), String> {
     let cwd = roost_engine::home_dir();
     let project = client
@@ -3297,6 +3297,8 @@ pub struct App {
     client: LocalClient,
     tabs: HashMap<TabKey, TerminalTab>,
     projects: Vec<Project>,
+    /// The local workspace revision `projects` was read at.
+    reconciled_revision: u64,
     /// Every drawn project's agent rows, keyed by project: the counts on
     /// the project rows and `app.sidebar_dump`'s `projects[].agents`.
     sidebar_agents: HashMap<ProjectKey, Vec<agent_palette::SidebarAgentRow>>,
@@ -3918,6 +3920,7 @@ impl App {
             client,
             tabs: HashMap::new(),
             projects: Vec::new(),
+            reconciled_revision: 0,
             sidebar_agents: HashMap::new(),
             agent_panel_rows: Vec::new(),
             agent_panel_scroll_id: Id::unique(),
@@ -4158,6 +4161,7 @@ impl App {
         runtime.spawn(engine_feed::pump_workspace_events(
             Arc::clone(&workspace),
             feed_tx.clone(),
+            engine_feed::test_event_delay(),
         ));
         let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
         runtime.spawn(engine_feed::pump_ui_requests(ui_rx, feed_tx.clone()));
@@ -12869,8 +12873,7 @@ mod tests {
     /// committed. It must surface as the op's error rather than as a
     /// silent half-create — the completion's reconcile then shows
     /// whatever the engine's own rollback left (here: none of it, because
-    /// rolling the seed tab back closes the project it was the last tab
-    /// of).
+    /// a failed open into a project with no tab deletes the project).
     #[test]
     fn create_project_reports_a_failure_that_lands_after_the_project_committed() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -12921,7 +12924,7 @@ mod tests {
                 .map(|project| project.id)
                 .collect::<Vec<_>>(),
             vec![probe.id],
-            "the engine rolled the seed tab back, and with it the project it was the last tab of"
+            "the engine rolled the project back with its seed tab"
         );
 
         supervisor.close(doomed_tab_id);

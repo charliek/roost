@@ -79,7 +79,9 @@ pub use facade::{
     EngineSnapshot,
 };
 pub use opener::TabOpener;
-pub use pty::{Geometry, PtyError, PtyOutputEvent, PtySupervisor, ShutdownReport, SupervisorEvent};
+pub use pty::{
+    Geometry, PtyError, PtyOutputEvent, PtySupervisor, ShutdownReport, StartGate, SupervisorEvent,
+};
 #[cfg(feature = "server-vt")]
 pub use tab_task::{
     AttachDecision, ResumeAt, ServerVtConfig, ServerVtWorkspace, SnapshotAt, TabCmd, TabError,
@@ -87,9 +89,9 @@ pub use tab_task::{
     SERVER_VT_CONTINUATION_MAX, SERVER_VT_SCROLLBACK, TAB_CHANNEL_CHUNKS, TAB_CMD_CAPACITY,
 };
 pub use workspace::{
-    AttentionSource, PersistOutcome, ReplayBounds, RestoreLayout, RestoreProject, RestoreTab,
-    ResumeCut, ResumeError, TabEffectKind, VersionedWorkspaceEvent, Workspace, WorkspaceError,
-    WorkspaceEvent, AGENTS_PANEL_DEFAULT_FRACTION, AGENTS_PANEL_MAX_FRACTION,
+    AttentionSource, PendingTab, PersistOutcome, ReplayBounds, RestoreLayout, RestoreProject,
+    RestoreTab, ResumeCut, ResumeError, TabEffectKind, VersionedWorkspaceEvent, Workspace,
+    WorkspaceError, WorkspaceEvent, AGENTS_PANEL_DEFAULT_FRACTION, AGENTS_PANEL_MAX_FRACTION,
     AGENTS_PANEL_MIN_FRACTION, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 
