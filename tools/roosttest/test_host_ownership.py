@@ -559,8 +559,10 @@ def test_a21_an_owner_change_in_a_resume_gap_arrives_with_the_accept(host, roost
             "desk-a21",
             True,
             view,
-            cell_w_px=max(1, round(metrics["cell_width"])),
-            cell_h_px=max(1, round(metrics["cell_height"])),
+            # Rust's `.round()` takes halves away from zero; Python's
+            # `round` takes them to even, so 8.5 would differ.
+            cell_w_px=max(1, int(metrics["cell_width"] + 0.5)),
+            cell_h_px=max(1, int(metrics["cell_height"] + 0.5)),
         )
         session.close_tab(other)
 

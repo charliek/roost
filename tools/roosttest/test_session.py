@@ -481,6 +481,10 @@ def test_the_session_owns_its_files_alone(env):
     env.stop_over_the_wire()
 
 
+# `resource.RLIM_INFINITY` is -1 on some Pythons; compare against this.
+UNLIMITED = 2**64 - 1
+
+
 def open_file_limits(pid: int) -> tuple[int, int]:
     """`(soft, hard)` "Max open files" from `/proc/<pid>/limits`."""
     text = (Path("/proc") / str(pid) / "limits").read_text()
@@ -488,7 +492,7 @@ def open_file_limits(pid: int) -> tuple[int, int]:
     assert match, text
 
     def value(field: str) -> int:
-        return resource.RLIM_INFINITY if field == "unlimited" else int(field)
+        return UNLIMITED if field == "unlimited" else int(field)
 
     return value(match[1]), value(match[2])
 
@@ -506,7 +510,7 @@ def test_a_session_started_under_a_low_soft_fd_limit_raises_it():
     by a `preexec_fn`, which is unsafe in this threaded harness."""
     started_soft = 256
     _, runner_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    if runner_hard < started_soft:
+    if runner_hard != resource.RLIM_INFINITY and runner_hard < started_soft:
         pytest.skip(f"the runner's hard open-file limit {runner_hard} is below {started_soft}")
     made = sessionlib.make_env(explicit=True)
     try:
