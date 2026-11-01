@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import socket
+import string
 import subprocess
 import tempfile
 import threading
@@ -165,10 +166,11 @@ class SessionDirTests(unittest.TestCase):
     def test_cleanup_never_touches_a_path_that_is_not_its_own_dir(self) -> None:
         victim, listener = self._victim()
         own = self._own_dir()
-        link = TMP_ROOT / f"roost-uitest-ss.{own.name[-6:-1]}L"
+        foreign = [c for c in string.ascii_letters + string.digits if c != own.name[-1]][:2]
+        link = TMP_ROOT / f"roost-uitest-ss.{own.name[-6:-1]}{foreign[0]}"
         os.symlink(victim, link)
         self.addCleanup(link.unlink)
-        shared = TMP_ROOT / f"roost-uitest-ss.{own.name[-6:-1]}S"
+        shared = TMP_ROOT / f"roost-uitest-ss.{own.name[-6:-1]}{foreign[1]}"
         shared.mkdir()
         shared.chmod(0o755)
         self.addCleanup(shutil.rmtree, shared, ignore_errors=True)

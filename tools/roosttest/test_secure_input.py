@@ -265,7 +265,7 @@ def test_the_active_tabs_password_prompt_drives_auto(mac, roost, project):
     finally:
         for tab in (other, helper):
             if tab is not None:
-                roost.close_tab(tab)
+                roost.close_tab_if_present(tab)
 
 
 def test_the_toggle_survives_a_relaunch_and_indication_hides_the_lock(
@@ -324,7 +324,7 @@ def test_off_macos_the_owner_reads_all_false_at_a_prompt(linux, roost, project):
         roost.send(helper, SECRET + "\n")
         roost.wait_text(helper, DONE)
     finally:
-        roost.close_tab(helper)
+        roost.close_tab_if_present(helper)
 
 
 def test_off_macos_the_bound_chord_is_consumed_and_writes_nothing(

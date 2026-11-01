@@ -283,7 +283,10 @@ wrapper small.
     `ROOST_TEST_MODE=1`) holds each workspace event that long before the
     iced UI's event pump forwards it, so a request overtakes the event of
     the mutation it follows (#640's window 2) every time; it is for that
-    proof, not the curated lanes.
+    proof, not the curated lanes. `ROOST_TEST_EVENT_PUSH_DELAY_MS=<ms>`
+    (same gate) holds each batch in `roost-engine`'s event relay before it
+    is queued for the socket, so a session's stop overtakes it every time
+    (#602).
 
 ## Docs
 

@@ -665,7 +665,15 @@ jobs:
               sleep 2
             done
           ' EXIT
-          hdiutil attach "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg" -readonly -nobrowse -noautoopen -noverify -mountpoint "$MNT"
+          # Hosted macOS runners fail an attach now and then with "Resource
+          # temporarily unavailable" (2026-10-06), the same contention
+          # make-dmg.sh retries its `hdiutil create` through.
+          for attempt in 1 2 3; do
+            hdiutil attach "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg" -readonly -nobrowse -noautoopen -noverify -mountpoint "$MNT" >/dev/null && break
+            [ "$attempt" = 3 ] && { echo "FAIL: hdiutil attach failed $attempt times"; exit 1; }
+            echo "hdiutil attach failed (attempt $attempt); retrying in 5s"
+            sleep 5
+          done
           xcrun stapler validate "$MNT/Roost.app"
 
       # What governs Gatekeeper on a downloaded DMG is whether it's *notarized*

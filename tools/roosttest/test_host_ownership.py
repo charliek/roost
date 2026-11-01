@@ -336,6 +336,7 @@ def test_a5_a_click_and_the_wheel_are_delivered_then_take(host, roost):
         view = view_grid(roost)
         session.tab_feed_pty_bytes(tab, b"\x1b[?2048h")
         desk = raw(host.env, session, tab, "desk-a5", False, DESK)
+        roost.wait_text(key, "UP")
         for gesture, events, report in (
             ("click", [("press", "left"), ("release", "left")], b"\x1b[<0;4;3M"),
             ("wheel", [("press", "wheel_up")], b"\x1b[<64;4;3M"),

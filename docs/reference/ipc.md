@@ -3448,7 +3448,8 @@ and a restart mints new ones, so if the fresh ack's `session_id` is not the
 one the wait began with, the tab being waited on has to be found again
 (by title, cwd, or whatever the client knew it by) before anything is read
 off the new snapshot — a tab missing there is not a tab that closed.
-`session.stopping` means the session is going away.
+`session.stopping` means the session is going away, and it is final: events
+still queued when a session stops are dropped, not flushed ahead of it.
 
 ## Session ops
 

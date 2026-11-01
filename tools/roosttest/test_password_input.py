@@ -86,7 +86,7 @@ def test_a_prompt_with_echo_off_reads_true_until_it_is_answered(iced, roost, pro
         roost.wait_password_input(tab, True)
         answer_and_clear(roost, tab)
     finally:
-        roost.close_tab(tab)
+        roost.close_tab_if_present(tab)
 
 
 def test_read_s_in_bash_reads_true(iced, roost, project):
@@ -107,7 +107,7 @@ def test_read_s_in_bash_reads_true(iced, roost, project):
         roost.wait_password_input(tab, True)
         answer_and_clear(roost, tab)
     finally:
-        roost.close_tab(tab)
+        roost.close_tab_if_present(tab)
 
 
 # ---------------------------------------------------------------------------

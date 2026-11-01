@@ -37,6 +37,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -1309,7 +1310,18 @@ def test_roostctl_events_and_wait_read_a_session_named_by_socket(env):
             stderr=subprocess.PIPE,
             text=True,
         )
+        lines: list[dict] = []
+        reader_errors: list[Exception] = []
+
+        def read_events() -> None:
+            try:
+                lines.extend(json.loads(line) for line in events.stdout)
+            except Exception as error:
+                reader_errors.append(error)
+
+        reader = threading.Thread(target=read_events, daemon=True)
         try:
+            reader.start()
             relay.wait_for_response("session.identify")
             assert list(relay.by_connection().values()) == [
                 ["identify"],
@@ -1325,14 +1337,26 @@ def test_roostctl_events_and_wait_read_a_session_named_by_socket(env):
             with env.client() as client:
                 client.set_state(other, "idle")
                 client.set_state(watched, "needs_input")
+            deadline = time.monotonic() + sessionlib.scaled_timeout(30.0)
+            while not any(
+                line["event"] == "tab.state_changed" and line["data"]["state"] == "needs_input"
+                for line in list(lines)
+            ):
+                assert time.monotonic() < deadline, f"no needs_input event: {list(lines)}"
+                time.sleep(0.02)
             env.stop_over_the_wire()
-            out, err = events.communicate(timeout=sessionlib.scaled_timeout(60.0))
+            events.wait(timeout=sessionlib.scaled_timeout(60.0))
+            reader.join(timeout=sessionlib.scaled_timeout(10.0))
+            assert not reader.is_alive(), "the events reader never saw end of stream"
+            err = events.stderr.read()
         finally:
             if events.poll() is None:
                 events.kill()
-                events.communicate()
-    assert events.returncode == 0, out + err
-    lines = [json.loads(line) for line in out.splitlines()]
+                events.wait()
+            reader.join(timeout=sessionlib.scaled_timeout(10.0))
+    if reader_errors:
+        raise reader_errors[0]
+    assert events.returncode == 0, f"{lines} {err}"
     assert lines[-1] == {"event": "session.stopping", "data": {"reason": "stop"}}, lines
     assert {"tab_id": str(watched), "state": "needs_input"} in [
         line["data"] for line in lines if line["event"] == "tab.state_changed"

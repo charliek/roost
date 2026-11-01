@@ -194,6 +194,16 @@ FAKE_SSH_EXEC="${FAKE_SSH_EXEC:-true}"
 
 TAB=$(printf '\t')
 
+# Concurrent invocations append to one log, and the shell's printf
+# flushes a long line in pieces that another writer can land between.
+# Staging the line in a file of its own and appending it with cat makes
+# it a single write(2) to the O_APPEND log.
+log_line() {
+    printf '%s\n' "$1" >"$FAKE_SSH_LOG.$$"
+    cat "$FAKE_SSH_LOG.$$" >>"$FAKE_SSH_LOG"
+    rm -f "$FAKE_SSH_LOG.$$"
+}
+
 line="pid=$$"
 ctl=
 want_ctl=0
@@ -238,16 +248,16 @@ if [ "$is_exit" -eq 1 ]; then
     # which is the one shape a teardown test cannot tell from a bug.
     if [ -n "$ctl" ] && [ -e "$ctl" ]; then
         line="$line${TAB}ctl-exists=1"
-        printf '%s\n' "$line" >>"$FAKE_SSH_LOG"
+        log_line "$line"
         rm -f "$ctl"
     else
         line="$line${TAB}ctl-exists=0"
-        printf '%s\n' "$line" >>"$FAKE_SSH_LOG"
+        log_line "$line"
     fi
     exit 0
 fi
 
-printf '%s\n' "$line" >>"$FAKE_SSH_LOG"
+log_line "$line"
 
 changed_key_block() {
     cat >&2 <<'EOF'
