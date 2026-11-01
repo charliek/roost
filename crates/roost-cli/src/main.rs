@@ -356,7 +356,7 @@ enum Cmd {
     /// `identify.ops` doesn't list `project.ensure` — the Mac app today
     /// — naming the manual route (`project list --json` +
     /// `tab open --project-id`) rather than falling back to it itself,
-    /// which would reopen the same race. Refuses `usage` (exit 2) while
+    /// which would reopen the same race. Refuses `busy` (exit 1) while
     /// `identify.local_backend_switch` shows a switch in progress: the
     /// project set is mid-flight, so a name resolved against it may not
     /// hold. A `not-found` from the `tab.open` half (the project vanished
@@ -1604,9 +1604,10 @@ async fn run_on_ui(
         } => {
             let identity = require_project_ensure(ui).await?;
             if identity.local_backend_switch.is_some() {
-                return Err(CliError::Usage(
-                    "a backend switch is in progress; retry".into(),
-                ));
+                return Err(CliError::Server {
+                    code: roost_ipc::codes::BUSY.into(),
+                    message: roost_ipc::local_route::SWITCH_BUSY_MESSAGE.into(),
+                });
             }
             let cwd = resolve_cwd(cwd, cwd_env)?;
             let ensured: ProjectEnsureResult = ui
@@ -5781,7 +5782,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_refuses_usage_during_a_backend_switch_before_project_ensure() {
+    async fn open_refuses_busy_during_a_backend_switch_before_project_ensure() {
         let ui = FakeUi::start("switch-in-progress", |op| match op {
             "identify" => Ok(fake_identify_ensure_mid_switch()),
             _ => Err(("unknown-op", "not faked")),
@@ -5802,8 +5803,12 @@ mod tests {
         .expect_err("a switch is in progress");
         assert_eq!(
             error,
-            CliError::Usage("a backend switch is in progress; retry".into())
+            CliError::Server {
+                code: roost_ipc::codes::BUSY.into(),
+                message: roost_ipc::local_route::SWITCH_BUSY_MESSAGE.into(),
+            }
         );
+        assert_eq!(error.exit_code(), 1);
         let sent = ui.take();
         assert_eq!(
             sent.iter().map(|(op, _)| op.as_str()).collect::<Vec<_>>(),

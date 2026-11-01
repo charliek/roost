@@ -1,6 +1,9 @@
 //! Plan 087 D3: an `accept` that fails `EMFILE` must not end a server's
-//! accept loop. The connection it could not take is served once
-//! descriptors free up, and so is every later one.
+//! accept loop. Every connection after the error is served. On Linux the
+//! connection the failed `accept` could not take stays queued and is
+//! served too; XNU has already dequeued it when the descriptor
+//! allocation fails, so on macOS the kernel resets it and only the
+//! later connection can be asserted.
 //!
 //! This is the only test in its binary, and has to be: it lowers the
 //! process's soft `RLIMIT_NOFILE` and then takes every descriptor under
@@ -109,6 +112,14 @@ async fn identify(stream: UnixStream) -> serde_json::Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_connection_that_met_emfile_is_served_once_descriptors_free() {
+    // Connects and writes have no budget of their own; this one bounds
+    // the whole scenario so a stuck step fails instead of hanging.
+    tokio::time::timeout(ANSWER_BUDGET.mul_f64(4.0 * timeout_scale()), scenario())
+        .await
+        .expect("the EMFILE scenario did not finish within its budget");
+}
+
+async fn scenario() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("roost.sock");
     let server = IpcServer::bind(&socket, IdentifyHandler)
@@ -134,11 +145,16 @@ async fn a_connection_that_met_emfile_is_served_once_descriptors_free() {
     }
     drop(fillers);
 
-    let reply = identify(pending).await;
-    assert_eq!(reply["ok"], true, "{reply}");
-    assert_eq!(reply["result"]["app"], "emfile-test", "{reply}");
+    if cfg!(target_os = "linux") {
+        let reply = identify(pending).await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["result"]["app"], "emfile-test", "{reply}");
+    } else {
+        drop(pending);
+    }
 
     let fresh = UnixStream::connect(&socket).await.expect("connect again");
     let reply = identify(fresh).await;
     assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["result"]["app"], "emfile-test", "{reply}");
 }

@@ -817,6 +817,18 @@ impl AcceptBackoff {
     }
 }
 
+impl Drop for AcceptBackoff {
+    fn drop(&mut self) {
+        if self.burst > 0 {
+            info!(
+                listener = %self.listener,
+                errors = self.burst,
+                "accept loop ended during transient errors"
+            );
+        }
+    }
+}
+
 /// Process-unique connection ids. Starts at 1 so `0` stays available
 /// as "no connection" in a registry.
 fn next_conn_id() -> u64 {

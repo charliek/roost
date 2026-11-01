@@ -731,7 +731,7 @@ without `--json`**: this is an agent verb, not a human-typed one.
 | Exit | `code` | When |
 |---|---|---|
 | 1 | `unsupported` | This server's `identify --json` `ops` doesn't list `project.ensure` (the Swift `Roost.app` today) — names the manual route (`project list --json` + `tab open --project-id`) rather than racing it itself (#221) |
-| 2 | `usage` | `identify --json`'s `local_backend_switch` shows a backend switch in progress — the project set is mid-flight, so a name resolved against it may not hold; retry once it settles |
+| 1 | `busy` | `identify --json`'s `local_backend_switch` shows a backend switch in progress — the project set is mid-flight, so a name resolved against it may not hold; the same `busy` the server itself answers with; retry once it settles |
 | 1 | *the server's own* | `tab.open`'s own refusal, verbatim — most notably `not-found` if the ensured project vanished between the two calls (a backend switch landing in that window, say). **The two calls are not atomic with each other**, only each is atomic on the server, so this is possible even though `ensure` itself never races another `ensure` |
 
 ## `screenshot`
