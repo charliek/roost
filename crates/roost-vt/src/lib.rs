@@ -145,6 +145,8 @@ mod image;
 #[cfg(feature = "ffi")]
 mod key_encoder;
 #[cfg(feature = "ffi")]
+mod kitty;
+#[cfg(feature = "ffi")]
 mod memory;
 #[cfg(feature = "ffi")]
 mod mouse_encoder;
@@ -173,6 +175,8 @@ pub use formatter::{scrollback_rows, scrollback_text, UNWRAP_SOFT_WRAPPED_LINES}
 pub use image::{install_image_decoder, KITTY_IMAGE_STORAGE_LIMIT};
 #[cfg(feature = "ffi")]
 pub use key_encoder::{key_action, mods, Key, KeyAction, KeyEncoder, KeyEvent, Mods};
+#[cfg(feature = "ffi")]
+pub use kitty::{ImageFormat, ImageLayer, ImagePlacement, KittyImage, PixelRect, PlacementKind};
 #[cfg(feature = "ffi")]
 pub use memory::{MemoryUsage, ScreenMemory};
 #[cfg(feature = "ffi")]

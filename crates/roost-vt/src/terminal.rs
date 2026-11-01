@@ -720,6 +720,8 @@ impl Terminal {
 
     /// Public escape-hatch accessor. Use only when no safe wrapper
     /// covers your call yet; prefer adding one over reaching for this.
+    /// A caller that mutates through it while a [`crate::KittyImage`] is
+    /// alive breaks that view's borrow (see its Lifetime section).
     pub fn as_ffi(&self) -> sys::GhosttyTerminal {
         self.handle
     }

@@ -7,7 +7,8 @@
 //!   3. `walk(|cell| ...)` iterates rows × cells, calling the closure
 //!      once per cell; `walk_dirty` iterates only the rows that
 //!      changed and consumes the frame's damage.
-//!   4. `cursor()` / `colors()` extract additional per-frame data.
+//!   4. `cursor()` / `colors()` / `image_placements()` extract additional
+//!      per-frame data.
 //!
 //! `mac/Sources/Roost/RenderState.swift` mirrors the constructor,
 //! walk, and cursor-info shape — but the two have **intentionally
@@ -18,8 +19,10 @@
 //! so investing in its render path is potentially wasted work. Do not
 //! "restore parity" here without that decision changing.
 
+use std::os::raw::{c_int, c_void};
 use std::ptr;
 
+use crate::kitty::{sort_placements, ImageLayer, ImagePlacement, PixelRect, PlacementKind};
 use crate::sys;
 use crate::{ColorRgb, Error, Result, Terminal};
 
@@ -201,6 +204,12 @@ pub struct RenderState {
     handle: sys::GhosttyRenderState,
     row_iter: sys::GhosttyRenderStateRowIterator,
     row_cells: sys::GhosttyRenderStateRowCells,
+    image_iter: sys::GhosttyRenderStateImageIterator,
+    /// A failed `update` can leave libghostty's row count ahead of its
+    /// row storage; the image iterator slices one by the other, so no
+    /// placement is read until an update completes (render.h's
+    /// incomplete-update rule).
+    incomplete: bool,
 }
 
 unsafe impl Send for RenderState {}
@@ -247,10 +256,32 @@ impl RenderState {
             return Err(Error::NullHandle);
         }
 
+        let mut image_iter: sys::GhosttyRenderStateImageIterator = ptr::null_mut();
+        // SAFETY: see above.
+        let rc = unsafe {
+            sys::ghostty_render_state_image_iterator_new(ptr::null_mut(), &mut image_iter)
+        };
+        if let Err(e) = Error::from_result(rc) {
+            // SAFETY: all three prior handles non-null.
+            unsafe { sys::ghostty_render_state_row_cells_free(row_cells) };
+            unsafe { sys::ghostty_render_state_row_iterator_free(row_iter) };
+            unsafe { sys::ghostty_render_state_free(handle) };
+            return Err(e);
+        }
+        if image_iter.is_null() {
+            // SAFETY: see above.
+            unsafe { sys::ghostty_render_state_row_cells_free(row_cells) };
+            unsafe { sys::ghostty_render_state_row_iterator_free(row_iter) };
+            unsafe { sys::ghostty_render_state_free(handle) };
+            return Err(Error::NullHandle);
+        }
+
         Ok(Self {
             handle,
             row_iter,
             row_cells,
+            image_iter,
+            incomplete: false,
         })
     }
 
@@ -262,13 +293,16 @@ impl RenderState {
         // only `begin` touches the terminal, `end` works purely on
         // render-state memory. The render state is incomplete until
         // `end` runs, so `end` is skipped when `begin` fails.
+        self.incomplete = true;
         // SAFETY: both handles non-null per constructors.
         let rc = unsafe { sys::ghostty_render_state_begin_update(self.handle, terminal.handle()) };
         Error::from_result(rc)?;
         // SAFETY: handle non-null per constructor; the end phase reads
         // and writes only render-state memory.
         let rc = unsafe { sys::ghostty_render_state_end_update(self.handle) };
-        Error::from_result(rc)
+        Error::from_result(rc)?;
+        self.incomplete = false;
+        Ok(())
     }
 
     /// Raw FFI handle. Internal use for crates that need to call a
@@ -541,6 +575,209 @@ impl RenderState {
             sys::GhosttyRenderStateDirty_GHOSTTY_RENDER_STATE_DIRTY_FALSE
         })?;
         Ok(global)
+    }
+
+    /// The Kitty image placements the last [`Self::update`] found, in
+    /// draw order: by layer, then z, then a deterministic tiebreak. Only
+    /// placements with pixels to draw are listed, and none while the
+    /// terminal's cell size is 0 px. Read the pixels with
+    /// [`Terminal::kitty_image`].
+    ///
+    /// An unknown layer or placement kind is an `Err`; placements from an
+    /// image protocol other than Kitty's are skipped.
+    pub fn image_placements(&mut self) -> Result<Vec<ImagePlacement>> {
+        if self.incomplete {
+            return Err(Error::InvalidValue);
+        }
+        self.bind_image_iterator()?;
+        let mut placements = Vec::new();
+        // SAFETY: iter handle non-null, just refilled from this frame.
+        while unsafe { sys::ghostty_render_state_image_iterator_next(self.image_iter) } {
+            if let Some(placement) = self.read_image_placement()? {
+                placements.push(placement);
+            }
+        }
+        sort_placements(&mut placements);
+        Ok(placements)
+    }
+
+    /// A value that changes whenever an update changes what
+    /// [`Self::image_placements`] returns; compare it for equality only.
+    /// `None` while libghostty reports 0: Kitty graphics are compiled out,
+    /// or no update has changed the list yet.
+    pub fn image_placements_generation(&self) -> Result<Option<u64>> {
+        let mut out: u64 = 0;
+        // SAFETY: handle non-null; out is a local of the documented type.
+        let rc = unsafe {
+            sys::ghostty_render_state_get(
+                self.handle,
+                sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_IMAGE_PLACEMENTS_GENERATION,
+                (&raw mut out).cast(),
+            )
+        };
+        Error::from_result(rc)?;
+        Ok((out != 0).then_some(out))
+    }
+
+    /// Refill `self.image_iter` from this frame. Same pointer-to-slot
+    /// semantics as [`Self::bind_row_iterator`].
+    fn bind_image_iterator(&mut self) -> Result<()> {
+        // SAFETY: state + iter handles non-null per constructor.
+        let rc = unsafe {
+            sys::ghostty_render_state_get(
+                self.handle,
+                sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR,
+                (&mut self.image_iter) as *mut _ as *mut _,
+            )
+        };
+        Error::from_result(rc)
+    }
+
+    /// The placement the image iterator sits on, or `None` for another
+    /// protocol's.
+    fn read_image_placement(&self) -> Result<Option<ImagePlacement>> {
+        let mut protocol: c_int = 0;
+        // SAFETY: iter handle non-null and on a placement; `protocol` is a
+        // 4-byte enum local (see `read_enum`).
+        let rc = unsafe {
+            sys::ghostty_render_state_image_get(
+                self.image_iter,
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_PROTOCOL,
+                (&raw mut protocol).cast(),
+            )
+        };
+        Error::from_result(rc)?;
+        if protocol as sys::GhosttyImageProtocol
+            != sys::GhosttyImageProtocol_GHOSTTY_IMAGE_PROTOCOL_KITTY
+        {
+            return Ok(None);
+        }
+
+        let mut image_id: u32 = 0;
+        let mut generation: u64 = 0;
+        let mut layer: c_int = 0;
+        let mut z: i32 = 0;
+        let mut col: i32 = 0;
+        let mut row: i32 = 0;
+        let mut grid_cols: u32 = 0;
+        let mut grid_rows: u32 = 0;
+        let mut offset_x: u32 = 0;
+        let mut offset_y: u32 = 0;
+        let mut pixel_width: u32 = 0;
+        let mut pixel_height: u32 = 0;
+        let mut source = PixelRect::default();
+        let mut placement_id: u32 = 0;
+        let mut kind: c_int = 0;
+        let fields: [(sys::GhosttyRenderStateImageData, *mut c_void); 18] = [
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_ID,
+                (&raw mut image_id).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_GENERATION,
+                (&raw mut generation).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_LAYER,
+                (&raw mut layer).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_Z,
+                (&raw mut z).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_COL,
+                (&raw mut col).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_ROW,
+                (&raw mut row).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_GRID_COLS,
+                (&raw mut grid_cols).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_GRID_ROWS,
+                (&raw mut grid_rows).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_X,
+                (&raw mut offset_x).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_Y,
+                (&raw mut offset_y).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_WIDTH,
+                (&raw mut pixel_width).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_HEIGHT,
+                (&raw mut pixel_height).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_X,
+                (&raw mut source.x).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_Y,
+                (&raw mut source.y).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_WIDTH,
+                (&raw mut source.width).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_HEIGHT,
+                (&raw mut source.height).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_PLACEMENT_ID,
+                (&raw mut placement_id).cast(),
+            ),
+            (
+                sys::GhosttyRenderStateImageData_GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_KIND,
+                (&raw mut kind).cast(),
+            ),
+        ];
+        let keys = fields.map(|(key, _)| key);
+        let mut values = fields.map(|(_, value)| value);
+        let mut written: usize = 0;
+        // SAFETY: iter handle non-null and on a placement; each value
+        // points at a live local of its key's documented type, the enums
+        // as 4-byte `c_int`s (see `read_enum`).
+        let rc = unsafe {
+            sys::ghostty_render_state_image_get_multi(
+                self.image_iter,
+                keys.len(),
+                keys.as_ptr(),
+                values.as_mut_ptr(),
+                &mut written,
+            )
+        };
+        Error::from_result(rc)?;
+        if written != keys.len() {
+            return Err(Error::InvalidValue);
+        }
+        Ok(Some(ImagePlacement {
+            image_id,
+            generation,
+            layer: ImageLayer::from_raw(layer)?,
+            z,
+            col,
+            row,
+            grid_cols,
+            grid_rows,
+            offset_x,
+            offset_y,
+            pixel_width,
+            pixel_height,
+            source,
+            placement_id,
+            kind: PlacementKind::from_raw(kind)?,
+        }))
     }
 
     /// Rebind `self.row_iter` to the current frame's state.
@@ -850,9 +1087,10 @@ fn read_row_flag(row: sys::GhosttyRow, data: sys::GhosttyRowData) -> bool {
 
 impl Drop for RenderState {
     fn drop(&mut self) {
-        // SAFETY: all three handles allocated by constructor; we own
+        // SAFETY: all four handles allocated by constructor; we own
         // them exclusively. Free in reverse construction order.
         unsafe {
+            sys::ghostty_render_state_image_iterator_free(self.image_iter);
             sys::ghostty_render_state_row_cells_free(self.row_cells);
             sys::ghostty_render_state_row_iterator_free(self.row_iter);
             sys::ghostty_render_state_free(self.handle);
@@ -884,6 +1122,19 @@ mod color_tests {
 mod tests {
     use super::*;
     use crate::{Terminal, TerminalOptions};
+
+    #[test]
+    fn placements_are_refused_after_an_incomplete_update() {
+        let terminal = Terminal::new(TerminalOptions::default()).expect("terminal");
+        let mut render = RenderState::new().expect("render state");
+        render.update(&terminal).expect("update");
+        assert!(render.image_placements().expect("complete").is_empty());
+        render.incomplete = true;
+        assert!(matches!(
+            render.image_placements(),
+            Err(Error::InvalidValue)
+        ));
+    }
 
     /// Regression test for the row-iterator binding bug fixed in M1 of
     /// `polish/gtk-parity`. Pre-fix, `walk` passed the iterator handle's
