@@ -2149,6 +2149,9 @@ async fn a_replaced_generation_never_announces_for_its_successor() {
         )
         .expect("respawn");
     let new = sup.tab_commands(939).expect("the replacement's tab task");
+    // `spawn` returns before the replacement's task has registered its
+    // generation; it serves commands only after, so one round trip proves it.
+    quiesce(&new).await;
 
     let decision = decide(&old, 1, "a", true, geometry(100, 30, 8, 16)).await;
     assert!(

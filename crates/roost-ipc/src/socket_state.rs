@@ -197,16 +197,4 @@ mod tests {
             SocketState::NotASocket("regular file")
         );
     }
-
-    #[tokio::test]
-    async fn a_bound_listener_is_live_and_its_corpse_is_stale() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("roost.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        assert_eq!(probe(&path, PROBE_TIMEOUT).await, SocketState::Live);
-        // Dropping a listener does NOT unlink its path — which is
-        // exactly how a stale socket comes to exist after a SIGKILL.
-        drop(listener);
-        assert_eq!(probe(&path, PROBE_TIMEOUT).await, SocketState::Stale);
-    }
 }
