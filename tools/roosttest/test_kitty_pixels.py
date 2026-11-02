@@ -325,29 +325,32 @@ def test_a_freed_image_leaves_its_cells(roost, project, tmp_path):
 
 
 def test_unicode_placeholder_cells_show_the_image_and_no_glyph(roost, project, tmp_path):
-    """A `U=1` placement draws in its placeholder cells, row by row, with
-    no gap between the rows' slices, and the U+10EEEE text those cells
-    hold is never drawn: a font with a notdef glyph would box every
-    cell (yazi on macOS). The cells' foreground is palette 196, a red no
-    image pixel has, so any ink shows."""
+    """A `U=1` placement draws in its placeholder cells, each row its own
+    slice of the image (green over purple) with no seam between them, and
+    the U+10EEEE text those cells hold is never drawn: a font with a
+    notdef glyph would box every cell (yazi on macOS). The cells'
+    foreground is palette 196, a red no image pixel has, so any ink
+    shows."""
     tab, (cw, ch) = _scene(roost, project)
     width, height = 4 * cw, 2 * ch
     roost.tab_feed_pty_bytes(
         tab,
-        virtual(196, solid(GREEN, width, height), width, height, 4, 2)
+        virtual(196, solid(GREEN, width, ch) + solid(PURPLE, width, ch), width, height, 4, 2)
         + placeholders(196, row=3, col=5, cols=4, rows=2),
     )
     _listed(roost, tab, 2)
     grid = _capture_grid(roost, tab, _artifact(tmp_path, "kitty-placeholders"))
 
-    for row in (3, 4):
-        stray = _only(grid.cells(5, row, cols=4), GREEN)
-        assert not stray, f"row {row} isn't only the image: {sorted(set(stray))[:4]}"
+    for row, color in ((3, GREEN), (4, PURPLE)):
+        stray = _only(grid.cells(5, row, cols=4), color)
+        assert not stray, f"row {row} isn't only its slice: {sorted(set(stray))[:4]}"
     seam = grid.y0 + 4 * grid.cell_h
     left, right = grid.x0 + 5 * grid.cell_w + 1, grid.x0 + 9 * grid.cell_w - 1
-    gap = [_pixel(grid.shot, x, y) for y in (seam - 1, seam) for x in range(left, right)]
-    assert not _only(gap, GREEN), "a seam between the two rows' slices"
+    for y, color in ((seam - 1, GREEN), (seam, PURPLE)):
+        edge = [_pixel(grid.shot, x, y) for x in range(left, right)]
+        assert not _only(edge, color), f"a seam between the rows' slices at y={y}"
     background = grid.corner(1, 0)
     for col, row in [(4, 3), (9, 3), (5, 2), (8, 5)]:
         assert grid.corner(col, row) == background, (col, row)
-        assert GREEN not in grid.cells(col, row), f"the image spilled into {(col, row)}"
+        spilled = {GREEN, PURPLE} & set(grid.cells(col, row))
+        assert not spilled, f"the image spilled into {(col, row)}"
