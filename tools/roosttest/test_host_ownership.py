@@ -257,7 +257,6 @@ def test_a3_an_explicit_switch_takes_before_the_snapshot(host, roost):
         tab = size_tab(host.env, session)
         desk = raw(host.env, session, tab, "desk-a3", True, DESK)
         on_desk = bytearray()
-        child_says(desk, on_desk, b"UP")
         view = view_grid(roost)
         assert view != DESK
 

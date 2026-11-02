@@ -108,13 +108,21 @@ def project_of(client: Roost) -> int:
 
 
 def size_tab(env, client: Roost) -> int:
-    return client.open_tab(
+    """A tab running `SIZE_CHILD`, returned once its `UP` is on screen.
+
+    `UP` is written once. Read off the data plane, it could land inside
+    the attach's snapshot, which a PTY-frame reader never sees, and the
+    wait for it would run out (#678). An attach made after it is on
+    screen carries it in the snapshot, so every later byte is new."""
+    tab = client.open_tab(
         project_of(client),
         cwd=str(env.launch_cwd),
         cols=COLS,
         rows=ROWS,
         argv=[sys.executable, "-c", SIZE_CHILD],
     )
+    client.wait_text(tab, "UP", timeout=30.0)
+    return tab
 
 
 def quiet_tab(env, client: Roost) -> int:
@@ -308,7 +316,6 @@ def test_a3_an_explicit_switch_takes_before_the_snapshot(env):
         tab = size_tab(env, c)
         desk, _ = attached(env, c, tab, "desk", True, (COLS, ROWS))
         on_desk = bytearray()
-        child_says(desk, on_desk, b"UP")
 
         phone, reply = attach(env, c, tab, "phone", True, DESK, kind=dataplane.VT)
         assert reply.ok, (reply.code, reply.message)
@@ -435,7 +442,6 @@ def test_a4_keys_and_paste_take_with_the_resize_applied_first(env):
         desk, _ = attached(env, c, tab, "desk", True, (COLS, ROWS), cell_w_px=8, cell_h_px=16)
         phone, _ = attached(env, c, tab, "phone", False, DESK, cell_w_px=8, cell_h_px=16)
         on_desk, on_phone = bytearray(), bytearray()
-        child_says(desk, on_desk, b"UP")
         c.tab_feed_pty_bytes(tab, SIZE_REPORTS_ON)
         c.dump(tab)
         c.tab_capture_pty_input(tab)
@@ -540,7 +546,6 @@ def test_a10_tab_write_changes_nothing(env):
         desk, _ = attached(env, c, tab, "desk", True, (COLS, ROWS))
         phone, _ = attached(env, c, tab, "phone", False, DESK)
         on_desk = bytearray()
-        child_says(desk, on_desk, b"UP")
         third.send(tab, b"written\n")
         assert size_of(child_says(desk, on_desk, b"| written")) == (COLS, ROWS)
         assert geometry(c, tab) == (COLS, ROWS)
@@ -556,7 +561,6 @@ def test_a11_a_failed_apply_takes_nothing_and_still_delivers(env):
         desk, _ = attached(env, c, tab, "desk", True, (COLS, ROWS))
         phone, _ = attached(env, c, tab, "phone", False, DESK)
         on_desk = bytearray()
-        child_says(desk, on_desk, b"UP")
         c.call("tab.fail_next_resize", {"tab_id": str(tab)})
         phone.send_input(b"delivered\n", take=dataplane.TAKE_BEFORE)
         line = child_says(desk, on_desk, b"| delivered")
@@ -759,7 +763,6 @@ def test_a19_a_grid_sits_at_its_sequence_position_whatever_the_delivery_order(en
         tab = size_tab(env, c)
         desk, _ = attached(env, c, tab, "desk", True, (COLS, ROWS))
         on_desk = bytearray()
-        child_says(desk, on_desk, b"UP")
         for events_first in (True, False):
             with EventStream(env.socket) as stream:
                 stream.subscribe()
@@ -778,7 +781,7 @@ def test_a19_a_grid_sits_at_its_sequence_position_whatever_the_delivery_order(en
                     grid["rows"],
                     grid["owner"],
                 ), "tab.resized and GRID agree"
-                assert grid["seq"] == (desk.last_seq or 0), (
+                assert grid["seq"] == desk.next_seq - 1, (
                     "the GRID names the last PTY seq before it"
                 )
                 assert b"WINCH 30 100" not in on_desk, "the SIGWINCH marker came before the GRID"
