@@ -286,10 +286,7 @@ async fn restricted_pump(socket: UnixStream, old_socket: &Path) -> anyhow::Resul
                 Admit::Refuse(reply) => write_line(&replies, &reply).await?,
             }
         }
-        socket_write
-            .shutdown()
-            .await
-            .context("half-close the session socket")
+        half_close(socket_write).await
     });
     let downstream = async {
         let mut lines = FrameReader::new(socket_read);
@@ -355,10 +352,17 @@ async fn stdin_to_socket(mut socket: OwnedWriteHalf) -> anyhow::Result<()> {
     // The session must see a real EOF on its read half, not a connection
     // that merely went quiet — that is how a client's own half-close
     // reaches it through the bridge.
-    socket
-        .shutdown()
-        .await
-        .context("half-close the session socket")
+    half_close(socket).await
+}
+
+/// A session that already replied and closed leaves nothing to half-close:
+/// macOS answers that `shutdown` with ENOTCONN where Linux succeeds, and the
+/// bridge had relayed everything, so it is not a failure.
+async fn half_close(mut socket: OwnedWriteHalf) -> anyhow::Result<()> {
+    match socket.shutdown().await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotConnected => Ok(()),
+        r => r.context("half-close the session socket"),
+    }
 }
 
 async fn socket_to_stdout(mut socket: OwnedReadHalf) -> anyhow::Result<()> {
