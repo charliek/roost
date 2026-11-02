@@ -1,7 +1,10 @@
 # The protocol-7 release: sessions everywhere, Ghostty main, program status
 
 **Status: decided, 2026-10-28; panel-reviewed the same day (Codex
-astra, GLM 5.3, CodeRabbit). Not started.**
+astra, GLM 5.3, CodeRabbit). All five milestones merged by 2026-10-31,
+and the two pre-release plans added on 2026-10-31 merged on
+2026-11-01 ([Pre-release additions](#pre-release-additions)). The
+release itself is not cut yet: see [At release](#protocol).**
 
 This is the source of truth for the next release. Each milestone below
 runs as its own plan (`/flows:gauntlet`). Every milestone plan cites
@@ -1440,6 +1443,31 @@ because these files churn (#568, #570, #597).
 
 ---
 
+## Pre-release additions
+
+Charlie added two plans to the release on 2026-10-31, after M5. Both
+are merged on `main`, so neither is left for the release cut:
+
+- **Plan 087, hardening** (#675, merged `75c8b439`, thirteen issues
+  closed). It amends protocol 7 in place, as the release rules allow:
+  the GRID frame and the attach reply now carry the session terminal's
+  cell px, and host mirrors size their terminal with them. The rest is
+  correctness and flake fixes found after the milestones.
+- **Plan 088, Kitty graphics drawn in iced** (#677, merged `fb65a92a`,
+  closes #645). Images draw on local and session tabs, the snapshot
+  carries them across an attach, and `tab.dump_resolved` gains an
+  additive `images` field. No protocol change. It also adds:
+  - device-pixel cell sizes on HiDPI;
+  - a pixel-carrying PTY winsize;
+  - `window_metrics.scale_factor`.
+
+  The CHANGELOG's behaviour notes should cover these: size reports
+  (CSI 14t/16t, mode 2048) answer in device px on HiDPI, and the PTY
+  reports a pixel size. Animation is deferred to #676.
+
+**Still open at the cut:** the corpus re-check and the one CHANGELOG
+bullet from [Protocol](#protocol). Two CI flakes are filed as #678.
+
 ## Test plan, across milestones
 
 - **Unit tests** live inline, in `#[cfg(test)]`:
@@ -1489,7 +1517,8 @@ These change in the milestone PRs, not here:
 
 ## Out of scope (tracked)
 
-- **Kitty graphics:** #645.
+- ~~**Kitty graphics:** #645.~~ Pulled in as plan 088; animation
+  stays out (#676).
 - **Scrollback search:** #167.
 - **History compression and parking:** #366, measured with M1's memory
   query.

@@ -1,7 +1,9 @@
 # Sessions everywhere: work that doesn't care where you sit
 
-**Status: discovery, 2026-10-23. Partly decided on 2026-10-28. G2
-shipped in plan 084 (2026-10-30), see [G2](#g2-window-size-with-several-clients).**
+**Status: discovery, 2026-10-23. Partly decided on 2026-10-28. G1, G2
+and G9 landed on `main` in the protocol-7 milestones (by 2026-10-31,
+not yet released); see [G2](#g2-window-size-with-several-clients). G5's
+Kitty item closed in plan 088.**
 [protocol-7-release.md](protocol-7-release.md) is now the source of
 truth for G1, G2 and the new G9, and supersedes the leanings below
 where they differ. The [decision summary](#decided-2026-10-28-protocol-7-release)
@@ -314,9 +316,11 @@ connect if present, since they're local and cheap to try. Possibly an
 These would make retiring in-process tabs a regression for someone, so
 they have to be closed, or explicitly accepted, first:
 
-- Kitty graphics render blank after attach, because the snapshot
-  doesn't carry them (`docs/development/host-sessions.md`, "Known
-  limitations").
+- ~~Kitty graphics render blank after attach.~~ Closed by plan 088
+  (#677, 2026-11-01): the iced UI draws images on session tabs, and the
+  snapshot carries them across an attach. A build-skew `vt` attach
+  still drops images sent before it (`docs/development/host-sessions.md`,
+  "Known limitations").
 - Effects that fire while nobody is attached (bell, clipboard) are
   gone, by design. Notifications within the replay window are replayed.
 - Reduced fidelity on a build-skew `vt` attach (wrapped lines replay as

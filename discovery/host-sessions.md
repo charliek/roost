@@ -5,6 +5,15 @@ Status: **discovery** — not a commitment, not a roadmap slice. Written
 upstream libghostty-vt, and Superlogical’s public multiplexer design.
 Update this file when a later pass changes the recommendation.
 
+**Superseded (2026-11-01 note):** this discovery graduated on
+2026-08-26 to [host-sessions-roadmap.md](host-sessions-roadmap.md) and
+[host-sessions-architecture.md](host-sessions-architecture.md), which
+win where they differ. The roadmap tracks status; the open work after
+the protocol-7 release continues in
+[sessions-everywhere.md](sessions-everywhere.md) and
+[mobile-client.md](mobile-client.md). The text below is kept as
+written.
+
 The feature: an opt-in way to connect a **host** (this machine or
 another) so projects and tabs on that host survive closing the Roost
 window, with native iced chrome. Default Roost stays what it is today.

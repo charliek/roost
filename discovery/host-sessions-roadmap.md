@@ -803,7 +803,11 @@ the ladder's actionable three-rung message — newly reachable on macOS,
 and not diagnosable without [#382](https://github.com/charliek/roost/issues/382)'s
 connection-state op.
 
-#### HS-4c — Mac as an SSH host
+#### HS-4c — Mac as an SSH host (PR #643) — SHIPPED
+
+**Shipped in v0.0.26 (2026-10-19)** as PR #643: the bootstrap installs
+and upgrades `roost-session` on a Mac over ssh, from the
+`darwin-arm64` release asset. The scope as planned:
 
 Connect *to* a Mac the way HS-3 connects to a Linux box. Everything
 HS-4b ships, plus the bootstrap grows an OS axis: `check_os` accepts
@@ -820,7 +824,14 @@ is manual-only — there is no macOS analog of the shed VM — and the
 artifact matrix only fully proves itself at tag time, so it lands
 after HS-4b has proven the Mac binary in the wild.
 
-#### HS-4d — Multi-client: viewports vs. takeover integrity
+#### HS-4d — Multi-client: viewports vs. takeover integrity — RESOLVED
+
+**Resolved by neither alternative below.** Protocol 5 retired the lease
+and takeover (plan 061), so every client sees every tab and #381 is
+closed. Protocol 7's size ownership
+([protocol-7-release.md](protocol-7-release.md) M3) settles which
+client's size a tab uses. Independent per-client viewports were not
+built. The original framing:
 
 Two alternatives to weigh together, not a sequence: **independent
 per-client viewports** (replacing takeover outright) versus

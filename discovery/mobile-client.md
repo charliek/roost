@@ -1,17 +1,26 @@
 # Roost on mobile: a Flutter client for host sessions
 
-**Status: discovery, 2026-10-27. Direction decided on 2026-10-28.**
+**Status: discovery, 2026-10-27. Direction decided on 2026-10-28.
+Prerequisites all merged by 2026-11-01; the MVP branch waits only on
+the protocol-7 release cut.**
 The MVP will be built on a feature branch *after* the protocol-7
 release ([protocol-7-release.md](protocol-7-release.md)). That release
 lands the prerequisites on `main`, each of which is also a desktop
-improvement:
-- finding the session (G1);
-- tab size ownership (G2), which **supersedes the Fit/Mirror design in
-  [Sizing](#sizing-the-one-real-protocol-question)**;
-- tab environment by opener;
-- OSC 7501 program status;
-- Ghostty main with Zig 0.17;
-- the first `roost-client` extraction (B1).
+improvement. All six are merged:
+
+| Prerequisite | Landed in |
+|---|---|
+| Finding the session (G1) | M2, #653 |
+| Tab size ownership (G2), which **supersedes the Fit/Mirror design in [Sizing](#sizing-the-one-real-protocol-question)** | M3, #663 |
+| Tab environment by opener | M4, #668 |
+| OSC 7501 program status | M1, #647/#648 |
+| Ghostty main with Zig 0.17 | M1 |
+| The first `roost-client` extraction (B1) | M5, #671 |
+
+The release also gained Kitty graphics drawn on the desktop (plan 088,
+#677), which changes two facts below: the [image line under rendering](#terminal-rendering-in-flutter)
+and cell sizes in device pixels. Code citations below predate these
+merges unless a line says otherwise.
 
 [Decisions from the 2026-10-27/28 review](#decisions-from-the-2026-1027-28-review)
 lists what changed. A mockup canvas is at
@@ -160,6 +169,19 @@ back. It is never a second source of truth.
 
 **`roost-client` (new): extracted from `roost-iced`.**
 
+> **Update, 2026-11-01: step B1 shipped** (protocol-7 M5, #671). The
+> crate is `crates/roost-client/`, and iced imports it. It holds
+> `state.rs`, `mirror.rs`, `reconnect.rs`, `queue.rs` and `upload.rs`,
+> plus `ConnectFailure` (`lib.rs`) and `Shutdown`/`scale()` (`task.rs`).
+> `check_compatibility` is at `crates/roost-client/src/state.rs:226`. Its
+> closure holds no iced, winit, wgpu or `roost-engine`, and it doesn't
+> turn on `roost-vt`'s `ffi` feature; CI's `rust-build` checks both.
+> Still in iced, and still to move behind `HostSink`, `Dialer` and
+> `AttachTarget`: `host_conn.rs` (about 6.2k lines with tests),
+> `host_conn/task.rs` (about 5.0k), `host_conn/restart.rs`, and
+> `app/host_tab.rs` (about 4.7k). None of those seams exists yet. The
+> table and line numbers below are the pre-B1 survey.
+
 The iced host client lives inside the binary crate, under
 `crates/roost-iced/src/`. `host_conn.rs` and `host_conn/*` hold about
 7.0k production lines, and `app/host_tab.rs` about 1.46k. There are
@@ -190,7 +212,8 @@ The proposed event API keeps today's shape: `HostEvent` mirrors the
 2. **Drop order.** `HostConnSet` and the host attaches must drop before
    the runtime they run on, because their `Drop` signals runtime tasks
    to wind down. iced gets this from field order
-   (`crates/roost-iced/src/app.rs:3413-3423`). Whatever owns them in
+   (`crates/roost-iced/src/app.rs:3413-3423` at survey time; the
+   `runtime` field now sits near the end of `App`, at `app.rs:3739`). Whatever owns them in
    `roost-mobile` (`RoostApp` below) needs the same field order, or an
    explicit `Drop`.
 3. Under `local-backend = session`, which a fresh Roost-Iced install
@@ -208,8 +231,9 @@ mobile-only change.
 | B | Move the four pure modules now (state, mirror, reconnect, queue), with iced importing them from `roost-client`. Write a mobile-shaped task and attach in `roost-client` against `Dialer`. Converge iced's `task.rs`/`host_tab.rs` onto it after the MVP. | The tricky pure logic (compatibility gate, mirror folding, retry policy) has one copy immediately. The first move is low risk. | For a while, two connection tasks live in the repo. |
 | C | Write the mobile client inside `roost-mobile` | Fastest start | It becomes a third implementation, counting shed-core's. This is the drift the crate exists to prevent. |
 
-**Leaning: B.** Its convergence step should be an explicit milestone
-with an exit criterion, not a hope.
+**Chosen: B.** Its first step shipped as M5. The convergence step
+(B2) should be an explicit milestone with an exit criterion, not a
+hope.
 
 **`roost-mobile` (new): the FRB crate.**
 
@@ -462,7 +486,22 @@ the MVP, and it overlaps G2.
   the same default as iced, so cell metrics and glyph coverage match the
   desktop. Pinch-to-zoom changes the font size, which changes the grid,
   so it must debounce the same way window resizes do.
-- Kitty graphics stay blank after attach, as on the desktop (G5).
+- **Kitty graphics.** The desktop draws them since plan 088 (#677),
+  and a session's snapshot carries them across an attach. Whether the
+  MVP painter draws them is open (see [Open questions](#open-questions)).
+  `roost-vt` already has the toolkit-neutral API:
+  - `RenderState::image_placements` (`crates/roost-vt/src/render_state.rs:588`)
+    returns the resolved draw list in libghostty's order;
+  - `Terminal::kitty_image` (`crates/roost-vt/src/kitty.rs:274`)
+    returns the pixels, and `to_rgba` converts them.
+
+  The frame protocol would need an image side channel, keyed on
+  (image id, generation) as iced's texture cache is.
+- **Cell size in device pixels.** Since plan 088 a desktop terminal's
+  cell px are device px (logical × scale, `crates/roost-iced/src/app/terminal_tab.rs:295`),
+  and the PTY winsize carries them. `TerminalHandle::resize`'s
+  `cell_w`/`cell_h` should be logical × `devicePixelRatio` the same
+  way, so size reports and image placement match the device.
 
 ## Input
 
@@ -573,8 +612,9 @@ The MVP refuses any session whose `session_protocol` differs from its
 own constant, and it is built from the same commit as the
 `roost-session` it ships alongside.
 
-- `SESSION_PROTOCOL_VERSION` has been `6` since 2026-09-15
-  (`crates/roost-ipc/src/messages.rs:2436`).
+- `SESSION_PROTOCOL_VERSION` is `7` on `main`
+  (`crates/roost-ipc/src/messages.rs:2731`). It was `6` from 2026-09-15
+  until the unreleased protocol-7 work.
 - A Ghostty pin mismatch doesn't refuse the session; it falls back to
   the `vt` payload kind, at lower fidelity.
 - It isn't a one-way door. The check is the client's own policy, and
@@ -610,15 +650,18 @@ mobile-only plumbing (build targets, `peer.rs`, the stream-generic
 2, the `Dialer` and the minimal connection task. "Fit and Mirror
 modes" in step 4 no longer exist.
 
-1. **Plumbing.**
-   - Target-aware `build.sh` and `build.rs`.
-   - Fix the `peer.rs` Android warnings.
-   - Make `IpcClient` and `EventStream` stream-generic.
+1. **Plumbing.** None of it has started on `main` (checked 2026-11-01).
+   - Target-aware `build.sh` and `build.rs`. `build.rs` still reads
+     `third_party/ghostty/out` (`crates/roost-vt/build.rs:40`).
+   - Fix the `peer.rs` Android warnings. Android still takes the
+     fallback `cfg` (`crates/roost-ipc/src/peer.rs:35,67,82`).
+   - Make `IpcClient` and `EventStream` stream-generic. Both still
+     hold a `UnixStream` (`crates/roost-ipc/src/client.rs:59,260`).
    - Add a CI job that builds `roost-vt` for Android, and optionally
      runs its tests on an emulator.
 2. **`roost-client`, step B1.**
-   - Move state, mirror, reconnect and queue, with iced importing them;
-     `e2e-iced` stays green.
+   - ~~Move state, mirror, reconnect and queue, with iced importing
+     them.~~ Done in protocol-7 M5 (#671).
    - Add `Dialer` and `UnixDialer`.
    - Write a minimal connection task (prologue, mirror, reconnect) and
      an attach/hydration path behind an `AttachTarget`. `roost-mobile`
@@ -632,7 +675,7 @@ modes" in step 4 no longer exist.
    - Hardware keys through `KeyEncoder`.
    - A soft-keyboard spike, then the real implementation.
    - The extra-keys bar, compose box, selection and copy, scrolling.
-   - Fit and Mirror modes.
+   - ~~Fit and Mirror modes.~~ Replaced by protocol-7 ownership.
 5. **SSH and devices.**
    - `SshDialer` with russh/ring, a key store, trust-on-first-use, Add
      Host, and Start session.
@@ -640,9 +683,9 @@ modes" in step 4 no longer exist.
    - The compact and medium layouts.
 6. **Mobile niceties.** Notification inbox, quick replies, Share to
    Roost, tab previews.
-7. **After the MVP.** Converge iced onto `roost-client` (step B2). Add
-   the server-side `tab.resized` event and the G2 background-wave rule.
-   Consider iOS.
+7. **After the MVP.** Converge iced onto `roost-client` (step B2).
+   Consider iOS. ~~Add the server-side `tab.resized` event and the G2
+   background-wave rule.~~ Shipped in protocol-7 M3.
 
 **MVP exit criterion.** From a tablet and from a phone on the same
 tailnet, you can:
@@ -655,8 +698,10 @@ tailnet, you can:
 - answer an agent prompt with a quick reply;
 - survive backgrounding and a network change without losing the tab.
 
-And the desktop's open copy of that tab hasn't been resized unless the
-user chose Fit.
+And the size follows the protocol-7 ownership rules. The phone takes
+a tab's size when it switches to it or types into it. The desktop gets
+the size back when the phone goes to the background and sends
+`release`. The compose box and quick replies never take the size.
 
 ## Risks
 
@@ -704,6 +749,10 @@ user chose Fit.
 - **iOS.** Background networking is far stricter there. Is "reconnect on
   foreground" enough for iOS v1? Ghostty already builds an iOS
   xcframework (`src/build/GhosttyLibVt.zig:148-215`).
+- **Kitty graphics in the MVP painter.** The desktop draws them now
+  (plan 088). Draw them in the MVP too, or ship blank images first and
+  add them later? The `roost-vt` API is ready either way (see
+  [rendering](#terminal-rendering-in-flutter)).
 - **D1.** If the MVP happens, the roadmap's D1 and the vision's
   non-goals need amending in the same PR.
 
