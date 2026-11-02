@@ -83,7 +83,16 @@ from agent_jail import (
 from client import Roost, RoostError, scaled_timeout
 from eventstream import EventStream
 from host_probe import host_key, sibling_key  # noqa: F401  (re-exported)
-from test_kitty_images import cell_px, images_of, place, placed, settled_images
+from test_kitty_images import (
+    cell_px,
+    images_of,
+    place,
+    placed,
+    placeholder_runs,
+    placeholders,
+    settled_images,
+    virtual,
+)
 from test_program_status import PROBE, PROBE_REPLY, osc7501
 from util import (
     assert_opened_in,
@@ -841,6 +850,26 @@ def test_a_host_tabs_images_are_the_sessions_after_a_snapshot_attach_and_live(ho
         both = [snapshot_image, placed(52, 4, 6, cell)]
         settled_images(lambda: images_of(session.tab_dump_resolved(tab)), both, 30.0)
         assert wait_mirror_lists_the_sessions_images(roost, session, tab, key) == both
+
+
+def test_a_host_tabs_unicode_placeholder_images_are_the_sessions(host, roost):
+    """A `U=1` placement's per-row runs reach a host tab's mirror as the
+    session resolved them, and the session's list is checked against
+    the cells first, so two empty lists can't agree."""
+    host.connect_and_wait()
+    with host.client() as session:
+        tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
+        key = host_key(roost, tab)
+        cell = cell_px(roost.window_metrics())
+        width, height = 3 * cell[0], 2 * cell[1]
+        session.tab_feed_pty_bytes(
+            tab,
+            virtual(62, bytes(4 * width * height), width, height, 3, 2)
+            + placeholders(62, row=2, col=1, cols=3, rows=2),
+        )
+        want = placeholder_runs(62, 2, 1, 3, 2, cell)
+        settled_images(lambda: images_of(session.tab_dump_resolved(tab)), want, 30.0)
+        assert wait_mirror_lists_the_sessions_images(roost, session, tab, key) == want
 
 
 def test_a_refocus_resumes_without_blanking_or_duplicating(host, roost):
