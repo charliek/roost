@@ -2450,6 +2450,15 @@ fn claude_install(json: bool) -> Result<i32, CliError> {
 /// still need to build a fixture shaped like what a pre-046 install
 /// wrote — the same shell quoting `roost-cli`'s `doctor::shell_split`
 /// has to read back.
+/// Held by every test that sets a process-global variable (`$HOME`,
+/// `PATH`, …) and by every test that reads a path derived from one: the
+/// tests share a process, and a `$HOME` one test points at a temp dir
+/// stretches another's session socket past `SUN_LEN` on macOS. A tokio
+/// mutex rather than a `std` one: it is the only kind that may be held
+/// across an `.await`.
+#[cfg(test)]
+static TEST_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 fn quote_for_shell(s: &str) -> String {
     let needs_quote = s
