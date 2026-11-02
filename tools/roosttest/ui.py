@@ -630,8 +630,10 @@ def _wait_menu_installed(target: str, deadline: float, timeout: float) -> None:
             c.app_menu_dump()
             return
         except RoostError as e:
-            if "not installed yet" not in e.message:
+            if e.code == "not-enabled":
                 return
+            if "not installed yet" not in e.message:
+                raise
         finally:
             c.close()
         if time.monotonic() >= deadline:

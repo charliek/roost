@@ -517,10 +517,22 @@ async fn a_session_that_answered_and_closed_before_stdin_eof_is_not_an_error() {
     let mut server = fixture.accept().await;
 
     let payload: Vec<u8> = (0..4 * 1024 * 1024usize).map(|i| (i % 251) as u8).collect();
-    let stalled = tokio::time::timeout(Duration::from_millis(500), server.write_all(&payload))
-        .await
-        .is_err();
-    assert!(stalled, "the bridge kept draining a stdout nobody reads");
+    let mut sent = 0;
+    while sent < payload.len() {
+        match tokio::time::timeout(Duration::from_millis(500), server.writable()).await {
+            Err(_) => break,
+            Ok(ready) => ready.expect("writable"),
+        }
+        match server.try_write(&payload[sent..]) {
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("write the answer: {e}"),
+        }
+    }
+    assert!(
+        sent < payload.len(),
+        "the bridge kept draining a stdout nobody reads"
+    );
     drop(server);
 
     fixture.close_stdin();
@@ -530,8 +542,12 @@ async fn a_session_that_answered_and_closed_before_stdin_eof_is_not_an_error() {
         .expect("the bridge exits");
     let seen = drain.await.expect("the drain task");
 
-    assert!(!seen.is_empty(), "the answer reaches stdout");
-    assert_eq!(seen, payload[..seen.len()], "byte-exact, in order");
+    assert_eq!(
+        seen.len(),
+        sent,
+        "every byte the session wrote reaches stdout"
+    );
+    assert_eq!(seen, payload[..sent], "byte-exact, in order");
     assert_eq!(status.code(), Some(0), "everything was relayed");
 }
 
