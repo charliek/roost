@@ -514,7 +514,7 @@ fn spawn_bridge_with(root: &Path, ssh_connection: &str, ssh_client: Option<&str>
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_that_answered_and_closed_before_stdin_eof_is_not_an_error() {
     let mut fixture = Fixture::start();
-    let mut server = fixture.accept().await;
+    let server = fixture.accept().await;
 
     let payload: Vec<u8> = (0..4 * 1024 * 1024usize).map(|i| (i % 251) as u8).collect();
     let mut sent = 0;
