@@ -99,6 +99,67 @@ def placed(image_id: int, row: int, col: int, cell: tuple[int, int]) -> dict:
     }
 
 
+#: Kitty's row and column diacritics: the cell's index is the
+#: diacritic's position in this list (`rowcolumn-diacritics.txt`).
+DIACRITICS = "\u0305\u030d\u030e\u0310"
+PLACEHOLDER = "\U0010eeee"
+
+
+def virtual(image_id: int, rgba: bytes, width: int, height: int, cols: int, rows: int) -> bytes:
+    """Transmit `rgba` as `image_id` with a `U=1` virtual placement
+    `cols` × `rows` cells large, chunked as kitty requires. Nothing is
+    drawn until placeholder cells name it."""
+    data = base64.b64encode(rgba)
+    chunks = [data[i : i + 4096] for i in range(0, len(data), 4096)] or [b""]
+    keys = f"a=T,U=1,t=d,f=32,q=2,i={image_id},s={width},v={height},c={cols},r={rows}"
+    out = b""
+    for index, chunk in enumerate(chunks):
+        more = int(index < len(chunks) - 1)
+        head = f"{keys},m={more}" if index == 0 else f"m={more}"
+        out += f"\x1b_G{head};".encode() + chunk + b"\x1b\\"
+    return out
+
+
+def placeholders(image_id: int, row: int, col: int, cols: int, rows: int) -> bytes:
+    """Placeholder cells showing all of virtual placement `image_id`
+    (< 256, named by the 256-colour foreground) from the 0-based
+    `row`/`col`. Each row's first cell carries its row and column
+    diacritics; the rest continue the run."""
+    out = b""
+    for r in range(rows):
+        cells = PLACEHOLDER + DIACRITICS[r] + DIACRITICS[0] + PLACEHOLDER * (cols - 1)
+        out += f"\x1b[{row + r + 1};{col + 1}H\x1b[38;5;{image_id}m".encode()
+        out += cells.encode() + b"\x1b[39m"
+    return out
+
+
+def placeholder_runs(image_id: int, row: int, col: int, cols: int, rows: int, cell) -> list[dict]:
+    """What `placeholders` lists for an image exactly `cols` × `rows`
+    cells of `cell` px: one placement per row, each its own slice of
+    the image, under the text."""
+    width, height = cols * cell[0], rows * cell[1]
+    return [
+        {
+            "image_id": image_id,
+            "placement_id": 0,
+            "layer": "below-text",
+            "z": -1,
+            "col": col,
+            "row": row + r,
+            "grid_cols": cols,
+            "grid_rows": 1,
+            "offset_x": 0,
+            "offset_y": 0,
+            "pixel_width": width,
+            "pixel_height": cell[1],
+            "source": {"x": 0, "y": r * cell[1], "width": width, "height": cell[1]},
+            "image_width": width,
+            "image_height": height,
+        }
+        for r in range(rows)
+    ]
+
+
 def images_of(dumped: dict) -> list[dict]:
     return dumped.get("images", [])
 
@@ -156,6 +217,24 @@ def test_a_hidden_tab_keeps_its_list(roost, project):
     # `tab.dump` refreshes the tab's snapshot before it reads it.
     roost.dump(tab)
     assert read() == want
+
+
+def test_unicode_placeholders_list_one_placement_per_row(roost, project):
+    """A `U=1` virtual placement draws where its placeholder cells are,
+    as yazi and tmux use it: libghostty resolves each row of cells into
+    its own placement showing that row's slice of the image."""
+    tab = quiet_tab(roost, project)
+    cell = cell_px(roost.window_metrics())
+    read = lambda: images_of(roost.tab_dump_resolved(tab))  # noqa: E731
+    width, height = 3 * cell[0], 2 * cell[1]
+
+    roost.tab_feed_pty_bytes(tab, virtual(61, bytes(4 * width * height), width, height, 3, 2))
+    roost.tab_feed_pty_bytes(tab, b"\x1b[1;1Hvirtual-sent")
+    roost.wait_text(tab, "virtual-sent")
+    assert read() == [], "a virtual placement with no placeholder cells draws nothing"
+
+    roost.tab_feed_pty_bytes(tab, placeholders(61, row=4, col=2, cols=3, rows=2))
+    settled_images(read, placeholder_runs(61, 4, 2, 3, 2, cell))
 
 
 #: Prints the shell's own `TIOCGWINSZ`, `rows,cols,xpixel,ypixel`, between
