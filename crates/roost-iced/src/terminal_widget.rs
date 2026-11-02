@@ -687,6 +687,12 @@ struct InkedCell<'a> {
 
 /// The foreground pass: every cell that draws ink, sprites and glyphs
 /// alike, in its role's ink (see [`cell_ink`]).
+/// The Kitty graphics Unicode placeholder. A cell holding it (plus its
+/// row and column diacritics) marks where a `U=1` virtual placement's
+/// image goes; libghostty lists that image as a placement, and the cell's
+/// text is never drawn.
+const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
+
 fn inked_cells(
     snapshot: &TerminalSnapshot,
     cursor: Option<BlockCursor>,
@@ -703,7 +709,11 @@ fn inked_cells(
             let selection = snapshot.selection_on(row_y);
             row.cells
                 .iter()
-                .filter(|cell| !cell.text.is_empty() && cell.text != " ")
+                .filter(|cell| {
+                    !cell.text.is_empty()
+                        && cell.text != " "
+                        && !cell.text.starts_with(KITTY_PLACEHOLDER)
+                })
                 .map(move |cell| InkedCell {
                     row: row_y,
                     cell,
@@ -2090,6 +2100,24 @@ mod tests {
         inked_cells(snapshot, snapshot.block_cursor(focused), metrics())
             .map(|inked| (inked.cell.col, inked.ink, inked.sprite.is_some()))
             .collect()
+    }
+
+    #[test]
+    fn kitty_placeholder_cells_draw_no_text() {
+        let snapshot = cursor_snapshot(
+            0,
+            40,
+            vec![
+                draw_cell(0, "\u{10EEEE}\u{0305}\u{0305}"),
+                draw_cell(1, "\u{10EEEE}"),
+                draw_cell(2, "a"),
+            ],
+        );
+        let cols: Vec<u16> = ink_by_col(&snapshot, true)
+            .into_iter()
+            .map(|(col, _, _)| col)
+            .collect();
+        assert_eq!(cols, vec![2]);
     }
 
     #[test]
