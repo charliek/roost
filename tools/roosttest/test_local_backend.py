@@ -304,6 +304,19 @@ class Lane:
         with self.session() as c:
             return c.list()
 
+    def session_holds_a_project(self) -> bool:
+        """`socket_answers` and then a project, asked as one predicate:
+        a daemon on its way out can answer one connect and be gone by the
+        next (#638), and that is "not yet", not a failure."""
+        try:
+            return bool(self.session_projects())
+        except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError, BrokenPipeError):
+            return False
+        except RoostError as e:
+            if e.code == "disconnected":
+                return False
+            raise
+
     def empty_the_session(self) -> None:
         """Leave the daemon running with no projects at all.
 
@@ -1685,7 +1698,7 @@ def session_ui(lane: Lane, **launch) -> Roost:
     """
     roost = lane.start("session", **launch)
     wait_until(
-        lambda: lane.socket_answers() and bool(lane.session_projects()),
+        lane.session_holds_a_project,
         120.0,
         "the slot to come up holding a project",
     )
@@ -3696,7 +3709,7 @@ def test_a_local_session_that_cannot_start_says_so_and_offers_the_way_out(
     the rest is written, and offers the two ways out.
 
     Both are pressed here. "Try again" runs the launch once more, which
-    settles where it was — the same notice, a newer showing. "Use
+    settles where it was — the same notice. "Use
     in-process tabs" raises the confirm card the palette's row does, in
     the words for a session that never ran, and nothing moves until it
     is confirmed. Confirming lands in-process with a tab to show, the
@@ -3723,8 +3736,18 @@ def test_a_local_session_that_cannot_start_says_so_and_offers_the_way_out(
         "actions": CANNOT_START_ACTIONS,
     }
 
+    # The attempt is what to wait on, not the notice: a launch that fails
+    # within one update never takes the notice down, so its generation
+    # need not move (#612).
+    attempts = roost.host_status(slot)["hosts"][0]["generation"]
     roost.notice_answer(CANNOT_START, slot, first["generation"], "reconnect")
-    again = shown_notice(roost, "the notice back after trying again", after=first["generation"])
+
+    def tried_again() -> bool:
+        host = roost.host_status(slot)["hosts"][0]
+        return host["generation"] > attempts and host["state"] != "connecting"
+
+    wait_until(tried_again, 60.0, "the second launch to settle")
+    again = shown_notice(roost, "the notice back after trying again")
     assert again["terminal"] == notice, again
 
     roost.notice_answer(CANNOT_START, slot, again["generation"], "use_in_process")

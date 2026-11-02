@@ -594,6 +594,9 @@ def wait_alive(target: str, timeout: float = 30.0) -> None:
             )
         time.sleep(0.25)
 
+    if target == "iced" and platform.system() == "Darwin":
+        _wait_menu_installed(target, deadline, timeout)
+
     if session_mode:
         return
 
@@ -613,6 +616,32 @@ def wait_alive(target: str, timeout: float = 30.0) -> None:
         )
     finally:
         c.close()
+
+
+def _wait_menu_installed(target: str, deadline: float, timeout: float) -> None:
+    """The macOS iced UI installs its native menu bar and Sparkle when its
+    window opens, after the socket already answers, so a lane's first
+    `app.menu_*` or `app.update_status` call can otherwise beat it (#678).
+    Without ROOST_TEST_MODE the dump answers `not-enabled`, and the wait
+    has nothing to observe."""
+    while True:
+        c = Roost(socket_path(target))
+        try:
+            c.app_menu_dump()
+            return
+        except RoostError as e:
+            if e.code == "not-enabled":
+                return
+            if "not installed yet" not in e.message:
+                raise
+        finally:
+            c.close()
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"{target} UI's native menu bar not installed within {timeout}s"
+                f"{_boot_failure_detail(target)}"
+            )
+        time.sleep(0.1)
 
 
 def _materializes(c: Roost, tab_id: int, deadline: float, window: float = 3.0) -> bool:

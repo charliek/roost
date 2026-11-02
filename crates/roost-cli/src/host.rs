@@ -489,6 +489,7 @@ mod tests {
     /// `roost_ipc::ssh::classify`'s own contract and is pinned there.)
     #[test]
     fn every_target_form_the_help_text_names_classifies() {
+        let _env = crate::TEST_ENV.blocking_lock();
         let help = HostCmd::augment_subcommands(clap::Command::new("host"))
             .find_subcommand("add")
             .expect("host add")

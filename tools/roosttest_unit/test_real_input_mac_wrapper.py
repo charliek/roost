@@ -238,6 +238,22 @@ class TimeoutTests(FakeHelperCase):
             patcher = patch.object(runner, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # The timeout clock starts once `_launch` returns. Under load the fake
+        # can be killed before it records its call (#667), so `_launch`
+        # returns only once that line is written.
+        real_launch = runner.Helper._launch
+
+        def launch(helper, outdir, argv):
+            before = len(self.called())
+            proc = real_launch(helper, outdir, argv)
+            recorded_by = time.monotonic() + 5
+            while len(self.called()) <= before and time.monotonic() < recorded_by:
+                time.sleep(0.01)
+            return proc
+
+        patcher = patch.object(runner.Helper, "_launch", launch)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def assert_gone(self, outdir: str) -> None:
         pid = int((self.artifacts / "helper" / outdir / "pid").read_text())

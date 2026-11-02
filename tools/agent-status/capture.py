@@ -129,12 +129,16 @@ def terminate(pid, fd, on_data):
             except ProcessLookupError:
                 done = True
                 break
+            except PermissionError:
+                # macOS answers EPERM for a group whose only member is an
+                # unreaped zombie, the state right after the pty's EOF (#666).
+                break
             if reaped(pid, fd, wait, on_data):
                 done = True
                 break
         try:
             os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         if not done:
             reaped(pid, fd, 2.0, on_data)

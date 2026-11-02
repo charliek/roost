@@ -8057,9 +8057,8 @@ mod tests {
     // be. Plan §8's "Integration (Rust)" row.
 
     /// `collect` reads process-global env, so the tests below serialize
-    /// on this. A tokio mutex rather than a `std` one: it is the only
-    /// kind that may be held across an `.await`.
-    static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// on the crate's [`crate::TEST_ENV`].
+    use crate::TEST_ENV as ENV;
 
     /// Restores whatever the variable held, so one test's `$HOME` cannot
     /// leak into the next.

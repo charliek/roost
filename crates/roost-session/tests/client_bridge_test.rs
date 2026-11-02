@@ -506,6 +506,51 @@ fn spawn_bridge_with(root: &Path, ssh_connection: &str, ssh_client: Option<&str>
 
 /// Long enough for the bridge's own 2 s preamble budget and a fresh
 /// dial; what it bounds is a bridge that never answers at all.
+/// The session answers and closes before the client's stdin EOF reaches
+/// the bridge: the half-close then meets a peer that is already gone,
+/// which macOS reports as ENOTCONN. Nobody reads stdout until after, so
+/// the bridge is parked writing the answer and cannot see the socket's
+/// EOF first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_that_answered_and_closed_before_stdin_eof_is_not_an_error() {
+    let mut fixture = Fixture::start();
+    let server = fixture.accept().await;
+
+    let payload: Vec<u8> = (0..4 * 1024 * 1024usize).map(|i| (i % 251) as u8).collect();
+    let mut sent = 0;
+    while sent < payload.len() {
+        match tokio::time::timeout(Duration::from_millis(500), server.writable()).await {
+            Err(_) => break,
+            Ok(ready) => ready.expect("writable"),
+        }
+        match server.try_write(&payload[sent..]) {
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("write the answer: {e}"),
+        }
+    }
+    assert!(
+        sent < payload.len(),
+        "the bridge kept draining a stdout nobody reads"
+    );
+    drop(server);
+
+    fixture.close_stdin();
+    let drain = fixture.drain();
+    let status = tokio::time::timeout(bridge_budget(), fixture.wait())
+        .await
+        .expect("the bridge exits");
+    let seen = drain.await.expect("the drain task");
+
+    assert_eq!(
+        seen.len(),
+        sent,
+        "every byte the session wrote reaches stdout"
+    );
+    assert_eq!(seen, payload[..sent], "byte-exact, in order");
+    assert_eq!(status.code(), Some(0), "everything was relayed");
+}
+
 fn bridge_budget() -> Duration {
     support::scaled(Duration::from_secs(20))
 }

@@ -365,8 +365,22 @@ class World:
         return self.roost
 
     def show(self, tab: int) -> None:
-        """Select a slot tab and wait until it streams into the window."""
-        self.roost.focus(tab)
+        """Select a slot tab and wait until it streams into the window.
+
+        The tab may have been opened on the session's own socket a moment
+        ago, so the window can still be catching up to it: `not-found`
+        until it does (#636)."""
+
+        def focused() -> bool:
+            try:
+                self.roost.focus(tab)
+            except RoostError as e:
+                if e.code != "not-found":
+                    raise
+                return False
+            return True
+
+        wait_until(focused, 30.0, f"the window to know slot tab {tab}")
         streamed = token("SHOWN")
         with self.env.client() as c:
             c.send(tab, echo_line(streamed) + "\n")
