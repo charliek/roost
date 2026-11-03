@@ -23,6 +23,8 @@
 #   * roost-session — the headless host-session daemon; binary is
 #                     `roost-session`. Same engine as a UI, no toolkit.
 #   * roost-cli   — shell-integration CLI; binary is `roostctl`.
+#   * roost-ssh   — the mobile app's in-process SSH dialer (russh, ring):
+#                   Tailscale SSH to a host's `client-bridge`.
 #
 # The pre-M7 daemon-era crates (roost-core, roost-proto, roost-common,
 # roost-smoke) are gone; `proto/roost.proto` has moved to
@@ -44,6 +46,7 @@ members = [
     "crates/roost-iced",
     "crates/roost-session",
     "crates/roost-mobile",
+    "crates/roost-ssh",
 ]
 # The mobile crates (roost-mobile, roost-ssh) are members but not default
 # members: `cargo build`/`make check` at the root skip their russh and
