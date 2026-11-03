@@ -1,8 +1,36 @@
 # Roost mobile
 
-The Flutter client for Roost host sessions (plan 089, milestone M5): Android
+The Flutter client for Roost host sessions (plan 090): Android
 first, iOS kept possible, the Linux desktop target for development. It is a
 client of `roost-session` like Roost-Iced's host tabs, and adds no ops.
+
+## Using it on a phone or tablet
+
+**On each host:** `roost-session` from v0.0.27 or later (session protocol 7;
+the app refuses any other protocol and says which two it saw), running
+(`roostctl session start`), and Tailscale SSH on (`sudo tailscale set --ssh`)
+with a tailnet ACL that lets the device in. This build logs in only through
+Tailscale SSH: there is no key auth yet, so a host behind plain OpenSSH (macOS
+Remote Login, for one) refuses it.
+
+**Build and install** (from the repo root, Android SDK + NDK 28.2 installed):
+
+```bash
+make mobile-deps                 # libghostty-vt for both Android ABIs (cached)
+tools/mobile/link-signing.sh     # release key from .secrets/ (else the debug key)
+make mobile-apk-release          # mobile/build/app/outputs/flutter-apk/app-release.apk
+adb install -r mobile/build/app/outputs/flutter-apk/app-release.apk
+```
+
+Every build signed with the same key installs over the last one and keeps the
+app's hosts and trusted keys; a build signed with another key has to be
+uninstalled first, which loses them.
+
+**In the app:** tap **+**, name the host, and give the target as
+`user@machine` (the tailnet name, e.g. `charliek@popos`). The first connect
+shows the host key's SHA256 fingerprint to trust; it is pinned from then on,
+and a changed key refuses to connect. Opening a tab takes its size; going to the
+background hands it back.
 
 ## Dev loop
 

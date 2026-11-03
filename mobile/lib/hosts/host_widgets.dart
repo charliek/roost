@@ -185,9 +185,8 @@ class TrustCard extends StatelessWidget {
           Text('Trust ${host.label}?', style: text.titleSmall),
           const SizedBox(height: 6),
           Text(
-            'First connection to this host. Check that the fingerprint '
-            'matches what the host shows for '
-            'ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub.',
+            'First connection to this host. Trusting pins this key; '
+            'if it ever changes, Roost refuses to connect.',
             style: text.bodySmall,
           ),
           const SizedBox(height: 8),
