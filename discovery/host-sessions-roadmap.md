@@ -207,10 +207,16 @@ exactly why we need the snapshot payload Herdr doesn't.
 
 ### D1 — Client and products
 
-Iced is the only client, on both platforms. The Mac iced app is the
-Mac client. The Swift app, GTK (removed), and any web/mobile client
-are out of scope. Default launch of the iced app is in-process and
+Iced is the only desktop client, on both platforms. The Mac iced app is
+the Mac client. The Swift app, GTK (removed), and any web client are out
+of scope. Default launch of the iced app is in-process and
 byte-identical to today until the user connects a host.
+
+*Amended 2026-11-03 (plan 090):* a **mobile client** is in scope — a
+Flutter app (`mobile/`, Android first) over a Rust core
+(`crates/roost-mobile`, `roost-client`, `roost-ssh`) that is a client of
+`roost-session` like iced's host connection, adding no ops. See
+`discovery/mobile-client.md` and vision.md DL-34.
 
 ### D2 — Two planes on the session socket
 
@@ -388,7 +394,8 @@ section for why the two are allowed to disagree.
 
 ### D10 — Out of scope for the whole roadmap
 
-Herdr/tmux as the host runtime; splits; web/iOS; disk scrollback
+Herdr/tmux as the host runtime; splits; web; iOS (Android first — D1's
+mobile amendment keeps iOS possible but unbuilt); disk scrollback
 persistence (secrets — Herdr ships it off-by-default for a reason;
 revisit only post-HS-4); screen-manifest agent detection (own track);
 Swift host backend; flipping the local default (HS-5 is a placeholder
