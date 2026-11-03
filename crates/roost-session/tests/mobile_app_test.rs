@@ -71,6 +71,12 @@ impl Drop for Daemon {
     }
 }
 
+/// A shell prompt row: `$ ` from `/bin/sh` on Linux, `host:~ user$` on
+/// macOS, whose login shell reads `/etc/bashrc`'s prompt.
+fn is_prompt(row: &str) -> bool {
+    row.trim_end().ends_with('$')
+}
+
 /// `roost-session start --foreground` over `root`, once it says ready.
 fn start(root: &Path) -> Daemon {
     let home = owner_only(root.join("home"));
@@ -294,7 +300,7 @@ fn a_unix_host_mirrors_attaches_and_takes_typing_writes_and_ops() {
         .expect("attach");
     let mut screen = Screen::default();
     screen.wait(&handle, "the shell prompt", |rows| {
-        rows.iter().any(|row| row.starts_with('$'))
+        rows.iter().any(|row| is_prompt(row))
     });
     assert_eq!(screen.rows.len(), 24);
     // Dart sets its sink after `attach` returns: what the terminal said
@@ -615,7 +621,7 @@ fn input_typed_just_before_a_close_still_reaches_the_tab() {
     let (handle, _events) = attach(&app, &host, tab, true);
     let mut screen = Screen::default();
     screen.wait(&handle, "the shell prompt", |rows| {
-        rows.iter().any(|row| row.starts_with('$'))
+        rows.iter().any(|row| is_prompt(row))
     });
     // Queued for the owner thread, then closed at once: the close must
     // not drop the stream out from under the queued input.
