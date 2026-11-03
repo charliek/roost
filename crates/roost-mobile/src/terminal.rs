@@ -807,7 +807,7 @@ impl TabTerminal {
                         ScrollDirection::Bottom => roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_ARROW_DOWN,
                     })
                     .set_mods(0);
-                self.keys.sync_from_terminal(&screen.terminal);
+                crate::keys::sync_encoder(&mut self.keys, &screen.terminal);
                 for _ in 0..rows {
                     input.bytes.extend(self.keys.encode(&event)?);
                 }

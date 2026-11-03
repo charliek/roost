@@ -221,7 +221,7 @@ fn encode_press(
         .set_unshifted_codepoint(press.unshifted)
         .set_utf8(press.utf8.as_bytes());
     if let Some(terminal) = terminal {
-        encoder.sync_from_terminal(terminal);
+        sync_encoder(encoder, terminal);
     }
     encoder.encode(&event)
 }
@@ -237,6 +237,13 @@ pub fn new_encoder() -> roost_vt::Result<KeyEncoder> {
     let mut encoder = KeyEncoder::new()?;
     encoder.set_macos_option_as_alt(OptionAsAlt::True);
     Ok(encoder)
+}
+
+/// Sync `encoder` from `terminal`'s modes. The sync resets Option-as-Alt,
+/// so [`new_encoder`]'s setting is put back after it.
+pub fn sync_encoder(encoder: &mut KeyEncoder, terminal: &Terminal) {
+    encoder.sync_from_terminal(terminal);
+    encoder.set_macos_option_as_alt(OptionAsAlt::True);
 }
 
 pub fn encode_key(
