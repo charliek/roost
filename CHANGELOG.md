@@ -9,6 +9,134 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.27 — 2026-11-03
+
+_The protocol-7 release: one `roost-session` per machine that every
+screen can reach, tabs sized by whoever is using them, tabs whose
+environment matches where they were opened, agent status reported by the
+agent itself, and Kitty graphics drawn in Roost-Iced. The session
+protocol goes 6 → 7, so **every `roost-session` must move to 0.0.27**:
+Roost-Iced shows the restart flow at Connect (Restart Session on a
+`localhost` host and for local tabs on a session, Update roost-session…
+over SSH), and a restart reopens each tab as a fresh shell in its
+directory. Update a laptop and the machines it connects to together.
+This is the **last release that ships the Swift `Roost.app`**. It gets the
+new Ghostty engine and nothing else. In v0.1.0 the iced build becomes
+`Roost.app` and takes over its update feed, and `Roost-Iced.app` is
+retired, so Roost-Iced users should switch to `Roost.app` then._
+
+### Changed
+
+- **Session protocol 6 → 7.** A 0.0.27 client and an older
+  `roost-session` cannot talk at all, in either direction; the client
+  shows the [upgrade / restart flow](docs/guides/host-sessions.md#the-upgrade-restart-flow)
+  rather than a broken screen. What protocol 7 adds over 6:
+  - client identity (`client.hello`) and a bridge preamble that says who is
+    connecting through an SSH bridge;
+  - tab size ownership: the `ROOSTDP3` data plane with a `GRID` frame
+    and `DETACH`, `tab.resized`, `tab.take_size` and `tab.release_size`.
+    `GRID` and the attach reply carry the session terminal's cell size in
+    pixels, so a host mirror whose font differs from the owner's no longer
+    drifts after a Kitty image;
+  - per-agent program status from OSC 7501;
+  - `tab.memory_usage`;
+  - `env` and `origin` on `tab.open`.
+
+  See [`ipc.md`](docs/reference/ipc.md) and
+  [`ipc-compatibility.md`](docs/reference/ipc-compatibility.md).
+- **The Linux session socket moved under your home directory**
+  (`~/.local/state/roost-session/run/roost.sock`, from the passwd
+  entry, not `$HOME`). It used to follow `XDG_RUNTIME_DIR`, which differs
+  between a desktop login, an SSH login and `sudo`, so a session started
+  over SSH was invisible to the desktop and the desktop then reported
+  "couldn't start". `ROOST_SESSION_SOCKET_DIR` overrides the directory.
+  A session still running on the old path shows as needing a restart
+  (reason "old socket path"). `roostctl session stop --old-path <socket>`
+  stops one by hand, and `roost-session start` refuses while one still
+  answers. macOS paths are unchanged. See
+  [Paths → Session socket](docs/reference/paths.md#session-socket-linux).
+- **A tab's environment reflects who opened it, not who started the
+  session.** Seven variables (`DISPLAY`, `WAYLAND_DISPLAY`,
+  `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, `SSH_CONNECTION`,
+  `SSH_CLIENT`, `SSH_TTY`) are set per tab. A tab opened at the desk gets
+  the desk's display, bus and agent. A tab opened from a laptop over SSH
+  gets that connection's `SSH_CONNECTION` and `SSH_CLIENT` and no display.
+  `roostctl` inside an SSH login declares itself remote on any socket.
+  **Upgrade day:** session tabs restored from state written before this
+  release have no saved opener and start with none of the seven until
+  you reopen them; in-process Roost-Iced tabs restore with Roost-Iced's
+  own values. See
+  [Host sessions → Environment](docs/guides/host-sessions.md#environment).
+- **Ghostty main and Zig 0.17.** libghostty-vt moves to Ghostty main
+  `6ba14415`, so building from source now needs Zig 0.17 (`mise install`
+  picks it up).
+- **`roostctl open` during a local-backend switch exits 1 with `busy`**,
+  the server's own refusal, instead of 2 with `usage` (#521). It still
+  refuses before `project ensure` can create anything.
+- **Roost-Iced and `roost-session` raise their open-file limit** to
+  `min(hard, 10240)` at startup (never lowering it), and shells inherit
+  it. macOS's soft limit of 256 used to run a session out of descriptors
+  at about 60 tabs (#572).
+- **Log target.** The host-client modules moved into the new
+  `roost-client` crate, so their log lines are under `roost_client`. Use
+  `RUST_LOG=roost_client=debug` to see them.
+
+### Added
+
+- **Several screens on one tab, without a size fight.** Watching a tab
+  never resizes it. A deliberate action takes the size: switching to the
+  tab, typing, pasting, clicking, copying, a settled scroll, or resizing
+  the focused window. Another window draws the owner's grid inside its own
+  and its tab band shows **Sized by ‹host›** with a **Take size**
+  button. Take size is also in the palette, as the unbound `take_size`
+  action, and as `roostctl tab take-size`. When the owner leaves, the size
+  passes to a window still attached, after a 5 s grace if it disconnected
+  rather than detached. See
+  [Host sessions → Who sizes a tab](docs/guides/host-sessions.md#who-sizes-a-tab).
+- **Agent status straight from the agent (OSC 7501).** Claude Code, Codex
+  and other agents that speak OSC 7501 report working, blocked (with the
+  reason) and done through the terminal, with nothing to wire. The
+  sidebar, the inbox and remote clients get the reason, it survives a
+  reconnect, and an interrupt shows at once. Hook reports still work and
+  fill in for agents that don't speak it. The Swift app doesn't answer
+  the probe, so agents there keep using hooks. See
+  [Agent Hooks → Program status](docs/guides/agents.md#program-status-osc-7501).
+- **Kitty graphics drawn in Roost-Iced (#645).** Images from
+  `kitten icat`, `chafa -f kitty`, plotting backends, yazi previews and
+  Unicode-placeholder (`U=1`) programs draw on local and session tabs,
+  above or below text as placed, and a session's images carry across an
+  attach. PNG is decoded under a 32 MiB per-screen image limit.
+  `tab.dump_resolved` gains an additive `images` field. On HiDPI screens,
+  size reports (CSI 14t/16t, mode 2048) answer in device pixels, and the
+  PTY's window size now carries a pixel size. Animation is not drawn yet
+  (#676).
+- **Per-tab memory:** `tab.memory_usage` on the session and UI sockets,
+  and `roostctl tab memory`, report how much memory a tab's terminal
+  holds.
+
+### Fixed
+
+- **A busy server no longer goes deaf.** One `EMFILE` used to end the IPC
+  accept loop for good: `roost-session` exited and Roost-Iced kept a dead
+  socket. Transient accept errors now back off and retry (#658); the SSH
+  tunnel's accept loop shares the fix.
+- **A tab is listed only once its PTY exists (#640),** so a request
+  right after `tab.open` or a `tab.opened` event can't get
+  `not-found: tab N has no live terminal`, and a failed spawn announces
+  nothing.
+- **Unicode-placeholder image cells draw no text (#680).** Kitty's
+  placeholder cells used to draw a box per cell over the image on macOS.
+- **One OSC 133 parser (#650).** Shell-integration marks such as
+  `P;k=i`, `N` and `A;k=s` are read the same way by the terminal and by
+  the agent-ownership checks.
+- **The SSH bridge exits 0 on macOS** after relaying everything when the
+  session closed first. It used to get `ENOTCONN` on its half-close and
+  exit 1.
+- **CI and test flakes** fixed ahead of the release: #583, #602, #612,
+  #628, #634, #635, #636, #638, #642, #656, #659, #666, #667, #673,
+  #674, #678. The Wayland tab-drag check now drops on the measured
+  target, and its pointer device takes the output's size (#694).
+
 ## v0.0.26 — 2026-10-19
 
 _The Mac-host release (#643): Roost-Iced can install and upgrade
