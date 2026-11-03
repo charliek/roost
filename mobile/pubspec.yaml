@@ -1,0 +1,36 @@
+name: roost_mobile
+description: "Roost for phones and tablets: a client of roost-session hosts."
+publish_to: 'none'
+version: 0.0.1+1
+
+environment:
+  sdk: ^3.13.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Grapheme clusters: the painter finds the glyph under the cursor by cell.
+  characters: ^1.4.0
+  # State management, hand-written providers (no codegen), as in shed-mobile.
+  flutter_riverpod: ^3.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  fonts:
+    # The terminal font, the same faces Roost-Iced bundles
+    # (third_party/jetbrains-mono, SIL OFL 1.1; license in assets/fonts/OFL.txt).
+    - family: JetBrains Mono
+      fonts:
+        - asset: assets/fonts/JetBrainsMono-Regular.ttf
+        - asset: assets/fonts/JetBrainsMono-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/JetBrainsMono-Italic.ttf
+          style: italic
+        - asset: assets/fonts/JetBrainsMono-BoldItalic.ttf
+          weight: 700
+          style: italic
