@@ -38,6 +38,7 @@ sys.path.insert(0, str(REPO / "tools" / "screenshot"))
 
 import pngtool  # noqa: E402
 import ui  # noqa: E402
+import wayland_output  # noqa: E402
 from iced_clipboard_check import (  # noqa: E402
     AUTOSCROLL_PREFIX,
     TERMINAL_PADDING,
@@ -266,13 +267,24 @@ def _wayland_tab_reorder(client, root: Path, width: int, height: int) -> None:
         "initial Wayland direct-drag order",
     )
 
-    def drag(source: int, target_x: int, expected: list[int], label: str) -> None:
-        client.focus(source)
+    def pill(tab_id: int, label: str) -> tuple[int, int, int, int]:
+        client.focus(tab_id)
         _wait_until(
-            lambda: int(client.identify()["active_tab_id"]) == source,
-            f"{label} source focus",
+            lambda: int(client.identify()["active_tab_id"]) == tab_id,
+            f"{label} focus on {tab_id}",
         )
-        left, top, right, bottom = _active_pill_bounds(client, root)
+        return _active_pill_bounds(client, root)
+
+    def drag(source: int, onto: int, expected: list[int], label: str) -> None:
+        """Drop `source` just inside the far edge of `onto`'s pill. A pill's
+        width follows its title and the font drawing it, so a fixed x lands
+        on a different side of a pill's centre, which is the strip's drop
+        rule, from one machine to the next (#693)."""
+        order = client.project_tab_ids(project)
+        onto_left, _, onto_right, _ = pill(onto, label)
+        forward = order.index(onto) > order.index(source)
+        target_x = onto_right - 4 if forward else onto_left + 4
+        left, top, right, bottom = pill(source, label)
         x0 = left + min(22, max(8, (right - left) // 3))
         _inject_drag(width, height, x0, (top + bottom) // 2, target_x)
         _wait_until(
@@ -280,9 +292,8 @@ def _wayland_tab_reorder(client, root: Path, width: int, height: int) -> None:
             f"{label} authoritative order",
         )
 
-    sidebar = round(float(client.window_metrics()["sidebar_width"]))
-    drag(home, sidebar + 440, [second, third, home], "forward Wayland tab drag")
-    drag(home, sidebar + 30, [home, second, third], "backward Wayland tab drag")
+    drag(home, third, [second, third, home], "forward Wayland tab drag")
+    drag(home, second, [home, second, third], "backward Wayland tab drag")
     for tab_id in tabs:
         assert client.tab_capture_pty_input(tab_id, drain=True) == b"", (
             tab_id,
@@ -464,20 +475,20 @@ def main() -> int:
         if not logical_width or not logical_height:
             _skip(f"window_metrics returned invalid size: {metrics!r}")
         # The virtual absolute device is normalized against the compositor
-        # output, not the client's logical/decorated window extent. Cage's
-        # headless output can be wider than `window_metrics` (for example,
-        # 2048 output pixels for a 1920-wide client); using the client extent
-        # shifts every injected point proportionally. A scale-1 product
-        # capture reports the renderer/output extent we must advertise to
-        # uinput while the target coordinates remain logical layout points.
-        _png, width, height = client.screenshot(scale=1)
-        if not width or not height:
-            _skip(f"screenshot returned invalid output size: {(width, height)!r}")
+        # output, not the client's window, so its extent is the output's
+        # current mode, asked of cage itself. Neither the window nor a
+        # capture of it is that size: under cage on the runner the window is
+        # 1280x685 in a 1280x720 output, which put every injected point
+        # lower by 720/685 (#693). Target coordinates stay logical layout
+        # points; cage places the window at the output's origin.
+        _png, capture_width, capture_height = client.screenshot(scale=1)
+        width, height = wayland_output.current_mode(runtime)
         print(
             "Wayland geometry:",
             {
                 "window": (logical_width, logical_height),
-                "capture": (width, height),
+                "capture": (capture_width, capture_height),
+                "output": (width, height),
                 "sidebar": sidebar,
                 "terminal_top": client.terminal_top(metrics),
             },
