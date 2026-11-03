@@ -1268,11 +1268,10 @@ def test_rpc_matches_the_named_verb_and_reports_errors_through_the_envelope(env)
 
 def test_open_against_a_session_creates_a_project_and_a_tab(env):
     """Plan 066 §3.2 (C10): `open` needs no UI. `project.ensure` is
-    served by the shared engine both UIs and `roost-session` embed
+    served by the shared engine the UI and `roost-session` embed
     (`served_ops` withholds it from neither — see `roost-engine::ipc`),
     so a session reached through `--socket` answers `open` the same way
-    a UI socket does — unlike the Mac app, which is a UI-only gap this
-    module doesn't cover."""
+    a UI socket does."""
     started(env)
     socket = str(env.socket)
     name = f"e2e-session-open-{uuid.uuid4().hex[:8]}"

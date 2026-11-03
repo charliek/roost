@@ -46,12 +46,10 @@ _PS_TIMEOUT_S = 5.0
 _SOCKET_TIMEOUT_S = 2.0
 
 
-def platform_mismatch(system: str, target: str) -> str | None:
+def platform_mismatch(system: str) -> str | None:
     """Why this run cannot drive real input at all, or None."""
     if system != "Darwin":
         return "real CGEvent input is macOS-only"
-    if target != "iced":
-        return "drives the iced bundle; the Swift lane collects the whole directory"
     return None
 
 

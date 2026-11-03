@@ -1,22 +1,18 @@
 # Agent state golden fixtures
 
 Canonical corpus for the agent state machine defined in plan 002 §3.2 /
-§3.3 — `crates/roost-ipc/src/agent.rs` (Rust) and
-`mac/Sources/Roost/AgentState.swift` (Swift). Both ports load these
-files and assert the same expectations, so drift between the two UIs
-surfaces here rather than in a user's sidebar.
+§3.3 — `crates/roost-ipc/src/agent.rs`. The loader asserts every
+expectation, so a change to the state machine surfaces here rather than
+in a user's sidebar.
 
-Loaders — the corpus is only a parity guard once **both** read it:
+Loader:
 
 - Rust: `crates/roost-ipc/tests/agent_state_fixtures.rs`
   (`cargo test -p roost-ipc`).
-- Swift: `mac/Tests/RoostTests/AgentStateFixtureTests.swift`
-  (`swift test --package-path mac`), added with the Swift port of the
-  state machine.
 
 Same pattern as [`tests/word-fixtures/`](../word-fixtures/README.md) and
 [`tests/url-fixtures/`](../url-fixtures/README.md), with one adaptation:
-the derivation is wire-shape logic owned by `roost-ipc`, so the Rust
+the derivation is wire-shape logic owned by `roost-ipc`, so the
 loader lives in that crate rather than in a consumer crate.
 [`tests/ipc-vectors/`](../ipc-vectors/README.md) pins the wire *shape*
 of the ops; this directory pins the *behavior* behind them.
@@ -26,7 +22,7 @@ of the ops; this directory pins the *behavior* behind them.
 One JSON object per file. The top-level `group` field selects the case
 schema, so a group may be split across several files and the loader
 dispatches on the field, not the filename. Enum values are plain
-snake_case strings — no language-specific encodings — and every expected
+snake_case strings — the wire's own spellings — and every expected
 value is written out explicitly rather than derived.
 
 ### `group: "derivation"`
@@ -161,6 +157,6 @@ fixture may assume one.
 
 ## Adding a case
 
-Append it to the file for its group and run both loaders. Every case
-needs a unique, descriptive `name`: the loaders report failures by name,
+Append it to the file for its group and run the loader. Every case
+needs a unique, descriptive `name`: the loader reports failures by name,
 and the name is the only thing a reader of a red CI log sees.

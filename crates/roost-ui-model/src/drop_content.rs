@@ -1,9 +1,9 @@
 //! Toolkit-neutral normalization for content dropped onto a terminal.
 //!
 //! Native adapters own drag protocols and paste delivery. This module owns the
-//! payload policy for the Rust UI adapter (Iced), mirrored by Swift's
-//! `TerminalView.swift`: safe local paths take precedence over plain text,
-//! retain first-seen order, and become shell-safe terminal input.
+//! payload policy for the Rust UI adapter (Iced): safe local paths take
+//! precedence over plain text, retain first-seen order, and become
+//! shell-safe terminal input.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -104,7 +104,7 @@ mod tests {
         );
     }
 
-    /// Shared with the Swift `testNewlineBearingPathIsDropped` vector.
+    /// Ported from the Swift `testNewlineBearingPathIsDropped` vector.
     #[test]
     fn newline_and_carriage_return_paths_are_rejected() {
         assert_eq!(
@@ -117,7 +117,7 @@ mod tests {
         );
     }
 
-    /// Shared with the Swift `testVerticalTabBearingPathIsDropped` vector.
+    /// Ported from the Swift `testVerticalTabBearingPathIsDropped` vector.
     #[test]
     fn vertical_tab_bearing_paths_are_rejected() {
         assert_eq!(resolve(["/tmp/ev\u{0b}il.png"], None, None), None);
@@ -127,7 +127,7 @@ mod tests {
         );
     }
 
-    /// Shared with the Swift `testFormFeedBearingPathIsDropped` vector.
+    /// Ported from the Swift `testFormFeedBearingPathIsDropped` vector.
     #[test]
     fn form_feed_bearing_paths_are_rejected() {
         assert_eq!(resolve(["/tmp/ev\u{0c}il.png"], None, None), None);
@@ -137,7 +137,7 @@ mod tests {
         );
     }
 
-    /// Shared with the Swift `testUnicodeNewlineBearingPathIsDropped` vector.
+    /// Ported from the Swift `testUnicodeNewlineBearingPathIsDropped` vector.
     #[test]
     fn unicode_newline_bearing_paths_are_rejected() {
         assert_eq!(resolve(["/tmp/ev\u{0085}il.png"], None, None), None);
@@ -158,7 +158,7 @@ mod tests {
         );
     }
 
-    /// Shared with the Swift `testControlBearingPathIsDropped` vector.
+    /// Ported from the Swift `testControlBearingPathIsDropped` vector.
     #[test]
     fn escape_bearing_paths_are_rejected() {
         assert_eq!(resolve(["/tmp/ev\u{1b}[201~il.png"], None, None), None);
@@ -178,7 +178,7 @@ mod tests {
         assert_eq!(resolve([invalid], None, None), None);
     }
 
-    /// Shared with the Swift `testWebURLIsEscapedWhenNoFiles` vector.
+    /// Ported from the Swift `testWebURLIsEscapedWhenNoFiles` vector.
     #[test]
     fn url_is_escaped_when_no_safe_path_remains() {
         assert_eq!(
@@ -207,7 +207,7 @@ mod tests {
         );
     }
 
-    /// Shared with the Swift `testControlBearingURLFallsThroughToString`
+    /// Ported from the Swift `testControlBearingURLFallsThroughToString`
     /// vector: a rejected URL is absent, not stripped, so the unfiltered text
     /// fallback answers instead.
     #[test]
@@ -223,7 +223,7 @@ mod tests {
         }
     }
 
-    /// Shared with the Swift
+    /// Ported from the Swift
     /// `testControlBearingURLAndStringYieldsRawString` vector. Documents the
     /// accepted #282 baseline: when a drag carries the same control-bearing
     /// text on both the URL and the text side, the rejected URL falls through
@@ -239,7 +239,7 @@ mod tests {
         );
     }
 
-    /// Shared with the Swift `testControlBearingURLWithoutStringIsNil` vector.
+    /// Ported from the Swift `testControlBearingURLWithoutStringIsNil` vector.
     #[test]
     fn control_bearing_url_without_text_is_none() {
         assert_eq!(

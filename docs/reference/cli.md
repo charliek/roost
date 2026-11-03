@@ -2,7 +2,7 @@
 
 Shell-integration CLI for the running Roost UI. Talks JSON over
 a Unix-domain socket directly to the UI process — no daemon by
-default, except a fresh Roost-Iced install, which starts its local
+default, except a fresh install, which starts its local
 tabs on a `roost-session` it manages. The other exception is opt-in:
 `roostctl session` starts, stops, and inspects a headless
 `roost-session` daemon (see
@@ -161,24 +161,23 @@ For more information, try '--help'.
 
 ### Where `roostctl` lives
 
-`roostctl` ships next to each UI, but the two platforms put it in
+`roostctl` ships next to the UI, but the two platforms put it in
 different places — only one is on `PATH`:
 
 | Platform | Path | On `PATH`? |
 |---|---|---|
 | **Linux (`.deb`)** | `/usr/bin/roostctl` | ✅ yes |
 | **macOS, `Roost.app` (`.dmg`)** | `Roost.app/Contents/Resources/bin/roostctl` (inside the bundle) | ❌ no — a Finder-launched app gets a minimal `PATH` |
-| **macOS, `Roost-Iced.app` (`.dmg`)** | `Roost-Iced.app/Contents/Resources/bin/roostctl` (inside the bundle) | ❌ no — a Finder-launched app gets a minimal `PATH` |
 
 For your own shell on macOS, symlink it onto `PATH` once
 (`ln -s /Applications/Roost.app/Contents/Resources/bin/roostctl
-/usr/local/bin/roostctl`, or the equivalent `Roost-Iced.app` path if
-that is the build you drive agents through). **Provider scripts don't
+/usr/local/bin/roostctl`). **Provider scripts don't
 need to** — Roost sets `ROOST_ROOSTCTL` to the absolute path of its own
 `roostctl` when it runs them, so `"${ROOST_ROOSTCTL:-roostctl}"` is
 portable across both platforms. See [Extending Roost](../guides/extending.md#opening-tabs-from-activate).
 
-Running both apps at once, `roostctl` can't auto-detect which one you
+With more than one Roost running (an installed `Roost.app` and a dev
+`Roost-Iced.app`, say), `roostctl` can't auto-detect which one you
 mean and exits 1 with `ambiguous-target` ([exit codes](#exit-codes)
 below); pass `--target mac` or `--target iced` (or set `ROOST_SOCKET`
 to the specific socket) to pick one.
@@ -358,12 +357,13 @@ gate is skipped, the settled wait begins at once, and
 `started_after_ms` is `null`.
 
 **The stream is required.** Against a server whose `identify.ops` lacks
-`events.subscribe` and that names no `local_session_socket` — the Swift
-Mac app today — the verb exits 1 `unsupported` and writes nothing. There
-is no polling fallback: a poll cannot see a turn that starts and ends
-between two `tab.list` calls, so it would report a stall that never
-happened. Use [`tab send`](#tab-open-close-send-resize-reorder-dump)
-and [`tab dump`](#tab-open-close-send-resize-reorder-dump) there.
+`events.subscribe` and that names no `local_session_socket` — a Roost
+older than this `roostctl` — the verb exits 1 `unsupported` and writes
+nothing. There is no polling fallback: a poll cannot see a turn that
+starts and ends between two `tab.list` calls, so it would report a
+stall that never happened. Update Roost, or use
+[`tab send`](#tab-open-close-send-resize-reorder-dump)
+and [`tab dump`](#tab-open-close-send-resize-reorder-dump).
 
 Every call to the socket is bounded the way [`wait`](#wait)'s are, and a
 stream lost after the writes follows `wait`'s rules — resolved again
@@ -423,7 +423,7 @@ roostctl tab dump --tab 5 --scrollback 200   # 200 rows of history, then the vie
 | `--cwd-from-tab <id>` | Start the new tab where that tab's working directory is, when the server can resolve one (`tab.open`'s `cwd_from_tab`; see [ipc.md](ipc.md)). Omitted ⇒ the field is absent on the wire, not sent as `null`. A host tab (`h<host>.<id>`) is refused: `cwd_from_tab` never crosses a host. A server that predates the field answers `unknown-field`, same as `--no-activate`. Refused beside `--here`. |
 | `--here` | `--cwd-from-tab $ROOST_TAB_ID`: start where the calling tab already is. Only accepted with no explicit `--socket`/`--target` naming another target — `$ROOST_TAB_ID` is otherwise not necessarily this call's own id space — including from inside a session tab, which still [dials the window](#inside-a-session-tab) that owns it. Anything else is exit 2 `usage`. Refused beside `--cwd-from-tab`. |
 
-**The caller's opener.** `tab open` (and [`open`](#open)) also state who is opening the tab, so the new tab's display, bus, agent and SSH variables reflect the caller (see [Tab environment](ipc.md#tab-environment)). A `roostctl` whose own environment is an SSH context (any of `SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY` set) declares itself remote with `origin` (its `SSH_CONNECTION` and `SSH_CLIENT`); otherwise it sends `env` with its `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` and `SSH_AUTH_SOCK` (an empty `{}` when it has none). This holds on whichever socket it dials, and through a UI socket under `local-backend = session` the session sees the original caller's fields. Nothing is sent to `Roost.app` when the target resolves to it on macOS (the frozen Swift app refuses both fields), and a server that refuses `env` or `origin` by name with `unknown-field` is asked once more without them; any other `unknown-field` (`activate`, say) is reported as it always was.
+**The caller's opener.** `tab open` (and [`open`](#open)) also state who is opening the tab, so the new tab's display, bus, agent and SSH variables reflect the caller (see [Tab environment](ipc.md#tab-environment)). A `roostctl` whose own environment is an SSH context (any of `SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY` set) declares itself remote with `origin` (its `SSH_CONNECTION` and `SSH_CLIENT`); otherwise it sends `env` with its `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` and `SSH_AUTH_SOCK` (an empty `{}` when it has none). This holds on whichever socket it dials, and through a UI socket under `local-backend = session` the session sees the original caller's fields. A server that refuses `env` or `origin` by name with `unknown-field` is asked once more without them; any other `unknown-field` (`activate`, say) is reported as it always was.
 
 These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab right here and switch to it" primitive that providers and other scripts use. (`--after-tab`/`--focus` are CLI orchestration over `tab.reorder` / `tab.focus`; `-- <cmd>` fills the `tab.open` op's `argv` — see [ipc.md](ipc.md).)
 
@@ -476,8 +476,7 @@ does, and the tab is chosen and routed the same way: `$ROOST_TAB_ID`,
 then the UI's active tab, and under `local-backend = session` a bare id
 is read from the session `identify.local_session_socket` names. An
 `h<host>.<id>` goes to the UI, which reads the figure from that host's
-session. The Swift Mac app does not serve the op and answers
-`unknown-op`.
+session.
 
 ## `tab send-file`
 
@@ -492,11 +491,6 @@ that host and the host paths are pasted, so an agent running there can
 actually read them; on a local tab it pastes the escaped local paths.
 Exactly what dropping the files onto the tab does — same route, same
 gesture queue — backed by the [`tab.send_file`](ipc.md#tabsend_file) op.
-
-**Linux/iced only.** The Swift `Roost.app` does not serve this op and
-answers `unknown-op`; it has no host sessions to upload to, and its
-local drop route is unchanged. See [the Swift fold-in
-note](ipc.md#tabsend_file).
 
 | Flag | Effect |
 |---|---|
@@ -551,7 +545,7 @@ roostctl wait --tab 5 --state idle --no-timeout --json
 | `--gone` | flag | `false` | Wait until the tab no longer exists. Cannot be combined with `--state` or `--text` |
 | `--timeout` | float | `5.0` | Give up after this many seconds, every call to the socket included. `0` checks once: exit `0` if the condition already holds, `4` if not. A value that is not a finite number of seconds (`inf`, `nan`), or too long to set a deadline by, is `usage` (exit 2), never "forever" |
 | `--no-timeout` | flag | `false` | Wait for as long as it takes. Cannot be combined with `--timeout` (exit 2) |
-| `--interval-ms` | int | `100` | The poll interval where there is no stream, and how often `--text` re-reads the viewport where there is |
+| `--interval-ms` | int | `100` | How often `--text` re-reads the viewport |
 | `--tab` | bare id | `$ROOST_TAB_ID`, then the UI's active tab | Target tab. A host tab (`h<host>.<id>`) is refused with `usage` (exit 2): the stream is the local workspace's |
 
 **Where it listens.** `wait` asks the UI's `identify` which socket owns
@@ -561,8 +555,8 @@ instead of polling:
 | `identify` says | `wait` reads |
 |---|---|
 | `local_session_socket` is present (`local-backend = session`) | The local session: both connections dial that socket |
-| `ops` names `events.subscribe` (the iced UI, in-process) | The UI socket itself |
-| Neither — the Swift Mac app, or a Roost older than this | The poll loop: `tab.list` (and `tab.dump` for `--text`) every `--interval-ms`, as `wait` always did |
+| `ops` names `events.subscribe` (the UI, in-process) | The UI socket itself |
+| Neither — a Roost older than this | Nothing: `wait` exits 1 `unsupported` (update Roost) before subscribing or writing anything |
 
 On a stream it subscribes on one connection, then — on a second — checks
 that `identify.instance_id` (or, on a session,
@@ -665,7 +659,7 @@ local-backend switch to settle` — so stdout stays JSON lines.
 |---|---|
 | 0 | The terminal envelope arrived (printed as the last line), or the reader of stdout went away (`events \| head -n1`) |
 | 1 `connection` | The stream closed without a label or skipped a revision — nothing is resolved again; run it again |
-| 1 *the server's own* | The server does not serve the stream: the Swift Mac app, an older Roost. Its refusal is passed through verbatim (`not-implemented`, `unknown-op`), as is every refusal but a switch in flight |
+| 1 *the server's own* | The server does not serve the stream: an older Roost. Its refusal is passed through verbatim (`not-implemented`, `unknown-op`), as is every refusal but a switch in flight |
 | 2 `usage` | A bad command line, including a host `--tab` |
 
 `events` is always JSON, with or without `--json`; a failure still goes
@@ -695,13 +689,6 @@ other `project` verb with a one-line human form, and
 `rename`/`delete`/`reorder` print nothing without the flag, so there is
 no single convention `ensure` could join instead.
 
-Refuses `unsupported` (exit 1) against a server whose `identify --json`
-`ops` field doesn't list `project.ensure` — the Swift Mac app today.
-The refusal names the manual route — `project list --json` to find an
-existing project by name, `project create` to make one — rather than
-falling back to it itself: a list-then-create fallback inside `ensure`
-would reopen the very race (#221) it exists to close.
-
 ## `open`
 
 ```bash
@@ -730,7 +717,6 @@ without `--json`**: this is an agent verb, not a human-typed one.
 
 | Exit | `code` | When |
 |---|---|---|
-| 1 | `unsupported` | This server's `identify --json` `ops` doesn't list `project.ensure` (the Swift `Roost.app` today) — names the manual route (`project list --json` + `tab open --project-id`) rather than racing it itself (#221) |
 | 1 | `busy` | `identify --json`'s `local_backend_switch` shows a backend switch in progress — the project set is mid-flight, so a name resolved against it may not hold; the same `busy` the server itself answers with; retry once it settles |
 | 1 | *the server's own* | `tab.open`'s own refusal, verbatim — most notably `not-found` if the ensured project vanished between the two calls (a backend switch landing in that window, say). **The two calls are not atomic with each other**, only each is atomic on the server, so this is possible even though `ensure` itself never races another `ensure` |
 
@@ -987,13 +973,11 @@ roostctl host status --id 3f9a2b7c1d4e4f5a --json
 
 `host connect` starts a new, symmetric connection alongside any this client or another already has open — reconnecting to an already-connected host claims nothing from anybody — and, on a `localhost` target, spawns the session first if nothing is listening. It returns once the attempt is under way, not once it settles — watch the sidebar or poll `host status` for the connected/needs-restart outcome. `host disconnect` never stops the session; its shells keep running and a later connect picks them back up.
 
-`host list` prints one line per saved host — `id  label  target=…  state=…  last_connected=…`. The `state=` column is a **best-effort second call** to `host.status` after the registry read: a target that answers `unknown-op` (a session socket, the Swift app) or errors for any other reason prints `state=?` for every row rather than failing the listing. `host list --json` is deliberately the registry alone, unchanged — a script that wants connection state calls the op that owns it.
+`host list` prints one line per saved host — `id  label  target=…  state=…  last_connected=…`. The `state=` column is a **best-effort second call** to `host.status` after the registry read: a target that answers `unknown-op` (a session socket) or errors for any other reason prints `state=?` for every row rather than failing the listing. `host list --json` is deliberately the registry alone, unchanged — a script that wants connection state calls the op that owns it.
 
 `host status` is that op. It reports, for every saved host (or just `--id`), the state the sidebar's band is drawn from: `generation` (which attempt the host is on — the monotonic edge to poll against), `state`, `reason` (the band's untruncated input), `rollup` (the band's own output), and `retry` (an armed auto-reconnect's `delay_ms`/`attempt`/`budget`/`armed_at`, absent when nothing is scheduled, plus `retry.reason` — the classified failure that armed the rung, ssh-only, read it whenever it is present rather than gating on `attempt`). A **live** connection additionally carries `connect` (`session_id`, `reduced_fidelity`, `resumed`, `from_revision?` — plan 056 §3.1/§3.2, R14/#447 and R11/#442) and `tabs` (how many rows the sidebar section is currently listing, `0` included, always present). `--json` prints the op's result verbatim and is what scripts and the functional harness assert on; the human form is `id  label  state  rollup`, followed by the host's `detail` on indented lines when there is one — a settled launch failure's full text, which the band has no room for. `retry`'s `delay_ms`/`attempt`/`budget`/`armed_at` stay **`--json`-only**, but `retry.reason` does not: while a rung is armed the band, and so the human form's `rollup`, has to read `reconnecting in 8s (3/10)`, which is exactly the moment the cause would otherwise be unreadable, so the human form prints `retry.reason` too, on its own indented line right after the `reason`/`detail` lines and before the reduced-fidelity line: `    armed because: <reason>`. Also `--json`-only are `payload_kind` and `connect`/`tabs`: `payload_kind` names what the last attach on that host is being decoded as — `vt` there means the connection is on the [reduced-fidelity fallback](../guides/host-sessions.md#when-a-build-skew-connects-instead-the-vt-fallback) a libghostty build skew lands on — but it appears only once a tab has actually attached, while `connect.reduced_fidelity` is known the moment the connection is up. That is what the human form prints instead, keyed on `connect.reduced_fidelity` rather than `payload_kind` for exactly that reason: whenever it is `true`, an indented line follows the `reason`/`detail` lines: `    reduced fidelity: this Roost and the session pin different libghostty builds; update or restart the session from the sidebar`. See [ipc.md](ipc.md) for the field-by-field wire shape.
 
 There is no `roostctl host stop`: the palette's **Stop Session** verb goes straight onto the host's own connection as an ordinary `session.stop`, not through a client-side `host.*` op, so there is nothing yet for a CLI verb to drive. The fidelity fix-it verbs (`host:update:<id>` on an ssh host, `host:restart:<id>` on `localhost`) are the same story: **UI-only, deliberately, with no `roostctl` twin.** Plan 039 §3.5's rule is that a machine is never prompted by a connect it did not ask for; these verbs exist only on a person's already-connected, reduced-fidelity host, and their first remote activity is a consent card (ssh) or a restart confirmation (`localhost`) — exactly the shape Stop Session already set. No new IPC op backs either one.
-
-**Swift Mac app note:** `roostctl host *` against `--target mac` answers `unknown-op` — a documented, permanent boundary, not a gap. Host sessions are iced-only (the Linux `roost` build and the experimental Roost-Iced Mac app); the Swift `Roost.app` never grows this surface.
 
 ## `rpc`
 

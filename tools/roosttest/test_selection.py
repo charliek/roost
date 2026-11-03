@@ -9,9 +9,8 @@ Nothing here touches the host pasteboard, which is why this file runs
 in every lane including headless Wayland. The clipboard round-trip
 lives in `test_osc52.py` alongside the OSC 52 tests that need it.
 
-Run against any UI:
+Run it directly:
 
-    pytest -q tools/roosttest/test_selection.py --roost-target mac
     pytest -q tools/roosttest/test_selection.py --roost-target iced
 """
 
@@ -24,9 +23,8 @@ import pytest
 
 from util import wait_tab_quiet
 
-# `tab.feed_pty_bytes` is gated the same way it is in `test_test_ops.py`
-# — without it the handler returns `not-enabled` and every assertion
-# fails for an unrelated reason.
+# `tab.feed_pty_bytes` is test-mode-gated — without it the handler
+# returns `not-enabled` and every assertion fails for an unrelated reason.
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
 
@@ -154,7 +152,7 @@ def _flood_scrollback(roost, tab, count: int) -> None:
 
 
 def test_selection_follows_then_vanishes_when_evicted(roost, project):
-    """Regression for #334, on both UIs.
+    """Regression for #334.
 
     Endpoints are libghostty tracked grid refs, so a selection follows
     its content while the content exists and reports *nothing* once the
@@ -162,8 +160,8 @@ def test_selection_follows_then_vanishes_when_evicted(roost, project):
     the third outcome the old screen-coordinate endpoints produced:
     silently copying whichever row moved into the stored coordinate.
 
-    Row counts are sized off the 2000-line scrollback limit both UIs
-    ship. libghostty prunes at page granularity — how many rows a page
+    Row counts are sized off the 2000-line scrollback limit the UI
+    ships. libghostty prunes at page granularity — how many rows a page
     holds depends on the window's column count and the host's memory
     page size — so the first flood stays comfortably under the limit
     (nothing is pruned at all) and the second overshoots it by a wide

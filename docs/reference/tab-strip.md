@@ -6,43 +6,13 @@ a minimum and maximum width so the strip behaves like Ghostty's:
 pills shrink proportionally as you open more tabs, then start
 scrolling horizontally once they hit the minimum.
 
-## Config keys
+## Sizing
 
-Set these in `~/.config/roost/config.conf` (more precisely
-`$XDG_CONFIG_HOME/roost/config.conf` on both platforms). They take
-effect on next launch.
+The pill width is bounded between `TAB_PILL_MIN_WIDTH = 80` and
+`TAB_PILL_MAX_WIDTH = 220` points (`crates/roost-iced/src/chrome.rs`). The
+active pill in edit mode (during `Cmd-R` / `Alt-R` rename) always gets at
+least 220pt so the rename field is usable.
 
-| Key                | Default | Notes |
-|--------------------|---------|-------|
-| `tab-min-width`    | `80`    | Pill width floor in points. As more tabs open, pills shrink toward this minimum. Set to `0` to disable the floor — pills can shrink to whatever their label needs. |
-| `tab-max-width`    | `220`   | Pill width cap in points. The active pill in edit mode (during `Cmd-R` rename) is unaffected — it always gets at least 220pt so the rename field is usable. Set to `0` to disable the cap entirely (pills grow to fit their full title; this is the pre-round-4 behavior). |
-
-## Examples
-
-```conf
-# Default: pills shrink between 80pt and 220pt, then scroll.
-# (No config lines needed — these are the built-in defaults.)
-
-# Wider pills before they start shrinking:
-tab-max-width = 280
-
-# Don't shrink at all; cap pills at 200pt and scroll past that.
-tab-min-width = 200
-tab-max-width = 200
-
-# Disable the cap entirely — pills grow to their full title.
-# Useful if you set short, deliberate titles via `roostctl set-title`
-# (from inside the tab, or with `--tab <id>` from anywhere else).
-tab-max-width = 0
-```
-
-## Platform notes
-
-- **macOS** uses these config keys directly to constrain the
-  `TabPillView` `widthAnchor` on each pill.
-- **Linux** (the iced UI) ignores these keys. Its tab strip applies the
-  same bounded-width algorithm with the Mac defaults compiled in —
-  `TAB_PILL_MIN_WIDTH = 80` and `TAB_PILL_MAX_WIDTH = 220` in
-  `crates/roost-iced/src/chrome.rs` — so the behavior already matches
-  the Mac default, but there is no config knob for it yet. The keys are
-  macOS-only for now.
+There is no config knob for these bounds. The `tab-min-width` and
+`tab-max-width` keys the Swift app used to read are ignored; a
+`config.conf` that still carries them is harmless.

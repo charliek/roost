@@ -21,9 +21,8 @@ No keystroke-interleaving case: `roost.send`/`tab.write` bypasses
 `capture_pty_input` — ordering is proven compositionally in the roost-vt
 + Mac unit tests instead (plan §3.5).
 
-Both targets run these in CI with `ROOST_TEST_MODE: "1"` set in the workflow
-env block: iced through `ICED_E2E_TESTS` and the X11, Wayland and macOS
-iced lists, the Swift app through `e2e-mac`'s whole-directory sweep.
+CI runs these with `ROOST_TEST_MODE: "1"` set in the workflow env block,
+through `ICED_E2E_TESTS` and the X11, Wayland and macOS lists.
 """
 
 from __future__ import annotations
@@ -95,13 +94,11 @@ class TestDeviceQueries:
         captured = drain_until_match(roost, tab, rb"libghostty")
         assert b"libghostty" in captured, captured
 
-    def test_kitty_png_query_is_answered_ok_once(self, roost, project, target):
+    def test_kitty_png_query_is_answered_ok_once(self, roost, project):
         """A Kitty graphics PNG query (`a=q,f=100`) is decoded by the PNG
         decoder roost-iced installs at startup and answered `OK`, once.
-        DA1 behind it is the fence: its reply follows the answer. Iced
-        only: the frozen Swift app installs no decoder (plan 087 D2)."""
-        if target != "iced":
-            pytest.skip("only roost-iced installs a PNG decoder")
+        DA1 behind it is the fence: its reply follows the answer (plan
+        087 D2)."""
         tab = roost.open_tab(project, cwd="/tmp")
         wait_tab_attached(roost, tab)
         query = b"\x1b_Gi=32,a=q,t=d,f=100;" + ONE_PIXEL_PNG + b"\x1b\\"

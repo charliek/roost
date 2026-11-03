@@ -32,11 +32,11 @@
       hardened runtime for a WHY that does not apply here.
 
     * No App Sandbox flags: sandboxing the shells the session hosts
-      would defeat the product, exactly as for the two UIs.
+      would defeat the product, exactly as for the app.
 
     An empty dict is not the same as passing no entitlements file at
     all: codesign_or_die always passes one, and this file keeps the
-    daemon's posture explicit and asserted (EntitlementsTests.swift
+    daemon's posture explicit and asserted (test_mac_entitlements.py
     and CI's "Assert bundle contents" step).
 -->
 <plist version="1.0">

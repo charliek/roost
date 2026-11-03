@@ -27,8 +27,8 @@ use crate::{
     AttentionSource, PtySupervisor, RestoreTab, SupervisorEvent, Workspace, WorkspaceError,
 };
 
-/// The one `tab.close` sequence, shared by the served handler, the
-/// in-process client and the facade.
+/// The one `tab.close` sequence, shared by the served handler and the
+/// in-process client.
 ///
 /// The row leaves the workspace BEFORE the PTY is torn down. The
 /// teardown's SIGHUP starts the exit path, whose `close_row` also
@@ -122,8 +122,8 @@ fn is_enterable(path: &Path) -> bool {
     path.is_dir() && crate::process::is_executable_by_current_user(path)
 }
 
-/// Where a `tab.open` lands, settled in `params` itself, shared by the
-/// served handler and the facade: `cwd_from_tab` replaces `cwd` before
+/// Where a `tab.open` lands, settled in `params` itself, for the served
+/// handler: `cwd_from_tab` replaces `cwd` before
 /// anything reads it, `ensure_default_project` included, and a `cwd`
 /// that is not a directory ([`usable_cwd`]) is dropped so the empty
 /// chain places the tab.
@@ -148,8 +148,8 @@ pub fn resolve_open_target(
 }
 
 /// A `tab.open` request, served: [`resolve_open_target`] then
-/// [`open_and_spawn`], for the served handler and the facade. `cols` and
-/// `rows` are the caller's, already validated, so a refused size never
+/// [`open_and_spawn`], for the served handler. `cols` and `rows` are
+/// the caller's, already validated, so a refused size never
 /// reaches the default project `resolve_open_target` can create.
 pub fn open_requested(
     workspace: &Workspace,
@@ -193,9 +193,8 @@ pub struct NewTab<'a> {
     pub rows: u16,
 }
 
-/// The one `tab.open` sequence, shared by the served handler, the
-/// in-process client and the facade: a tab is listed only once its PTY
-/// exists (#640).
+/// The one `tab.open` sequence, shared by the served handler and the
+/// in-process client: a tab is listed only once its PTY exists (#640).
 ///
 /// 1. Reserve the row ([`Workspace::reserve_tab`]): its id, cwd and title,
 ///    with nothing listed, emitted or written.
@@ -346,8 +345,7 @@ impl LocalClient {
         // exceeding u16 surface as a clear error rather than
         // silently truncating via `as u16` (CR-flagged: a CLI
         // caller passing `--cols 100000` would land with cols=34464
-        // and a wildly-misshapen grid). Mirrors the Mac side's
-        // `IPCHandlerImpl.ipcDim` validation.
+        // and a wildly-misshapen grid).
         let cols = pty_dim(cols, 80, "cols")?;
         let rows = pty_dim(rows, 24, "rows")?;
         open_and_spawn(
@@ -1825,6 +1823,95 @@ mod tests {
             Some(d),
             "with /b gone P1 keeps the tab the reopening left it on (/d = {d}), \
              never /c = {c}, which took /b's index"
+        );
+    }
+
+    /// `tests/swift-state-fixture/state.json`, which the v0.0.27 Swift
+    /// `Roost.app` wrote, through the iced app's in-process launch: the
+    /// open, then the restore. An upgrading user keeps every project, the
+    /// tab layout, the selection, and an id counter no new id collides
+    /// under. Cwds the restore moves to an enterable directory are this
+    /// machine's, so the saved ones are read off the layout instead.
+    #[tokio::test]
+    async fn a_state_file_the_swift_app_wrote_restores_whole() {
+        const P1: &str = "/tmp/roost089-swift-state/work/p1";
+        const P2: &str = "/tmp/roost089-swift-state/work/p2";
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/swift-state-fixture/state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::copy(&fixture, &path).unwrap();
+
+        let ws = Workspace::open(path.clone());
+        let projects: Vec<(i64, String, String, i32, i64)> = ws
+            .snapshot()
+            .into_iter()
+            .map(|p| (p.id, p.name, p.cwd, p.position, p.created_at))
+            .collect();
+        let at = 1_793_692_939;
+        assert_eq!(
+            projects,
+            [
+                (2, "Untitled 1".into(), String::new(), 0, at),
+                (3, "Alpha".into(), P1.into(), 1, at),
+                (4, "Beta".into(), P2.into(), 2, at),
+            ]
+        );
+        let layout = ws.retained_layout().expect("the file's tab layout");
+        assert_eq!(
+            (layout.active_project_id, layout.active_tab_position),
+            (4, 0)
+        );
+        let saved: Vec<_> = layout
+            .projects
+            .iter()
+            .map(|p| {
+                let tabs: Vec<_> = p
+                    .tabs
+                    .iter()
+                    .map(|t| (t.cwd.as_str(), t.title.as_str(), t.user_titled))
+                    .collect();
+                (p.project_id, tabs, p.last_tab_position)
+            })
+            .collect();
+        assert_eq!(
+            saved,
+            [
+                (
+                    2,
+                    vec![("/Users/charliek", "👻 /Users/charliek", false)],
+                    Some(0)
+                ),
+                (3, vec![(P1, "p1", false), (P1, "p1", false)], Some(1)),
+                (4, vec![(P2, "p2", false)], Some(0)),
+            ]
+        );
+
+        hydrate_rows(&ws, &[]).await;
+
+        assert_eq!(
+            tab_ids(&ws),
+            [(2, vec![9]), (3, vec![10, 11]), (4, vec![12])],
+            "every saved tab reopened, under ids minted past the file's next_id, \
+             the last id the Swift app minted"
+        );
+        assert_eq!(ws.active(), (4, 12), "Beta, the saved active project");
+        assert_eq!(ws.preferred_tab(3), Some(11), "Alpha's last-shown tab");
+        let on_disk = crate::persistence::read_state(&path).unwrap().unwrap();
+        assert_eq!(on_disk.next_id, 12);
+        let titles: Vec<(i64, Vec<&str>)> = on_disk
+            .projects
+            .iter()
+            .map(|p| (p.id, p.tabs.iter().map(|t| t.title.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                (2, vec!["👻 /Users/charliek"]),
+                (3, vec!["p1", "p1"]),
+                (4, vec!["p2"]),
+            ],
+            "the iced app's first write keeps the layout"
         );
     }
 

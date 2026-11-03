@@ -1,11 +1,10 @@
 //! Toolkit-neutral `~/.config/roost/config.conf` parser.
 //!
-//! Mirrors `mac/Sources/Roost/Config.swift`'s parse shape and value
-//! normalization: same lenient-line parsing (blank lines and
-//! `#`-comments dropped), same forward-compat (unknown keys silently
-//! ignored), same raw-vs-unquoted split per key. The recognized-key
-//! sets are not identical — `link-modifier` is Rust-only, `tab-min-width`
-//! / `tab-max-width` are Mac-only.
+//! Lenient line parsing (blank lines and `#`-comments dropped),
+//! forward-compatible (unknown keys silently ignored), and a
+//! raw-vs-unquoted split per key — the shape the retired Swift app's
+//! `Config.swift` parsed with, so a config written for it reads the same
+//! here. `tests/config-fixtures/` pins the value semantics.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -63,7 +62,6 @@ pub struct RoostConfig {
     /// `None` means "use the platform default"
     /// ([`keybind::default_link_modifier`]: Cmd on macOS, Alt on
     /// Linux). Set `link-modifier = ctrl` for traditional Ctrl+click.
-    /// Consumed by both Rust UIs; the Swift UI's modifier is fixed to Cmd.
     pub link_modifier: Option<AccelMods>,
 
     /// `macos-option-as-alt` — which Option keys type as Alt (Meta)
@@ -73,8 +71,8 @@ pub struct RoostConfig {
     pub macos_option_as_alt: OptionAsAlt,
 
     /// `show-sidebar-agents` — whether the sidebar shows its Agents
-    /// panel and the project rows' agent counts (plan 080 D2; the Swift
-    /// app's per-project agent rows, plan 007). Defaults to `true`.
+    /// panel and the project rows' agent counts (plan 080 D2). Defaults
+    /// to `true`.
     /// Toggled at runtime via the `toggle_sidebar_agents` keybind /
     /// palette row / Mac View menu item, which writes the live value
     /// straight back here through `set_key`.
@@ -517,9 +515,8 @@ fn parse_bool_like(s: &str) -> Option<bool> {
     }
 }
 
-/// Strip one matched quote pair. Mirrors `unquote` in
-/// `mac/Sources/Roost/Config.swift`: no recursion (`""x""` → `"x"`), and
-/// no re-trim afterward, so `word-break-chars = " -"` keeps its leading
+/// Strip one matched quote pair: no recursion (`""x""` → `"x"`), and no
+/// re-trim afterward, so `word-break-chars = " -"` keeps its leading
 /// space.
 fn unquote(s: &str) -> &str {
     let t = s.trim();
@@ -581,7 +578,7 @@ impl RoostConfig {
                     // The first `=` was the outer split; the value
                     // now looks like `<trigger> = <action>`. An empty
                     // trigger or action is malformed — dropped, like
-                    // every other malformed line (mirrors Config.swift).
+                    // every other malformed line.
                     if let Some((trigger, action)) = raw_value.split_once('=') {
                         let (trigger, action) = (trigger.trim(), action.trim());
                         if !trigger.is_empty() && !action.is_empty() {
@@ -785,10 +782,6 @@ impl RoostConfig {
 /// link paths have to contend on one file. `$ROOST_CONFIG` therefore
 /// moves the lock with the config, which is what lets a jailed harness
 /// — and a second profile — write without touching the developer's.
-///
-/// Public because Roost's Swift half resolves the same path in its own
-/// `setKey`, and `flock(2)` only serialises writers that agree on which
-/// file they are contending for.
 pub fn lock_path(config_path: &Path) -> PathBuf {
     lock_beside(&follow_links(config_path))
 }
@@ -877,10 +870,9 @@ impl From<LockError> for io::Error {
 ///
 /// An atomic rename stops a *torn* file but not a lost update: two
 /// readers, two renders built on the same pre-image, and the second
-/// rename silently discards the first's work. `config.conf` has four
-/// writers that can all run at once — this UI, the Swift app,
-/// `roostctl`, and a remote connect raising `agent-hooks` — so the
-/// rename alone was never enough.
+/// rename silently discards the first's work. `config.conf` has writers
+/// that can all run at once — this UI, `roostctl`, and a remote connect
+/// raising `agent-hooks` — so the rename alone was never enough.
 ///
 /// **Never acquired on a UI thread.** The hold spans a whole
 /// agent-hooks ensure (read the key, union it, write up to five agent
@@ -1602,7 +1594,6 @@ mod tests {
         assert!(!RoostConfig::parse("show-sidebar-agents = no").show_sidebar_agents);
     }
 
-    // Quoted and CRLF forms must agree with the Swift mirror.
     #[test]
     fn show_sidebar_agents_accepts_quoted_and_crlf_values() {
         assert!(!RoostConfig::parse("show-sidebar-agents = \"false\"").show_sidebar_agents);
@@ -1727,8 +1718,6 @@ mod tests {
     }
 
     // ----- agent-hooks (plan 064 §3.1; supersedes plan 046 §3.6) -----
-    // Mirrored 1:1 by `mac/Sources/Roost/Config.swift`'s
-    // `ConfigAgentHooksTests`.
 
     fn allow(names: &[&str]) -> AgentHooks {
         AgentHooks::allow(names.iter().copied())
@@ -1948,7 +1937,7 @@ mod tests {
         }
     }
 
-    // ----- unquote semantic (mirrors Config.swift's `unquote`) -------
+    // ----- unquote semantic -------------------------------------------
 
     #[test]
     fn theme_accepts_both_quote_kinds() {
@@ -1979,9 +1968,8 @@ mod tests {
 
     #[test]
     fn unquote_keeps_mismatched_pair_verbatim() {
-        // Deliberately narrower than Swift's old set-trim: a mismatched
-        // pair is not a quoted value, so both platforms now fail the
-        // theme lookup identically.
+        // A mismatched pair is not a quoted value: it is kept verbatim,
+        // and the theme lookup fails on it.
         assert_eq!(
             RoostConfig::parse("theme = \"dark'").theme_name.as_deref(),
             Some("\"dark'")
@@ -1995,7 +1983,7 @@ mod tests {
     #[test]
     fn unquote_matches_scalar_level_quotes() {
         // A combining mark right after the opening quote must not stop
-        // the strip: both platforms compare unicode scalars, so the
+        // the strip: quotes are compared as unicode scalars, so the
         // quote is matched even when a grapheme-cluster view would
         // fuse it with the following mark.
         assert_eq!(
@@ -2009,7 +1997,7 @@ mod tests {
     #[test]
     fn bool_value_with_interior_cr_before_closing_quote_parses() {
         // `"false\r"` unquotes to `false\r`; the bool parser's trim
-        // must strip that CR on both platforms.
+        // must strip that CR.
         assert!(!RoostConfig::parse("show-sidebar-agents = \"false\r\"").show_sidebar_agents);
     }
 
@@ -2043,8 +2031,8 @@ mod tests {
 
     #[test]
     fn keybind_uses_the_raw_value() {
-        // Pinned to the raw value on both platforms: a quoted trigger
-        // stays verbatim rather than becoming a different binding.
+        // Pinned to the raw value: a quoted trigger stays verbatim
+        // rather than becoming a different binding.
         let cfg = RoostConfig::parse("keybind = \"ctrl+t\" = new_tab");
         assert_eq!(
             cfg.keybinds,
@@ -2347,12 +2335,11 @@ mod tests {
         assert_eq!(cfg.theme_name.as_deref(), Some("roost-dark"));
     }
 
-    /// The degenerate half of that path, pinned on both sides: this is
-    /// the table `Config.swift`'s `configLockPath` is tested against, and
-    /// a config path with no parent directory is where the two resolvers
-    /// can silently pick different files.
+    /// The degenerate half of that path: a config path with no parent
+    /// directory is where two resolvers can silently pick different
+    /// files.
     #[test]
-    fn the_lock_path_table_the_swift_twin_mirrors() {
+    fn the_lock_path_of_a_config_with_no_parent_directory() {
         for (config, lock) in [
             ("/", "./config.lock"),
             ("//", "./config.lock"),

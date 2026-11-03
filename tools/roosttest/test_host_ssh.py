@@ -1254,8 +1254,8 @@ def test_quitting_during_a_scheduled_retry_leaves_no_ssh_children(
     Relaunches the UI it ended rather than being the module's last test:
     the SIGTERM case below owns that slot and asserts a different thing
     (the *tunnel's* `-O exit` on the way out, which needs a live tunnel
-    at signal time — and a live ladder means there is none). Same
-    quit → launch cycle `test_sidebar_collapse_persistence.py` uses.
+    at signal time — and a live ladder means there is none). The same
+    quit → launch cycle `test_project_lifecycle.py`'s restore case uses.
     """
     process = ui.owned_process(target)
     if process is None:

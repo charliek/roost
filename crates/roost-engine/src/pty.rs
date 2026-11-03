@@ -52,8 +52,6 @@ const PTY_OUTPUT_BROADCAST_CAPACITY: usize = 256;
 const PTY_INPUT_CHANNEL_CAPACITY: usize = 64;
 const PTY_OUTPUT_CHUNK_SIZE: usize = 4096;
 /// Grace period after SIGHUP before `close()` escalates to SIGKILL.
-/// Matches the Mac side's 20×10ms teardown window in
-/// `PtySupervisor.swift`.
 const KILL_GRACE: Duration = Duration::from_millis(200);
 /// How often the reap fallback polls when `waitid(WNOWAIT)` is
 /// unavailable. No supported target is expected to take that path; the
@@ -2055,7 +2053,7 @@ impl PtySupervisor {
     }
 }
 
-/// Terminate a PTY child the way the Mac side does: SIGHUP first (via
+/// Terminate a PTY child: SIGHUP first (via
 /// portable-pty's killer, which sends SIGHUP on Unix), then a SIGKILL
 /// fallback after a grace period if the child ignored the hangup.
 ///
@@ -2734,8 +2732,8 @@ fn build_command(
         Some(hook) => cmd.env("ROOST_AGENT_HOOK", hook),
         None => cmd.env_remove("ROOST_AGENT_HOOK"),
     }
-    // Roost shell-integration contract (parity with the Mac UI). TERM
-    // stays xterm-256color (above). ROOST_SHELL_FEATURES is overridable.
+    // Roost shell-integration contract. TERM stays xterm-256color
+    // (above). ROOST_SHELL_FEATURES is overridable.
     cmd.env("TERM_PROGRAM", "Roost");
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
     cmd.env("ROOST_SHELL_INTEGRATION", "1");
@@ -2744,8 +2742,7 @@ fn build_command(
     }
     if let Some(dir) = resources_dir {
         cmd.env("ROOST_RESOURCES_DIR", dir);
-        // Auto-bootstrap the shipped integration with no rc edit (parity
-        // with the Mac UI):
+        // Auto-bootstrap the shipped integration with no rc edit:
         //   * zsh: point ZDOTDIR at our shim — it restores the user's
         //     ZDOTDIR, runs their startup, then loads roost.zsh.
         //   * modern bash: set ENV + ROOST_BASH_INJECT so the `--posix`

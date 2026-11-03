@@ -1,7 +1,7 @@
 # roosttest — pytest E2E harness
 
-Functional end-to-end tests that drive a **real** Roost UI (Mac or Iced)
-over the JSON IPC socket and assert on the op set (one headless
+Functional end-to-end tests that drive a **real** Roost UI (the Rust + iced
+app, as a bare binary or a macOS bundle) over the JSON IPC socket and assert on the op set (one headless
 exception: `test_session.py` drives the UI-less `roost-session` daemon) — exactly what users
 and `roostctl` drive (the [north star](../../docs/development/vision.md#the-command-core-north-star)).
 Most tests read back via `tab.dump` / `tab.list` / `identify`; the
@@ -13,11 +13,9 @@ regression patterns" below.
 ## Run
 
 ```bash
-make e2e            # dispatch on $ROOST_TARGET (default iced): the curated e2e-iced lane, or e2e-mac
+make e2e            # the curated e2e-iced lane
 make e2e-iced       # the curated iced lane (see ICED_E2E_TESTS in the Makefile); sets ROOST_TEST_MODE=1 but NOT --roost-fresh, so it still reuses a running dev instance — tests that need test-mode ops on a reused non-test-mode instance skip with a reason (#483) rather than failing confusingly
-make e2e-mac        # against the Mac app (full tools/roosttest directory)
 make e2e-iced-ci    # CI parity: ROOST_TEST_MODE=1 + --roost-fresh (owns a fresh UI)
-make e2e-mac-ci     # CI parity (DESTRUCTIVE: force-quits any running Roost.app)
 make e2e-session    # the headless host-session lane (no UI, no display)
 make e2e-host-client # HS-2: a roost-session daemon beside the Iced UI (needs both)
 make e2e-host-ssh   # HS-3: the same pair with a real SshTunnel between them (fake ssh)
@@ -28,13 +26,18 @@ make e2e-host-bootstrap       # HS-3 slice 2: installing/starting roost-session 
 make e2e-old-session          # this tree's UI against released roost-sessions, already running when it starts (#537)
 # The six host lanes run ONE AT A TIME — never two at once, locally or in CI.
 # or directly:
-uv run --group test pytest tools/roosttest --roost-target mac -v
-uv run --group test pytest tools/roosttest --roost-target iced -v
+uv run --group test pytest tools/roosttest/test_smoke.py --roost-target iced -v
 ```
+
+`--roost-target iced` is the one target (and the default). Run a curated
+list rather than the whole directory: it holds the app-ending lanes and
+the daemon lanes, each of which needs its own invocation (see the
+Makefile's lists).
 
 The session fixture launches the UI if it isn't already running (and
 quits only what it launched), so a bare `make e2e` is self-contained.
-Build first if needed: `make build` (iced + roostctl) / `make bundle` (Mac).
+Build first if needed: `make build` (iced + roostctl) / `make bundle-iced`
+(the dev macOS bundle).
 `ROOST_ICED_BIN` selects an explicit iced UI executable;
 `ROOST_ROOSTCTL` selects the CLI. The shed uses these to run shed-local ELF
 artifacts while the mounted repository's `target/` contains macOS output.
@@ -44,15 +47,40 @@ test-mode-gated ops (`ROOST_TEST_MODE=1`) and force a fresh harness-owned
 instance (`--roost-fresh`), so you run the *same set CI does* rather than
 silently skipping ~30 mode-gated tests. See "Hermetic / fresh mode" below.
 
-Every mac launch (the first one per process; a mid-test relaunch reuses it)
-runs `./mac/scripts/bundle.sh debug` — SwiftPM is incremental, so a no-op
-rebuild is cheap — and logs the bundle binary's mtime against the newest
-`mac/` source mtime, warning `stale Roost.app: sources are newer than the
-bundle` when the bundle is older. Set `ROOST_MAC_NO_BUNDLE=1` to skip the
-rebuild (still logs/warns); it errors if no bundle exists yet. The harness
-refuses to rebuild over a Developer-ID-signed bundle — that is a release
-artifact, and `bundle.sh debug` would replace it with an ad-hoc debug build
-at the same path; set the opt-out to test it as it is.
+### Bundles and their identities (`ROOST_ICED_APP`)
+
+One naming, stated once. `--roost-target iced` drives the iced UI: the bare
+`target/debug/roost-iced` (the dev `Iced` profile), or on macOS whichever
+bundle `ROOST_ICED_APP` names. `mac/scripts/bundle-iced.sh` assembles two
+identities, and the bundle's own `Info.plist` decides which one the harness
+is driving:
+
+| `ROOST_BUNDLE_IDENTITY` | Bundle | `CFBundleIdentifier` | Profile | Socket, logs |
+|---|---|---|---|---|
+| `production` | `mac/build/Roost.app` | `ai.stridelabs.Roost` | `Mac` | `~/Library/Caches/Roost/`, `~/Library/Logs/Roost/` |
+| `dev` (default) | `mac/build/Roost-Iced.app` | `ai.stridelabs.Roost.iced` | `Iced` | `~/Library/Caches/Roost-iced/`, `~/Library/Logs/Roost-iced/` |
+
+Every profile-derived value follows that mapping: the socket and its lock,
+the log the launch reads back, the expected `identify.app_id` and the
+`resolved bundle identity` line it asserts. roostctl names the same two
+profiles `--target mac` (the production Roost.app) and `--target iced` (a
+dev build).
+
+The production identity is the installed Roost.app's on a developer's Mac:
+same socket, logs and defaults domain, and `--roost-fresh` quits whatever
+answers on that socket. So outside CI the harness refuses it unless
+`ROOST_TEST_ALLOW_PRODUCTION_IDENTITY=1` is set — quit Roost.app first. CI
+(`CI` set) needs no opt-in. Either way it only ever launches on a throwaway
+`ROOST_STATE_DIR`, and teardown signals a bundle's processes by pid, each
+re-checked to be running the executable inside the launched bundle — never
+by process name, which for the production bundle is `Roost`, the installed
+app's too.
+
+```bash
+make e2e-iced-bundle                                   # assembles + drives the dev Roost-Iced.app
+make e2e-iced-bundle ICED_APP=mac/build/Roost.app \
+  ROOST_TEST_ALLOW_PRODUCTION_IDENTITY=1               # drives an already-built production bundle
+```
 
 ## Layout
 
@@ -61,7 +89,7 @@ at the same path; set the opt-out to test it as it is.
 | `client.py` | `Roost` — a thin JSON-IPC client (direct Unix socket). Op methods (`open_tab`, `set_state`, `agent_report`, `dump`, …), the agent-axis readers (`shell_state`, `agent_lifecycle`, `ownership`, `hook_active`) + no-`sleep` waits (`wait_state`, `wait_lifecycle`, `wait_shell_state`, `wait_notification`, `wait_text`, `wait_gone`) + `run()` (wait for prompt, then send a command). |
 | `session.py` | The **host-session** launcher: build a throwaway `roost-session` profile (per-OS env isolation), spawn the daemon in either start shape, parse its readiness verdict, and tear every process down before the root goes. Deliberately parallel to `ui.py` rather than part of it — a session is not a UI. |
 | `eventstream.py` | `EventStream` — a second connection that sends `events.subscribe`, keeps the ack's fence revision, then reads pushed `EventBatch` frames. Separate from `client.py` because the push stream is one-way and would sit in front of every ordinary `call`. |
-| `relay.py` | `Relay` — a recording Unix-socket proxy in front of a UI or session socket: `roostctl --socket <relay>` goes through it, and it logs each connection's requests and the answers it passed back, so a test asserts which ops `roostctl` sent on which connection. `forced_poll=True` strips `events.subscribe` (and `local_session_socket`) from `identify`, which forces `roostctl wait` onto its poll loop; `session_socket=` reroutes a session-mode UI's `local_session_socket` through a second relay. |
+| `relay.py` | `Relay` — a recording Unix-socket proxy in front of a UI or session socket: `roostctl --socket <relay>` goes through it, and it logs each connection's requests and the answers it passed back, so a test asserts which ops `roostctl` sent on which connection. `no_stream=True` strips `events.subscribe` (and `local_session_socket`) from `identify`, the answer of a Roost that serves no stream, which `roostctl wait` refuses `unsupported`; `session_socket=` reroutes a session-mode UI's `local_session_socket` through a second relay. |
 | `dataplane.py` | `DataPlane` — an attach **data** connection: the handshake line, the `ROOSTDP2` preamble, and the length-prefixed binary frames behind it (`INPUT` / `RESIZE` out, `SNAP` / `PTY` / `EXIT` / `ERROR` in). Its own module for `eventstream.py`'s reason — `client.py`'s whole shape is one request, one response. It decodes no payload: GHOSTSNP and `vt` each have exactly one client implementation and both live Rust-side, so what happens here is frame accounting (seq contiguity, terminal frames, nothing ahead of readiness) plus a walk of GHOSTSNP's record *boundaries*. Its header is the contract. |
 | `ui.py` | Launch/quit a UI per target + socket-path resolution. `wait_alive` also confirms the UI's event subscription is live (see below). |
 | `conftest.py` | Fixtures: `target` (`--roost-target`), `fresh` (`--roost-fresh`/`ROOST_TEST_FRESH`), a session fixture that owns/ensures the UI (hermetic in fresh mode), `roost` (a client), `project` (a throwaway, cascade-cleaned project). Also the `SKIPS: N` terminal summary. |
@@ -71,24 +99,21 @@ at the same path; set the opt-out to test it as it is.
 | `test_notifications.py` | The multi-project notification inbox: `view_notifications` frame, jump-to-notification (focuses the tab + clears its badge), clear-all. |
 | `test_notification_raise.py` | A desktop banner click's window raise (plan 074 §D6, #351), through `app.notification_activate` and `app.last_activation`: a click with an activation token comes to the outcome the display and the compositor's registry say it should (`not-wayland` under Xvfb, `no-global` under weston, whose registry has no `xdg_activation_v1`), a click without one is `no-token`, and both focus their tab. iced only; skipped on macOS and without `ROOST_TEST_MODE=1`. In `ICED_E2E_TESTS`. |
 | `test_agent_lifecycle.py` | The agent state model end to end: synthetic Claude hook payloads driven through the **real `roostctl claude-hook` binary** (adapter → CLI → IPC → workspace → the derived `state` / `hook_active` / axis fields on `tab.list`). Covers the full turn, `PermissionRequest` -> `waiting` with exactly one banner and `PostToolUse` -> `working`, `Stop` with in-flight `background_tasks`, `StopFailure` (and that `tab.state` stays a closed four-value enum), the guarded `idle_prompt` nag after `Stop` and after `StopFailure`, unknown `notification_type`, `agent_id` events, foreign-session rejection, the legacy `prompt-submit` spelling, the deprecated `tab.set_hook_active` alias, `lifecycle_if`-guarded reports (vetoed but still accepted), and the OSC 133 `D`/`A` failsafe. |
-| `test_launcher.py` | The custom-command launcher (Cmd/Alt+Shift+T): lists the seeded commands + activating one spawns a tab that runs it. |
 | `test_newtab_cwd.py` | New-tab cwd inheritance: `palette.activate("new_tab")` (Cmd-T / Ctrl-T) and the launcher both spawn in the active tab's live (OSC 7) cwd, not the project cwd. Emits OSC 7 itself so it's shell-independent. |
-| `test_terminal.py` | Program-driven terminal behavior: `test_cwd_tracking_follows_cd` (`cd` + an explicit OSC 7 emit → tracked cwd; cross-platform) and `test_title_follows_cwd` (title derives from cwd; skipped on Mac — shell-OSC-0-driven, see issue #196). |
-| `test_test_ops.py` | Smoke triple for the test-only IPC ops (`tab.feed_pty_bytes`, `tab.capture_pty_input`, `tab.dump_resolved`) — the scaffolding for the byte-level OSC pipeline tests. Skipped without `ROOST_TEST_MODE=1`. |
 | `test_osc_pipeline.py` | End-to-end OSC pipeline: bold + inverse resolver call-site coverage (#142), OSC 10/11/12 set/query reply round-trips (#145), and parity OSC 0/7/9 routing tests. Drives bytes via `tab.feed_pty_bytes`; reads back via `tab.dump_resolved` + `tab.capture_pty_input`. The canonical example for the "OSC-routed regression patterns" section below. |
-| `test_device_queries.py` | End-to-end device-query replies (#247): each engine-autonomous query (DA1, DSR 5n/6n, DECRQM ?25, XTVERSION `libghostty`, Kitty keyboard `ESC[?u`) fed via `tab.feed_pty_bytes` produces its reply on the input side, read back via `tab.capture_pty_input`. Pins the `write_pty` drain wiring both UIs install. Skipped without `ROOST_TEST_MODE=1`. |
+| `test_device_queries.py` | End-to-end device-query replies (#247): each engine-autonomous query (DA1, DSR 5n/6n, DECRQM ?25, XTVERSION `libghostty`, Kitty keyboard `ESC[?u`) fed via `tab.feed_pty_bytes` produces its reply on the input side, read back via `tab.capture_pty_input`. Pins the `write_pty` drain wiring the UI installs. Skipped without `ROOST_TEST_MODE=1`. |
 | `test_selection.py` | The `selection.*` op set: set/dump/clear round trips, and copy completeness (#249) — a selection scrolled into scrollback still copies in full, a multi-row selection copies every row in order, a reversed drag copies in document order, and wide/CJK glyphs copy without a phantom space. IPC-only (no pasteboard), so it runs in every lane including headless Wayland. |
-| `test_tab_dump_scrollback.py` | `tab.dump`'s `scrollback` on a **UI** socket (plan 053 R4): the history above the viewport, its last row adjacent to `rows_text[0]`, a short answer when the ask outruns the history, a clamp instead of a refusal above the maximum, and an unasked dump still shaped the way a pre-053 client decodes it. Seeds with `tab.feed_pty_bytes`, so it skips without `ROOST_TEST_MODE=1`. In `ICED_E2E_TESTS`, and on the Mac gate by being in the directory `e2e-mac` collects. The session socket's half is in `test_session_attach.py`; the *scrolled* viewport has no IPC seam on either target and is pinned in `roost-vt`'s reader tests and their Swift twin. |
+| `test_tab_dump_scrollback.py` | `tab.dump`'s `scrollback` on a **UI** socket (plan 053 R4): the history above the viewport, its last row adjacent to `rows_text[0]`, a short answer when the ask outruns the history, a clamp instead of a refusal above the maximum, and an unasked dump still shaped the way a pre-053 client decodes it. Seeds with `tab.feed_pty_bytes`, so it skips without `ROOST_TEST_MODE=1`. In `ICED_E2E_TESTS`. The session socket's half is in `test_session_attach.py`; the *scrolled* viewport has no IPC seam and is pinned in `roost-vt`'s reader tests. |
 | `test_osc52.py` | Program-initiated OSC 52 clipboard writes, plus the `clipboard.write`/`clipboard.dump` round trip they read through, and a middle press pasting the selection clipboard (iced only, through `tab.dispatch_mouse_event`). Touches the host pasteboard, so it is in `ICED_CLIPBOARD_TESTS`, which the headless-Wayland lanes skip. |
 | `test_paste_files.py` | Pasting copied files (plan 073 D2): `clipboard.write_files` seeds the clipboard the way a file manager's copy does, the paste key runs the real paste, and the tab receives what `tab.send_file` types for the same paths. iced only; skipped without `ROOST_TEST_MODE=1`. In `ICED_CLIPBOARD_TESTS` beside `test_osc52.py`. |
 | `test_context_menu.py` | Right-click menus through their test ops (plan 073 D9): `app.context_menu_dump` lists a tab's and a project's exact items, and `app.context_menu_activate` runs New Tab Here (from a tab whose project is not on screen: its directory, the selection, and keys typed while it opens), Close Tab, Close Project… (waits on its card; Enter closes), and Rename… (the editor takes the keyboard; Escape hands it back). A tab closed after its menu was listed, and an item not on the row's menu, are refused `invalid-param`. On Linux, `app.context_menu_open` shows the overlay a right-click shows: `ArrowDown` steps past the separator to Close Tab and `Enter` runs it, and a letter typed at the open menu never reaches the PTY while `Escape` closes it; on macOS the op is `not-supported`. iced only; skipped without `ROOST_TEST_MODE=1`. In `ICED_E2E_TESTS`. |
 | `test_context_menu_clipboard.py` | The menu's Copy Path: a tab's and a project's path reach the system clipboard, read back with `clipboard.dump`. iced only; skipped without `ROOST_TEST_MODE=1`. In `ICED_CLIPBOARD_TESTS`. |
-| `test_password_input.py` | `Tab.password_input` (plan 074 §D2): a helper that sets line mode with echo off reads `true` on `tab.list` within 5 s × `ROOST_TEST_TIMEOUT_SCALE`, and `false` once its prompt is answered (echo off, so the answer never reaches the screen); bash's `read -s` reads the same. **Two lanes in one module, split by marker:** the unmarked cases drive the harness UI's in-process tabs (`ICED_E2E_TESTS`, the three iced CI cells, which deselect the daemon markers; skipped on the Swift target), and the `session_daemon` cases spawn a headless daemon (`SESSION_E2E_TESTS`, which `make e2e-session` runs as `-m session_daemon`) — the `tab.password_input` event on the stream, and a client that attaches mid-prompt reading it off `tab.list` with no new transition. The `local-backend = session` UI restart is in `test_local_backend.py`. |
-| `test_secure_input.py` | Secure Keyboard Entry (plan 074 §D3): `app.secure_input` reports the owner's inputs and state, and every macOS case asserts `desired == (app_active && (manual \|\| (auto && password_input)))`, `owned == desired` and `indicator == owned` against what it reports, never an outcome — a bare binary on a CI runner may never be the active app. **macOS iced:** the App menu's row right after Settings…, its checkmark following the toggle; the menu, the palette row and the keybind (`fixtures/launcher.conf` binds Ctrl+Shift+K) flipping one setting written to `config.conf`; `test_password_input.py`'s helper prompt counting only while its tab is active; and, off CI, the toggle surviving a relaunch and `macos-secure-input-indication = false` hiding the lock. **Linux iced:** the bound chord is consumed and writes nothing, the palette has no row, and the op reads all false at a prompt. Skipped on the Swift target and without `ROOST_TEST_MODE=1`. In `ICED_E2E_TESTS` and the three iced CI cells. |
+| `test_password_input.py` | `Tab.password_input` (plan 074 §D2): a helper that sets line mode with echo off reads `true` on `tab.list` within 5 s × `ROOST_TEST_TIMEOUT_SCALE`, and `false` once its prompt is answered (echo off, so the answer never reaches the screen); bash's `read -s` reads the same. **Two lanes in one module, split by marker:** the unmarked cases drive the harness UI's in-process tabs (`ICED_E2E_TESTS`, the three iced CI cells, which deselect the daemon markers), and the `session_daemon` cases spawn a headless daemon (`SESSION_E2E_TESTS`, which `make e2e-session` runs as `-m session_daemon`) — the `tab.password_input` event on the stream, and a client that attaches mid-prompt reading it off `tab.list` with no new transition. The `local-backend = session` UI restart is in `test_local_backend.py`. |
+| `test_secure_input.py` | Secure Keyboard Entry (plan 074 §D3): `app.secure_input` reports the owner's inputs and state, and every macOS case asserts `desired == (app_active && (manual \|\| (auto && password_input)))`, `owned == desired` and `indicator == owned` against what it reports, never an outcome — a bare binary on a CI runner may never be the active app. **macOS iced:** the App menu's row right after Settings…, its checkmark following the toggle; the menu, the palette row and the keybind (`fixtures/launcher.conf` binds Ctrl+Shift+K) flipping one setting written to `config.conf`; `test_password_input.py`'s helper prompt counting only while its tab is active; and, off CI, the toggle surviving a relaunch and `macos-secure-input-indication = false` hiding the lock. **Linux iced:** the bound chord is consumed and writes nothing, the palette has no row, and the op reads all false at a prompt. Skipped without `ROOST_TEST_MODE=1`. In `ICED_E2E_TESTS` and the three iced CI cells. |
 | `test_ime.py` | End-to-end IME (plan 021): `tab.feed_ime` (preedit/commit/clear) driven through the same route the iced adapter's winit IME handler takes — byte-exact commit encoding, preedit-only-at-cursor (never reaches the PTY), single-emit on preedit-then-commit, and the one-shot discard latch that drops a stray commit after a route change (e.g. opening the palette) cancels a live composition. Iced-only; skipped without `ROOST_TEST_MODE=1`. |
-| `test_dock_badge.py` | The macOS Dock-tile badge (plan 027 C7, the M6 § 6b native seam's first consumer): a pending notification badges the tile with the inbox count and clearing the inbox removes it, read back off AppKit via the `app.dock_badge` test-mode op rather than recomputed from the inbox. Skips unless the host is macOS **and** the target is iced — `make e2e-mac` collects the whole directory, so an OS-only skip would aim an iced-only op at the Swift app. Skipped without `ROOST_TEST_MODE=1`. |
+| `test_dock_badge.py` | The macOS Dock-tile badge (plan 027 C7, the M6 § 6b native seam's first consumer): a pending notification badges the tile with the inbox count and clearing the inbox removes it, read back off AppKit via the `app.dock_badge` test-mode op rather than recomputed from the inbox. Skips unless the host is macOS. Skipped without `ROOST_TEST_MODE=1`. |
 | `test_exit_on_empty.py` | Iced's exit-on-empty policy (plan 026 D8, mac parity): deleting the LAST project over IPC replies successfully, the process then exits on its own with status 0, and the throwaway `state.json` records the emptied workspace (proving `App`'s drop-time flush ran). **Runs in its own pytest invocation** — `make e2e-iced-exit`, and its own ci.yml step per lane — because it ends the UI it drives; a mid-suite exit would strand every module after it in the session-scoped harness. Deliberately NOT in `ICED_E2E_TESTS`, and self-enforcing: it skips (loudly) whenever it is collected beside another module, so a whole-directory run can't be poisoned by it. Also skipped off iced and without `--roost-fresh`. |
-| `test_session.py` | The headless host session (`roost-session`, plan 035): both start shapes, the readiness verdicts (`ready` / `already-running` / `error`), the D2b two-first-starts race, SIGTERM-converges-with-stop, stale-socket recovery after SIGKILL, the umask posture (socket 0600, dirs 0700, `state.json` + log 0600), layout restore across a restart, headless OSC + natural-exit handling, `tab.open` racing `session.stop`, the Python-side event-push reader, and `roostctl session start/stop/status` end to end. **Runs no UI at all** — `make e2e-session` and its own `session-e2e` CI job; every test carries the `session_daemon` marker, which is what tells `conftest`'s autouse UI fixture to stand down, and every whole-directory run (`e2e-mac`, `e2e-mac-ci`, the `e2e-mac` CI job, release.yml's bundle E2E) deselects it — see `DAEMON_E2E_DESELECT` in the Makefile — so the Mac gate never has to build `roost-session`. |
+| `test_session.py` | The headless host session (`roost-session`, plan 035): both start shapes, the readiness verdicts (`ready` / `already-running` / `error`), the D2b two-first-starts race, SIGTERM-converges-with-stop, stale-socket recovery after SIGKILL, the umask posture (socket 0600, dirs 0700, `state.json` + log 0600), layout restore across a restart, headless OSC + natural-exit handling, `tab.open` racing `session.stop`, the Python-side event-push reader, and `roostctl session start/stop/status` end to end. **Runs no UI at all** — `make e2e-session` and its own `session-e2e` CI job; every test carries the `session_daemon` marker, which is what tells `conftest`'s autouse UI fixture to stand down, and every shared-UI run (the curated iced lanes, release.yml's bundle E2E) deselects it — see `DAEMON_E2E_DESELECT` in the Makefile. |
 | `test_session_attach.py` | The attach **data plane** against a real daemon (plan 036, plan 053, plan 057, plan 061): many clients on one tab all reading and typing, none of them closing any of the others, geometry following the last one that interacted, refusals that are one JSON line and a close, the kind negotiation (GHOSTSNP, `vt`, the build-skew fallback), the READY fence and the seq contiguity behind it, resume, the lifecycle endings (child exit / disconnect / stop / a SIGKILLed daemon), the headless server terminal, and the plan 036 D9 perf budgets. Speaks the wire through `dataplane.py` and decodes no payload — see that row. `session_daemon`-marked, so it rides `make e2e-session` beside the module above. |
 | `test_session_effects.py` | What the daemon gained so an attached client can be a faithful terminal without owning one (plan 037 §3.6 + §3.7, plan 038 C6, plan 057, plan 061): `tab.effect` fan-out for bells and OSC 52 writes, unfiltered to every subscriber, plus the 256 KiB cap; `session.set_theme` reaching the colors the terminal answers its own queries with, last-writer-wins across clients; notifications fanning out to every client with `session.set_focus` deleted (#474) — a session mutes nothing, the client reading the tab answers with a generation-checked `tab.clear_notification`, a stale acknowledgement is refused, and a resume replays the dot but never the banner; that a write into a session tab needs no credential at all (over IPC and through the real `roostctl tab send`); and the `ROOST_SESSION_FAKE_BUILD` seam behind the build-mismatch refusal. `session_daemon`-marked. |
 | `test_host_client.py` | HS-2's **client** side (plan 037): a real `roost-session` daemon beside the harness UI, wired together with `host.add` + `host.connect` and observed entirely over IPC. Covers the roadmap acceptance (a marker survives disconnect + reconnect), attach fidelity (the session's `tab.dump_resolved` vs the UI's for the `h<host>.<id>` spelling), never-blank/no-duplication on refocus, disconnect-vs-stop, the build-mismatch `needs-restart` state and the restart composition, a second client changing nothing for the first (a scripted wire client subscribes and attaches alongside the harness UI; both receive the same bell, symmetric — plan 061), the local/host id collision, the attach latency budget, and the attention-surface regressions. **Needs a UI *and* a daemon**, so it is in neither `ICED_E2E_TESTS` nor `SESSION_E2E_TESTS`: `make e2e-host-client` / `make e2e-host-client-ci`, its own Linux X11 + Wayland steps in `iced-build-e2e`, and the `host_client` marker every whole-directory run and every macOS iced cell deselects. |
@@ -105,19 +130,18 @@ at the same path; set the opt-out to test it as it is.
 | `fixtures/fake-roost-session.sh` | The stand-in `roost-session` the launcher tests spawn (`roost-cli`'s `session.rs` lifecycle cases, `roost-ipc`'s `session_launch.rs` and `session_launch_state_dir_test.rs`, `roost-iced`'s `host_conn` and `update_knowledge` cases), and the same stand-in for the `$SHELL` `roost-cli`'s `doctor.rs` tests run and the hook `roost-agent-install`'s `command.rs` tests run; its header lists the cases. No behaviour of its own: a test symlinks it in and writes the body to a `.conf` beside it, which the fixture sources — so nothing a test execs is ever written by the test process (the ETXTBSY race, #431/#408; its header has the mechanism). |
 
 The shared `palette` fixture (open from closed, leave closed) lives in
-`conftest.py`. The two UIs expose one command set (kept at parity), so
-`test_palette.py`'s `COMMON_COMMAND_IDS` is the full palette command list
-and is asserted present on whichever UI is under test.
+`conftest.py`. `test_palette.py`'s `COMMON_COMMAND_IDS` is the full
+palette command list, asserted present.
 
 ## Seeding config (`ROOST_CONFIG`)
 
 `ui.launch` sets `ROOST_CONFIG=fixtures/launcher.conf` on the UIs it
-starts (iced via env; Mac via `open --env`), so the launcher reads a
+starts (a bare binary via env; a bundle via `open --env`), so the launcher reads a
 known command list. It applies only to harness-launched UIs — a
 developer's already-running UI keeps its own config, so the launcher
 tests `precondition` on the seed: a graceful skip against an ad-hoc dev
 UI, but a hard failure in fresh mode (where the harness guarantees the
-seed). (`ROOST_CONFIG` is a real override on both UIs, mirroring
+seed). (`ROOST_CONFIG` is a real override in the product, mirroring
 `ROOST_SOCKET` / `ROOST_BUNDLE_PROFILE`.)
 
 ## Hermetic / fresh mode (`--roost-fresh`, `ROOST_STATE_DIR`)
@@ -125,23 +149,18 @@ seed). (`ROOST_CONFIG` is a real override on both UIs, mirroring
 A **harness-launched** UI always runs against a throwaway state dir, so a
 run never reads or writes the developer's real `state.json`/tabs:
 
-- `ROOST_STATE_DIR` (prod env on **both** UIs) redirects `state.json`'s
+- `ROOST_STATE_DIR` (a product env var) redirects `state.json`'s
   directory **and the state lock beside it**; the socket, the socket/bind
   lock and the log stay on the default profile path, so `ui.py` still finds
   the UI by its unchanged socket. The harness `mkdtemp`s one per session
   and cleans it up. (Stricter than `ROOST_CONFIG`: must be absolute — see
   [paths.md](../../docs/reference/paths.md).)
-- `ROOST_DEFAULTS_SUITE` (prod env, **Mac** only) redirects the app's
-  `UserDefaults` (sidebar visibility/width) to a throwaway suite —
-  `ROOST_STATE_DIR` can't reach `UserDefaults`.
 
 `--roost-fresh` / `ROOST_TEST_FRESH=1` makes the harness **own** the
-instance: it force-quits any running UI first (lock-safe on Mac via
-`_quit_mac_process` + `_mac_cleanup`), launches a hermetic one, and always
+instance: it force-quits any running UI first, launches a hermetic one, and always
 quits it at teardown — vs. the default, which reuses a developer's running
 UI and leaves it alone. Fresh mode is what `make e2e-*-ci` (and CI) use; it
-also flips setup preconditions to hard failures (below). (It replaced the
-old `ROOST_TEST_RESET_STATE`, which *deleted* the real `state.json` on Mac.)
+also flips setup preconditions to hard failures (below).
 
 ### Teardown and the two instance locks
 
@@ -214,13 +233,13 @@ readiness check.
   round-trips a **probe tab** — open via IPC, require it to materialize a
   live terminal (`dump` succeeds), then close it — so tests only start
   once the UI is fully up. A tab opened via IPC *before* the
-  subscription is live no longer races permanently: both UIs reconcile
+  subscription is live no longer races permanently: the UI reconciles
   against a snapshot as the subscription's first action
   (resync-on-subscribe), so the probe is a readiness gate, not a
   workaround for a dropped event.
 - **Isolation.** Each test gets its own `project` fixture and
   cascade-cleans it; a harness-launched UI also runs against a throwaway
-  `ROOST_STATE_DIR` (+ `ROOST_DEFAULTS_SUITE` on Mac), so a run never
+  `ROOST_STATE_DIR`, so a run never
   touches the dev's real workspace — see "Hermetic / fresh mode" above.
 
 ## Writing a test
@@ -280,8 +299,8 @@ the production code path actually drive the resolver correctly?, does
 an OSC reply reach `send_input`? — go through the gated
 `tab.feed_pty_bytes` + `tab.capture_pty_input` ops instead of trying
 to drive the shell into emitting the sequence. They require
-`ROOST_TEST_MODE=1` at UI launch (CI sets it; the harness's
-`tools/roosttest/test_test_ops.py` skips otherwise):
+`ROOST_TEST_MODE=1` at UI launch (CI sets it; the tests that use them
+skip otherwise):
 
 ```python
 def test_osc11_set_then_query_replies_with_new_bg(roost, project):
@@ -342,7 +361,7 @@ queries (device-attribute replies, mode enables) don't need it.
 For resolver-output asserts (theme bold-color, SGR inverse swap,
 etc.), `roost.tab_dump_resolved(tab)` walks the viewport through the
 production color resolver and returns per-cell `{fg, bg, bold,
-inverse, ...}` — see the smoke test in `test_test_ops.py`. This op
+inverse, ...}` — see `test_osc_pipeline.py`'s resolver cases. This op
 is ungated.
 
 ## Out of scope here (use the other harnesses)

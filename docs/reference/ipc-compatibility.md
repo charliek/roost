@@ -141,16 +141,15 @@ pre-053 clients always sent, and only a client that actually asks for
 history is refused by a server that predates the key.
 
 The same row is why `tab.open`'s `env` and `origin` (plan 085) are
-sent only to Rust servers — a session, or Roost-Iced's UI socket. The
-frozen Swift app's `tab.open` decodes against a fixed key list and
-answers either one `unknown-field`, so a client that may be talking to
-Roost.app omits them there, and the tab is opened as it always was.
+sent only to servers that know them — a session, or the UI socket. A
+server that predates them answers either one `unknown-field`, and the
+tab is opened as it always was.
 
 ### Closed enums
 
 Some string enums have no fallback case on either side of the wire —
-notably the Swift decoders, which are closed `String` enums that throw a
-`DecodingError` on an unrecognized value. **Adding a value to any of
+a closed enum throws a decode error on an unrecognized value, whatever
+language an external client is written in. **Adding a value to any of
 these is a breaking protocol change and requires a generation bump**, not
 merely a new vector:
 
@@ -292,7 +291,7 @@ same week, because a consumer's lockfile can sit on the commit between
 them.
 
 A bump is not just an integer. Every mirror of it moves in the same
-commit: the Rust constant and its doc comment, the Swift test constant,
+commit: the Rust constant and its doc comment,
 `tools/roosttest/dataplane.py`, the iced host-connection check, the value
 quoted in `ipc.md`, and the versioned fixtures below.
 
@@ -383,8 +382,7 @@ program status composes with the hook layer, so a pre-bump client that
 derives the tab's state from `agent_lifecycle` + `shell_state` +
 `ownership` disagrees with the session about the same tab; a
 `program_status` object rides beside them; and `DroppedReport.reason`,
-a closed enum, gained `program_status` and `foreign_app`. A Swift UI
-target keeps no records, so its `Tab.state` is never composed. `7` is
+a closed enum, gained `program_status` and `foreign_app`. `7` is
 unreleased, so it may still be amended in place under the rule above,
 and it has been: the session socket's `tab.memory_usage` (plan 082 D6)
 rides the same generation rather than spending one of its own, as do
@@ -425,7 +423,7 @@ dev builds of the UI and the session from different amendments need the
 session restarted onto the matching build. **Upgrade day:** a session's
 tabs restored from a `state.json` written before the amendment carry no
 saved opener and restore with none of the seven opener variables until
-reopened; an in-process Roost-Iced restores such tabs with its own
+reopened; an in-process UI restores such tabs with its own
 values, since only it could have opened them.
 
 ## Fixtures are the contract
@@ -435,9 +433,8 @@ holds a canonical JSON exemplar per op and event, pinned in three
 layers. Every vector is schema-agnostically round-tripped through
 `serde_json::Value` (`crates/roost-ipc/tests/vectors.rs`), which catches
 a vector that stops parsing. Selected vectors are decoded into the typed
-structs on both sides — Rust (`roundtrip.rs`, `wire_types_test.rs`) and
-Swift (`IPCSessionTypesTests.swift`) — which is what pins field names
-and shapes across two independent implementations of the same wire.
+structs (`roundtrip.rs`, `wire_types_test.rs`), which is what pins field
+names and shapes.
 And for the session types, `wire_types_test.rs` additionally asserts
 serialization byte-exactly against in-file literal exemplars. No test
 byte-compares the on-disk files themselves: JSON key order and
@@ -484,8 +481,7 @@ session.identify.response.v<N>.json
 ```
 
 Tests do not hardcode `<N>`. They build the filename from the constant —
-the Rust side from `SESSION_PROTOCOL_VERSION`, the Swift side from its
-mirror — so a bump that forgets to add the new generation's vector fails
+from `SESSION_PROTOCOL_VERSION` — so a bump that forgets to add the new generation's vector fails
 loudly instead of silently testing the old shape. That is the
 **current-generation lookup rule**. Older `v<N>` files stay where they
 are and keep being exercised by decode-only tests, which is how "an old
@@ -494,10 +490,8 @@ client's view still parses" stops being a claim and becomes a test.
 The set was backfilled at the `2` → `3` bump (plan 047):
 `session.identify.response.v2.json` is the unversioned file that existed
 before, renamed and carrying its original content, `v3.json` is the
-current generation, and both suites build the name from their constant
-(`wire_types_test.rs`'s `identify_vector_name`,
-`IPCSessionTypesTests.swift`'s `testSessionIdentifyVectorDecodes`). The
-Rust suite additionally decodes every prior generation, from `2` up to
+current generation, and the suite builds the name from the constant
+(`wire_types_test.rs`'s `identify_vector_name`). It additionally decodes every prior generation, from `2` up to
 the current one, so a retired generation's vector cannot quietly stop
 parsing.
 
@@ -508,7 +502,7 @@ Stated honestly, because overstating it would be worse than the gap:
 * **review policy** — the "never semantically edit a vector" rule is
   enforced by whoever reads the diff. A changed vector in a pull request
   is a question that has to be answered;
-* **named-vector decode tests** — the Rust and Swift suites reference
+* **named-vector decode tests** — the suite references
   specific vectors by name, so deleting or renaming one breaks a build.
   This is what makes individual files effectively frozen;
 * **the emptied-directory guard** — the loader fails if the vector

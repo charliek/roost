@@ -38,9 +38,8 @@ lane's own reason — and the incarnation probe every host lane shares
 cannot tell two connected hosts' tabs apart.
 
 `pytestmark = pytest.mark.host_client` for the reason the other host
-lanes carry it: a whole-directory run — `make e2e-mac` in particular,
-where the Swift app answers `unknown-op` to every `host.*` op —
-deselects it rather than failing it.
+lanes carry it: the shared-UI lanes deselect it (the Makefile's
+`DAEMON_E2E_DESELECT`) rather than run it beside their own UI.
 
 Condition waits only.
 """

@@ -1,7 +1,7 @@
-"""Sidebar agent rows E2E — plan 007 §7 A9/A10, both targets
-(`--roost-target mac|iced`). Drives `app.sidebar_dump` (plan 007 §3.8),
-the same per-project `rendered_agents` cache both UIs paint the sidebar
-from, so a missed refresh is a stale dump rather than an invisible bug.
+"""Sidebar agent rows E2E — plan 007 §7 A9/A10. Drives `app.sidebar_dump`
+(plan 007 §3.8), the same per-project `rendered_agents` cache the UI paints
+the sidebar from, so a missed refresh is a stale dump rather than an
+invisible bug.
 
 Isolation rules mirror `test_agent_palette.py`: assertions are scoped to
 projects/tabs THIS test seeded, never to the dump's absolute row list —
@@ -29,7 +29,16 @@ from __future__ import annotations
 import uuid
 
 from test_agent_palette import TIME_TEXT_RE, _seed
-from util import BARE_SHELL_ARGV
+from util import (
+    BARE_SHELL_ARGV,
+    palette_agent_tab_id,
+    palette_agent_tab_ids,
+    set_sidebar_agents_visible,
+    sidebar_agent_row,
+    sidebar_agents_visible,
+    sidebar_project_row,
+    toggle_sidebar_agents,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -37,24 +46,11 @@ from util import BARE_SHELL_ARGV
 # ---------------------------------------------------------------------------
 
 
-def _project_row(dump: dict, project_id: int) -> dict | None:
-    return next(
-        (p for p in dump["projects"] if int(p["project_id"]) == project_id), None
-    )
-
-
-def _agent_row(dump: dict, project_id: int, tab_id: int) -> dict | None:
-    proj = _project_row(dump, project_id)
-    if proj is None:
-        return None
-    return next((a for a in proj["agents"] if int(a["tab_id"]) == tab_id), None)
-
-
 def _wait_agent_row(roost, project_id: int, tab_id: int, timeout: float = 5.0) -> dict:
     box: dict = {"row": None}
 
     def pred() -> bool:
-        row = _agent_row(roost.sidebar_dump(), project_id, tab_id)
+        row = sidebar_agent_row(roost.sidebar_dump(), project_id, tab_id)
         box["row"] = row
         return row is not None
 
@@ -64,51 +60,9 @@ def _wait_agent_row(roost, project_id: int, tab_id: int, timeout: float = 5.0) -
 
 def _wait_agent_row_gone(roost, project_id: int, tab_id: int, timeout: float = 5.0) -> None:
     roost._wait(
-        lambda: _agent_row(roost.sidebar_dump(), project_id, tab_id) is None,
+        lambda: sidebar_agent_row(roost.sidebar_dump(), project_id, tab_id) is None,
         timeout,
         f"sidebar_dump row for tab {tab_id} in project {project_id} disappears",
-    )
-
-
-def _palette_agent_tab_id(item: dict) -> int | None:
-    """The tab id an agent row activates, or None for any other row —
-    the Python twin of `agent_tab_id` in `agent_palette.rs`. The empty
-    sentinel (`agents:empty`) deliberately doesn't parse."""
-    rest = item["id"].removeprefix("agent:")
-    return int(rest) if rest != item["id"] and rest.isdigit() else None
-
-
-def _palette_agent_tab_ids(items: list[dict]) -> list[int]:
-    """The palette's flat agent list as tab ids, in wire order."""
-    return [t for t in (_palette_agent_tab_id(it) for it in items) if t is not None]
-
-
-def _toggle_sidebar_agents(roost) -> dict:
-    """Drive the toggle through the command palette, the same way a user
-    or `roostctl` would (plan 007 §3.7 — `palette.activate` is the one
-    reachable-from-everywhere lane). Leaves the palette closed."""
-    roost.palette_dismiss()
-    roost.palette_open()
-    st = roost.palette_activate("toggle_sidebar_agents")
-    roost.palette_dismiss()
-    return st
-
-
-def _agents_visible(roost) -> bool:
-    return bool(roost.sidebar_dump()["agents_visible"])
-
-
-def _set_agents_visible(roost, want: bool) -> None:
-    """Toggle until `agents_visible` matches `want`, restoring the
-    instance to a known state (used at test start/end so this file never
-    leaves the toggle flipped for whatever runs next)."""
-    if _agents_visible(roost) == want:
-        return
-    _toggle_sidebar_agents(roost)
-    roost._wait(
-        lambda: _agents_visible(roost) == want,
-        5.0,
-        f"agents_visible becomes {want}",
     )
 
 
@@ -136,16 +90,16 @@ def test_seeded_agents_appear_under_their_project_in_palette_order(roost, projec
         def _ready() -> bool:
             dump = roost.sidebar_dump()
             return (
-                _agent_row(dump, project, t_working) is not None
-                and _agent_row(dump, project, t_failed) is not None
-                and _agent_row(dump, p2, t_other) is not None
+                sidebar_agent_row(dump, project, t_working) is not None
+                and sidebar_agent_row(dump, project, t_failed) is not None
+                and sidebar_agent_row(dump, p2, t_other) is not None
             )
 
         roost._wait(_ready, 5.0, "all three seeded rows appear in the sidebar dump")
 
         dump = roost.sidebar_dump()
-        proj1 = _project_row(dump, project)
-        proj2 = _project_row(dump, p2)
+        proj1 = sidebar_project_row(dump, project)
+        proj2 = sidebar_project_row(dump, p2)
         assert proj1 is not None and proj2 is not None
 
         # Ordering within project 1: failed outranks working, matching
@@ -157,9 +111,9 @@ def test_seeded_agents_appear_under_their_project_in_palette_order(roost, projec
         # project 2's agent must not leak into project 1's list.
         assert t_other not in ids_in_proj1
 
-        row_working = _agent_row(dump, project, t_working)
-        row_failed = _agent_row(dump, project, t_failed)
-        row_other = _agent_row(dump, p2, t_other)
+        row_working = sidebar_agent_row(dump, project, t_working)
+        row_failed = sidebar_agent_row(dump, project, t_failed)
+        row_other = sidebar_agent_row(dump, p2, t_other)
 
         assert row_working["name"] == "sb-working", row_working
         assert row_working["lifecycle"] == "working", row_working
@@ -183,10 +137,10 @@ def test_project_with_zero_agents_still_appears_with_empty_list(roost, project):
     — "all projects appear ... including those with zero agents")."""
 
     def _present() -> bool:
-        return _project_row(roost.sidebar_dump(), project) is not None
+        return sidebar_project_row(roost.sidebar_dump(), project) is not None
 
     roost._wait(_present, 5.0, "empty project appears in sidebar_dump")
-    proj = _project_row(roost.sidebar_dump(), project)
+    proj = sidebar_project_row(roost.sidebar_dump(), project)
     assert proj is not None
     assert proj["agents"] == [], proj
 
@@ -202,7 +156,7 @@ def test_freshly_created_project_appears_in_dump_immediately(roost):
     try:
         # Deliberately unpolled: the assertion is that the very first read
         # after the create reply already sees the project.
-        proj = _project_row(roost.sidebar_dump(), p)
+        proj = sidebar_project_row(roost.sidebar_dump(), p)
         assert proj is not None, roost.sidebar_dump()
         assert proj["agents"] == [], proj
     finally:
@@ -215,8 +169,8 @@ def test_freshly_created_project_appears_in_dump_immediately(roost):
 
 
 def test_sidebar_and_agent_palette_agree_on_membership_order_and_content(roost, project):
-    """The two surfaces share the pure builders in `agent_palette.rs` /
-    `AgentPalette.swift` (`sidebar_agents` vs `agent_items`), but nothing
+    """The two surfaces share the pure builders in `agent_palette.rs`
+    (`sidebar_agents` vs `agent_items`), but nothing
     else pins that they agree — the drift a later ordering or naming
     change would introduce lands silently, because each surface has its
     own tests. This is the cross-surface pin: same population, same
@@ -250,16 +204,16 @@ def test_sidebar_and_agent_palette_agree_on_membership_order_and_content(roost, 
             dump_ids = {
                 int(a["tab_id"]) for p in roost.sidebar_dump()["projects"] for a in p["agents"]
             }
-            pal_ids = set(_palette_agent_tab_ids(roost.palette_items("agents")))
+            pal_ids = set(palette_agent_tab_ids(roost.palette_items("agents")))
             return seeded <= dump_ids and seeded <= pal_ids
 
         roost._wait(_both_surfaces_ready, 10.0, "all five seeded agents reach both surfaces")
 
         dump = roost.sidebar_dump()
         items = roost.palette_items("agents")
-        palette_order = _palette_agent_tab_ids(items)
+        palette_order = palette_agent_tab_ids(items)
         palette_rows = {
-            t: it for it in items if (t := _palette_agent_tab_id(it)) is not None
+            t: it for it in items if (t := palette_agent_tab_id(it)) is not None
         }
 
         # (1) Same population. Compared as the intersection with what this
@@ -271,7 +225,7 @@ def test_sidebar_and_agent_palette_agree_on_membership_order_and_content(roost, 
 
         for pid, tabs in by_project.items():
             want = set(tabs)
-            proj = _project_row(dump, pid)
+            proj = sidebar_project_row(dump, pid)
             assert proj is not None, dump
             sidebar_seq = [t for t in (int(a["tab_id"]) for a in proj["agents"]) if t in want]
             palette_seq = [t for t in palette_order if t in want]
@@ -289,7 +243,7 @@ def test_sidebar_and_agent_palette_agree_on_membership_order_and_content(roost, 
         # drifts between the two reads, so it is excluded by design.
         for tab in sorted(seeded):
             pid = project if tab in by_project[project] else p2
-            row = _agent_row(dump, pid, tab)
+            row = sidebar_agent_row(dump, pid, tab)
             agent = palette_rows[tab]["agent"]
             assert row is not None, (pid, tab, dump)
             assert row["name"] == agent["name"], (row, agent)
@@ -314,8 +268,8 @@ def test_exactly_one_row_is_active_and_follows_tab_focus(roost, project):
 
     def _active_matches(want_tab: int) -> bool:
         dump = roost.sidebar_dump()
-        row_a = _agent_row(dump, project, tab_a)
-        row_b = _agent_row(dump, project, tab_b)
+        row_a = sidebar_agent_row(dump, project, tab_a)
+        row_b = sidebar_agent_row(dump, project, tab_b)
         if row_a is None or row_b is None:
             return False
         active = [t for t, r in ((tab_a, row_a), (tab_b, row_b)) if r["is_active"]]
@@ -348,11 +302,11 @@ def test_toggle_flips_agents_visible_and_keeps_rows_populated_when_off(roost, pr
     _seed(roost, tab, lifecycle="waiting", name="sb-toggle")
     _wait_agent_row(roost, project, tab)
 
-    before = _agents_visible(roost)
+    before = sidebar_agents_visible(roost)
     try:
-        _toggle_sidebar_agents(roost)
+        toggle_sidebar_agents(roost)
         roost._wait(
-            lambda: _agents_visible(roost) == (not before),
+            lambda: sidebar_agents_visible(roost) == (not before),
             5.0,
             "agents_visible flips after toggle_sidebar_agents",
         )
@@ -364,9 +318,9 @@ def test_toggle_flips_agents_visible_and_keeps_rows_populated_when_off(roost, pr
         # Restore to what the instance had before this test, regardless
         # of outcome, so this test never leaves the toggle flipped for
         # whatever runs next.
-        _set_agents_visible(roost, before)
+        set_sidebar_agents_visible(roost, before)
 
-    assert _agents_visible(roost) == before
+    assert sidebar_agents_visible(roost) == before
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +362,6 @@ def test_row_disappears_when_project_deleted(roost):
     roost.delete_project(p)
 
     def _project_gone() -> bool:
-        return _project_row(roost.sidebar_dump(), p) is None
+        return sidebar_project_row(roost.sidebar_dump(), p) is None
 
     roost._wait(_project_gone, 5.0, "deleted project's row leaves the sidebar dump")

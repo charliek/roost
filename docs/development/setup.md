@@ -1,18 +1,13 @@
 # Development Setup
 
-Roost has two active development surfaces:
-
-1. The Rust workspace at `crates/` — `roost-ipc`, `roost-engine`, `roost-ui-model`, `roost-vt`, `roost-osc`, `roost-url`, `roost-agent`, `roost-cli`, `roost-iced` (the Linux UI), and `roost-session` (the opt-in headless host-session daemon).
-2. The Swift package at `mac/` — the macOS UI, `Roost.app`.
-
-Both link the same vendored `libghostty-vt` static archive built from `third_party/ghostty/`.
+Roost is one Rust workspace at `crates/` — `roost-ipc`, `roost-engine`, `roost-ui-model`, `roost-vt`, `roost-osc`, `roost-url`, `roost-agent`, `roost-cli`, `roost-iced` (the UI, on macOS and Linux), `roost-client`, and `roost-session` (the headless host-session daemon). `mac/` holds the macOS bundle scripts and resources, not code. Everything links the same vendored `libghostty-vt` static archive built from `third_party/ghostty/`.
 
 ## Prerequisites
 
 | Tool | Use |
 |---|---|
 | `mise` | Provisions Rust 1.97.1 + Zig 0.17.x at the pinned versions |
-| Xcode Command Line Tools | Builds the Mac UI (SwiftPM) |
+| Xcode Command Line Tools | Builds the Mac bundle (macOS) |
 | `libclang-dev` + `pkg-config` | Build-time deps of `roost-vt`'s FFI bindings (Linux) |
 | `uv` | Builds the documentation site and runs the E2E harness |
 
@@ -29,11 +24,11 @@ cd roost
 mise install                 # Rust + Zig
 make setup                   # + builds libghostty-vt (idempotent on cache hit)
 make build                   # cargo build the workspace (iced UI + roostctl)
-make bundle                  # macOS: assemble mac/build/Roost.app (debug)
+make bundle-iced             # macOS: assemble mac/build/Roost-Iced.app (debug)
 ```
 
 `third_party/ghostty/build.sh` (what `make setup` runs) is the only step that
-needs Zig. After it finishes, normal Rust + Swift workflows work without
+needs Zig. After it finishes, normal Rust workflows work without
 invoking Zig again.
 
 ## Iteration
@@ -41,21 +36,18 @@ invoking Zig again.
 | Goal | Command |
 |---|---|
 | Build the Rust workspace | `make build` — or `cargo build -p roost-iced -p roost-cli` for just the UI + CLI |
-| Build the Mac UI | `make build-mac` (`cd mac && swift build`) |
-| Run the Linux UI | `make run-iced` — runs the dev `Iced` profile, so it never touches a packaged install's state |
-| Run the Mac UI | `make run-mac` (bundles, then `open mac/build/Roost.app`) |
+| Run the UI | `make run-iced` — runs the dev `Iced` profile, so it never touches a packaged install's state |
 | Start/stop the headless session daemon | `cargo build -p roost-session -p roost-cli && ROOST_SESSION_BIN=target/debug/roost-session target/debug/roostctl session start` (`session stop` to tear down) |
-| Bundle the experimental macOS iced app | `make bundle-iced` → `mac/build/Roost-Iced.app` |
+| Bundle the dev macOS app | `make bundle-iced` → `mac/build/Roost-Iced.app` (the shipped `Roost.app` is the same script with `ROOST_BUNDLE_IDENTITY=production`, normally CI's job) |
 | Smoke-test the CLI | `cargo run -p roost-cli -- identify` |
 | Rust unit tests | `cargo test --workspace` (`make test-rust` adds the cfg-gated `roost-vt` ffi tests) |
 | Iced UI tests | `cargo test -p roost-iced` (`make test-iced`) |
-| Mac unit tests | `cd mac && swift test` (`make test-mac`) |
 | Harness unit tests | `make test-harness` |
 | Everything above | `make test` |
 | Rust formatting | `make fmt` (check-only: `make fmt-check`) |
 | Rust lint at CI parity | `make clippy` |
 | Iced gate incl. dependency boundaries + the `linux-package` build | `make check-iced` |
-| Pre-push gate | `make check` — fmt-check + clippy + theme parity + tests |
+| Pre-push gate | `make check` — fmt-check + clippy + tests |
 | Build the docs site | `make docs` (or `make docs-serve` for live reload at `http://127.0.0.1:7070`) |
 
 `make` with no target lists everything.
@@ -63,15 +55,15 @@ invoking Zig again.
 ### Profiles and sockets
 
 Each UI resolves a **bundle profile** that owns its socket, state, lock, and
-log paths, so the Mac app, a packaged Linux install, and a dev iced build never
+log paths, so an installed `Roost.app`, a packaged Linux install, and a dev iced build never
 collide. `ROOST_BUNDLE_PROFILE` (`mac` \| `linux` \| `iced`) overrides the
 compiled-in default.
 
 | Profile | Who resolves it | Socket |
 |---|---|---|
-| `mac` | `Roost.app` (Swift) | `~/Library/Caches/Roost/roost.sock` |
+| `mac` | `Roost.app` | `~/Library/Caches/Roost/roost.sock` |
 | `linux` | the packaged `.deb` (`/usr/bin/roost`) | `$XDG_RUNTIME_DIR/roost/roost.sock` |
-| `iced` | every dev iced build, and `Roost-Iced.app` | `$XDG_RUNTIME_DIR/roost-iced/roost.sock`, or `~/Library/Caches/Roost-iced/roost.sock` on macOS |
+| `iced` | every dev iced build, and the dev `Roost-Iced.app` | `$XDG_RUNTIME_DIR/roost-iced/roost.sock`, or `~/Library/Caches/Roost-iced/roost.sock` on macOS |
 | `session` | the headless `roost-session` daemon (opt-in, `roostctl session start`) | `~/.local/state/roost-session/run/roost.sock` under the uid's passwd home on Linux (not `XDG_RUNTIME_DIR`), or `~/Library/Caches/RoostSession/roost.sock` on macOS — debug builds use `roost-session-dev` / `RoostSessionDev`; `ROOST_SESSION_SOCKET_DIR` replaces the directory |
 
 Without `XDG_RUNTIME_DIR`, Linux falls back to `/tmp/roost-<uid>` and
@@ -88,7 +80,7 @@ session via `--target session` or an explicit `roostctl --socket <path>`
 table — state, locks, logs, and the macOS dev paths for the `linux`
 profile — is in [Paths & Environment](../reference/paths.md).
 
-Each UI writes a log file **and** tees to stdout. The iced UI logs to
+The UI writes a log file **and** tees to stdout. It logs to
 `$XDG_STATE_HOME/roost/roost.log` when it resolves the `linux` profile and
 `.../roost-iced/roost.log` in a dev build; `roostctl --help` and
 [`ipc.md`](../reference/ipc.md) document the wire surface.
@@ -101,24 +93,21 @@ Rust tests live next to the code they exercise. Major coverage:
 |---|---|
 | `roost-ipc` | Frame reader/writer, JSON wire vectors, path/profile resolution, target selection (probe alive + env precedence), agent-state fixtures |
 | `roost-osc` | OSC 9 / 777 streaming parser, ST terminator, hook suppression |
-| `roost-url` | URL detection, pinned against `tests/url-fixtures/` shared with the Swift mirror |
+| `roost-url` | URL detection, pinned against `tests/url-fixtures/` |
 | `roost-vt` | FFI smoke tests against the vendored `libghostty-vt` archive (gated on `--features ffi`) |
 | `roost-engine` | Workspace, PTY supervision, persistence, events, OSC routing, IPC dispatch, instance lock |
 | `roost-ui-model` | Config, theme, keybind, palette, provider, and agent projection models |
-| `roost-iced` | iced presentation, native ports, input, and the terminal rendering adapter — what the Linux package ships |
+| `roost-iced` | iced presentation, native ports, input, and the terminal rendering adapter — the UI both platforms ship |
 | `roost-cli` | Escape decoder, shell quoter, target arg mapping, doctor checks + doc anchors, `session` verb decisions (verdict classification, stop-completion) |
 | `roost-session` | Daemonize handshake, readiness verdicts, headless hydration, per-tab OSC drains, socket-guard identity-checked unlink (unlink-if-ours), lifecycle + fast-exit races |
-
-Mac tests are under `mac/Tests/RoostTests/`; they cover the workspace state machine, PTY supervisor lifecycle, IPC server framing, single-instance flock, renderer, OSC scanner, key encoder, drag/drop math, and tab pill state machine. They run in headless `swift test` (no NSWindow required for any covered surface).
 
 Above the unit tier sit the functional E2E suite and the visual + real-input
 harnesses:
 
 ```bash
 make e2e-iced         # functional E2E against the iced UI (reuses a running one)
-make e2e-mac          # functional E2E against Roost.app
 make e2e-iced-ci      # CI parity: ROOST_TEST_MODE=1 + --roost-fresh. DESTRUCTIVE.
-make e2e-mac-ci       # same, for the Mac app. DESTRUCTIVE.
+make e2e-iced-bundle  # macOS: the bundle smoke against the dev Roost-Iced.app
 ```
 
 See [Test automation](test-automation.md) for the layer map, the test-mode IPC
@@ -161,5 +150,5 @@ The full set is in `CLAUDE.md` at the repo root. Highlights:
 - Concrete types until duplication forces an interface — no premature `Manager` / `Coordinator` abstractions.
 - Errors are returned, not logged-and-swallowed. Log at the boundary that handles them.
 - Default to no comments. Add one when the *why* is non-obvious (a hidden constraint, a workaround, a tricky invariant).
-- UI calls happen on the main thread. On Linux that is the winit event-loop thread, reached from `update`; background work arrives through the single engine feed. On macOS it is `@MainActor` / `DispatchQueue.main`.
-- The JSON IPC schema is the durable boundary — change `crates/roost-ipc/src/messages.rs`, update vectors under `tests/ipc-vectors/`, and bump the Swift mirror in `mac/Sources/Roost/IPCMessages.swift` in the same commit.
+- UI calls happen on the main thread. That is the winit event-loop thread, reached from `update`; background work arrives through the single engine feed.
+- The JSON IPC schema is the durable boundary — change `crates/roost-ipc/src/messages.rs`, and update the vectors under `tests/ipc-vectors/` in the same commit.

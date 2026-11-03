@@ -4,7 +4,7 @@ A host session is a workspace that keeps running after Roost's window closes. In
 
 This guide is task-shaped: enabling a host on your own machine, reaching a second machine over SSH, the verb set, and what to do when something looks wrong. For the wire contract, see [`reference/ipc.md`](../reference/ipc.md#session-sockets); for the architecture, see [Host sessions (development)](../development/host-sessions.md).
 
-**Both platforms run a local session now.** Host sessions are built into the iced UI — the Linux `roost` package and the Roost-Iced Mac app both ship `roost-session` and can run a `localhost` session of their own; see [Enabling a host on this machine](#enabling-a-host-on-this-machine-localhost) below. Either can also be the far end of an SSH host — a Linux box (amd64 or arm64) or an Apple-silicon Mac — and Roost installs and upgrades `roost-session` there the same way; see [macOS note](#macos-note) below for what differs on a Mac. The Swift `Roost.app` doesn't have this feature at all; host sessions are iced-only.
+**Both platforms run a local session now.** Host sessions are built into the iced UI — the Linux `roost` package and the Mac `Roost.app` both ship `roost-session` and can run a `localhost` session of their own; see [Enabling a host on this machine](#enabling-a-host-on-this-machine-localhost) below. Either can also be the far end of an SSH host — a Linux box (amd64 or arm64) or an Apple-silicon Mac — and Roost installs and upgrades `roost-session` there the same way; see [macOS note](#macos-note) below for what differs on a Mac.
 
 ## Enabling a host on this machine (localhost)
 
@@ -25,7 +25,7 @@ Once connected, the sidebar gains a **LOCALHOST** section (or whatever label you
 
 `roost-session`'s own socket, state, and logs live at: on Linux, `~/.local/state/roost-session/run/roost.sock` under your passwd home — not `XDG_RUNTIME_DIR`, so a desktop login, an SSH login and a `sudo -u` back to your own user all find the same session (the path follows the uid, so a `sudo` to root finds root's) (state under `$XDG_DATA_HOME/roost-session/`, logs under `$XDG_STATE_HOME/roost-session/`); on macOS, `~/Library/Caches/RoostSession/roost.sock` (state under `~/Library/Application Support/RoostSession/`, logs under `~/Library/Logs/RoostSession/` — `RoostSessionDev` in place of `RoostSession` for a debug build, so a dev daemon can never collide with a real one). See [Paths and Environment](../reference/paths.md#session-profile) for the full table.
 
-**Persistence is scoped to host sections, not to Roost as a whole — worth stating plainly.** A project or tab created under *any* host section, including **LOCALHOST**, survives quitting Roost, because its shells live in `roost-session`, not in the app. An ordinary **LOCAL** tab is still hosted in-process and still ends when Roost quits — unless you've switched your *local* tabs onto a session too, which is what the next section covers. A fresh Roost-Iced install starts that way (see [First Run](../getting-started/first-run.md#roost-iced-a-fresh-install-starts-on-a-session)); an install with no `local-backend` key that already has a `state.json` or `config.conf` on disk keeps in-process local tabs until you switch.
+**Persistence is scoped to host sections, not to Roost as a whole — worth stating plainly.** A project or tab created under *any* host section, including **LOCALHOST**, survives quitting Roost, because its shells live in `roost-session`, not in the app. An ordinary **LOCAL** tab is still hosted in-process and still ends when Roost quits — unless you've switched your *local* tabs onto a session too, which is what the next section covers. A fresh install starts that way (see [First Run](../getting-started/first-run.md#a-fresh-install-starts-on-a-session)); an install with no `local-backend` key that already has a `state.json` or `config.conf` on disk keeps in-process local tabs until you switch.
 
 ## Switching the local backend
 
@@ -304,7 +304,7 @@ A program in a terminal sees exactly one window size, so a tab shown in two wind
 
 **A window that is not the owner** draws the owner's grid inside its own. When the grid is taller than the window, the window scrolls to keep the cursor row on screen; when it is smaller, the rest of the pane stays empty. The tab band shows **Sized by ‹label›** next to a **Take size** button, where the label is the owner's host name. Clicks and selection land on the cells you see, not on the window's own grid.
 
-**Take size** gives the tab your window's grid without typing. It is the band's button, the **Take Size** row in the command palette, the `take_size` [keybind action](../getting-started/keybindings.md#available-actions) (unbound by default), and `roostctl tab take-size --tab h2.7` ([reference](../reference/cli.md#tab-take-size)). A tab that lives in this window's own process (no session behind it) always follows the window, so there is nothing to take there. Roost-Iced only; Roost.app has no host tabs.
+**Take size** gives the tab your window's grid without typing. It is the band's button, the **Take Size** row in the command palette, the `take_size` [keybind action](../getting-started/keybindings.md#available-actions) (unbound by default), and `roostctl tab take-size --tab h2.7` ([reference](../reference/cli.md#tab-take-size)). A tab that lives in this window's own process (no session behind it) always follows the window, so there is nothing to take there.
 
 A script's `roostctl tab resize` only sizes a tab nobody owns; on an owned tab it is refused with an `owned` error naming the owner. The wire rules are in [`ipc.md`](../reference/ipc.md#size-ownership).
 
@@ -314,8 +314,8 @@ A tab's environment reflects **who opened it**, not who started the session. A s
 
 | Who opens the tab | What the tab gets |
 |---|---|
-| Roost-Iced on the machine itself (a new tab on the machine's own session, or a `localhost` host) | Roost-Iced's own `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` and `SSH_AUTH_SOCK`, so GUI programs open on that desk and `git push` uses the desk's agent. It sends them with the open. |
-| Roost-Iced on your laptop, connected over SSH | `SSH_CONNECTION` and `SSH_CLIENT` of that SSH connection, and nothing else of the seven: no display, bus, agent or `SSH_TTY`. Tools in the tab behave as remote, and the desk's display and agent are out of reach. |
+| Roost on the machine itself (a new tab on the machine's own session, or a `localhost` host) | Roost's own `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` and `SSH_AUTH_SOCK`, so GUI programs open on that desk and `git push` uses the desk's agent. It sends them with the open. |
+| Roost on your laptop, connected over SSH | `SSH_CONNECTION` and `SSH_CLIENT` of that SSH connection, and nothing else of the seven: no display, bus, agent or `SSH_TTY`. Tools in the tab behave as remote, and the desk's display and agent are out of reach. |
 | `roostctl tab open` or `roostctl open` | The caller's own: inside an SSH login (or in a tab that carries `SSH_CONNECTION`) it declares itself remote, as above; otherwise it sends its display, bus and agent. This holds whichever socket it dials, and `roostctl` pointed at the window reaches the session with the original caller's values. |
 | Any other client on a local connection (not through an SSH bridge) that states nothing | The baseline: none of the seven. A request through a bridge is remote, as above. |
 
@@ -329,9 +329,9 @@ A remote tab does not get the laptop's `SSH_AUTH_SOCK` on purpose: a forwarded a
 
 **Known limit.** A remote tab keeps `XDG_RUNTIME_DIR`, so a program that falls back to libwayland's default `wayland-0` socket, or to `$XDG_RUNTIME_DIR/bus`, can still reach the desk's compositor and bus. Roost controls the variables, not what a program finds by default.
 
-**A `UnixSocket` host gets your local values.** A host added as a socket path is reached directly, with no SSH bridge to say it is remote, so tabs opened on it carry Roost-Iced's display, bus and agent. If that socket is an `ssh -L` forward to another machine, those values name your machine and are of no use there; unset them in the tab if they get in the way. A host reached over Roost's own SSH transport is unaffected.
+**A `UnixSocket` host gets your local values.** A host added as a socket path is reached directly, with no SSH bridge to say it is remote, so tabs opened on it carry Roost's display, bus and agent. If that socket is an `ssh -L` forward to another machine, those values name your machine and are of no use there; unset them in the tab if they get in the way. A host reached over Roost's own SSH transport is unaffected.
 
-**Upgrade day.** Tabs a session restores from state written before this change have no saved opener, and they restore with none of the seven variables until you reopen them. Tabs in Roost-Iced's own in-process workspace get Roost-Iced's own values instead, since only it could have opened them. A development session built before this change refuses the new `tab.open` fields, so restart it onto the matching build.
+**Upgrade day.** Tabs a session restores from state written before this change have no saved opener, and they restore with none of the seven variables until you reopen them. Tabs in Roost's own in-process workspace get Roost's own values instead, since only it could have opened them. A development session built before this change refuses the new `tab.open` fields, so restart it onto the matching build.
 
 ## The upgrade / restart flow
 
@@ -444,12 +444,11 @@ This is a deliberate trade: connecting at reduced fidelity beats refusing to con
 
 ## macOS note
 
-`localhost` now works on macOS exactly the same way it does on Linux: `roost-session` ships inside `Roost-Iced.app` itself (`Contents/MacOS/roost-session`), so the seeded **Connect Host: localhost** row, spawn-if-missing, and launch-time auto-reconnect described above all apply unchanged to the Mac build. What stays Mac-specific:
+`localhost` now works on macOS exactly the same way it does on Linux: `roost-session` ships inside `Roost.app` itself (`Contents/MacOS/roost-session`), so the seeded **Connect Host: localhost** row, spawn-if-missing, and launch-time auto-reconnect described above all apply unchanged to the Mac build. What stays Mac-specific:
 
 - **A Mac can be an SSH host.** The install/upgrade flow — the [not-found row](#troubleshooting) below, **Install Update…**, and the remote "needs restart" dialog — targets an Apple-silicon Mac exactly as it does a Linux box: the binary lands in `~/.local/bin/roost-session` on the Mac, and nothing is written anywhere else. The bytes come from the same ladder: a Mac client sends its own bundled `roost-session` (the same build it runs), and a Linux client downloads the release's `roost-session-<version>-darwin-arm64`, checksum-verified. Releases before the one that added this publish no macOS download, so a Linux client can't install an older build onto a Mac. An Intel Mac has no build and is refused before anything is offered.
-- **A Mac that also runs Roost-Iced has two copies.** Its own app starts its `localhost` session from the bundle (`Contents/MacOS/roost-session`); an SSH client installs to and execs `~/.local/bin/roost-session`. They are independent, the same as a deb's `/usr/bin` copy and an SSH install on Linux (see [the ssh-to-self trap](#the-upgrade-restart-flow) above). A restart from an SSH client starts the `~/.local/bin` copy, and the Mac's own app keeps attaching to it as long as the two builds stay compatible. Updating the app on that Mac does not update `~/.local/bin`.
+- **A Mac that also runs Roost has two copies.** Its own app starts its `localhost` session from the bundle (`Contents/MacOS/roost-session`); an SSH client installs to and execs `~/.local/bin/roost-session`. They are independent, the same as a deb's `/usr/bin` copy and an SSH install on Linux (see [the ssh-to-self trap](#the-upgrade-restart-flow) above). A restart from an SSH client starts the `~/.local/bin` copy, and the Mac's own app keeps attaching to it as long as the two builds stay compatible. Updating the app on that Mac does not update `~/.local/bin`.
 - **Add Host reaches a Linux box or a Mac directly** — `workbox` / `user@host` / `ssh://…` — with no manual `ssh -L` forward to stand up first (see [Adding a remote host](#adding-a-remote-host-over-ssh) above — the older forwarding recipe still works too, if you'd rather use it). Everything past Add Host — Connect, the sidebar section, the verb set — behaves identically whether the target is `localhost` or a remote machine.
-- **The Swift `Roost.app` still has none of this feature at all** — permanently (see the top of this guide).
 
 ## Surviving reboots and logouts {: #surviving-reboots-launchd }
 
@@ -498,7 +497,7 @@ for a login.
     <string>ai.stridelabs.roost-session</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/Roost-Iced.app/Contents/MacOS/roost-session</string>
+        <string>/Applications/Roost.app/Contents/MacOS/roost-session</string>
         <string>start</string>
         <string>--foreground</string>
     </array>

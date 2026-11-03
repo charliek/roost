@@ -347,9 +347,10 @@ class SilentSocketTests(unittest.TestCase):
 
 
 @unittest.skipIf(importlib.util.find_spec("pytest") is None, "this interpreter has no pytest")
+@unittest.skipIf(sys.platform == "darwin", "on macOS the module would drive real input")
 class RequiredModeTests(unittest.TestCase):
-    """The module's platform and target mismatch skips an ordinary run (the
-    Swift lane collects the whole directory) but fails a required one."""
+    """The module's platform mismatch skips an ordinary run (a lane that
+    collects it off macOS) but fails a required one."""
 
     def run_module(self, required: bool) -> subprocess.CompletedProcess:
         env = {k: v for k, v in os.environ.items() if k not in ("PYTEST_ADDOPTS", "ROOST_TEST_FRESH")}
@@ -359,7 +360,7 @@ class RequiredModeTests(unittest.TestCase):
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         return subprocess.run(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-             "tools/roosttest/test_real_input_mac.py", "--roost-target", "mac"],
+             "tools/roosttest/test_real_input_mac.py", "--roost-target", "iced"],
             cwd=REPO, env=env, capture_output=True, text=True, timeout=120, check=False,
         )
 

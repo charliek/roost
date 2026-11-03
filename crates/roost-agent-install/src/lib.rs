@@ -72,8 +72,8 @@
 //!
 //! `plan` reads and decides; [`apply`] writes. A plan with no edits is
 //! the idempotency assertion — a second `ensure` plans nothing.
-//! [`ensure`] holds one advisory lock across both, because the UI, the
-//! Swift app, `roostctl` and a remote connect can all run at once. The
+//! [`ensure`] holds one advisory lock across both, because the UI,
+//! `roostctl` and a remote connect can all run at once. The
 //! wait for that lock is bounded ([`write::LOCK_DEADLINE`]): a caller
 //! that cannot get it hears [`InstallError::LockBusy`], because the one
 //! thing worse than two writers is a daemon that can never shut down.

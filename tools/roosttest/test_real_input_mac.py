@@ -183,8 +183,8 @@ FOREIGN_CLAIM = "holds a key window in front of"
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _macos_iced_only(target):
-    if (reason := platform_mismatch(platform.system(), target)) is not None:
+def _macos_only():
+    if (reason := platform_mismatch(platform.system())) is not None:
         real_input.skip_or_fail(reason)
 
 

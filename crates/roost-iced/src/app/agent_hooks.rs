@@ -5,8 +5,8 @@
 //!
 //! [`roost_agent_install::ensure`] reads and writes files in the user's
 //! home, takes an advisory `flock` across the whole plan+apply, and can
-//! block on another Roost — the CLI, the Swift app, a host connect —
-//! doing the same. Iced's `update`/`view` is the winit event-loop
+//! block on another Roost — the CLI, a host connect — doing the same.
+//! Iced's `update`/`view` is the winit event-loop
 //! thread; a `flock` taken there freezes the window. So the work goes to
 //! the runtime's **blocking** pool and the answer comes back on the
 //! engine feed, which is the same road every other off-thread result in
@@ -17,9 +17,9 @@
 //! `ensure` returns the agents the **state record** says are wired and
 //! have never been announced — `Outcome::unnoticed`, not the agents this
 //! particular run wired. That is what makes the sentence a property of
-//! the machine: a wiring done by `roostctl` or by the Mac app (which has
-//! no transient status surface and leaves `noticed` false on purpose)
-//! still gets said here, once, on the first launch that can say it.
+//! the machine: a wiring done by `roostctl` (which has no transient
+//! status surface and leaves `noticed` false on purpose) still gets said
+//! here, once, on the first launch that can say it.
 //!
 //! The order is deliberate: toast first, then
 //! [`roost_agent_install::mark_noticed`]. A crash in between loses the

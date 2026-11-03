@@ -13,8 +13,7 @@
 //! Hook-driven state **participates**. Until plan 002 this module
 //! skipped every tab with `hook_active` set, so a project whose only
 //! blocked tab was a Claude session showed no stripe at all — the
-//! differentiating case, hidden. Kept at parity with the Mac UI's
-//! `ProjectRollup.swift`.
+//! differentiating case, hidden.
 
 use roost_ipc::agent::{self, AgentLifecycle};
 

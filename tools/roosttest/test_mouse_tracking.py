@@ -17,12 +17,8 @@ All tests use the `tab.feed_pty_bytes` (to enable a mode) +
 `tab.dispatch_mouse_event` / `app.set_window_focus` /
 `app.cursor_shape` IPC ops; capture via `tab.capture_pty_input`.
 
-Cross-platform behavioral-parity gate: every case runs against
-`--roost-target mac` and `--roost-target iced`. A regression on
-either side fails the matching job in CI. Two exceptions skip on mac:
-the same-cell drag-gate cases — the gate is wired from iced only
-(plan 026 D11) — and the tab switch's release of a held button (#587),
-which landed after the Swift app was frozen.
+Every case runs in the Linux and macOS lanes, so a regression on either
+OS fails its job in CI.
 """
 
 from __future__ import annotations
@@ -49,7 +45,7 @@ pytestmark = [
 ]
 
 
-def test_button_press_release_emits_sgr_when_tracking_enabled(roost, project, target):
+def test_button_press_release_emits_sgr_when_tracking_enabled(roost, project):
     """Mode 1000 + 1006 (button-event + SGR). A press LEFT at cell
     (5, 3) → `\\x1b[<0;6;4M`; release → `\\x1b[<0;6;4m`. SGR
     encoding uses 1-indexed cells; bit 0 of the button byte is left
@@ -75,7 +71,7 @@ def test_button_press_release_emits_sgr_when_tracking_enabled(roost, project, ta
     assert b"\x1b[<0;6;4m" in captured, captured
 
 
-def test_button_no_emit_when_tracking_off(roost, project, target):
+def test_button_no_emit_when_tracking_off(roost, project):
     """No `\\x1b[?1000h` enable bytes → the encoder declines and the
     UI routes the press to the selection layer instead. Capture must
     be empty (no SGR sequence in the input channel)."""
@@ -93,7 +89,7 @@ def test_button_no_emit_when_tracking_off(roost, project, target):
     assert b"\x1b[<" not in captured, captured
 
 
-def test_drag_emits_motion_with_button_in_mode_1002(roost, project, target):
+def test_drag_emits_motion_with_button_in_mode_1002(roost, project):
     """Mode 1002 (button-event-drag) → a press → motion → release
     sequence produces three SGR reports: press(LEFT), motion with
     drag bit set, release. The drag bit is `+ 32` on the button
@@ -122,7 +118,7 @@ def test_drag_emits_motion_with_button_in_mode_1002(roost, project, target):
     assert b"\x1b[<0;8;4m" in captured, ("release missing", captured)
 
 
-def test_motion_no_button_emits_only_in_mode_1003(roost, project, target):
+def test_motion_no_button_emits_only_in_mode_1003(roost, project):
     """Mode 1000 alone: motion-no-button is suppressed (no report).
     Mode 1003 enabled: same motion emits an SGR motion report with
     button=35 (no-button + motion bit 32, total 35)."""
@@ -150,9 +146,9 @@ def test_motion_no_button_emits_only_in_mode_1003(roost, project, target):
     assert b"\x1b[<35;5;5M" in captured_on, captured_on
 
 
-def test_motion_throttle_dedups_same_cell(roost, project, target):
+def test_motion_throttle_dedups_same_cell(roost, project):
     """100 motion events at the same cell collapse to one report
-    (per-cell dedup). The 60 Hz cap is covered by the Swift
+    (per-cell dedup). The 60 Hz cap was covered by the Swift
     `MotionThrottleTests`; here we lock in that the
     `tab.dispatch_mouse_event` path actually hits the throttle."""
     tab = roost.open_tab(project, cwd="/tmp")
@@ -179,7 +175,7 @@ def _show(roost, tab: int) -> None:
         time.sleep(0.05)
 
 
-def test_a_press_and_release_on_a_background_tab_both_reach_it(roost, project, target):
+def test_a_press_and_release_on_a_background_tab_both_reach_it(roost, project):
     """`tab.dispatch_mouse_event` names a tab by **id**, so which tab the
     window happens to be showing may not change what the op does.
 
@@ -216,16 +212,6 @@ def test_a_press_and_release_on_a_background_tab_both_reach_it(roost, project, t
     )
 
 
-def _skip_unless_iced(target) -> None:
-    """The same-cell drag gate is wired from iced only (plan 026 D11):
-    AppKit never synthesizes a same-cell drag, so mac forwards what it
-    is given (the now-removed GTK UI's X11 backend did the same).
-    Adopting the gate there is a later parity choice; until then these
-    cases are iced-scoped."""
-    if target != "iced":
-        pytest.skip("same-cell drag gate is iced-wired only (plan 026 D11)")
-
-
 def _enable_drag_reporting(roost, project) -> int:
     """Open a tab with modes 1002 (button-event-drag) + 1006 (SGR)
     enabled and the input drain emptied."""
@@ -236,13 +222,12 @@ def _enable_drag_reporting(roost, project) -> int:
     return tab
 
 
-def test_same_cell_drag_is_suppressed(roost, project, target):
+def test_same_cell_drag_is_suppressed(roost, project):
     """Button-held motion that never leaves the press cell emits no
     report. winit delivers sub-pixel `CursorMoved` events during a
     stationary click, so without the cell gate every click sent
     press + `\\x1b[<32;x;yM` + release and crossterm read the drag as
     a new gesture — breaking strix's double-click detection."""
-    _skip_unless_iced(target)
     tab = _enable_drag_reporting(roost, project)
 
     roost.tab_dispatch_mouse_event(
@@ -261,11 +246,10 @@ def test_same_cell_drag_is_suppressed(roost, project, target):
     assert b"\x1b[<32;" not in captured, ("same-cell drag leaked", captured)
 
 
-def test_cross_cell_drag_is_reported(roost, project, target):
+def test_cross_cell_drag_is_reported(roost, project):
     """The gate is a cell-crossing gate, not a mute: a drag that
     leaves the press cell reports the crossing with the drag bit
     (+32) set."""
-    _skip_unless_iced(target)
     tab = _enable_drag_reporting(roost, project)
 
     roost.tab_dispatch_mouse_event(
@@ -285,11 +269,10 @@ def test_cross_cell_drag_is_reported(roost, project, target):
     assert captured == b"\x1b[<0;6;4M\x1b[<32;8;4M\x1b[<0;8;4m", captured
 
 
-def test_return_to_origin_reports_every_crossing(roost, project, target):
+def test_return_to_origin_reports_every_crossing(roost, project):
     """press A → motion A (suppressed) → motion B → motion A →
     release: the return to the press cell is a crossing and reports.
     A time throttle would have swallowed it."""
-    _skip_unless_iced(target)
     tab = _enable_drag_reporting(roost, project)
 
     roost.tab_dispatch_mouse_event(
@@ -310,14 +293,12 @@ def test_return_to_origin_reports_every_crossing(roost, project, target):
 
 
 def test_a_tab_switch_releases_the_button_held_on_the_tab_it_leaves(
-    roost, project, target
+    roost, project
 ):
     """#587: the pointer can only be over the tab on screen, so a button
     held on the tab the window switches away from would never see its
     release, and the application on the far end would be left holding
     it down. The switch sends that release itself."""
-    if target != "iced":
-        pytest.skip("the switch-time release is iced's (#587); the Swift app is frozen")
     held = _enable_drag_reporting(roost, project)
     other = roost.open_tab(project, cwd="/tmp")
     wait_tab_attached(roost, other)
@@ -342,13 +323,11 @@ def test_a_tab_switch_releases_the_button_held_on_the_tab_it_leaves(
     )
 
 
-def test_opening_the_palette_releases_the_held_button(roost, project, target):
+def test_opening_the_palette_releases_the_held_button(roost, project):
     """#342: the palette rebuilds the terminal widget with no button
     held, so the button's physical release would never reach the
     application. Opening it sends that release instead, and closing it
     sends nothing more."""
-    if target != "iced":
-        pytest.skip("the rewrap-time release is iced's; the Swift app is frozen")
     held = _enable_drag_reporting(roost, project)
     _show(roost, held)
     drain(roost, held)
@@ -372,7 +351,7 @@ def test_opening_the_palette_releases_the_held_button(roost, project, target):
     )
 
 
-def test_focus_event_emitted_when_mode_1004_enabled(roost, project, target):
+def test_focus_event_emitted_when_mode_1004_enabled(roost, project):
     """Mode 1004 on → focus-out emits `\\x1b[O`; focus-in emits
     `\\x1b[I`. The bytes are the canonical xterm focus sequences and
     the order matters (TUIs interpret O as "lost"; I as "gained")."""
@@ -390,7 +369,7 @@ def test_focus_event_emitted_when_mode_1004_enabled(roost, project, target):
     assert b"\x1b[I" in captured, captured
 
 
-def test_focus_event_silent_when_mode_1004_disabled(roost, project, target):
+def test_focus_event_silent_when_mode_1004_disabled(roost, project):
     """Default mode (no 1004 enable) → focus toggles emit nothing.
     A regression that always emitted would dump junk into the user's
     shell prompt on every Cmd-Tab."""
@@ -419,7 +398,7 @@ def _wait_cursor_shape(roost, expected: str, timeout: float = 2.0) -> None:
     )
 
 
-def test_osc_22_pointer_changes_cursor(roost, project, target):
+def test_osc_22_pointer_changes_cursor(roost, project):
     """Each W3C name produced by strix and friends round-trips
     through the OSC scanner → cursor mapper → `app.cursor_shape`.
     Empty body and unknown names both canonicalise to `"default"`."""
@@ -444,7 +423,7 @@ def test_osc_22_pointer_changes_cursor(roost, project, target):
     _wait_cursor_shape(roost, "default")
 
 
-def test_right_click_emits_button_2_when_tracking_on(roost, project, target):
+def test_right_click_emits_button_2_when_tracking_on(roost, project):
     """Mode 1000 + 1006: right-button press at (3, 3) → SGR
     `\\x1b[<2;4;4M`. Button code `2` is right-button in SGR
     encoding; the cells are 1-indexed."""
@@ -459,7 +438,7 @@ def test_right_click_emits_button_2_when_tracking_on(roost, project, target):
     assert b"\x1b[<2;4;4M" in captured, captured
 
 
-def test_left_click_when_tracking_off_does_not_emit_sgr(roost, project, target):
+def test_left_click_when_tracking_off_does_not_emit_sgr(roost, project):
     """Belt-and-braces of `test_button_no_emit_when_tracking_off`:
     confirm that with NO mode bytes the SGR encoder is genuinely
     silent. (Earlier test asserts absence; this one also exercises

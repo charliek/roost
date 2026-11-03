@@ -536,7 +536,7 @@ fn file_transfer_vectors_decode_as_typed_params_and_results() {
 
 /// The two `identify` vectors are the wire's record of plan 063's
 /// additive response fields, and the pair is the point: the pre-063 file
-/// is what a Swift UI still answers, the session one is what an iced UI
+/// is what an older UI answers, the session one is what an iced UI
 /// answers under `local-backend = session`. Decoding both against the
 /// *current* struct is the old-server → new-client direction of the
 /// compatibility matrix, which is the direction `#[serde(default)]` on
@@ -574,7 +574,7 @@ fn both_identify_vectors_decode_as_the_current_typed_result() {
 
 /// The same pair for `app.sidebar_dump` and plan 063 §D2's band strip:
 /// the pre-063 file is a dump with `hosts` and no `sections` (still what
-/// a Swift UI and an `in-process` UI with no saved hosts answer), the
+/// an `in-process` UI with no saved hosts answers), the
 /// session one is what an iced UI answers under `local-backend =
 /// session` — a leading band that is itself a saved host.
 #[test]
@@ -622,8 +622,8 @@ fn both_sidebar_dump_vectors_decode_as_the_current_typed_result() {
     );
 }
 
-/// Plan 080 D10's Agents panel: both pre-080 vectors (what the Swift
-/// app still answers) decode with no panel and re-encode exactly, and
+/// Plan 080 D10's Agents panel: both pre-080 vectors (what an older UI
+/// answers) decode with no panel and re-encode exactly, and
 /// the panel vector carries every host's agents in one list — a host
 /// row under its `h<host>.<id>` key, dimmed while its host is down.
 #[test]

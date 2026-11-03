@@ -45,8 +45,7 @@ libghostty resolves a color query as `override orelse default`:
 `override` is whatever an `OSC 4;Ps;rgb:…` / `OSC 11;rgb:…` *set* from
 the program established, and `default` is the theme Roost pushed through
 `ghostty_terminal_set(GHOSTTY_TERMINAL_OPT_COLOR_*)` at tab creation and
-on every theme switch (`TerminalTab::apply_theme_candidate` on iced,
-`Theme.apply` on macOS). **That push is what makes the queries
+on every theme switch (`TerminalTab::apply_theme_candidate`). **That push is what makes the queries
 answerable at all** — a terminal with neither an override nor a default
 has nothing to report and stays silent (pinned by
 `an_unseeded_color_query_gets_no_reply` in
@@ -67,8 +66,7 @@ its terminal color detection behind a single probe — `OSC 4;0;?` with a
 and opencode renders an unreadable gray fallback theme.
 
 **What Roost's own OSC scanner still does.** Roost keeps scanning PTY
-output in parallel with libghostty (`roost-osc` on Linux,
-`OscScanner.swift` on macOS) — it is how title / cwd / notification /
+output in parallel with libghostty (`roost-osc`) — it is how title / cwd / notification /
 clipboard / pointer-shape OSCs reach the workspace, since libghostty's
 C API surfaces no payload for them. The scanner surfaces color queries
 too, but every consumer now drops them; `roost-engine`'s `OscColorState`
@@ -77,16 +75,14 @@ colors.
 
 Code: `crates/roost-osc/src/lib.rs` (scanner),
 `crates/roost-engine/src/osc.rs` (`OscRouter` — color events produce no
-action), `mac/Sources/Roost/TerminalView.swift` (`appendBytes` passes
-color queries through). Reply bytes are pinned at the FFI in
-`crates/roost-vt/tests/write_pty_test.rs`, end-to-end on macOS in
-`mac/Tests/RoostTests/TerminalViewOscDrainTests.swift`, and on both UIs
-by `tools/roosttest/test_osc_pipeline.py`.
+action), Reply bytes are pinned at the FFI in
+`crates/roost-vt/tests/write_pty_test.rs` and end-to-end by
+`tools/roosttest/test_osc_pipeline.py`.
 
 ## The `write_pty` channel — *live*
 
 > **Status: live (#247).** Roost installs libghostty-vt's `write_pty`
-> effects callback on both UIs, so the engine-autonomous device replies
+> effects callback, so the engine-autonomous device replies
 > below now reach the PTY. Before this, probing TUIs saw a terminal that
 > ignored DA1/DSR/XTVERSION/DECRQM — most visibly crossterm's
 > `supports_keyboard_enhancement()` blocked ~2 s on an unanswered Kitty
@@ -132,26 +128,19 @@ The callback fires **synchronously inside `vt_write`** (mid-parse) **and
 inside `resize`** — mode 2048 (in-band size reports) emits its report from
 `ghostty_terminal_resize`, *outside* `vt_write`. So Roost uses a
 **collect-then-send** buffer: the callback only appends reply bytes to a
-per-tab buffer, and Roost drains that buffer to `send_input` / `onKey`
+per-tab buffer, and Roost drains that buffer to `send_input`
 *after* the producing call returns. Draining only after `vt_write` would
 silently drop resize-triggered reports.
 
-Drain points, per UI:
-
-- **macOS** (`mac/Sources/Roost/TerminalView.swift`): the module-level
-  `roostWritePtyCallback` appends to `pendingPtyReplies`;
-  `flushPendingPtyReplies()` drains it into `onKey` at the end of
-  `appendBytes` (post-`vt_write`) and immediately after the
-  `ghostty_terminal_resize` call in `reflowGridForBounds`.
-- **iced** (`crates/roost-iced/src/app/terminal_tab.rs`): the trampoline
-  (in `crates/roost-vt/src/terminal.rs`) appends to the
-  `Arc<Mutex<Vec<u8>>>` installed by `Terminal::set_write_pty_buffer`;
-  `TerminalTab::drain_terminal_replies` takes the bytes and hands them to
-  `TabSession::send_input` after `write_vt`. The resize path is staged
-  rather than sent inline: `apply_geometry` takes the buffer into
-  `GeometryChange::deferred_replies`, and those bytes are sent only once
-  the geometry transaction commits — a rolled-back resize discards its
-  report, because the PTY never observed that size.
+Drain point (`crates/roost-iced/src/app/terminal_tab.rs`): the trampoline
+(in `crates/roost-vt/src/terminal.rs`) appends to the
+`Arc<Mutex<Vec<u8>>>` installed by `Terminal::set_write_pty_buffer`;
+`TerminalTab::drain_terminal_replies` takes the bytes and hands them to
+`TabSession::send_input` after `write_vt`. The resize path is staged
+rather than sent inline: `apply_geometry` takes the buffer into
+`GeometryChange::deferred_replies`, and those bytes are sent only once
+the geometry transaction commits — a rolled-back resize discards its
+report, because the PTY never observed that size.
 
 The buffer take never holds its lock across `vt_write`/`resize` (the
 trampoline locks the same mutex synchronously — a held guard would
@@ -185,17 +174,13 @@ enabled:
 | light | `CSI ? 997 ; 2 n` (`ESC[?997;2n`) |
 
 Light vs dark is derived from the theme's **background luminance** (Rec.
-709 weighted sum over the sRGB channels, > 0.5 → light) — the same one
-formula on both UIs (`ColorRgb::is_light` in
-`crates/roost-vt/src/render_state.rs`; `Theme.isLight` in
-`mac/Sources/Roost/Theme.swift`). Roost ships only dark themes today, so
+709 weighted sum over the sRGB channels, > 0.5 → light) (`ColorRgb::is_light` in
+`crates/roost-vt/src/render_state.rs`). Roost ships only dark themes today, so
 in practice the report is `997;1n` until a light theme is added.
 
-The report is emitted from each UI's runtime theme-switch path
-(`TerminalTab::set_theme` in the iced UI, `TerminalView.setTheme` on
-macOS),
-routed through the **same per-tab PTY-input sink as keystrokes** (`onKey`
-/ `input_callback` → `send_input`) so it stays FIFO-ordered with input
+The report is emitted from the runtime theme-switch path
+(`TerminalTab::set_theme`),
+routed through the **same per-tab PTY-input sink as keystrokes** (`input_callback` → `send_input`) so it stays FIFO-ordered with input
 and is visible to `tab.capture_pty_input`. Gating: only when the tab's
 terminal reports mode 2031 set (`ghostty_terminal_get(DATA_MODE)`), and
 only on an actual theme switch — merely *enabling* the mode emits nothing

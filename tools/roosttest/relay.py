@@ -7,10 +7,10 @@ order, on which connection — rather than only what it printed.
 
 Two rewrites of `identify`'s answer, and nothing else is ever touched:
 
-* `forced_poll` strips `events.subscribe` from `ops` and drops
-  `local_session_socket`, which is exactly the answer the Mac app or an
-  older Roost gives: `roostctl wait` then takes its poll loop against the
-  very UI a stream lane would have streamed from.
+* `no_stream` strips `events.subscribe` from `ops` and drops
+  `local_session_socket`, which is exactly the answer of a Roost that
+  serves no stream: `roostctl wait` and `tab prompt` then refuse it,
+  against the very UI a stream lane would have streamed from.
 * `session_socket` replaces a present `local_session_socket`, so the
   session legs of a UI under `local-backend = session` can be routed
   through a second relay and recorded too.
@@ -72,12 +72,12 @@ class Relay:
         upstream,
         path,
         *,
-        forced_poll: bool = False,
+        no_stream: bool = False,
         session_socket=None,
     ):
         self.upstream = str(upstream)
         self.path = str(path)
-        self.forced_poll = forced_poll
+        self.no_stream = no_stream
         self.session_socket = None if session_socket is None else str(session_socket)
         self.log: list[Seen] = []
         #: Every line the server pushed back on an event stream, in order.
@@ -266,7 +266,7 @@ class Relay:
 
     def _rewrite_identify(self, result: dict) -> dict:
         result = dict(result)
-        if self.forced_poll:
+        if self.no_stream:
             result["ops"] = [op for op in result.get("ops", []) if op != "events.subscribe"]
             result.pop("local_session_socket", None)
         elif self.session_socket is not None and result.get("local_session_socket"):

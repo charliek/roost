@@ -1,15 +1,13 @@
 # Config parser golden fixtures
 
 Canonical corpus for the `config.conf` value semantics pinned in plan
-008 §3.1 — originally shared between a Rust parser and
-`mac/Sources/Roost/Config.swift` (Swift). Only Swift loads this corpus
-today (`crates/roost-ui-model/src/config.rs`'s own unit tests cover
-the Rust parser directly instead); no equivalent Rust loader exists.
+008 §3.1: what `RoostConfig::parse`
+(`crates/roost-ui-model/src/config.rs`) makes of each config body.
 
 Loader:
 
-- Swift: `mac/Tests/RoostTests/ConfigFixtureTests.swift`
-  (`swift test --package-path mac`).
+- Rust: `crates/roost-ui-model/tests/config_fixtures_test.rs`
+  (`cargo test -p roost-ui-model`).
 
 Same pattern as [`tests/agent-state-fixtures/`](../agent-state-fixtures/README.md).
 
@@ -28,10 +26,10 @@ schema (`config_values` is the only group today). Each case:
 
 - `content` is a full config-file body; CRLF files spell `\r\n`
   literally in the JSON string.
-- `expect` pins **parser output for the shared key surface** — never
+- `expect` pins **parser output for the keys below** — never
   downstream resolution (theme lookup, font matching). A mismatched
   quote pair like `"dark'` stays verbatim and fails theme resolution
-  identically on both platforms; that later layer is out of scope here.
+  later; that layer is out of scope here.
 - Every `expect` field is written explicitly in every case:
   - `theme`, `font_family`: string or `null` (= unset).
   - `font_size`: number or `null`.
@@ -46,12 +44,12 @@ schema (`config_values` is the only group today). Each case:
     `[key, value]` pairs; `providers`: `{label, run, title,
     timeout_secs, limit}` — full objects, so the raw-value path is
     proven, not just labels.
-- Platform-only keys (`tab-min-width` / `tab-max-width`,
-  `link-modifier`'s application) stay in per-side unit tests; the
-  corpus pins the shared surface only.
+- Keys outside this surface (`link-modifier`, `local-backend`,
+  `agent-hooks`, the `macos-*` keys, …) stay in `config.rs`'s own unit
+  tests.
 
 ## Adding a case
 
-Append it to `values.json` and run both loaders. Every case needs a
-unique, descriptive `name`: the loaders report failures by name, and
+Append it to `values.json` and run the loader. Every case needs a
+unique, descriptive `name`: the loader reports failures by name, and
 the name is the only thing a reader of a red CI log sees.

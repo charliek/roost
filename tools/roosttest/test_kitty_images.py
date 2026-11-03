@@ -11,8 +11,6 @@ its session's, live and after a snapshot attach) is the host-client lane's
 The PTY's winsize carries the same cell size in pixels (plan 088 D4), which
 is what `kitten icat` sizes an image from.
 
-Iced only: the frozen Swift app neither stores nor lists images.
-
 Condition waits only.
 """
 
@@ -41,12 +39,6 @@ QUIET_ARGV = ["/bin/sh", "-c", "exec sleep 300"]
 RGBA_2X2 = bytes(
     [255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 10, 20, 30, 40]
 )
-
-
-@pytest.fixture(autouse=True)
-def iced_only(target):
-    if target != "iced":
-        pytest.skip("only roost-iced stores and lists Kitty images (plan 088)")
 
 
 def place(image_id: int, row: int, col: int) -> bytes:

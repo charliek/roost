@@ -37,9 +37,7 @@ roostctl open --project "$name" --cwd "$PWD" --title "$name" -- bash -lc 'make t
 `tab.open`, atomic *per call* — a hand-written list-then-create (`tab
 list` to look for the project, `project create` if it's missing) races
 another caller doing the same thing at the same time, and two of them
-can each create their own "review" project (#221). `open` refuses
-`unsupported` instead of racing on a Roost with no `project.ensure` (the
-Swift Mac app today) — see [`open`](../reference/cli.md#open) for the
+can each create their own "review" project (#221). See [`open`](../reference/cli.md#open) for the
 full contract, including `--hold`/`--focus` and its exit codes.
 
 A script launched *inside* a Roost tab can call back without any discovery

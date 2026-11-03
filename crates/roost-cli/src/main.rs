@@ -223,8 +223,11 @@ struct Args {
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
 enum TargetArg {
+    /// The macOS `Roost.app` (`~/Library/Caches/Roost/roost.sock`).
     Mac,
+    /// The packaged Linux `roost`.
     Linux,
+    /// A dev build: `roost-iced` from a dev tree, or a dev `Roost-Iced.app`.
     Iced,
     /// The headless `roost-session` daemon (#475). Explicit only —
     /// unlike the other three, this value has no `ROOST_BUNDLE_PROFILE`
@@ -287,9 +290,9 @@ enum Cmd {
     /// Event-driven where the tabs' socket streams its events: an
     /// in-process UI, or the local session `identify` names under
     /// `local-backend = session`. `--text` also re-reads the viewport every
-    /// `--interval-ms`, since no event carries a tab's output. Against a
-    /// server with no stream (the Mac app, an older Roost) it polls at
-    /// `--interval-ms` instead. A lost stream is resolved again once, and
+    /// `--interval-ms`, since no event carries a tab's output. A Roost that
+    /// serves no stream is refused, exit 1 (`unsupported`): `wait` does
+    /// not poll. A lost stream is resolved again once, and
     /// the wait carries on only if the same process answers: tab ids do not
     /// carry across a local-backend switch or a restart, so either exits 1
     /// (`connection`), as do a second loss and a session that stops.
@@ -305,7 +308,7 @@ enum Cmd {
     /// terminal envelope, `session.stopping` or `stream.ended` (no
     /// `revision`), and then it exits 0. A stream that drops or skips a
     /// revision exits 1 (`connection`); a server that does not serve the
-    /// stream (the Mac app, an older Roost) exits 1 with its own refusal.
+    /// stream exits 1 with its own refusal.
     /// The one refusal not passed through is a local-backend switch in
     /// flight: that is waited out, with one line on stderr saying so.
     /// Always JSON, with or without `--json`.
@@ -352,16 +355,12 @@ enum Cmd {
     /// `tab.focus` and nothing else ever does, and `--no-activate` asks
     /// `tab.open` itself to leave the selection where it was.
     ///
-    /// Refuses `unsupported` (exit 1) against a server whose
-    /// `identify.ops` doesn't list `project.ensure` — the Mac app today
-    /// — naming the manual route (`project list --json` +
-    /// `tab open --project-id`) rather than falling back to it itself,
-    /// which would reopen the same race. Refuses `busy` (exit 1) while
-    /// `identify.local_backend_switch` shows a switch in progress: the
-    /// project set is mid-flight, so a name resolved against it may not
-    /// hold. A `not-found` from the `tab.open` half (the project vanished
-    /// between the two calls — a switch landing in that window, say)
-    /// reaches the caller as the server's own refusal, unchanged.
+    /// Refuses `busy` (exit 1) while `identify.local_backend_switch`
+    /// shows a switch in progress: the project set is mid-flight, so a
+    /// name resolved against it may not hold. A `not-found` from the
+    /// `tab.open` half (the project vanished between the two calls — a
+    /// switch landing in that window, say) reaches the caller as the
+    /// server's own refusal, unchanged.
     Open {
         /// The project's exact name. Created at `--cwd` if no project
         /// has it; found otherwise.
@@ -577,11 +576,6 @@ enum ProjectCmd {
     /// without `--json`: `project create`/`rename`/`delete`/`reorder`
     /// print nothing without the flag, so there is no single human form
     /// this verb could match instead.
-    ///
-    /// Refuses `unsupported` (exit 1) against a server whose
-    /// `identify.ops` doesn't list `project.ensure` — the Mac app today
-    /// — naming the manual route (`project list --json` + `project
-    /// create`) rather than racing it with a list-then-create fallback.
     Ensure {
         /// The project's exact name.
         #[arg(long)]
@@ -880,8 +874,8 @@ enum TabCmd {
     ///
     /// Exits 4 `stalled` when the tab reaches no `running` within
     /// `--activity-timeout`, 4 `timeout` when `--timeout` runs out, and
-    /// 1 `unsupported` against a server that serves no event stream (the
-    /// Swift Mac app) — there is no polling fallback.
+    /// 1 `unsupported` against a Roost that serves no event stream —
+    /// there is no polling fallback.
     ///
     /// Prints `{"tab_id","started_after_ms","settled":{"state"},"after_ms"}`
     /// under `--json`, and one line with the same facts without it. Both
@@ -1009,7 +1003,7 @@ async fn main() {
     // are all decoded by something. The config parser warns about a key
     // it cannot read, and since plan 064 the retired `agent-hooks =
     // auto` spelling is one of those — so on stdout that warning would
-    // land in front of the JSON the Mac app decodes from `agent ensure`.
+    // land in front of the JSON a script decodes from `agent ensure`.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
@@ -1229,9 +1223,6 @@ struct UiSocket<'a> {
     follows_window: bool,
     client: Option<IpcClient>,
     path: PathBuf,
-    /// The kind of UI `client` dialled, when the target ladder named one;
-    /// `None` before it has dialled.
-    kind: Option<BundleProfileKind>,
 }
 
 impl<'a> UiSocket<'a> {
@@ -1246,7 +1237,6 @@ impl<'a> UiSocket<'a> {
             follows_window,
             client: None,
             path: PathBuf::new(),
-            kind: None,
         }
     }
 
@@ -1258,7 +1248,6 @@ impl<'a> UiSocket<'a> {
                     window::route(self.selector, self.environment, self.follows_window).await?;
                 let client = dial(&target.socket_path).await?;
                 self.path = target.socket_path;
-                self.kind = target.kind;
                 client
             }
         };
@@ -1294,26 +1283,18 @@ impl<'a> UiSocket<'a> {
 }
 
 /// `tab.open` with this roostctl stated as the tab's opener (plan 085
-/// D7), the one way `tab open` and `open` send it.
-///
-/// Nothing is stated to a target the ladder named Roost.app: the Swift
-/// app is frozen and refuses both fields. Only on macOS — elsewhere that
-/// profile resolves to a Rust UI, which honours them. A server that
-/// refuses them by name — Roost.app reached by `--socket`, a session from
-/// before them — is asked once more without; any other refusal is the
-/// answer.
+/// D7), the one way `tab open` and `open` send it, to whatever kind of
+/// UI the ladder resolved. A server that refuses the fields by name — a
+/// session from before them — is asked once more without; any other
+/// refusal is the answer.
 async fn open_tab(
     ui: &mut UiSocket<'_>,
     mut params: TabOpenParams,
 ) -> Result<TabOpenResult, CliError> {
-    ui.client().await?;
-    let stated = !(cfg!(target_os = "macos") && ui.kind == Some(BundleProfileKind::Mac));
-    if stated {
-        ui.environment.opener.state(&mut params);
-    }
+    ui.environment.opener.state(&mut params);
     match ui.client().await?.call(ops::TAB_OPEN, &params).await {
         Err(roost_ipc::ClientError::Server { code, message })
-            if stated && opener::refuses_opener_fields(&code, &message) =>
+            if opener::refuses_opener_fields(&code, &message) =>
         {
             tracing::debug!(%message, "the server refuses the opener fields; asking again");
             params.env = None;
@@ -1456,7 +1437,6 @@ async fn run_on_ui(
             }
         }
         Cmd::Project(ProjectCmd::Ensure { name, cwd }) => {
-            require_project_ensure(ui).await?;
             let cwd = resolve_cwd(cwd, cwd_env)?;
             let resp: ProjectEnsureResult = ui
                 .call(
@@ -1602,7 +1582,7 @@ async fn run_on_ui(
             hold,
             argv,
         } => {
-            let identity = require_project_ensure(ui).await?;
+            let identity = identify(ui.client().await?).await?;
             if identity.local_backend_switch.is_some() {
                 return Err(CliError::Server {
                     code: roost_ipc::codes::BUSY.into(),
@@ -2150,30 +2130,6 @@ async fn identify(client: &mut IpcClient) -> Result<IdentifyResult, CliError> {
 
 async fn list_tabs(client: &mut IpcClient) -> Result<TabListResult, CliError> {
     Ok(client.call(ops::TAB_LIST, serde_json::json!({})).await?)
-}
-
-/// `identify`, refusing `unsupported` (exit 1) if this server's `ops`
-/// doesn't list `project.ensure` — an absent field (an older server, or
-/// the Swift Mac app) and a list without the name both mean "not
-/// served" (plan 066 §3.1). Named for the manual route rather than
-/// falling back to it: a list-then-create fallback here would reopen the
-/// #221 race `project.ensure` exists to close, so `open` and `project
-/// ensure` refuse instead of ever sending `project.list`/`project.create`
-/// themselves.
-async fn require_project_ensure(ui: &mut UiSocket<'_>) -> Result<IdentifyResult, CliError> {
-    let identity = identify(ui.client().await?).await?;
-    let supported = identity
-        .ops
-        .as_deref()
-        .is_some_and(|served| served.iter().any(|op| op == ops::PROJECT_ENSURE));
-    if !supported {
-        return Err(CliError::Unsupported(format!(
-            "this Roost does not serve {}; find the project with `roostctl project list \
-             --json` and open the tab directly with `roostctl tab open --project-id`",
-            ops::PROJECT_ENSURE
-        )));
-    }
-    Ok(identity)
 }
 
 /// `--cwd`, or `cwd_env` (`$PWD` as `main` resolved it) when the flag is
@@ -3816,29 +3772,6 @@ mod tests {
         }
     }
 
-    /// The Mac app spawns these and decodes their stdout; there is no
-    /// Linux lane that runs the spawn, so the argv is pinned here.
-    #[test]
-    fn the_argv_the_mac_app_spawns_still_parses() {
-        let args = Args::try_parse_from(["roostctl", "agent", "ensure", "--json"])
-            .expect("the Mac app's agent ensure argv");
-        assert!(args.json);
-        assert!(matches!(
-            args.command,
-            Cmd::Agent(agent_install::AgentCmd::Ensure { startup: false })
-        ));
-
-        for argv in [
-            &["roostctl", "agent", "ensure", "--startup", "--json"][..],
-            &["roostctl", "agent", "status", "--json"],
-            &["roostctl", "agent", "set", "--local", "claude", "--json"],
-        ] {
-            let args = Args::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
-            assert!(args.json, "{argv:?}");
-            assert!(matches!(args.command, Cmd::Agent(_)), "{argv:?}");
-        }
-    }
-
     #[test]
     fn a_refused_command_line_reads_json_off_the_raw_argv() {
         let argv: Vec<OsString> = ["roostctl", "--json", "tab", "list", "--bogus"]
@@ -3944,11 +3877,17 @@ mod tests {
 
     impl FakeUi {
         fn start(tag: &str, answer: impl Fn(&str) -> Answer + Send + Sync + 'static) -> Self {
+            Self::start_at(&short_socket_dir(tag).join("ui.sock"), answer)
+        }
+
+        fn start_at(
+            socket: &Path,
+            answer: impl Fn(&str) -> Answer + Send + Sync + 'static,
+        ) -> Self {
             use roost_ipc::messages::{RawRequest, Response};
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-            let socket = short_socket_dir(tag).join("ui.sock");
-            let listener = tokio::net::UnixListener::bind(&socket).expect("bind the fake UI");
+            let listener = tokio::net::UnixListener::bind(socket).expect("bind the fake UI");
             let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let seen = requests.clone();
             let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4339,15 +4278,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_wait_that_never_holds_times_out_with_exit_4() {
-        let ui = FakeUi::start("wait-timeout", |op| match op {
-            "identify" => Ok(fake_identify(0)),
-            "tab.list" => Ok(serde_json::json!({"projects": []})),
-            _ => Err(("unknown-op", "not faked")),
-        });
+        let ui = crate::events::fake::Fake::ui("wait-timeout");
+        ui.with(|world| world.tabs.clear());
         let error = run_argv(
             &[
                 "--socket",
-                &ui.socket,
+                &ui.socket(),
                 "wait",
                 "--tab",
                 "7",
@@ -4673,7 +4609,6 @@ mod tests {
     async fn the_read_only_verbs_fall_back_to_the_active_tab() {
         let ui = FakeUi::start("fallback", |op| match op {
             "identify" => Ok(fake_identify(5)),
-            "tab.list" => Ok(serde_json::json!({"projects": []})),
             "tab.dump" => Ok(serde_json::json!({"cols": 80, "rows": 1, "rows_text": [""]})),
             _ => Err(("unknown-op", "not faked")),
         });
@@ -4689,15 +4624,28 @@ mod tests {
             (ops::TAB_DUMP, &"5".into())
         );
 
+        let streaming = crate::events::fake::Fake::ui("fallback-wait");
+        streaming.with(|world| world.identify["active_tab_id"] = serde_json::json!("5"));
         assert_eq!(
             run_argv(
-                &["--socket", &ui.socket, "wait", "--gone", "--timeout", "0"],
+                &[
+                    "--socket",
+                    &streaming.socket(),
+                    "wait",
+                    "--gone",
+                    "--timeout",
+                    "0"
+                ],
                 None
             )
             .await,
-            Ok(0)
+            Ok(0),
+            "tab 5, the active tab, is not in the snapshot"
         );
-        assert_eq!(ui.take()[0].0, ops::IDENTIFY);
+        assert_eq!(
+            streaming.with(|world| world.ops()[0].to_string()),
+            ops::IDENTIFY
+        );
 
         // `ROOST_TAB_ID` still comes before the active tab.
         assert_eq!(
@@ -4788,18 +4736,9 @@ mod tests {
     // `open` / `project ensure` (plan 066 §3.2)
     // ------------------------------------------------------------------
 
-    /// `identify.ops` advertising `project.ensure` (and the rest `open`
-    /// needs), with no backend switch in flight.
-    fn fake_identify_supports_ensure() -> serde_json::Value {
+    /// `identify` with a backend switch reported in progress.
+    fn fake_identify_mid_switch() -> serde_json::Value {
         let mut identity = fake_identify(0);
-        identity["ops"] =
-            serde_json::json!(["identify", "project.ensure", "tab.open", "tab.focus",]);
-        identity
-    }
-
-    /// The same, with a backend switch reported in progress.
-    fn fake_identify_ensure_mid_switch() -> serde_json::Value {
-        let mut identity = fake_identify_supports_ensure();
         identity["local_backend_switch"] = serde_json::json!("attach_remote");
         identity
     }
@@ -5089,7 +5028,7 @@ mod tests {
 
     fn answer_ensure_and_open(op: &str) -> Result<serde_json::Value, (&'static str, &'static str)> {
         match op {
-            "identify" => Ok(fake_identify_supports_ensure()),
+            "identify" => Ok(fake_identify(0)),
             "project.ensure" => Ok(fake_project_ensure_result()),
             "tab.open" => Ok(fake_tab_open_result()),
             "tab.focus" => Ok(serde_json::json!({})),
@@ -5152,8 +5091,8 @@ mod tests {
             Ok(0)
         );
         let sent = ui.take();
-        assert_eq!(sent[1].0, ops::PROJECT_ENSURE, "{sent:?}");
-        assert_eq!(sent[1].1["cwd"], "/injected/pwd", "{sent:?}");
+        assert_eq!(sent[0].0, ops::PROJECT_ENSURE, "{sent:?}");
+        assert_eq!(sent[0].1["cwd"], "/injected/pwd", "{sent:?}");
 
         assert_eq!(
             run_argv_env(
@@ -5451,7 +5390,10 @@ mod tests {
         }
 
         let refusing = FakeUi::start("no-activate-refused", |op| match op {
-            "tab.open" => Err(("unknown-field", "unknown params: activate")),
+            "tab.open" => Err((
+                "unknown-field",
+                "unknown field `activate`, expected one of `project_id`, `env`, `origin`",
+            )),
             _ => answer_ensure_and_open(op),
         });
         let error = run_argv(
@@ -5472,7 +5414,8 @@ mod tests {
             error,
             CliError::Server {
                 code: "unknown-field".into(),
-                message: "unknown params: activate".into(),
+                message: "unknown field `activate`, expected one of `project_id`, `env`, `origin`"
+                    .into(),
             }
         );
         let sent = refusing.take();
@@ -5547,13 +5490,8 @@ mod tests {
         }
     }
 
-    /// `open_tab` on a connection already dialled to `ui`, as the ladder
-    /// would have left it had it resolved a UI of `kind`.
-    async fn open_tab_on(
-        ui: &FakeUi,
-        kind: Option<BundleProfileKind>,
-        opener: opener::Opener,
-    ) -> Result<TabOpenResult, CliError> {
+    /// `open_tab` on a connection already dialled to `ui`.
+    async fn open_tab_on(ui: &FakeUi, opener: opener::Opener) -> Result<TabOpenResult, CliError> {
         let selector = TargetSelector::default();
         let environment = Environment {
             opener,
@@ -5561,7 +5499,6 @@ mod tests {
         };
         let mut socket = UiSocket::new(&selector, &environment, false);
         socket.client = Some(dial(Path::new(&ui.socket)).await.unwrap());
-        socket.kind = kind;
         open_tab(
             &mut socket,
             TabOpenParams {
@@ -5572,39 +5509,73 @@ mod tests {
         .await
     }
 
-    /// Plan 085 D7 (rule 7): a target the ladder named Roost.app is sent
-    /// neither field — the frozen Swift app refuses both — while every
-    /// other kind, and a socket of unknown kind, is.
-    #[tokio::test]
-    async fn nothing_is_stated_to_a_target_named_roost_app() {
-        let ui = FakeUi::start("opener-mac-kind", answer_ensure_and_open);
-        for (kind, opener) in [
-            (Some(BundleProfileKind::Mac), desk_opener()),
-            (Some(BundleProfileKind::Mac), laptop_opener()),
-        ] {
-            open_tab_on(&ui, kind, opener).await.expect("opened");
-            let sent = ui.take();
-            let opener_fields = stated(tab_opens(&sent)[0]);
-            if cfg!(target_os = "macos") {
-                assert_eq!(opener_fields, (None, None), "{kind:?}");
-            } else {
-                assert_ne!(
-                    opener_fields,
-                    (None, None),
-                    "{kind:?} is a Rust UI off macOS"
-                );
+    /// Sets one process-global variable for the life of the guard. Hold
+    /// [`TEST_ENV`] across it.
+    struct EnvVar {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            EnvVar { key, prev }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
             }
         }
-        for kind in [
-            None,
-            Some(BundleProfileKind::Iced),
-            Some(BundleProfileKind::Linux),
-            Some(BundleProfileKind::Session),
+    }
+
+    /// Plan 089 D2: `--target mac` names the iced `Roost.app`, so the
+    /// ladder's `Mac` answer is told its opener like any other target, on
+    /// every OS — `env` at the machine and `origin` over SSH.
+    #[tokio::test]
+    async fn tab_open_states_its_opener_to_a_mac_profile_target() {
+        let _env = TEST_ENV.lock().await;
+        let root = short_socket_dir("opener-mac");
+        let _paths = if cfg!(target_os = "macos") {
+            EnvVar::set("HOME", &root)
+        } else {
+            EnvVar::set("XDG_RUNTIME_DIR", &root)
+        };
+        let socket = roost_ipc::paths::BundleProfile::mac()
+            .expect("mac profile")
+            .socket_path;
+        assert!(
+            socket.starts_with(&root),
+            "{socket:?} is not under {root:?}"
+        );
+        std::fs::create_dir_all(socket.parent().expect("a socket dir")).unwrap();
+        let ui = FakeUi::start_at(&socket, answer_ensure_and_open);
+        let desk = serde_json::json!({ "DISPLAY": ":4", "SSH_AUTH_SOCK": "/desk/agent" });
+        let laptop = serde_json::json!({
+            "ssh_connection": "10.0.0.2 5 10.0.0.1 22",
+            "ssh_client": "10.0.0.2 5 22",
+        });
+        for (opener, expected) in [
+            (desk_opener(), (Some(desk), None)),
+            (laptop_opener(), (None, Some(laptop))),
         ] {
-            open_tab_on(&ui, kind, desk_opener()).await.expect("opened");
+            let environment = Environment {
+                opener,
+                ..Environment::default()
+            };
+            let argv = ["--target", "mac", "tab", "open", "--project-id", "42"];
+            let args = parse(&argv).unwrap();
+            assert_eq!(run(args, None, None, &environment).await, Ok(0));
             let sent = ui.take();
-            assert!(stated(tab_opens(&sent)[0]).0.is_some(), "{kind:?}");
+            let opens = tab_opens(&sent);
+            assert_eq!(opens.len(), 1, "{sent:?}");
+            assert_eq!(stated(opens[0]), expected);
         }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A stand-in UI that refuses the first `tab.open` it is sent with
@@ -5619,17 +5590,11 @@ mod tests {
         })
     }
 
-    /// Plan 085 D7: a server that refuses `env` or `origin` by name —
-    /// Swift's spelling and serde's — is asked once more with neither.
+    /// Plan 085 D7: a server that refuses `env` or `origin` by name — a
+    /// protocol-6 session — is asked once more with neither.
     #[tokio::test]
     async fn a_server_refusing_the_opener_by_name_is_asked_again_without_it() {
         for (tag, refusal, opener) in [
-            ("opener-swift-env", "unknown params: env", desk_opener()),
-            (
-                "opener-swift-origin",
-                "unknown params: origin",
-                laptop_opener(),
-            ),
             (
                 "opener-serde-env",
                 "unknown field `env`, expected one of `project_id`, `cwd`, `origin`",
@@ -5642,7 +5607,7 @@ mod tests {
             ),
         ] {
             let ui = refusing_first_open(tag, ("unknown-field", refusal));
-            let opened = open_tab_on(&ui, None, opener).await;
+            let opened = open_tab_on(&ui, opener).await;
             assert!(opened.is_ok(), "{refusal}: {opened:?}");
             let sent = ui.take();
             let opens = tab_opens(&sent);
@@ -5659,8 +5624,8 @@ mod tests {
 
     /// Any other `unknown-field` is the answer, unretried: a key inside
     /// `origin`, and another field whose serde refusal goes on to list
-    /// every field `tab.open` knows, `env` and `origin` among them. (An
-    /// `activate` refusal in Swift's spelling is pinned the same way by
+    /// every field `tab.open` knows, `env` and `origin` among them. (A
+    /// refused `activate` is pinned the same way by
     /// [`no_activate_sends_activate_false_and_nothing_otherwise`].)
     #[tokio::test]
     async fn any_other_unknown_field_surfaces_unretried() {
@@ -5676,7 +5641,7 @@ mod tests {
             ),
         ] {
             let ui = refusing_first_open(tag, ("unknown-field", refusal));
-            let error = open_tab_on(&ui, None, laptop_opener())
+            let error = open_tab_on(&ui, laptop_opener())
                 .await
                 .expect_err("the refusal surfaces");
             assert_eq!(
@@ -5730,70 +5695,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_when_identify_has_no_ops_field_sends_nothing_else() {
-        let ui = FakeUi::start("no-ops-field", |op| match op {
-            "identify" => Ok(fake_identify(0)), // no `ops` field at all
-            _ => Err(("unknown-op", "not faked")),
-        });
-        for argv in [
-            vec![
-                "--socket",
-                ui.socket.as_str(),
-                "project",
-                "ensure",
-                "--name",
-                "x",
-            ],
-            vec!["--socket", ui.socket.as_str(), "open", "--project", "x"],
-        ] {
-            let error = run_argv(&argv, None).await.expect_err(&format!("{argv:?}"));
-            assert_eq!(error.code(), "unsupported", "{argv:?}: {error:?}");
-            assert_eq!(error.exit_code(), 1, "{argv:?}");
-            let sent = ui.take();
-            assert_eq!(
-                sent.iter().map(|(op, _)| op.as_str()).collect::<Vec<_>>(),
-                vec![ops::IDENTIFY],
-                "{argv:?}: {sent:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn unsupported_when_ops_lacks_project_ensure_sends_nothing_else() {
-        let ui = FakeUi::start("ops-without-ensure", |op| match op {
-            "identify" => {
-                let mut identity = fake_identify(0);
-                identity["ops"] = serde_json::json!(["identify", "tab.open", "tab.list"]);
-                Ok(identity)
-            }
-            _ => Err(("unknown-op", "not faked")),
-        });
-        for argv in [
-            vec![
-                "--socket",
-                ui.socket.as_str(),
-                "project",
-                "ensure",
-                "--name",
-                "x",
-            ],
-            vec!["--socket", ui.socket.as_str(), "open", "--project", "x"],
-        ] {
-            let error = run_argv(&argv, None).await.expect_err(&format!("{argv:?}"));
-            assert_eq!(error.code(), "unsupported", "{argv:?}: {error:?}");
-            let sent = ui.take();
-            assert_eq!(
-                sent.iter().map(|(op, _)| op.as_str()).collect::<Vec<_>>(),
-                vec![ops::IDENTIFY],
-                "{argv:?}: {sent:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn open_refuses_busy_during_a_backend_switch_before_project_ensure() {
         let ui = FakeUi::start("switch-in-progress", |op| match op {
-            "identify" => Ok(fake_identify_ensure_mid_switch()),
+            "identify" => Ok(fake_identify_mid_switch()),
             _ => Err(("unknown-op", "not faked")),
         });
         let error = run_argv(
@@ -5829,7 +5733,7 @@ mod tests {
     #[tokio::test]
     async fn open_passes_through_a_not_found_from_tab_open_verbatim() {
         let ui = FakeUi::start("open-not-found", |op| match op {
-            "identify" => Ok(fake_identify_supports_ensure()),
+            "identify" => Ok(fake_identify(0)),
             "project.ensure" => Ok(fake_project_ensure_result()),
             "tab.open" => Err(("not-found", "project 42 is gone")),
             _ => Err(("unknown-op", "not faked")),

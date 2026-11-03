@@ -216,13 +216,12 @@ Roost never writes into an agent's config file before you've said yes.
 
 - **Absent (a fresh install).** The first time the UI starts with no
   answer on file *and* at least one of the five agents installed, a
-  consent dialog opens — the iced **Agent Hooks…** card, the Mac
-  **Agent Hooks…** sheet — naming which agents it found and letting you
+  consent dialog opens — the **Agent Hooks…** card — naming which agents it found and letting you
   pick which to wire, or none. Nothing is written before you answer it.
   It reopens on demand from the command palette (or, on Mac, the View
   menu) as the same **Agent Hooks…** row, bound to the default-unbound
   `agent_hooks` keybind action, so you can revisit the choice later.
-- **A list.** At startup — the iced UI, the Swift app, and (on connect)
+- **A list.** At startup — the UI and (on connect)
   a host session — Roost runs the equivalent of `roostctl agent ensure`:
   for every agent the list names whose config directory exists on that
   machine, it makes sure Roost's hook entry is present and current,
@@ -230,12 +229,11 @@ Roost never writes into an agent's config file before you've said yes.
 - **`off`.** Nothing is wired at startup. See [How to opt
   out](#how-to-opt-out) for what this does and doesn't remove.
 
-The iced UI also shows a one-line toast the first time any agent is
+The UI shows a one-line toast the first time any agent is
 *newly* wired on a machine, naming which ones and how to undo it; after
-that, refreshes on upgrade are silent. **The Swift `Roost.app` has no equivalent
-toast** — its chrome has no transient status surface — so a machine
-wired only through the Swift app or `roostctl` stays unannounced until
-either the iced UI runs there too, or you check by hand.
+that, refreshes on upgrade are silent. A machine wired only through
+`roostctl` stays unannounced until the UI runs there too, or you check
+by hand.
 `roostctl agent status` and `roostctl doctor`'s `Agents` section are the
 durable way to see what's wired without waiting for a toast.
 
@@ -348,7 +346,7 @@ for `set`'s full behavior, including what it does over a running UI.
 that older mechanism.
 
 Every write goes through one advisory lock per agent config directory,
-so the iced UI, the Swift app, `roostctl`, and a remote connect can all
+so the UI, `roostctl`, and a remote connect can all
 run `ensure` at the same time without racing each other; a plan
 re-checks the file's content immediately before writing and skips
 (reporting `changed-underneath`) rather than clobbering a file that
@@ -463,7 +461,7 @@ future work in [#519](https://github.com/charliek/roost/issues/519).
 
 ### Which marks count
 
-On Roost-Iced, a session tab and an in-process tab take their OSC 133
+A session tab and an in-process tab take their OSC 133
 marks from libghostty, the same stream the
 [program-status](#program-status-osc-7501) records read, so a mark
 moves the hook layer and the records at the same byte. libghostty's
@@ -478,9 +476,7 @@ reading is the spec's:
 | a mark over 2048 bytes after `133;` (a long `C;cmdline_url=…`) | nothing: libghostty drops an OSC sequence that overflows its buffer, a known limit |
 
 A host tab's client shows what the session made of the marks; it reads
-none itself. Roost.app (the Swift Mac app) keeps its own scanner and the
-older rule: the first letter decides, `C` or one of `A`, `B`, `D`, so
-`A;k=s` and `Axyz` count as prompts there and `P`, `N` and `I` don't.
+none itself.
 
 ## Codex trust
 

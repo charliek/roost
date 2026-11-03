@@ -48,25 +48,18 @@ impl Opener {
 }
 
 /// Whether a `tab.open` refusal is a server that does not know `env` or
-/// `origin` — Roost.app reached by `--socket`, or a session from before
-/// either field. Decided by the field the server names as refused: Swift
-/// lists every unknown key (`unknown params: a, env`), serde names the
-/// first (``unknown field `env`, expected one of …``) and then lists the
-/// fields it knows, `origin` among them, so a substring match would also
-/// take a refusal of a key *inside* `origin` (``unknown field `ssh_tty` ``)
-/// or of any other field for this one.
+/// `origin`: a protocol-6 session, from before either field. Decided by
+/// the field serde names as refused (``unknown field `env`, expected one
+/// of …``), because the refusal goes on to list the fields it knows,
+/// `origin` among them — a substring match would also take a refusal of
+/// a key *inside* `origin` (``unknown field `ssh_tty` ``) or of any other
+/// field for this one.
 pub(crate) fn refuses_opener_fields(code: &str, message: &str) -> bool {
-    if code != codes::UNKNOWN_FIELD {
-        return false;
-    }
-    let opener_field = |name: &str| name == "env" || name == "origin";
-    if let Some(names) = message.strip_prefix("unknown params: ") {
-        return names.split(", ").any(opener_field);
-    }
-    message
-        .strip_prefix("unknown field `")
-        .and_then(|rest| rest.split_once('`'))
-        .is_some_and(|(name, _)| opener_field(name))
+    code == codes::UNKNOWN_FIELD
+        && message
+            .strip_prefix("unknown field `")
+            .and_then(|rest| rest.split_once('`'))
+            .is_some_and(|(name, _)| name == "env" || name == "origin")
 }
 
 #[cfg(test)]
@@ -143,9 +136,6 @@ mod tests {
     #[test]
     fn only_a_refusal_naming_env_or_origin_is_about_the_opener() {
         let refused = [
-            "unknown params: env",
-            "unknown params: origin",
-            "unknown params: activate, env",
             "unknown field `env`, expected one of `project_id`, `cwd`, `origin`",
             "unknown field `origin`, expected one of `project_id`, `env`",
         ];
@@ -156,8 +146,6 @@ mod tests {
             );
         }
         let other = [
-            "unknown params: activate",
-            "unknown params: environment",
             "unknown field `activate`, expected one of `project_id`, `env`, `origin`",
             "unknown field `ssh_tty`, expected `ssh_connection` or `ssh_client`",
             "unknown field `envy`, expected one of `env`",
@@ -169,7 +157,10 @@ mod tests {
             );
         }
         assert!(
-            !refuses_opener_fields(codes::INVALID_PARAM, "unknown params: env"),
+            !refuses_opener_fields(
+                codes::INVALID_PARAM,
+                "unknown field `env`, expected one of `project_id`"
+            ),
             "only an unknown-field refusal"
         );
     }

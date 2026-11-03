@@ -1,9 +1,8 @@
 # URL detection golden fixtures
 
 Canonical `(row, col) → UrlSpan` corpus for the URL detection logic in
-`crates/roost-url/` (Rust) and `mac/Sources/Roost/UrlDetection.swift`
-(Swift). Both ports load these files and assert byte-exact equality;
-drift between the two implementations surfaces here.
+`crates/roost-url/`. Its fixture loader (`cargo test -p roost-url`)
+asserts byte-exact equality with every file here.
 
 Same pattern as [`tests/ipc-vectors/`](../ipc-vectors/README.md).
 
@@ -32,6 +31,4 @@ When adding a fixture, mirror it in the existing tests too:
 
 - Rust unit test `find_url_at_matches_legacy_go_corpus` already covers
   the same scenarios for in-language coverage; the fixture-loader test
-  is the cross-port pin.
-- The Swift side picks up new fixtures automatically — the loader is
-  schema-agnostic.
+  picks up a new file automatically.

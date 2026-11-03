@@ -26,16 +26,8 @@
 # Fetched Sparkle stage (third_party/sparkle/fetch.sh; pinned version+SHA)
 /third_party/sparkle/out/
 
-# Mac (Xcode + SwiftPM) build artifacts
+# Mac bundle output (mac/scripts/bundle-iced.sh)
 /mac/build/
-/mac/.build/
-/mac/DerivedData/
-/mac/.swiftpm/
-/mac/Roost.xcodeproj/xcuserdata/
-/mac/Roost.xcodeproj/project.xcworkspace/xcuserdata/
-# Generated Swift proto bindings live under .build/plugins/outputs/...
-# (the SwiftPM build plugin writes them there); nothing to ignore here
-# inside the source tree.
 
 # Phase 1 throwaway spikes
 /spikes/

@@ -12,9 +12,6 @@ pointer's half is `tools/input/linux/iced_clipboard_check.py` (X11) and
 Assertions read the selection over `selection.dump`, never a clipboard,
 so the module runs on every lane. History is seeded with
 `tab.feed_pty_bytes`, never a shell, so its numbering is exact.
-
-Skipped under `--roost-target mac`: the auto-scroll is iced's, and the
-Swift app is frozen.
 """
 
 from __future__ import annotations
@@ -52,12 +49,6 @@ OVERSHOOT = 3
 # the auto-scroll for good, and only a native loss earns another attempt, so
 # a drag that stalls in a focused window still fails on its first.
 FOCUS_ATTEMPTS = 3
-
-
-@pytest.fixture(autouse=True)
-def _iced_only(target):
-    if target != "iced":
-        pytest.skip("the selection auto-scroll is iced's; the Swift app is frozen")
 
 
 LAST_COL = len(line(0)) - 1

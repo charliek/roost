@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 #
-# Shared toolkit-agnostic bundling stages for mac/scripts/bundle.sh and
-# mac/scripts/bundle-iced.sh.
+# Bundling stages for mac/scripts/bundle-iced.sh, kept apart from it so
+# tools/roosttest_unit can drive them one at a time.
 #
 # Sourced, not executed: callers set `set -euo pipefail` themselves and
 # source this file after computing SCRIPT_DIR/MAC_DIR/REPO_ROOT. Every
@@ -10,9 +10,9 @@
 
 # roost_check_libghostty_archive REPO_ROOT
 #
-# Sanity check: the static libghostty-vt archive must exist or `swift
-# build` / `cargo build` will fail at the linker. The same precondition
-# the Mac README documents.
+# Sanity check: the static libghostty-vt archive must exist or `cargo
+# build` will fail at the linker. The same precondition the Mac README
+# documents.
 roost_check_libghostty_archive() {
   local repo_root="$1"
   if [ ! -f "${repo_root}/third_party/ghostty/out/lib/libghostty-vt.a" ]; then
@@ -58,30 +58,102 @@ roost_assemble_skeleton() {
   mkdir -p "${app_dir}/Contents/Resources"
 }
 
-# roost_stamp_plist TEMPLATE_PLIST APP_DIR VERSION
+# roost_resolve_bundle_identity IDENTITY FEED_URL ED_PUBLIC_KEY
 #
-# Info.plist with version substitution. `sed -e s/.../.../g` is
-# portable across BSD + GNU sed; quoting `@VERSION@` and using a
-# unique-enough sentinel keeps the substitution unambiguous.
+# Sets ROOST_APP_NAME and ROOST_BUNDLE_ID in the caller's scope for one of
+# the two identities bundle-iced.sh assembles (the caller-scope convention
+# roost_setup_cargo_profile uses):
+#
+#   dev         Roost-Iced / ai.stridelabs.Roost.iced. Runs beside an
+#               installed Roost.app; feedless unless both Sparkle values
+#               are given.
+#   production  Roost / ai.stridelabs.Roost, the shipped Roost.app. Both
+#               Sparkle values are required: a shipped bundle with no feed
+#               can never deliver the update that fixes it.
+#
+# Anything else is a hard error. Callers run this before the cargo build,
+# so a misconfigured production build fails before it spends one.
+# shellcheck disable=SC2034  # both names are the caller's to read
+roost_resolve_bundle_identity() {
+  local identity="$1"
+  local feed_url="$2"
+  local ed_public_key="$3"
+  case "${identity}" in
+    dev)
+      ROOST_APP_NAME="Roost-Iced"
+      ROOST_BUNDLE_ID="ai.stridelabs.Roost.iced"
+      ;;
+    production)
+      if [ -z "${feed_url}" ] || [ -z "${ed_public_key}" ]; then
+        echo "error: ROOST_BUNDLE_IDENTITY=production requires both ROOST_BUNDLE_SPARKLE_FEED_URL" >&2
+        echo "       and ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY — a shipped Roost.app must carry its" >&2
+        echo "       update feed and the key that verifies it." >&2
+        exit 1
+      fi
+      ROOST_APP_NAME="Roost"
+      ROOST_BUNDLE_ID="ai.stridelabs.Roost"
+      ;;
+    *)
+      echo "error: ROOST_BUNDLE_IDENTITY must be 'dev' or 'production', got '${identity}'" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# roost_stamp_plist TEMPLATE_PLIST APP_DIR VERSION BUNDLE_ID APP_NAME
+#
+# Info.plist with @VERSION@, @BUNDLE_ID@ and @APP_NAME@ substituted.
+# `sed -e s/.../.../g` is portable across BSD + GNU sed. Each value is
+# checked against the characters it may hold first, because a `/`, `&` or
+# newline would be read as sed syntax rather than stamped; a placeholder
+# left over afterwards is a template this function does not know, and
+# fails the stamp rather than shipping as a literal.
 roost_stamp_plist() {
   local template_plist="$1"
   local app_dir="$2"
   local version="$3"
-  echo "==> Stamping Info.plist (version=${version})"
-  sed -e "s/@VERSION@/${version}/g" "${template_plist}" \
-    > "${app_dir}/Contents/Info.plist"
+  local bundle_id="$4"
+  local app_name="$5"
+  local plist="${app_dir}/Contents/Info.plist"
+  case "${version}" in
+    ''|*[!A-Za-z0-9.+-]*)
+      echo "error: version '${version}' is empty or not [A-Za-z0-9.+-]" >&2
+      exit 1
+      ;;
+  esac
+  case "${bundle_id}" in
+    ''|*[!A-Za-z0-9.-]*)
+      echo "error: bundle id '${bundle_id}' is empty or not [A-Za-z0-9.-]" >&2
+      exit 1
+      ;;
+  esac
+  case "${app_name}" in
+    ''|*[!A-Za-z0-9-]*)
+      echo "error: app name '${app_name}' is empty or not [A-Za-z0-9-]" >&2
+      exit 1
+      ;;
+  esac
+  echo "==> Stamping Info.plist (version=${version}, id=${bundle_id}, name=${app_name})"
+  sed -e "s/@VERSION@/${version}/g" \
+      -e "s/@BUNDLE_ID@/${bundle_id}/g" \
+      -e "s/@APP_NAME@/${app_name}/g" \
+      "${template_plist}" > "${plist}"
+  if grep -qE '@[A-Z_]+@' "${plist}"; then
+    echo "error: ${plist} still carries an unsubstituted placeholder:" >&2
+    grep -nE '@[A-Z_]+@' "${plist}" >&2
+    exit 1
+  fi
 }
 
 # roost_insert_sparkle_feed APP_DIR FEED_URL ED_PUBLIC_KEY
 #
-# Optional Sparkle feed enablement for the iced bundle (plan 028 § 3.9).
-# The template plist deliberately ships NO SUFeedURL/SUPublicEDKey — the
-# feed-enabled configuration is opt-in at bundle time via the
-# ROOST_ICED_SPARKLE_FEED_URL + ROOST_ICED_SPARKLE_ED_PUBLIC_KEY env
-# pair, which bundle-iced.sh passes through here. Both empty is today's
-# posture (no keys inserted, byte-identical plist); both set inserts the
-# pair into the already-stamped Info.plist; exactly one set is a hard
-# error — a feed URL without its EdDSA public key (or vice versa) is a
+# Sparkle feed enablement (plan 028 § 3.9). The template plist ships NO
+# SUFeedURL/SUPublicEDKey — the feed is set at bundle time via the
+# ROOST_BUNDLE_SPARKLE_FEED_URL + ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY env pair, which
+# bundle-iced.sh passes through here. Both empty leaves the plist
+# byte-identical (a feedless dev bundle); both set inserts the pair into
+# the already-stamped Info.plist; exactly one set is a hard error — a
+# feed URL without its EdDSA public key (or vice versa) is a
 # misconfigured build that would either never verify an update or never
 # check at all, and must not sign+ship looking healthy.
 #
@@ -97,7 +169,7 @@ roost_insert_sparkle_feed() {
     return 0
   fi
   if [ -z "${feed_url}" ] || [ -z "${ed_public_key}" ]; then
-    echo "error: ROOST_ICED_SPARKLE_FEED_URL and ROOST_ICED_SPARKLE_ED_PUBLIC_KEY" >&2
+    echo "error: ROOST_BUNDLE_SPARKLE_FEED_URL and ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY" >&2
     echo "       must be set together (both, or neither) — a feed without its" >&2
     echo "       public key (or vice versa) is a misconfigured Sparkle build." >&2
     exit 1
@@ -365,8 +437,8 @@ roost_is_runtime_signed() {
 # case where Xcode CLT codesign is missing.
 #
 # Sets SIGN_IDENTITY, TS_FLAG, and ROOST_SIGN_ENT_FILE in the caller's
-# scope, and defines the codesign_or_die / codesign_framework_or_die /
-# codesign_sparkle_or_die functions (also in the caller's scope — this
+# scope, and defines the codesign_or_die / codesign_sparkle_or_die
+# functions (also in the caller's scope — this
 # is bash, functions defined here are global to the sourcing script).
 # ROOST_SIGN_ENT_FILE stays global (not a local) because
 # codesign_or_die's default-entitlements argument reads it after this
@@ -444,40 +516,6 @@ roost_setup_signing() {
     exit 1
   }
 
-  # Sparkle.framework is signed --deep but WITHOUT --entitlements: the
-  # framework + its nested helpers (XPCServices/*.xpc, Updater.app,
-  # Autoupdate) carry their own designated requirements, and forcing the
-  # app's entitlements onto them can break Sparkle's XPC handshake. The
-  # app's `disable-library-validation` entitlement (on the outer bundle)
-  # is what lets it load this ad-hoc framework. --deep is safe here (a
-  # framework signed with uniform options) — it is only dangerous on the
-  # outer .app, where it would clobber these nested signatures.
-  # shellcheck disable=SC2329  # invoked by the sourcing script after this function returns
-  # NOTE: no callers as of #391 — bundle.sh and bundle-iced.sh both sign
-  # Sparkle through codesign_sparkle_or_die's strict chain now. Kept
-  # rather than deleted because removing a signing helper in the same
-  # change that rewires signing buys nothing and risks something; delete
-  # it in a hygiene pass once the next release has shipped from the new
-  # path.
-  codesign_framework_or_die() {
-    local target="$1"
-    # shellcheck disable=SC2086  # TS_FLAG must word-split (empty => no flag)
-    if codesign --force --sign "${SIGN_IDENTITY}" \
-         --options runtime \
-         --deep \
-         ${TS_FLAG} \
-         "${target}"
-    then
-      return 0
-    fi
-    if [ "${ROOST_ALLOW_UNSIGNED:-0}" = "1" ]; then
-      echo "    warn: codesign(${target}) failed; ROOST_ALLOW_UNSIGNED=1 set, continuing"
-      return 0
-    fi
-    echo "    error: codesign(${target}) failed (set ROOST_ALLOW_UNSIGNED=1 to bypass)" >&2
-    exit 1
-  }
-
   # One component of the strict Sparkle chain (codesign_sparkle_or_die
   # below). No --entitlements ever — Sparkle's helpers must keep their
   # own (empty, since Sparkle ≥2.6 removed its sandbox —
@@ -526,19 +564,12 @@ roost_setup_signing() {
   # then the caller signs the outer .app (with the app's entitlements)
   # after this returns — inner→outer to the end.
   #
-  # This DELIBERATELY deviates from codesign_framework_or_die above,
-  # whose comment says --deep is safe on a framework. That held for
-  # the Swift bundle's use, where it shipped working updates — but the
-  # hygiene pass plan 028 § 9 recorded is done: bundle.sh now signs
-  # Sparkle through this chain too (#391), so nothing calls
-  # codesign_framework_or_die on Sparkle any more. The shed reference
-  # embedding demonstrated the sharper truth: --deep, or a wrong
-  # signing order, produces a bundle that signs AND notarizes clean yet
-  # breaks at update-apply time — Sparkle's Installer/Downloader XPC
-  # handshake rejects helpers whose signatures were clobbered from the
-  # outside. Failure at the latest possible moment, on the user's
-  # machine, mid-update. The iced path therefore adopts the strict
-  # per-component chain. Downloader.xpc alone gets
+  # No --deep: a framework signed --deep, or in the wrong order, signs
+  # AND notarizes clean yet breaks at update-apply time — Sparkle's
+  # Installer/Downloader XPC handshake rejects helpers whose signatures
+  # were clobbered from the outside. Failure at the latest possible
+  # moment, on the user's machine, mid-update (the shed reference
+  # embedding demonstrated it; #391). Downloader.xpc alone gets
   # --preserve-metadata=entitlements: Sparkle ≥2.6 removed its sandbox
   # (sparkle-project/Sparkle#2511), and preserving whatever
   # entitlements the component itself shipped keeps us correct across

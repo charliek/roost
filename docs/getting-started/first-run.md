@@ -11,21 +11,17 @@ Top to bottom, left to right:
 | Title bar | Window title (active tab's cwd) |
 | Sidebar (left) | List of projects, with a **+ New Project** button at the bottom |
 | Tab strip (right) | Tabs for the currently selected project, with a trailing **+** button |
-| Terminal surface | One libghostty-vt terminal per tab (Core Graphics on macOS, iced + wgpu on Linux) |
+| Terminal surface | One libghostty-vt terminal per tab (iced + wgpu) |
 
 Click a project in the sidebar to switch its tab strip into the right pane. Click a tab to swap the terminal surface to that tab's session.
 
-With no [host sessions](../guides/host-sessions.md) saved, the sidebar looks exactly like this — one "PROJECTS" header, no dots. The first saved host splits it into per-host sections instead: a "LOCAL" band for the projects you see above, then one band per saved host, each with a small connection dot and a right-aligned agent count. This is opt-in. Roost-Iced on either platform can host a session on *this* machine or reach a Linux box or a Mac over SSH, and the host sections look the same on both (see the guide's macOS note).
+With no [host sessions](../guides/host-sessions.md) saved, the sidebar looks exactly like this — one "PROJECTS" header, no dots. The first saved host splits it into per-host sections instead: a "LOCAL" band for the projects you see above, then one band per saved host, each with a small connection dot and a right-aligned agent count. This is opt-in. Roost on either platform can host a session on *this* machine or reach a Linux box or a Mac over SSH, and the host sections look the same on both (see the guide's macOS note).
 
 ## Default state
 
 On first launch Roost creates a project named `Untitled 1` with one tab. The tab's working directory is your home directory and the shell is whatever `$SHELL` is set to (falling back to `/bin/sh`).
 
-## Roost-Iced: a fresh install starts on a session
-
-**Roost-Iced only**, on both platforms (Linux's `roost` and macOS's
-`Roost-Iced.app`) — the Swift `Roost.app` never reads this key and always
-runs in-process (see below).
+## A fresh install starts on a session
 
 One config key decides where local tabs run. If `config.conf` — a
 single file shared by every profile, not a per-profile one — already has
@@ -54,16 +50,15 @@ anything back (your session-side work stays put, one click away under
 Sessions → Switching the local backend](../guides/host-sessions.md#switching-the-local-backend)
 for the full mechanics, including what a mid-switch failure does.
 
-The Swift `Roost.app` is unaffected by all of this: it always runs
-local tabs in-process, never reads `local-backend`, and has no session
-backend at all.
+An upgrade from the old Swift `Roost.app` keeps its in-process tabs: it
+already has a `state.json` on disk, so no default fires.
 
 ## Agent hooks: the first-launch consent card
 
-The first time either UI starts with no answer on file yet and at least
+The first time Roost starts with no answer on file yet and at least
 one supported coding agent (Claude Code, Codex, grok/gx, cursor-agent,
-OpenCode) installed on the machine, a consent dialog opens — the iced
-**Agent Hooks…** card, the Mac **Agent Hooks…** sheet — naming what it
+OpenCode) installed on the machine, a consent dialog opens — the
+**Agent Hooks…** card — naming what it
 found and letting you choose which agents Roost wires notifications for,
 or none. Nothing is written into any agent's config file until you
 answer it, and it reopens on demand from the command palette (or, on
@@ -105,7 +100,7 @@ See [Paths & Environment](../reference/paths.md) for the full layout.
 ## Common first-launch behaviors
 
 - macOS Notification Center may prompt for permission the first time `roost` (or `osascript`, the macOS notification fallback) tries to surface a notification.
-- On Linux the UI logs to `$XDG_STATE_HOME/roost/roost.log` (default `~/.local/state/roost/roost.log`) **and** tees the same lines to stdout, so launching from a shell shows startup warnings (a missing font family, for instance) directly. `RUST_LOG=debug` turns the volume up. On macOS the Swift app logs to `~/Library/Logs/Roost/roost.log`.
+- On Linux the UI logs to `$XDG_STATE_HOME/roost/roost.log` (default `~/.local/state/roost/roost.log`) **and** tees the same lines to stdout, so launching from a shell shows startup warnings (a missing font family, for instance) directly. `RUST_LOG=debug` turns the volume up. On macOS the app logs to `~/Library/Logs/Roost/roost.log` (a dev `Roost-Iced.app` logs under `~/Library/Logs/Roost-iced/`).
 
 ## Next
 

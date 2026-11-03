@@ -15,12 +15,11 @@ quit), quits, relaunches, and reads the size back through
 `app.window_metrics`. The position and an off-screen saved frame need a
 screen reader; the real-input module's window scenario covers them.
 
-macOS iced only: Linux never remembers the frame (Ghostty's GTK build
-doesn't, and Wayland can't place a window), and Roost.app answers
-neither this file's ops nor its format. Skipped on CI like
-`test_sidebar_collapse_persistence.py` — the slow macOS LaunchServices
-respawn pushes a mid-test relaunch past `wait_alive`'s budget there — so
-it is a required local Mac step instead.
+macOS only: Linux never remembers the frame (Ghostty's GTK build
+doesn't, and Wayland can't place a window). Skipped on CI — the slow
+macOS LaunchServices respawn pushes a mid-test relaunch past
+`wait_alive`'s budget there — so it is a required local Mac step
+instead.
 """
 
 from __future__ import annotations
@@ -51,8 +50,8 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def _mac_iced_only(target):
-    if sys.platform != "darwin" or target != "iced":
+def _mac_iced_only():
+    if sys.platform != "darwin":
         pytest.skip("only the macOS iced UI remembers its window frame")
     skip_on_ci(
         "quit + relaunch is unreliable on CI: the slow macOS LaunchServices "

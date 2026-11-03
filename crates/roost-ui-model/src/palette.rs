@@ -202,9 +202,6 @@ fn contiguous_ranges(offsets: &[usize]) -> Vec<Range<usize>> {
 /// alignment with the keybind namespace is unit-testable. Every spec id
 /// is a `KeybindAction` id except `SELECT_THEME_ID` (a palette-only
 /// command that drills into the theme list rather than firing once).
-///
-/// This list is kept identical to the Swift app's `PaletteCommands.specs`
-/// (same ids, titles, and order) so the two UIs expose one command set.
 pub struct PaletteCommands;
 
 impl PaletteCommands {
@@ -235,7 +232,6 @@ impl PaletteCommands {
         // lands right after `SELECT_FONT_ID`) pushes this entry to sit
         // immediately after "Clear All Notifications" — plan 007 §3.7.
         ("toggle_sidebar_agents", "Toggle Sidebar Agents"),
-        // Roost-Iced only: the Swift list has no Agents panel to sort.
         ("cycle_agent_panel_sort", "Cycle Agent Panel Sort"),
         // The one surface that changes `agent-hooks` after the first
         // launch, and the row the wiring toast points at by name.

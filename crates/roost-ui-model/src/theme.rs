@@ -1,13 +1,10 @@
 //! Toolkit-neutral bundled themes + Ghostty-format parser.
 //!
 //! Ports `mac/Sources/Roost/Theme.swift` (Phase 6 M6). The theme files
-//! live in `crates/roost-ui-model/src/resources/themes/` (the Rust
-//! source-of-truth, alongside the vendored icons) and a byte-identical
-//! copy in `mac/Sources/Roost/Resources/themes/` for the Swift bundle;
-//! `make themes-check` guards the two against drift. Themes carry the
-//! 256-entry
-//! libghostty palette plus the chrome colors (foreground, background,
-//! cursor, selection). Each theme file is embedded via `include_str!`
+//! live in `crates/roost-ui-model/src/resources/themes/`, alongside the
+//! vendored icons. Themes carry the 256-entry libghostty palette plus
+//! the chrome colors (foreground, background, cursor, selection). Each
+//! theme file is embedded via `include_str!`
 //! so the binary is self-contained — no `XDG_DATA_DIRS` lookup, no
 //! ~/.config search for the bundled set. User-supplied theme files
 //! live in `~/.config/roost/themes/<name>` and load via the same
@@ -95,7 +92,7 @@ impl Theme {
     /// Bundled theme names, **sorted** — feeds the command palette's
     /// "Select Theme…" list. Names are returned verbatim (so
     /// `roost-dark` stays lowercase) and match the `load_bundled` keys
-    /// 1:1. Mirrors the Mac UI's `Theme.bundledNames()`.
+    /// 1:1.
     pub fn bundled_names() -> Vec<String> {
         let mut names: Vec<String> = BUNDLED_THEMES.iter().map(|(n, _)| n.to_string()).collect();
         names.sort();
@@ -354,11 +351,9 @@ mod tests {
     #[test]
     fn every_theme_file_is_registered() {
         // A theme file dropped into resources/themes/ but not added to
-        // BUNDLED_THEMES is invisible to the Linux UI (the Mac side
-        // auto-discovers by listing the dir). `themes-check` guards the two
-        // resource trees; this guards the Rust registration against them.
-        // (The reverse — a registered name with no file — fails to compile
-        // via include_str!.)
+        // BUNDLED_THEMES is invisible to the UI. (The reverse — a
+        // registered name with no file — fails to compile via
+        // include_str!.)
         use std::collections::HashSet;
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/resources/themes");
         let registered: HashSet<String> = Theme::bundled_names().into_iter().collect();

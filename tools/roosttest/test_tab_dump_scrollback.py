@@ -1,4 +1,4 @@
-"""`tab.dump`'s scrollback, on a UI socket, on both targets (plan 053 R4).
+"""`tab.dump`'s scrollback, on a UI socket (plan 053 R4).
 
 `tab.dump` returned the viewport and nothing else, so everything that
 scrolled off was unreadable over IPC — `roostctl tab dump | grep` saw
@@ -23,12 +23,11 @@ and a host tab's mirror in
 **Not here: the scrolled-up viewport.** `scrollback_rows` is anchored at
 the *current* viewport (`scrollbar().offset`), so scrolling up shrinks
 it while adjacency still holds. Scrolling a viewport is a UI act with no
-IPC seam on either target — `tab.dispatch_mouse_event` drives the mouse
+IPC seam — `tab.dispatch_mouse_event` drives the mouse
 *encoder* (a wheel becomes a mouse report, or nothing at all when no
 tracking mode is on) and never the local scroll route, and
 `app.keybind_dispatch` serves one action, `paste`. That case is pinned
-where a scroll can be performed directly: `roost-vt`'s reader tests and
-their Swift twin (`SelectionFormatterScrollbackTests`).
+where a scroll can be performed directly: `roost-vt`'s reader tests.
 
 Content is seeded with `tab.feed_pty_bytes`, never a shell, so the
 numbering is exact rather than a race with a prompt.
@@ -44,7 +43,7 @@ from util import wait_tab_attached, wait_tab_quiet
 
 # The handlers answer `not-enabled` without the gate, which would make
 # every assertion here fail for a reason that has nothing to do with
-# scrollback. CI sets it on both targets.
+# scrollback. CI sets it.
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
 pytestmark = pytest.mark.skipif(
@@ -58,7 +57,7 @@ MAX_DUMP_SCROLLBACK = 10_000
 
 # Comfortably more than either UI's window can show, so there is real
 # history above the viewport whatever the runner's geometry is, and
-# comfortably under the 2000-row retention both UIs keep.
+# comfortably under the 2000-row retention the UI keeps.
 SEEDED_LINES = 400
 
 # What a bounded ask takes, small enough to be well inside the history
@@ -162,7 +161,7 @@ def test_an_ask_above_the_maximum_is_clamped_never_refused(roost, seeded):
 
     Refusing would make the cap something every caller has to know; the
     clamp makes "give me all of it" a legal request whose answer is
-    bounded by what the tab actually retains (2000 rows on both UIs).
+    bounded by what the tab actually retains (2000 rows).
     """
     everything = roost.dump(seeded, scrollback=1_000_000)
 

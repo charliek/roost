@@ -1,0 +1,67 @@
+{
+  "active_project_id" : 4,
+  "active_tab_position" : 0,
+  "hosts" : [
+
+  ],
+  "next_id" : 8,
+  "projects" : [
+    {
+      "created_at" : 1793692939,
+      "cwd" : "",
+      "id" : 2,
+      "last_tab_position" : 0,
+      "name" : "Untitled 1",
+      "position" : 0,
+      "tabs" : [
+        {
+          "cwd" : "\/Users\/charliek",
+          "position" : 0,
+          "title" : "👻 \/Users\/charliek",
+          "user_titled" : false
+        }
+      ]
+    },
+    {
+      "created_at" : 1793692939,
+      "cwd" : "\/tmp\/roost089-swift-state\/work\/p1",
+      "id" : 3,
+      "last_tab_position" : 1,
+      "name" : "Alpha",
+      "position" : 1,
+      "tabs" : [
+        {
+          "cwd" : "\/tmp\/roost089-swift-state\/work\/p1",
+          "position" : 0,
+          "title" : "p1",
+          "user_titled" : false
+        },
+        {
+          "cwd" : "\/tmp\/roost089-swift-state\/work\/p1",
+          "position" : 1,
+          "title" : "p1",
+          "user_titled" : false
+        }
+      ]
+    },
+    {
+      "created_at" : 1793692939,
+      "cwd" : "\/tmp\/roost089-swift-state\/work\/p2",
+      "id" : 4,
+      "last_tab_position" : 0,
+      "name" : "Beta",
+      "position" : 2,
+      "tabs" : [
+        {
+          "cwd" : "\/tmp\/roost089-swift-state\/work\/p2",
+          "position" : 0,
+          "title" : "p2",
+          "user_titled" : false
+        }
+      ]
+    }
+  ],
+  "recent_hosts" : [
+
+  ]
+}

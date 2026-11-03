@@ -16,8 +16,8 @@ error naming it, so a `release.yml` change it doesn't understand is loud.
 What the output does differently:
 
 - Triggers on a push to `dryrun/**`, not on a tag.
-- Drops `ci-gate`, `create-release`, `publish-release`, `appcast`,
-  `appcast-iced` and `dispatch-apt-charliek`. The build jobs keep
+- Drops `ci-gate`, `create-release`, `publish-release`, `appcast` and
+  `dispatch-apt-charliek`. The build jobs keep
   `needs: version-check` where they had `needs: create-release`.
 - Replaces `GITHUB_REF_NAME` and `github.ref_name` with `DRYRUN_TAG`, a
   workflow-level `v<[workspace.package].version>`, so version stamping,

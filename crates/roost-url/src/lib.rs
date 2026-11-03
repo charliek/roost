@@ -1,10 +1,5 @@
-//! Shared URL detection for clickable-link support in both Roost UIs.
-//!
-//! The Linux (iced) UI consumes this directly; the Swift Mac UI
-//! re-implements the same regex + trim pipeline by hand and pins parity
-//! against the shared corpus in `tests/url-fixtures/`. One contract,
-//! two implementations — same shape as `roost-osc` vs.
-//! `mac/Sources/Roost/OscScanner.swift`.
+//! URL detection for the iced UI's clickable links, pinned by the corpus
+//! in `tests/url-fixtures/`.
 //!
 //! ## Detection is intentionally narrow
 //!
@@ -74,9 +69,8 @@ where
 /// Compiled regex. `OnceLock` so the first call pays the build cost
 /// and every subsequent call reuses the same matcher. The body's
 /// negation class spells out `[\t\n\x0c\r ]` instead of `\s` because
-/// Rust's `regex` and Swift's `NSRegularExpression` treat `\s` as
-/// Unicode whitespace — the explicit ASCII-only class is the only way
-/// to keep the Mac and Linux matchers in lockstep.
+/// Rust's `regex` treats `\s` as Unicode whitespace, and a no-break
+/// space stays inside a URL body (`tests/url-fixtures/15-…`).
 fn pattern() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -205,10 +199,8 @@ pub fn trim_url(mut u: &str) -> &str {
 mod tests {
     use super::*;
 
-    /// `find_url_at` against the shared URL fixture corpus. Any drift
-    /// in these cases would mean a user-visible regression in
-    /// URL-click behavior — keep them in step with the Mac UI's
-    /// matcher when widening either side.
+    /// `find_url_at` against the URL fixture corpus. Any drift in these
+    /// cases would mean a user-visible regression in URL-click behavior.
     #[test]
     fn find_at_matches_reference_corpus() {
         struct Case {
@@ -339,8 +331,7 @@ mod tests {
         }
     }
 
-    /// `trim_url` against the shared URL fixture corpus. Keep in step
-    /// with the Mac UI's trim pipeline.
+    /// `trim_url` against the URL fixture corpus.
     #[test]
     fn trim_url_matches_reference_corpus() {
         let cases: &[(&str, &str)] = &[
@@ -413,10 +404,8 @@ mod tests {
 // ============================================================================
 //
 // `tests/url-fixtures/*.txt` files at the workspace root carry the
-// canonical (row, col) → (col0, col1, url) corpus. Both this crate
-// (Rust) and `mac/Tests/RoostTests/UrlFixtureRoundTripTests.swift`
-// (Swift) load the same files; drift between the two ports surfaces
-// here. Same pattern as `tests/ipc-vectors/`.
+// canonical (row, col) → (col0, col1, url) corpus, loaded here. Same
+// pattern as `tests/ipc-vectors/`.
 
 #[cfg(test)]
 mod fixtures {
@@ -487,8 +476,7 @@ mod fixtures {
             }
         }
         // All-three or none — partial blocks indicate a fixture typo,
-        // not "no match", so refuse to interpret them silently. The
-        // Swift loader does the same.
+        // not "no match", so refuse to interpret them silently.
         let want = match (col0, col1, url) {
             (Some(c0), Some(c1), Some(u)) => Some((c0, c1, u)),
             (None, None, None) => None,

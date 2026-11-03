@@ -1,5 +1,5 @@
-//! `roostctl wait`: block until a tab reaches a condition — on the tabs'
-//! event stream where the server serves one, else by polling.
+//! `roostctl wait`: block until a tab reaches a condition, on the tabs'
+//! event stream.
 
 use std::future::Future;
 use std::time::Duration;
@@ -45,8 +45,8 @@ pub(crate) struct Args {
     /// within 30 s still ends the wait.
     #[arg(long, conflicts_with = "timeout")]
     pub no_timeout: bool,
-    /// Poll interval in milliseconds, and how often `--text` re-reads
-    /// the viewport on the stream.
+    /// How often, in milliseconds, `--text` re-reads the viewport, and a
+    /// local-backend switch in flight is checked again.
     #[arg(long, default_value_t = 100)]
     pub interval_ms: u64,
 }
@@ -366,19 +366,8 @@ struct Loss {
     why: String,
 }
 
-/// What a caller that needs the stream itself — to write on the request
-/// connection before it follows the stream — reached.
-pub(crate) enum Subscribed {
-    /// The two legs, in the order that fences them.
-    Legs(Source, Box<Legs>),
-    /// This server serves no stream at all.
-    None(Source),
-}
-
 /// Where resolving the source got to.
 enum Reached {
-    /// No stream there: the poll loop.
-    Poll(Source),
     Stream(Source, Box<Legs>),
     /// Subscribed, and lost before the second connection was of any use.
     Lost(Source, Loss),
@@ -388,20 +377,20 @@ impl Waiting<'_> {
     /// Resolve the source and wait on it.
     async fn run(&self, ui: &mut UiSocket<'_>, identify: IdentifyResult) -> Result<Seen, CliError> {
         let held = match self.reach(ui, identify).await? {
-            Reached::Poll(_) => return self.poll(ui).await,
             Reached::Stream(source, legs) => self.follow(ui, &source, *legs).await?,
             Reached::Lost(_, lost) => self.again(ui, lost).await?,
         };
         Ok(held.seen)
     }
 
-    /// The two legs of a subscribed stream, for a caller that writes on
-    /// the request connection before it follows the stream.
+    /// The two legs of a subscribed stream, in the order that fences
+    /// them, for a caller that writes on the request connection before it
+    /// follows the stream.
     pub(crate) async fn subscribe(
         &self,
         ui: &mut UiSocket<'_>,
         identify: IdentifyResult,
-    ) -> Result<Subscribed, CliError> {
+    ) -> Result<(Source, Box<Legs>), CliError> {
         let reached = match self.reach(ui, identify).await? {
             // Nothing has been written yet, so a subscription dropped
             // while it was still opening starts the whole sequence over
@@ -411,17 +400,14 @@ impl Waiting<'_> {
             Reached::Lost(..) => self.reach_again(ui).await?,
             reached => reached,
         };
-        Ok(match reached {
-            Reached::Poll(source) => Subscribed::None(source),
-            Reached::Stream(source, legs) => Subscribed::Legs(source, legs),
-            Reached::Lost(source, again) => {
-                return Err(CliError::Connection(format!(
-                    "{}: the event stream was lost twice while it was being opened: {}",
-                    source.socket.display(),
-                    again.why
-                )))
-            }
-        })
+        match reached {
+            Reached::Stream(source, legs) => Ok((source, legs)),
+            Reached::Lost(source, again) => Err(CliError::Connection(format!(
+                "{}: the event stream was lost twice while it was being opened: {}",
+                source.socket.display(),
+                again.why
+            ))),
+        }
     }
 
     /// Wait on a stream the caller holds; after a lost one, resolve again,
@@ -466,7 +452,6 @@ impl Waiting<'_> {
             Err(error) => return Err(after_loss(&lost, error)),
         };
         let (source, again) = match reached {
-            Reached::Poll(source) => return Err(self.changed(&source, &lost.why)),
             Reached::Stream(source, legs) => {
                 if legs.stream.session_id() != lost.incarnation {
                     return Err(self.changed(&source, &lost.why));
@@ -492,10 +477,11 @@ impl Waiting<'_> {
     }
 
     /// Once no local-backend switch is in flight, the source `identify`
-    /// names, subscribed to where it serves a stream. Until a switch
-    /// settles, which socket serves the stream is not yet decided; a
-    /// subscribe refused for a switch that began after that `identify` is
-    /// held off the same way.
+    /// names, subscribed to. Until a switch settles, which socket serves
+    /// the stream is not yet decided; a subscribe refused for a switch
+    /// that began after that `identify` is held off the same way. A
+    /// source that serves no stream is refused before anything is
+    /// subscribed: a tab's state is read off the stream alone.
     async fn reach(
         &self,
         ui: &mut UiSocket<'_>,
@@ -508,7 +494,7 @@ impl Waiting<'_> {
             }
             let source = events::resolve(ui.socket_path(), &identify);
             if !source.serves_stream {
-                return Ok(Reached::Poll(source));
+                return Err(no_stream(&source));
             }
             match events::open(&source, true, self.bound).await {
                 Ok(opened) => break (source, opened),
@@ -726,30 +712,24 @@ impl Waiting<'_> {
             },
         }
     }
+}
 
-    /// The poll loop, for a server with no stream.
-    async fn poll(&self, ui: &mut UiSocket<'_>) -> Result<Seen, CliError> {
-        let client = self.call(DIAL, ui.client()).await?;
-        loop {
-            let list = self.call(ops::TAB_LIST, crate::list_tabs(client)).await?;
-            let mut seen = Seen::listed(&list, self.tab_id);
-            if let (Some(needle), true) = (&self.want.text, seen.exists) {
-                seen.text = self
-                    .call(ops::TAB_DUMP, dump_contains(client, self.tab_id, needle))
-                    .await?;
-            }
-            if self.want.holds(&seen) {
-                return Ok(seen);
-            }
-            self.check_deadline()?;
-            self.pause().await;
-            self.check_deadline()?;
-        }
-    }
+/// What `wait` and `tab prompt` answer a source with no stream: a Roost
+/// older than the stream, or a session-backed UI that could not resolve
+/// its session's socket. Neither polls — a poll misses a state that comes
+/// and goes between two `tab.list` calls — so this is the answer, before
+/// anything is subscribed or written.
+fn no_stream(source: &Source) -> CliError {
+    CliError::Unsupported(format!(
+        "this Roost serves no event stream ({}): update Roost to the version this roostctl \
+         came with; a UI under local-backend = session that names no session socket serves \
+         none either — `roostctl session status` says why",
+        source.socket.display()
+    ))
 }
 
 /// Whether the tab's viewport contains `needle`. A tab that closed between
-/// the list and the dump does not, yet.
+/// the snapshot and the dump does not, yet.
 async fn dump_contains(
     client: &mut IpcClient,
     tab_id: i64,
@@ -992,8 +972,8 @@ mod tests {
     }
 
     /// `--gone` is the dangerous one: another process's snapshot without a
-    /// tab 7 says nothing about this tab 7 — across a switch, across a
-    /// restart on the same socket, or onto a server with no stream at all.
+    /// tab 7 says nothing about this tab 7 — across a switch, or across a
+    /// restart on the same socket.
     #[tokio::test]
     async fn gone_is_never_read_off_a_different_roost() {
         let session = Fake::session("gone-switched-to");
@@ -1020,8 +1000,11 @@ mod tests {
         assert_eq!(restarted.with(|world| world.count("events.subscribe")), 2);
     }
 
+    /// Resolved again after a loss, a Roost that serves no stream at all
+    /// ends the wait on the loss: there is nothing left to read tab 7 off,
+    /// and an empty `tab.list` there would be a `--gone` that never was.
     #[tokio::test]
-    async fn gone_is_never_polled_off_a_roost_that_lost_its_stream() {
+    async fn a_roost_that_lost_its_stream_and_serves_none_ends_the_wait() {
         let downgraded = Fake::ui("gone-downgraded");
         downgraded.on("tab.list", 1, Phase::After, |world| {
             world.identify = crate::events::fake::identify(&[], None);
@@ -1034,7 +1017,14 @@ mod tests {
             None,
         )
         .await;
-        assert!(changed_roost(&exit), "{exit:?}");
+        let Err(error) = exit else { panic!("{exit:?}") };
+        assert_eq!(error.code(), "connection", "{error:?}");
+        assert!(
+            error.message().contains(
+                "after the event stream was lost: unsupported: this Roost serves no event stream"
+            ),
+            "{error:?}"
+        );
         assert_eq!(downgraded.with(|world| world.count("tab.list")), 1);
     }
 
@@ -1384,57 +1374,6 @@ mod tests {
         assert_eq!(unheld.with(|world| world.count("tab.list")), 1);
     }
 
-    #[tokio::test]
-    async fn timeout_0_checks_once_when_polling() {
-        let fake = Fake::without_stream("poll-once");
-        fake.with(|world| world.tabs.insert(7, "idle"));
-        let exit = wait(
-            &fake,
-            &["--tab", "7", "--state", "idle", "--timeout", "0"],
-            None,
-        )
-        .await;
-        assert_eq!(exit, Ok(0));
-        let exit = wait(
-            &fake,
-            &["--tab", "7", "--state", "running", "--timeout", "0"],
-            None,
-        )
-        .await;
-        assert!(timed_out(&exit), "{exit:?}");
-    }
-
-    /// Polling, the sleep ends at the deadline and the deadline is checked
-    /// again before another `tab.list`.
-    #[tokio::test]
-    async fn a_poll_interval_longer_than_the_timeout_times_out_on_time() {
-        let fake = Fake::without_stream("poll-late");
-        let argv = [
-            "--tab",
-            "7",
-            "--state",
-            "idle",
-            "--timeout",
-            "1",
-            "--interval-ms",
-            "60000",
-        ];
-        let started = std::time::Instant::now();
-        let exit = wait(&fake, &argv, None).await;
-        assert_eq!(
-            exit,
-            Err(CliError::Timeout(
-                "timed out after 1s waiting for tab 7".into()
-            ))
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
-        assert_eq!(fake.with(|world| world.count("tab.list")), 1);
-    }
-
     #[test]
     fn a_positive_timeout_is_a_deadline_and_the_rest_the_ceiling() {
         let before = Instant::now();
@@ -1498,17 +1437,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_dump_that_never_answers_times_out_on_time() {
-        for fake in [
-            Fake::ui("dump-never"),
-            Fake::without_stream("dump-never-poll"),
-        ] {
-            never_answers(&fake, "tab.dump");
-            let started = std::time::Instant::now();
-            let argv = ["--tab", "7", "--text", "OK", "--timeout", "1"];
-            let exit = wait(&fake, &argv, None).await;
-            cut_at_the_deadline(&exit, started, "tab 7", "tab.dump");
-            assert_eq!(fake.with(|world| world.count("tab.dump")), 1);
-        }
+        let fake = Fake::ui("dump-never");
+        never_answers(&fake, "tab.dump");
+        let started = std::time::Instant::now();
+        let argv = ["--tab", "7", "--text", "OK", "--timeout", "1"];
+        let exit = wait(&fake, &argv, None).await;
+        cut_at_the_deadline(&exit, started, "tab 7", "tab.dump");
+        assert_eq!(fake.with(|world| world.count("tab.dump")), 1);
     }
 
     /// The first `identify`, whether or not `--tab` named the tab, and the
@@ -1752,34 +1687,42 @@ mod tests {
         assert_eq!(log[2].0, log[3].0);
     }
 
+    /// Exit 1 `unsupported` off the one `identify`, whichever way the
+    /// Roost has no stream, and whichever condition was asked — the tab is
+    /// already in the state asked for, so a poll would have answered 0.
     #[tokio::test]
-    async fn a_server_without_the_stream_is_polled() {
-        let fake = Fake::without_stream("poll-source");
-        fake.on("tab.list", 2, Phase::After, |world| {
-            world.tabs.insert(7, "idle");
-        });
-        let exit = wait(
-            &fake,
-            &[
-                "--tab",
-                "7",
-                "--state",
-                "idle",
-                "--interval-ms",
-                "10",
-                "--timeout",
-                "5",
-            ],
-            None,
-        )
-        .await;
-        assert_eq!(exit, Ok(0));
-        let ops = fake.with(|world| world.ops().join(" "));
-        assert!(!ops.contains("events.subscribe"), "{ops}");
-        assert!(
-            ops.starts_with("identify tab.list tab.list tab.list"),
-            "{ops}"
-        );
+    async fn a_roost_without_the_stream_is_refused_without_a_read() {
+        for fake in [
+            Fake::without_stream("no-stream-in-process"),
+            Fake::session_backed_without_a_session("no-stream-session"),
+        ] {
+            fake.with(|world| {
+                world.tabs.insert(7, "idle");
+                world.dump = "OK".into();
+            });
+            for condition in [&["--state", "idle"][..], &["--text", "OK"]] {
+                let argv = [&["--tab", "7", "--timeout", "5"][..], condition].concat();
+                let Err(error) = wait(&fake, &argv, None).await else {
+                    panic!("{argv:?}: a Roost with no stream was read")
+                };
+                assert_eq!(
+                    (error.exit_code(), error.code()),
+                    (1, "unsupported"),
+                    "{error:?}"
+                );
+                assert!(
+                    error
+                        .message()
+                        .starts_with("this Roost serves no event stream"),
+                    "{error:?}"
+                );
+            }
+            assert_eq!(
+                fake.with(|world| world.ops().join(" ")),
+                "identify identify",
+                "one identify per wait, and nothing after it"
+            );
+        }
     }
 
     /// Under `local-backend = session` a bare id on the UI socket already

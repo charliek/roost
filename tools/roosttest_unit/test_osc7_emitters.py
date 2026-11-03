@@ -1,22 +1,15 @@
 """Roost's own OSC 7/0 emitters send exactly the bytes its decoders expect
 (plan 071 C6, issue #535; plan 072 D11, issues #554/#193).
 
-Sources each of the four shipped shell-integration scripts in its real
-shell, points `$PWD` at a hostile directory name, calls `__roost_osc7` /
+Sources the shipped bash and zsh shell-integration scripts in their real
+shells, points `$PWD` at a hostile directory name, calls `__roost_osc7` /
 `__roost_title`, and pins the exact bytes. Every OSC 7 case runs under both
 a byte locale and a UTF-8 one, since that encoder walks the path by
 character; `__roost_title` needs no such round trip, so a control byte is
 just replaced with `?`.
 
-The Rust and Mac copies deliberately diverge elsewhere (the bash inject
-block, the default prompt), so only the shared functions are compared,
-guard wrapper included: bash's `__roost_osc7`, `__roost_title`,
-`__roost_marks`; zsh's `__roost_osc7`, `__roost_title`, `__roost_mark_c`,
-`__roost_mark_d`.
-
-ROOST_TEST_BASH / ROOST_TEST_ZSH pick the shell binary (the Mac copy has
-to hold under macOS /bin/bash 3.2). A missing shell skips locally and
-fails under CI.
+ROOST_TEST_BASH / ROOST_TEST_ZSH pick the shell binary. A missing shell
+skips locally and fails under CI.
 """
 
 from __future__ import annotations
@@ -31,7 +24,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUST_DIR = REPO_ROOT / "crates" / "roost-engine" / "resources" / "shell-integration"
-MAC_DIR = REPO_ROOT / "mac" / "Sources" / "Roost" / "Resources" / "shell-integration"
 
 HOST = "roost-host"
 UTF8_LOCALE = "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"
@@ -41,9 +33,6 @@ SHELLS = {
     ".bash": ("bash", "ROOST_TEST_BASH", ["--norc", "--noprofile", "-i", "-c"]),
     ".zsh": ("zsh", "ROOST_TEST_ZSH", ["-f", "-i", "-c"]),
 }
-
-BASH_SHARED_FUNCTIONS = ("__roost_osc7", "__roost_title", "__roost_marks")
-ZSH_SHARED_FUNCTIONS = ("__roost_osc7", "__roost_title", "__roost_mark_c", "__roost_mark_d")
 
 # (label, $PWD, the path as it must appear on the OSC 7 wire)
 OSC7_CASES: list[tuple[str, str, str]] = [
@@ -106,21 +95,6 @@ def _function_text(text: str, name: str) -> str:
         if text[pos:next_end] == "}\n":
             return text[idx:next_end]
         pos = next_end
-
-
-def _guarded_block(text: str, name: str) -> str:
-    """`name`'s definition plus the `if ... then` / `fi` redefinition
-    guard around it, so a dropped or edited guard fails the compare too."""
-    fn_text = _function_text(text, name)
-    fn_idx = text.index(fn_text)
-    if_start = text.rfind("\nif ", 0, fn_idx)
-    if if_start == -1:
-        raise AssertionError(f"no guard 'if' found before {name}")
-    if_start += 1
-    after = fn_idx + len(fn_text)
-    if not text[after:].startswith("fi\n"):
-        raise AssertionError(f"no matching 'fi' found after {name}")
-    return text[if_start : after + len("fi\n")]
 
 
 class ShellIntegrationEmitterTest(unittest.TestCase):
@@ -190,40 +164,14 @@ class ShellIntegrationEmitterTest(unittest.TestCase):
     def test_rust_bash_osc7(self) -> None:
         self._assert_osc7_emits(RUST_DIR / "roost.bash")
 
-    def test_mac_bash_osc7(self) -> None:
-        self._assert_osc7_emits(MAC_DIR / "roost.bash")
-
     def test_rust_zsh_osc7(self) -> None:
         self._assert_osc7_emits(RUST_DIR / "roost.zsh")
-
-    def test_mac_zsh_osc7(self) -> None:
-        self._assert_osc7_emits(MAC_DIR / "roost.zsh")
 
     def test_rust_bash_title(self) -> None:
         self._assert_title_emits(RUST_DIR / "roost.bash")
 
-    def test_mac_bash_title(self) -> None:
-        self._assert_title_emits(MAC_DIR / "roost.bash")
-
     def test_rust_zsh_title(self) -> None:
         self._assert_title_emits(RUST_DIR / "roost.zsh")
-
-    def test_mac_zsh_title(self) -> None:
-        self._assert_title_emits(MAC_DIR / "roost.zsh")
-
-    def test_bash_bodies_match(self) -> None:
-        rust = (RUST_DIR / "roost.bash").read_text(encoding="utf-8")
-        mac = (MAC_DIR / "roost.bash").read_text(encoding="utf-8")
-        for name in BASH_SHARED_FUNCTIONS:
-            with self.subTest(function=name):
-                self.assertEqual(_guarded_block(rust, name), _guarded_block(mac, name))
-
-    def test_zsh_bodies_match(self) -> None:
-        rust = (RUST_DIR / "roost.zsh").read_text(encoding="utf-8")
-        mac = (MAC_DIR / "roost.zsh").read_text(encoding="utf-8")
-        for name in ZSH_SHARED_FUNCTIONS:
-            with self.subTest(function=name):
-                self.assertEqual(_guarded_block(rust, name), _guarded_block(mac, name))
 
     def test_osc7_bash_and_zsh_bodies_match(self) -> None:
         rust_bash = (RUST_DIR / "roost.bash").read_text(encoding="utf-8")
@@ -258,11 +206,11 @@ class ShellIntegrationEmitterTest(unittest.TestCase):
                 f"exit {run.returncode}, stderr: {run.stderr.decode(errors='replace')}",
             )
 
-    def test_mac_bash_user_title_survives(self) -> None:
-        self._assert_user_title_survives(MAC_DIR / "roost.bash")
+    def test_rust_bash_user_title_survives(self) -> None:
+        self._assert_user_title_survives(RUST_DIR / "roost.bash")
 
-    def test_mac_zsh_user_title_survives(self) -> None:
-        self._assert_user_title_survives(MAC_DIR / "roost.zsh")
+    def test_rust_zsh_user_title_survives(self) -> None:
+        self._assert_user_title_survives(RUST_DIR / "roost.zsh")
 
 
 if __name__ == "__main__":

@@ -11,10 +11,6 @@ where CI's iced lane runs this module too, iced's shell is a stand-in
 whose environment can be read (`tab_env.readable_shell`) and an opened
 tab runs `tab_env.sleep_argv`. `roostctl` runs with an explicit
 environment per case, never the runner's.
-
-Against Roost.app (Swift is frozen and refuses both fields, rule 7) only
-that `roostctl` keeps working is asserted: by profile it states nothing,
-by `--socket` it is refused and asks again without.
 """
 
 from __future__ import annotations
@@ -108,8 +104,6 @@ class Iced:
 
 @pytest.fixture(scope="module")
 def iced(target):
-    if target != "iced":
-        pytest.skip("iced's own opener; the Swift app is frozen (rule 7)")
     if ui.session_state_dir() is None:
         pytest.skip("relaunching needs a harness-owned UI")
     if ui.iced_bundle_app() is not None:
@@ -216,48 +210,3 @@ def test_a_tab_saved_before_openers_restores_with_iceds_values(iced: Iced):
     restored = [int(tab["id"]) for tab in roost.tabs() if tab["title"] == "legacy"]
     assert len(restored) == 1, roost.list()
     assert tab_env.opener_vars(iced.tab_environ(restored[0])) == iced.opener()
-
-
-# ---------------------------------------------------------------------------
-# Roost.app: roostctl keeps working
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def mac_project(target, roost):
-    if target != "mac":
-        pytest.skip("Roost.app's frozen tab.open")
-    project = roost.create_project(name=f"pytest-te-{uuid.uuid4().hex[:8]}", cwd="/tmp")
-    try:
-        yield project
-    finally:
-        with contextlib.suppress(Exception):
-            roost.delete_project(project)
-
-
-@pytest.mark.parametrize(
-    "opener_env",
-    [
-        pytest.param({"DISPLAY": ":93"}, id="desk"),
-        pytest.param({"DISPLAY": ":93", "SSH_CONNECTION": ROOSTCTL_LOGIN["SSH_CONNECTION"]}, id="ssh-login"),
-    ],
-)
-@pytest.mark.parametrize(
-    "route",
-    [pytest.param(["--target", "mac"], id="by-profile"), pytest.param(None, id="by-socket")],
-)
-def test_roostctl_still_opens_tabs_on_roost_app(roost, mac_project, opener_env, route):
-    """By profile no opener is stated; by `--socket` it is, Swift refuses
-    the field by name, and roostctl asks once more without it. `open`
-    degrades as it always has — Roost.app serves no `project.ensure` —
-    rather than failing on the opener."""
-    route = route or ["--socket", str(ui.socket_path("mac"))]
-    opened = roostctl(*route, "tab", "open", "--project-id", str(mac_project), "--cwd", "/tmp",
-                      opener_env=opener_env)
-    tab = roostctl_opened(opened, "tab open")
-    assert roost.tab(tab) is not None, roost.list()
-
-    ensured = roostctl(*route, "--json", "open", "--project", "pytest-te", "--cwd", "/tmp",
-                       opener_env=opener_env)
-    assert ensured.returncode == 1, (ensured.stdout, ensured.stderr)
-    assert json.loads(ensured.stderr)["error"]["code"] == "unsupported", ensured.stderr

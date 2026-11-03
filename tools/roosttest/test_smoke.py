@@ -1,24 +1,20 @@
 """End-to-end smoke suite — drives the real UI over IPC and asserts on
-the op set (tab.dump / tab.list / identify). Runs against either UI via
-`--roost-target`. Mirrors the manual checklist in
+the op set (tab.dump / tab.list / identify), against a bare binary or the
+bundle `ROOST_ICED_APP` names. Mirrors the manual checklist in
 docs/development/claude-testing.md.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import uuid
+from pathlib import Path
 
 import pytest
 from client import RoostError
 from eventstream import EventStream
 import ui
-
-
-EXPECTED_APP_IDS = {
-    "mac": "ai.stridelabs.Roost",
-    "iced": "ai.stridelabs.Roost.iced",
-}
 
 
 def _wait_flag(roost, tab_id, key, value, timeout=4.0):
@@ -56,13 +52,29 @@ def test_notification_set_and_clear(roost, project):
     _wait_flag(roost, a, "has_notification", False)
 
 
-def test_identify_reports_the_target_app_id(roost, target):
-    # Exact equality, never a prefix check: the macOS iced id
-    # `ai.stridelabs.Roost.iced` has the production id as a prefix.
-    assert roost.identify()["app_id"] == EXPECTED_APP_IDS[target]
+def test_identify_reports_the_target_app_id(roost):
+    # Exact equality, never a prefix check: the dev id
+    # `ai.stridelabs.Roost.iced` has the production id as a prefix. A
+    # bundle serves the id it declares.
+    assert roost.identify()["app_id"] == ui.iced_app_id()
 
 
-def test_the_suite_runs_against_the_in_process_backend(roost, target):
+def test_the_ui_runs_the_profile_its_bundle_id_maps_to(roost):
+    """Plan 089 D2: the production Roost.app (ai.stridelabs.Roost) runs the
+    `Mac` profile — the label and socket the retired Swift Roost.app used,
+    so an upgrading user keeps them — while a dev Roost-Iced.app and a bare dev
+    binary run `Roost-iced`."""
+    bundle = ui.iced_bundle()
+    production = bundle is not None and bundle.bundle_id == "ai.stridelabs.Roost"
+    label = "Roost" if production else "Roost-iced"
+    identity = roost.identify()
+    assert identity["app_id"] == ("ai.stridelabs.Roost" if production else "ai.stridelabs.Roost.iced")
+    assert identity["app_label"] == label
+    if sys.platform == "darwin":
+        assert identity["socket_path"] == str(Path.home() / "Library/Caches" / label / "roost.sock")
+
+
+def test_the_suite_runs_against_the_in_process_backend(roost):
     """Plan 063 AC10, asserted rather than assumed.
 
     Every case in every existing lane opens tabs in the UI's own
@@ -74,17 +86,13 @@ def test_the_suite_runs_against_the_in_process_backend(roost, target):
     developer's own already-running UI is the same assert: a UI in
     session mode is not one this suite can drive.
     """
-    if target == "mac":
-        pytest.skip("Swift omits local_backend: the Mac app is in-process by construction")
     assert roost.identify()["local_backend"] == "in-process"
 
 
-def test_identify_names_what_this_socket_serves_and_which_process_it_is(roost, target):
+def test_identify_names_what_this_socket_serves_and_which_process_it_is(roost):
     """Plan 066 §3.1. The test seams are listed exactly when the UI was
     launched with ROOST_TEST_MODE=1 — the one input to `identify.ops`
     only a running app wires."""
-    if target == "mac":
-        pytest.skip("Swift omits identify.ops and identify.instance_id")
     first = roost.identify()
     ops = set(first["ops"])
     assert {"identify", "tab.open", "project.ensure", "host.status", "events.subscribe"} <= ops, (
@@ -100,14 +108,12 @@ def test_identify_names_what_this_socket_serves_and_which_process_it_is(roost, t
     assert roost.identify()["instance_id"] == first["instance_id"]
 
 
-def test_the_ui_socket_streams_its_own_workspace_fenced_by_tab_list(roost, project, target):
+def test_the_ui_socket_streams_its_own_workspace_fenced_by_tab_list(roost, project):
     """Plan 066 §3.1: an in-process UI serves `events.subscribe` live.
     The ack names the process `identify.instance_id` names, and a
     `tab.list` taken on a second connection — the pushed one answers
     nothing — fences the stream: every batch at or below its revision is
     already in the snapshot, and the next is exactly one past it."""
-    if target == "mac":
-        pytest.skip("the Swift Mac app answers events.subscribe not-implemented")
     with EventStream(roost.path) as stream:
         fence = stream.subscribe()
         assert stream.session_id == roost.identify()["instance_id"]
@@ -128,12 +134,10 @@ def test_the_ui_socket_streams_its_own_workspace_fenced_by_tab_list(roost, proje
         assert kept and kept[0]["revision"] == snapshot + 1, (snapshot, batches)
 
 
-def test_the_ui_socket_refuses_a_stream_it_cannot_serve(roost, target):
+def test_the_ui_socket_refuses_a_stream_it_cannot_serve(roost):
     """A UI keeps no replay ring, and no filter is implemented anywhere:
     both are refused on the ack rather than quietly served as something
     else."""
-    if target == "mac":
-        pytest.skip("the Swift Mac app answers events.subscribe not-implemented")
     with EventStream(roost.path) as stream:
         with pytest.raises(RoostError) as resumed:
             stream.subscribe(from_revision=0, session_id=roost.identify()["instance_id"])

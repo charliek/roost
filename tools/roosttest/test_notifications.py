@@ -129,7 +129,7 @@ def test_bare_ipc_focus_clears_badge_rollup_and_inbox(roost, project, palette):
 def test_jump_to_unread_focuses_notified_tab(roost, project, palette):
     """`jump_to_unread` (Cmd/Ctrl+Shift+U) focuses the next tab with a
     pending notification + clears it — a multi-project triage shortcut.
-    Now on both UIs (was Mac-only)."""
+    (Mac-only once.)"""
     a = roost.open_tab(project, cwd="/tmp")
     b = roost.open_tab(project, cwd="/tmp")  # b active
     roost.notify(a, "Unread")
@@ -169,12 +169,11 @@ def test_focused_active_tab_gets_no_badge_and_no_inbox_row(roost, project, palet
         # under xvfb (no window manager) never becomes active, so the
         # suppression arm is genuinely unobservable here. Not a silent
         # gap — the full four-way matrix is covered by the workspace
-        # unit tests on both UIs.
+        # unit tests.
         pytest.skip(
             "the UI window is not active in this environment, so the "
             "`window_active` half of policy B can't be exercised "
-            "[alt-coverage: daemon::state attention_policy_* (Rust) + "
-            "WorkspaceStateTests.attentionPolicy* (Swift)]"
+            "[alt-coverage: daemon::state attention_policy_* (Rust)]"
         )
 
     assert roost.has_notification(active) is False
@@ -228,8 +227,8 @@ class TestNotificationStatusBareIced:
     compiled in, so the op answers `not-implemented` there too."""
 
     @pytest.fixture(autouse=True)
-    def _bare_iced_only(self, target):
-        if sys.platform != "darwin" or target != "iced":
+    def _bare_iced_only(self):
+        if sys.platform != "darwin":
             pytest.skip(
                 "app.notification_status's bare-binary shape is "
                 "macOS-iced-only (plan 030 § 3.1)"

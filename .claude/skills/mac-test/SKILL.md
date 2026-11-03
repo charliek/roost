@@ -1,14 +1,16 @@
 ---
 name: mac-test
-description: Verify roost changes on a Mac, either the one you are on or a remote Mac over ssh. Covers the lane map (which make targets force-quit a running Roost app), checks that protect the human's live session, launching a dev Roost-Iced or Roost.app for a person to try, taking screenshots, the Mac real-input harness (real CGEvents and Accessibility through the never-rebuilt runner app) with `make mac-real-input-check`, the remote recipe (shell, sync by git bundle, lock, locked-screen stop), CI facts and gotchas. Use when asked to run, verify or screenshot Roost on macOS, run e2e-mac, e2e-iced-bundle or e2e-iced-real-input-mac, or test on a Mac you reach over ssh. For Linux see `linux-test` (a shed VM, from a Mac) and `popos-test` (a native Linux box).
+description: Verify roost changes on a Mac, either the one you are on or a remote Mac over ssh. Covers the lane map (which make targets force-quit a running Roost app), checks that protect the human's live session, launching a dev Roost-Iced.app for a person to try, driving a production Roost.app bundle (and its identity guard), taking screenshots, the Mac real-input harness (real CGEvents and Accessibility through the never-rebuilt runner app) with `make mac-real-input-check`, the remote recipe (shell, sync by git bundle, lock, locked-screen stop), CI facts and gotchas. Use when asked to run, verify or screenshot Roost on macOS, run e2e-iced-bundle or e2e-iced-real-input-mac, or test on a Mac you reach over ssh. For Linux see `linux-test` (a shed VM, from a Mac) and `popos-test` (a native Linux box).
 ---
 
 # Mac testing (local, or a remote Mac over ssh)
 
-Two Mac products exist: the Swift app `Roost.app` (`mac/`, profile `Roost`) and
-the iced app `Roost-Iced.app` (`crates/roost-iced/`, profile `Roost-iced`,
-bundled by `make bundle-iced`). Most lanes below drive a real UI through the
-JSON IPC op set; the real-input harness adds real key and pointer events.
+There is one Mac app, the iced UI (`crates/roost-iced/`), in two identities
+built by `mac/scripts/bundle-iced.sh`: the dev `Roost-Iced.app`
+(`ai.stridelabs.Roost.iced`, profile `Roost-iced`, `make bundle-iced`) and the
+shipped production `Roost.app` (`ai.stridelabs.Roost`, profile `Roost`,
+`ROOST_BUNDLE_IDENTITY=production`, normally built by CI). Most lanes below drive
+a real UI through the JSON IPC op set; the real-input harness adds real key and pointer events.
 Layers and when to use each: `tools/README.md`.
 
 ## Inputs for a remote Mac
@@ -40,7 +42,7 @@ state are all per GUI session.
   Only `make e2e-iced`, `e2e-iced-ci`, `e2e-session` and the `e2e-host-*` /
   `e2e-local-backend` / `e2e-old-session` lanes build it. `e2e-iced-exit`,
   `e2e-iced-menu-quit`, `e2e-iced-clipboard`, `e2e-iced-release-ci`,
-  `e2e-iced-bundle`, `e2e-iced-sparkle`, `e2e-mac*`, `e2e-iced-real-input-mac`
+  `e2e-iced-bundle`, `e2e-iced-sparkle`, `e2e-iced-real-input-mac`
   and a bare `pytest` do not: build `roost-cli` first for those.
 
 ## Don't break the human's session
@@ -57,11 +59,18 @@ that a destructive lane would force-quit: do not run those lanes, or ask first.
 
 Things to know:
 
-- The Swift app is single-instance and ignores `ROOST_BUNDLE_PROFILE`, so a dev
-  `Roost.app` cannot run beside the installed one.
-- A dev `Roost-Iced.app` shares the installed app's profile and state, but debug
-  builds use the `RoostSessionDev` session dirs, so their `roost-session` never
-  collides with a real one.
+- A dev `Roost-Iced.app` has its own bundle id and `Roost-iced` paths, so it runs
+  beside an installed `Roost.app` and never touches its socket or state. Both read
+  the same `~/.config/roost/config.conf`. Debug builds use the `RoostSessionDev`
+  session dirs, so their `roost-session` never collides with a real one.
+- **A production-identity bundle shares the installed `Roost.app`'s world.** Its
+  socket (`~/Library/Caches/Roost/roost.sock`), `~/Library/Logs/Roost` and the
+  `ai.stridelabs.Roost` defaults domain are the installed app's, and
+  `--roost-fresh` would quit whatever answers there. The harness therefore refuses
+  it outside CI unless `ROOST_TEST_ALLOW_PRODUCTION_IDENTITY=1` is set. Quit the
+  installed `Roost.app` first, then
+  `make e2e-iced-bundle ICED_APP=mac/build/Roost.app ROOST_TEST_ALLOW_PRODUCTION_IDENTITY=1`
+  (that drives an already-built bundle; it does not assemble one).
 - `make bundle-iced` rewrites `mac/build/Roost-Iced.app` under any dev app
   running from it. Order: build first, then quit, then relaunch.
 - A stale socket or flock is the one cascade failure mode. `roostctl doctor`
@@ -78,20 +87,19 @@ first.
 | Target | What it runs | Destructive | CI job |
 |---|---|---|---|
 | `make test-rust`, `make check-iced`, `make test-harness` | unit tests, iced lint + boundaries, harness unit tests | no | `rust-build`, `iced-build-e2e`, `harness-unit` |
-| `make test-mac` | `swift test` | no | `swift-mac` |
+| `make test-mac-scripts` | shell tests for `mac/scripts` (notarize, Sparkle key check) | no | `scripts` |
 | `make e2e-iced` | curated `ICED_E2E_TESTS` against an Iced UI | reuses a running Iced UI | `iced-build-e2e` (macOS cells) |
 | `make e2e-iced-ci` | the same list, `--roost-fresh` (CI parity) | yes (Iced) | `iced-build-e2e` |
 | `make e2e-iced-exit`, `e2e-iced-menu-quit` | exit-on-empty and menu-Quit, own invocation each | yes (Iced) | `iced-build-e2e` |
 | `make e2e-iced-sparkle` | Sparkle update flow against the bundle, `--roost-fresh`; rewrites the bundle with test update settings | yes (Iced) | `iced-build-e2e` |
 | `make e2e-iced-release-ci` | curated subset against a release binary (`ROOST_ICED_BIN`), `--roost-fresh` | yes (Iced) | `iced-release` (Linux only) |
-| `make e2e-iced-bundle` | `make bundle-iced`, then smoke + menu bar against the `.app` (`ROOST_ICED_APP`) | yes (Iced) | `iced-build-e2e` |
-| `make e2e-mac` / `e2e-mac-ci` | whole `tools/roosttest` against Roost.app (`-ci` adds `--roost-fresh`) | yes (Roost.app) | `e2e-mac` |
+| `make e2e-iced-bundle` | `make bundle-iced`, then smoke + menu bar against the dev `.app` (`ICED_APP`, `ROOST_ICED_APP`) | yes (Iced) | `iced-build-e2e` |
+| `make e2e-iced-bundle ICED_APP=mac/build/Roost.app ROOST_TEST_ALLOW_PRODUCTION_IDENTITY=1` | the same smoke against an already-built production bundle | yes (**the installed Roost.app**: quit it first) | `iced-build-e2e` (CI opts in implicitly) |
 | `make e2e-session` | headless `roost-session` daemons, no UI | no | `session-e2e` |
 | `make e2e-host-client-ci`, `e2e-host-ssh-ci`, `e2e-host-bootstrap-ci`, `e2e-host-missing-daemon-ci`, `e2e-host-local-spawn-ci` | host-session lanes | yes (Iced) | Linux cells only |
 | `make e2e-host-localhost-ci`, `e2e-local-backend-ci` | private `XDG_RUNTIME_DIR` | no | Linux cells only |
 | `make e2e-iced-real-input-mac` | real CGEvent/AX input; runs `make bundle-iced` | it owns the `Roost-linux` namespace; rewrites the bundle | `iced-build-e2e` (macOS/wgpu cell, direct mode) |
-| `make smoke-mac`, `smoke-iced` | screenshot smoke against a running UI | no | none |
-| `make visual-parity` | closes live UIs, captures a hermetic fixture | yes (both) | none |
+| `make smoke-iced` | screenshot smoke against a running UI | no | none |
 
 Rules for the host lanes (`e2e-host-*`, `e2e-local-backend`, `e2e-old-session`):
 **one at a time**, never concurrently, and never beside each other: two runs
@@ -158,9 +166,6 @@ The dev `roost-session` it started **outlives the app**; stop it with
 overrides the debug separation, so leave it unset here). The installed app's
 session is untouched.
 
-Swift app: `make bundle`, quit the running `Roost.app`, `open mac/build/Roost.app`,
-then `rc --target mac identify`.
-
 ## See the app
 
 - `rc --target iced screenshot --out /tmp/shot.png`: rendered in-process,
@@ -168,7 +173,7 @@ then `rc --target mac identify`.
   only. Under the GL fallback renderer it can return geometry without text
   (#496): check the `Selected: AdapterInfo` line in
   `~/Library/Logs/Roost-iced/roost.log`.
-- `tools/screenshot/` (`smoke.sh <mac|iced>`, `pngtool.py` for pixel
+- `tools/screenshot/` (`smoke.sh iced`, `pngtool.py` for pixel
   assertions): see its README.
 - `screencapture` for native menus and panels, which `roostctl` cannot capture.
   A locked screen blocks it.
@@ -308,7 +313,8 @@ real-input run.
 ## CI facts
 
 - Macs run in `iced-build-e2e` (matrix `macos-latest`, renderer `wgpu` and
-  `tiny-skia`) and `e2e-mac`. Everything gates through `ci-success`.
+  `tiny-skia`). Everything gates through `ci-success`. `release.yml`'s `mac` job
+  builds the production `Roost.app` and runs the bundle smoke against it.
 - Real input runs in direct mode only in the macOS/wgpu cell, JUnit-guarded:
   `tools/roosttest/junit_guard.py` proves every scenario in
   `test_real_input_mac.py` ran and passed.
@@ -324,7 +330,7 @@ real-input run.
 
 - `syspolicyd` stalls fresh test binaries during concurrent cargo builds
   (doctor and panic-hook tests fail): wait for a quiet machine.
-- `make e2e-mac` agent lanes fail locally on the system bash 3.2
+- The iced agent lanes fail locally on the system bash 3.2
   (`at_prompt` seed timeouts); baseline against `origin/main` before chasing.
 - A long gate in a background Bash dies at its timeout: use `nohup` plus a log.
 - `uv run --group test` is how pytest is invoked; a bare `pytest` lacks the deps.

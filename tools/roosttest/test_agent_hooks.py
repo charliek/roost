@@ -258,8 +258,6 @@ def test_a_codex_session_inside_a_claude_turn_leaves_claude_the_tab(roost, proje
     captured codex session lands on the tab while Claude is mid-turn. Its
     `SessionStart` used to evict Claude and its `SessionEnd` then
     released the tab, so every report Claude sent after it was dropped."""
-    if target != "iced":
-        pytest.skip("the frozen Swift app does not carry the nested-claim rule")
     tab = agent_tab(roost, project)
     roost.tab_feed_pty_bytes(tab, b"\x1b]133;C\x07")
     roost.wait_shell_state(tab, "foreground_process")
@@ -1092,13 +1090,7 @@ def test_the_test_mode_fence_refuses_without_the_override(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def iced_only(target):
-    if target != "iced":
-        pytest.skip("the startup ensure is asserted against the iced UI's own launch")
-
-
-def test_the_ui_wires_agent_hooks_at_startup_and_notices_once(short_root, iced_only):
+def test_the_ui_wires_agent_hooks_at_startup_and_notices_once(short_root):
     """Plan 046 W6/W7 against a real launch: the UI wires every present
     agent in a jailed home, says so once, and flips `noticed`.
 
@@ -1188,7 +1180,7 @@ def test_the_ui_wires_agent_hooks_at_startup_and_notices_once(short_root, iced_o
     assert jail.read_record() == record, "a silent relaunch rewrote the record"
 
 
-def test_a_startup_that_leaves_an_agent_unwired_says_so(short_root, iced_only):
+def test_a_startup_that_leaves_an_agent_unwired_says_so(short_root):
     """Plan 068 §3.6: an allowed, installed agent the startup ensure
     could not wire is named in the toast, and never marked noticed.
 
@@ -1237,7 +1229,7 @@ def test_a_startup_that_leaves_an_agent_unwired_says_so(short_root, iced_only):
         )
 
 
-def test_the_ui_wires_nothing_when_agent_hooks_is_off(short_root, iced_only):
+def test_the_ui_wires_nothing_when_agent_hooks_is_off(short_root):
     """`agent-hooks = off` stops the startup ensure before it opens a
     file (W6).
 
@@ -1257,7 +1249,7 @@ def test_the_ui_wires_nothing_when_agent_hooks_is_off(short_root, iced_only):
         assert contents == [], f"`off` wrote into {agent}'s config dir: {contents}"
 
 
-def test_agent_set_without_local_goes_through_the_running_ui(short_root, iced_only):
+def test_agent_set_without_local_goes_through_the_running_ui(short_root):
     """Bare `agent set` is the UI-routed form (plan 064 C6): it puts
     `agent.set_hooks` to the running UI, which writes the key and
     reconciles the files in *that* process's home.
@@ -1308,7 +1300,7 @@ def test_agent_set_without_local_goes_through_the_running_ui(short_root, iced_on
     assert not any(jail.agent_dirs["grok"].iterdir()), "the UI wired an agent nobody named"
 
 
-def test_agent_set_hooks_skips_a_name_this_build_cannot_wire(short_root, iced_only):
+def test_agent_set_hooks_skips_a_name_this_build_cannot_wire(short_root):
     """Plan 065 §3.1 on the UI socket, the sibling of the host op's rule.
 
     Driven over IPC rather than through `roostctl agent set`, which
@@ -1369,7 +1361,7 @@ def holds_open(pid: int, path: Path) -> bool:
     return False
 
 
-def test_two_processes_writing_config_conf_share_one_lock(short_root, iced_only):
+def test_two_processes_writing_config_conf_share_one_lock(short_root):
     """#487: `config.conf` has more than one writer, and they all take
     the same `config.lock`.
 
@@ -1474,7 +1466,7 @@ def test_two_processes_writing_config_conf_share_one_lock(short_root, iced_only)
     assert config_value(jail.config, "show-sidebar-agents") in ("true", "false"), text
 
 
-def test_two_overlapping_applies_land_in_request_order(short_root, iced_only):
+def test_two_overlapping_applies_land_in_request_order(short_root):
     """#490: the file holds the answer the user gave **last**, not the
     one that finished last.
 
@@ -1535,7 +1527,7 @@ def wait_for_agent_hooks_card(roost: Roost) -> dict:
     return seen[0]
 
 
-def test_a_superseded_apply_still_moves_the_running_key(short_root, iced_only):
+def test_a_superseded_apply_still_moves_the_running_key(short_root):
     """#490's other half: the UI's own `agent-hooks` value never lags the
     file.
 
@@ -1586,7 +1578,7 @@ def test_a_superseded_apply_still_moves_the_running_key(short_root, iced_only):
     assert rows["codex"]["on"] is False, card
 
 
-def test_a_failure_after_the_key_write_still_moves_the_running_key(short_root, iced_only):
+def test_a_failure_after_the_key_write_still_moves_the_running_key(short_root):
     """#491: an apply that writes the key and then fails answers its
     caller with an error naming the key now on disk — and the running UI
     takes that key anyway.

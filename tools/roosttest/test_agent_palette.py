@@ -1,5 +1,5 @@
-"""Agent palette E2E — plan 005 §3.10, both targets (`--roost-target
-mac|iced`). Drives `palette.open kind="agents"`, seeds lifecycles via
+"""Agent palette E2E — plan 005 §3.10. Drives `palette.open kind="agents"`,
+seeds lifecycles via
 `tab.agent_report` (and, for the two paths that must exercise the real
 adapter, the actual `roostctl claude-hook` binary), and asserts on the
 wire's `PaletteItemView.agent` payload documented in
@@ -177,8 +177,7 @@ def test_open_kind_agents_and_unknown_kind_is_invalid_param(palette):
     with pytest.raises(RoostError) as ei:
         palette.palette_open(kind=bad)
     assert ei.value.code == "invalid-param"
-    # Byte-identical across both UIs (crates/roost-engine/src/ipc.rs ~L787,
-    # mac/Sources/Roost/IPCHandlerImpl.swift ~L511) — the parity assertion.
+    # Pinned verbatim (crates/roost-engine/src/ipc.rs).
     assert ei.value.message == (
         f'unknown palette kind "{bad}" '
         '(want "commands", "launcher", "custom", or "agents")'

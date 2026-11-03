@@ -35,32 +35,25 @@ class GeometryContractTests(unittest.TestCase):
 
 
 class TargetContractTests(unittest.TestCase):
-    @patch("ui.subprocess.run")
-    def test_mac_test_defaults_cleanup_is_scoped_and_best_effort(self, run) -> None:
-        ui._clear_mac_test_defaults()
-        run.assert_called_once_with(
-            ["defaults", "delete", ui.MAC_TEST_DEFAULTS_SUITE],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-
-    def test_target_table_has_two_explicit_profiles(self) -> None:
-        self.assertEqual(ui.TARGETS, ("mac", "iced"))
+    def test_the_one_target_is_the_rust_ui(self) -> None:
+        self.assertEqual(ui.TARGETS, ("iced",))
         self.assertEqual(ui.TARGET_SPECS["iced"].rust_package, "roost-iced")
         self.assertEqual(ui.TARGET_SPECS["iced"].binary_name, "roost-iced")
-        self.assertTrue(ui.TARGET_SPECS["mac"].isolates_user_defaults)
 
+    @patch.dict(os.environ, {}, clear=False)
     @patch("ui.Path.home", return_value=Path("/Users/tester"))
     @patch("ui.platform.system", return_value="Darwin")
-    def test_macos_paths_are_pairwise_distinct(self, _system, _home) -> None:
-        paths = {target: ui.socket_path(target) for target in ui.TARGETS}
-        self.assertEqual(paths["iced"], Path("/Users/tester/Library/Caches/Roost-iced/roost.sock"))
-        self.assertEqual(len(set(paths.values())), 2)
+    def test_a_bare_macos_binary_uses_the_iced_profiles_socket(self, _system, _home) -> None:
+        os.environ.pop("ROOST_ICED_APP", None)
+        self.assertEqual(
+            ui.socket_path("iced"), Path("/Users/tester/Library/Caches/Roost-iced/roost.sock")
+        )
 
-    def test_unknown_target_names_all_candidates(self) -> None:
-        with self.assertRaisesRegex(ValueError, r"want mac\|iced"):
-            ui.socket_path("other")
+    def test_unknown_target_names_the_candidates(self) -> None:
+        for retired in ("mac", "other"):
+            with self.subTest(target=retired):
+                with self.assertRaisesRegex(ValueError, r"want iced\)"):
+                    ui.socket_path(retired)
 
     @patch.dict(os.environ, {"ROOST_ICED_BIN": "/home/shed/rt/debug/roost-iced"})
     def test_iced_binary_override_is_explicit_and_absolute(self) -> None:
@@ -68,10 +61,6 @@ class TargetContractTests(unittest.TestCase):
             ui.rust_binary_path("iced"),
             (Path("/home/shed/rt/debug/roost-iced"), True),
         )
-
-    def test_mac_has_no_rust_binary(self) -> None:
-        with self.assertRaisesRegex(ValueError, "not a Rust UI"):
-            ui.rust_binary_path("mac")
 
     def test_owned_session_config_is_available_only_inside_harness_state(self) -> None:
         with patch("ui._SESSION_STATE_DIR", None):
@@ -402,97 +391,16 @@ class BootRefusalTests(unittest.TestCase):
         ):
             self.assertIsNone(ui._boot_refusal("iced"))
 
-    def test_mac_refusal_reads_the_app_log_only_while_nothing_runs(self) -> None:
-        log = self._log(f"{self.REFUSAL}\n")
-        # Offset 0 == "this launch starts at the top of the file", which is
-        # what _launch_mac records for a log that did not exist yet.
-        with patch("ui._mac_ui_log_path", return_value=log), patch("ui._MAC_LOG_OFFSET", 0):
-            with patch("ui._roost_running", return_value=True):
-                self.assertIsNone(ui._boot_refusal("mac"))
-            with patch("ui._roost_running", return_value=False):
-                message = ui._boot_refusal("mac")
-        assert message is not None
-        self.assertIn("pid 4242", message)
-
-    def test_mac_refusal_is_silent_when_the_harness_never_launched_the_app(self) -> None:
-        """A refusal line from a previous day is not this run's refusal.
-
-        Without the `None` sentinel the offset defaulted to 0, so
-        `_launch_output("mac")` read the developer's whole accumulated
-        `~/Library/Logs/<label>/roost.log` and any historical refusal would
-        surface as this launch's, masking the real timeout.
-        """
-        log = self._log(f"{self.REFUSAL}\n")
-        with (
-            patch("ui._mac_ui_log_path", return_value=log),
-            patch("ui._MAC_LOG_OFFSET", None),
-            patch("ui._roost_running", return_value=False),
-        ):
-            self.assertEqual(ui._launch_output("mac"), "")
-            self.assertIsNone(ui._boot_refusal("mac"))
-
     def test_wait_alive_raises_the_refusal_instead_of_timing_out(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with (
                 patch("ui.socket_path", return_value=Path(root) / "absent.sock"),
                 patch("ui._boot_refusal", return_value="iced UI refused to start: x"),
             ):
-                # RuntimeError, not TimeoutError: `_launch_mac` retries only
-                # TimeoutError, so a refusal must not burn its second attempt.
+                # RuntimeError, not TimeoutError: a caller retrying a slow
+                # boot must not retry a refusal.
                 with self.assertRaisesRegex(RuntimeError, "refused to start"):
                     ui.wait_alive("iced", timeout=30)
-
-
-class MacQuitTests(unittest.TestCase):
-    def test_quit_gives_a_healthy_app_the_full_scaled_graceful_window(self) -> None:
-        """A mid-test relaunch must not be signalled merely for being slow to
-        exit; only `_mac_cleanup`'s already-unhealthy app gets the short one."""
-        root = Path(tempfile.mkdtemp(prefix="roost-unit-sock-"))
-        self.addCleanup(shutil.rmtree, root, True)
-        with (
-            patch("ui._roost_running", return_value=True),
-            patch("ui._wait_gone", return_value=True) as wait_gone,
-            patch("ui.subprocess.run"),
-            # `_mac_cleanup` unlinks the resolved socket + lock; keep it off
-            # the developer's real ones.
-            patch("ui.socket_path", return_value=root / "roost.sock"),
-        ):
-            ui.quit("mac")
-            self.assertGreaterEqual(wait_gone.call_args.args[0], 10.0)
-            wait_gone.reset_mock()
-            ui._mac_cleanup()
-            self.assertEqual(wait_gone.call_args.args[0], 3.0)
-
-    def test_quit_escalates_until_the_mac_app_is_confirmed_gone(self) -> None:
-        with (
-            patch("ui._roost_running", return_value=True),
-            patch("ui._wait_gone", side_effect=[False, False, True]),
-            patch("ui.subprocess.run") as run,
-        ):
-            ui.quit("mac")
-        self.assertEqual(
-            [call.args[0][0] for call in run.call_args_list],
-            ["osascript", "pkill", "pkill"],
-        )
-
-    def test_quit_raises_rather_than_returning_on_a_mac_app_that_survives_sigkill(
-        self,
-    ) -> None:
-        with (
-            patch("ui._roost_running", return_value=True),
-            patch("ui._wait_gone", return_value=False),
-            patch("ui.subprocess.run"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "survived SIGKILL"):
-                ui.quit("mac")
-
-    def test_quit_is_a_no_op_when_no_mac_app_runs(self) -> None:
-        with (
-            patch("ui._roost_running", return_value=False),
-            patch("ui.subprocess.run") as run,
-        ):
-            ui.quit("mac")
-        run.assert_not_called()
 
 
 if __name__ == "__main__":

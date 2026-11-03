@@ -1,70 +1,72 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-    Hardened-runtime entitlements for Roost.app.
+    Hardened-runtime entitlements for the macOS app, in both identities
+    `mac/scripts/bundle-iced.sh` assembles: Roost.app (production) and
+    Roost-Iced.app (dev builds). bundle-iced.sh signs the main executable
+    with this file and the `runtime` option. tools/roosttest_unit/
+    test_mac_entitlements.py pins the keys below, and CI's "Assert bundle
+    contents" step checks the signed bundle carries them.
 
-    Effective when the bundle is code-signed (ad-hoc or Developer
-    ID). bundle.sh signs with the `runtime` option; Phase 8 adds
-    Developer ID + notarization on top (#83).
+    Editing note: no double hyphens anywhere in this comment. AMFI's XML
+    parser rejects the sequence even inside a comment.
 
     com.apple.security.device.audio-input
     com.apple.security.device.camera
     com.apple.security.automation.apple-events
 
-    Roost is the TCC *responsible app* for the programs it hosts: when
-    a child process in a tab (Claude Code's /voice, ffmpeg, sox, an
-    osascript automation) touches the microphone, camera, or sends
-    Apple events, macOS attributes the request to Roost, not the
-    child. Under the hardened runtime that attribution is *silently
-    denied* unless Roost carries the matching resource entitlement —
-    no prompt, no Privacy pane entry, no error. These three let those
-    requests prompt ("A program running in Roost would like to use the
-    microphone") instead of failing silently. The paired purpose
-    strings live in Info.plist.template. cf. ghostty and cmux, which
-    both carry the same capture set.
+    Roost is the TCC *responsible app* for the programs it hosts: when a
+    child process in a tab (Claude Code's /voice, ffmpeg, sox, an
+    osascript automation) touches the microphone, camera, or sends Apple
+    events, macOS attributes the request to Roost, not the child. Under
+    the hardened runtime that attribution is *silently denied* unless
+    Roost carries the matching resource entitlement: no prompt, no
+    Privacy pane entry, no error. These three let those requests prompt
+    ("A program running in Roost would like to use the microphone")
+    instead of failing silently. The paired purpose strings live in
+    Info.plist.template. cf. ghostty and cmux, which carry the same
+    capture set.
 
     com.apple.security.cs.disable-library-validation
 
-    Required by the embedded Sparkle.framework (issue #122). Library
-    validation insists every linked library be signed by the SAME
-    Team ID as the main executable (or be a platform binary). Roost
-    ships ad-hoc-signed (no Team ID yet, #83), so the hardened runtime
-    would refuse to load the framework and the app would abort at
-    launch with a code-signature (LV) kill. This entitlement lifts the
-    same-team requirement so the ad-hoc framework loads.
+    bundle-iced.sh embeds an ad-hoc-signed Sparkle.framework, dlopen'd at
+    runtime under the hardened runtime. Library validation insists every
+    loaded library be signed by the SAME Team ID as the main executable
+    (or be a platform binary). A dev build ships ad-hoc-signed (no Team
+    ID), so without this entitlement the hardened runtime would refuse
+    the framework: a load failure at updater-init time.
 
-    REMOVE THIS once #83 lands (Developer ID + notarization): when
-    Roost and Sparkle.framework are both signed by our Team ID,
-    same-team signing satisfies library validation and the entitlement
-    is no longer needed (cf. Ghostty, which is team-signed and carries
-    no LV-disable). Keeping it past that point needlessly weakens the
-    hardened runtime.
+    Release Developer-ID builds (release.yml's `mac` job) are team-signed
+    and STILL carry this entitlement. Once the app and Sparkle.framework
+    are both signed by our Team ID, same-team signing satisfies library
+    validation and the entitlement is no longer needed for them (cf.
+    Ghostty, which is team-signed and carries no LV-disable); dropping it
+    there is a separate entitlements hygiene pass, not yet done.
 
-    What we still INTENTIONALLY do not need:
+    What we INTENTIONALLY do not need:
 
     * `cs.allow-unsigned-executable-memory` / `cs.allow-jit`
       libghostty-vt is linked as a static archive (its code is part of
       Roost's own signed image), no JIT, no dynamically generated
-      machine code at runtime. Add `allow-jit` only if a future
-      Ghostty bump introduces a JIT path (e.g. font shaping via SIMD
-      codegen).
+      machine code at runtime.
 
     * `network.client` / `network.server` Roost does not speak over a
       network socket; the IPC server is UNIX-domain only. (Sparkle's
       update download runs in its own XPC service, which carries its
-      own networking; the main app does not need the entitlement.)
+      own networking. Host sessions reach other machines through the
+      user's own `ssh`, a child process.)
 
     * App Sandbox flags sandboxing the shells Roost spawns would defeat
       the product. cmux makes the same choice.
 
     * com.apple.security.personal-information.{addressbook,calendars,
-      location,photos-library} ghostty carries these; we deliberately
-      do NOT. A TCC grant to Roost is inherited by *every* child it
-      ever spawns, so the entitlement set is the blast radius. Capture
-      devices (mic/camera) light a menu-bar in-use indicator; PIM reads
-      have *none* — a buggy or hostile agent could exfiltrate the whole
-      address book invisibly. We add a PIM key only if a concrete Roost
-      feature needs it (one-line change), not speculatively.
+      location,photos-library} ghostty carries these; we deliberately do
+      NOT. A TCC grant to Roost is inherited by *every* child it ever
+      spawns, so the entitlement set is the blast radius. Capture devices
+      (mic/camera) light a menu-bar in-use indicator; PIM reads have
+      none, so a buggy or hostile agent could read the whole address
+      book invisibly. We add a PIM key only if a concrete Roost feature
+      needs it, not speculatively.
 -->
 <plist version="1.0">
 <dict>

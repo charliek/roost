@@ -22,15 +22,6 @@
 //! judgment — CRC checks, record order, version acceptance,
 //! continuation validation — stays inside libghostty; the scanner never
 //! validates, it only measures.
-//!
-//! # No Swift twin
-//!
-//! Every other libghostty capability roost uses is mirrored on the Mac
-//! side, but the Swift app calls `ghostty_terminal_new` and friends
-//! directly and never consumes `roost-vt`. Host sessions ship with the
-//! iced UI as their only client (roadmap D1/D5), so there is
-//! deliberately no Swift counterpart to this API and `mac/` stays
-//! untouched. Revisit only if the Mac UI becomes a host-sessions client.
 
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;

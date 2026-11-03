@@ -27,10 +27,6 @@ either terminal the hook layer reads its shell marks from the same
 libghostty stream as the records, so a mark's form decides what it does
 the way libghostty reads it.
 
-The Mac app keeps no program-status records, so every case is iced-only,
-like `test_agent_hooks_dialog.py`; `e2e-mac` deselects `session_daemon`
-too.
-
 Condition waits only.
 """
 
@@ -56,12 +52,6 @@ PROBE_REPLY = (
     b"\x1b]7501;?:states=idle,working,done,blocked,error"
     b":kinds=permission,question,auth\x1b\\"
 )
-
-
-@pytest.fixture(autouse=True)
-def iced_only(target):
-    if target != "iced":
-        pytest.skip("the Mac app keeps no program-status records (plan 082 D4.2)")
 
 
 def osc7501(**fields: str) -> bytes:

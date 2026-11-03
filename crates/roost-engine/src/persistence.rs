@@ -52,18 +52,12 @@ pub struct SnapshotFile {
     pub active_tab_position: i32,
     /// Whether the sidebar was collapsed (hidden) at save time, so a
     /// relaunch restores the user's hide/show choice. Defaulted so a
-    /// file from an older build (no key) loads as "expanded". The Mac
-    /// UI persists the same choice in UserDefaults (`RoostSidebarVisible`);
-    /// this is the Rust UI adapter's (Iced) equivalent, kept at
-    /// behavioral parity.
+    /// file from an older build (no key) loads as "expanded".
     #[serde(default)]
     pub sidebar_collapsed: bool,
     /// The sidebar's width in logical points at save time, so a
     /// relaunch restores the user's drag. Defaulted so a file from an
-    /// older build (no key) loads as the default width. The Mac UI
-    /// persists the same value in UserDefaults (`RoostSidebarWidth`);
-    /// this is the Rust UI adapter's (Iced) equivalent, kept at
-    /// behavioral parity. Values outside
+    /// older build (no key) loads as the default width. Values outside
     /// [`SIDEBAR_MIN_WIDTH`]..=[`SIDEBAR_MAX_WIDTH`] are clamped when
     /// the workspace loads them.
     ///
@@ -102,8 +96,8 @@ pub struct SnapshotFile {
     /// SSH and socket targets only: this machine's own session is
     /// implicit (there is always a `localhost` to save again), so
     /// remembering it would be a row that says nothing. Defaulted like
-    /// `hosts` so a file from an older build — or from the Mac UI, which
-    /// carries this list without reading it — still loads.
+    /// `hosts` so a file from an older build — or from the retired Swift
+    /// app, which carried this list without reading it — still loads.
     #[serde(default)]
     pub recent_hosts: Vec<HostSnapshot>,
 }

@@ -1,8 +1,8 @@
 //! JSON-over-Unix-socket IPC for Roost.
 //!
 //! This crate is the wire-format home of the post-daemon-removal IPC
-//! that `roostctl` (Rust) and Roost's native UIs (Swift on Mac, iced
-//! on Linux) speak. The full protocol spec lives at
+//! that `roostctl`, `roost-session` and the iced UI (macOS and Linux)
+//! speak. The full protocol spec lives at
 //! [`docs/reference/ipc.md`]; this crate is the Rust implementation
 //! of it.
 //!
@@ -15,8 +15,8 @@
 //! * [`schema`] — the JSON Schema bundle of every op, event and
 //!   envelope, generated from the types in [`messages`] and [`agent`].
 //! * [`agent`] — the agent state model (shell / lifecycle / ownership
-//!   axes) and the pure state machine that derives `TabState` from it.
-//!   Shared with the Swift port via `tests/agent-state-fixtures/`.
+//!   axes) and the pure state machine that derives `TabState` from it,
+//!   pinned by `tests/agent-state-fixtures/`.
 //! * [`program_status`] — OSC 7501 reports and the OSC 133 prompt marks
 //!   ordered with them, as `roost-engine`'s composition layer reads them.
 //! * [`format_chars`] — the Unicode `Cf` table that `roostctl doctor`
@@ -28,13 +28,12 @@
 //! * [`local_route`] — the local-backend snapshot the UI publishes and
 //!   its own IPC handler reads (plan 063 §D1), in this crate because
 //!   `roost-engine` cannot see `roost-ui-model`.
-//! * [`paths`] — `BundleProfile` path resolution. The Mac UI's Swift
-//!   side has a byte-for-byte equivalent.
+//! * [`paths`] — `BundleProfile` path resolution.
 //! * [`old_session`] — finding a session still on a path an older build
 //!   used, for the upgrade across the session socket's move.
 //! * [`socket_state`] — the one shared answer to "is a listener alive
 //!   at this socket path?", used by the bind path and `roostctl
-//!   doctor` and mirrored in Swift.
+//!   doctor`.
 //! * [`client`] — the three client transports: `IpcClient` (typed
 //!   wrappers around the framed request/response cycle), `EventStream`
 //!   (subscribe-then-stream), and `DataConnection` (the attach data
@@ -67,9 +66,8 @@
 //!   what they answer, the release-asset naming and checksum rules, and
 //!   the failure families with the copy a user acts on.
 //!
-//! The Swift companion lives in `mac/Sources/Roost/IPCServer.swift`
-//! (post-M4). Golden cross-language vectors live under
-//! `tests/ipc-vectors/*.json` at the workspace root.
+//! Golden wire vectors live under `tests/ipc-vectors/*.json` at the
+//! workspace root.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 

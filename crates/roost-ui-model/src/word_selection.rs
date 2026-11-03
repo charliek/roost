@@ -1,8 +1,7 @@
 //! Toolkit-neutral word- and line-expansion helpers for double-/triple-click
-//! selection. Mirrors
-//! `mac/Sources/Roost/WordSelection.swift` 1:1; the shared
-//! `tests/word-fixtures/` corpus pins the two ports byte-equal on every
-//! supported edge case (see `crates/roost-ui-model/tests/word_fixtures_test.rs`).
+//! selection. Ported 1:1 from `mac/Sources/Roost/WordSelection.swift`; the
+//! `tests/word-fixtures/` corpus pins every supported edge case (see
+//! `crates/roost-ui-model/tests/word_fixtures_test.rs`).
 //!
 //! No UI toolkit imports — same shape as `roost_url`, so the algorithm is
 //! exercised from unit tests without spinning up a UI widget.

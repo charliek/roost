@@ -596,7 +596,7 @@ fn set_roost_timeouts(value: &mut Json, agent: Agent, timeout: u64) {
 /// The toast list is the record's, not the run's.
 ///
 /// The gap this closes: wire on a machine through one surface that
-/// cannot toast (the Mac app, which has no transient status line and so
+/// cannot toast (`roostctl`, which has nowhere to show one and so
 /// leaves `noticed` false on purpose), then start the UI that can. That
 /// second run wires nothing — every agent is already current — so a
 /// toast driven by `outcome.wired` would never fire, and `noticed` would

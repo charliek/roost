@@ -1174,8 +1174,8 @@ impl RemotePlatform {
     };
 
     /// Every platform with a published build, which is release.yml's
-    /// matrix: the two deb arches, and the Mac app's one. Roost-Iced.app
-    /// is Apple-silicon only, so there is no `darwin-amd64` to fetch and
+    /// matrix: the two deb arches, and the Mac app's one. Roost.app is
+    /// Apple-silicon only, so there is no `darwin-amd64` to fetch and
     /// no Intel Mac client whose own binary could stand in for one.
     pub const PUBLISHED: [Self; 3] = [Self::LINUX_AMD64, Self::LINUX_ARM64, Self::DARWIN_ARM64];
 }

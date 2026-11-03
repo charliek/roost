@@ -21,9 +21,8 @@ pub enum CliError {
     Connection(String),
     /// The server refused; `code` is the server's own, verbatim.
     Server { code: String, message: String },
-    /// The server does not serve an op the verb needs — `open` and
-    /// `project ensure` when `identify.ops` lacks `project.ensure`
-    /// (plan 066 §3.2).
+    /// The server does not serve what the verb needs — `wait` and `tab
+    /// prompt` against a Roost with no event stream.
     Unsupported(String),
     /// `doctor` found a failing check. The report is on stdout.
     ChecksFailed(String),
@@ -263,7 +262,7 @@ mod tests {
     #[test]
     fn unsupported_exits_1() {
         assert_row(
-            &CliError::Unsupported("no project.ensure".into()),
+            &CliError::Unsupported("this Roost serves no event stream".into()),
             1,
             "unsupported",
         );

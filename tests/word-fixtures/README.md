@@ -2,17 +2,13 @@
 
 Canonical `(row, col, click_count, break_chars) → WordSpan` corpus for
 the double-/triple-click selection algorithm in
-`mac/Sources/Roost/WordSelection.swift` (Swift) and
-`crates/roost-ui-model/src/word_selection.rs` (Rust). Both ports load
-these files and assert byte-exact equality — drift between the two
-implementations surfaces here.
+`crates/roost-ui-model/src/word_selection.rs`. The loader asserts
+byte-exact equality with every file here.
 
-Loaders:
+Loader:
 
 - Rust: `crates/roost-ui-model/tests/word_fixtures_test.rs`
   (`cargo test -p roost-ui-model`).
-- Swift: `mac/Tests/RoostTests/WordFixtureRoundTripTests.swift`
-  (`cd mac && swift test`).
 
 Same pattern as [`tests/url-fixtures/`](../url-fixtures/README.md) and
 [`tests/ipc-vectors/`](../ipc-vectors/README.md).
@@ -49,6 +45,5 @@ text: <expected selected text>
 
 When adding a fixture, mirror it in the in-language tests too:
 
-- Swift `WordSelectionTests.swift` and Rust `word_selection::tests`
-  already cover the same scenarios for readability; the fixture
-  loader on each side is the cross-port pin.
+- `word_selection::tests` already covers the same scenarios for
+  readability; the fixture loader runs every file here.

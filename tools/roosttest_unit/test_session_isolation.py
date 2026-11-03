@@ -85,7 +85,7 @@ class ClaimTests(unittest.TestCase):
         self.addCleanup(setattr, ui, "_ICED_LOG", None)
         with (
             mock.patch.dict(os.environ, {"ROOST_ICED_BIN": TRUE}),
-            mock.patch("ui.iced_bundle_app", return_value=None),
+            mock.patch("ui.iced_bundle", return_value=None),
             mock.patch("ui.is_alive", return_value=False),
             mock.patch("ui._rust_log_path", return_value=Path(os.devnull)),
             mock.patch("ui.subprocess.Popen", side_effect=popen),
@@ -121,7 +121,7 @@ class ClaimTests(unittest.TestCase):
         }
         with (
             mock.patch.dict(os.environ, inherited),
-            mock.patch("ui.iced_bundle_app", return_value=None),
+            mock.patch("ui.iced_bundle", return_value=None),
             mock.patch("ui.is_alive", return_value=False),
             mock.patch("ui._rust_log_path", return_value=Path(os.devnull)),
             mock.patch("ui.subprocess.Popen", side_effect=popen),

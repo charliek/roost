@@ -182,14 +182,10 @@ struct Inner {
     active_project_id: i64,
     active_tab_id: i64,
     /// Whether the sidebar is collapsed (hidden). UI-set via
-    /// `set_sidebar_collapsed`; persisted so a relaunch restores it
-    /// (Rust UI adapter (Iced) parity with the Mac UI's
-    /// `RoostSidebarVisible`).
+    /// `set_sidebar_collapsed`; persisted so a relaunch restores it.
     sidebar_collapsed: bool,
     /// The sidebar's width in logical points. UI-set via
-    /// `set_sidebar_width`; persisted so a relaunch restores it
-    /// (Rust UI adapter (Iced) parity with the Mac UI's
-    /// `RoostSidebarWidth`).
+    /// `set_sidebar_width`; persisted so a relaunch restores it.
     sidebar_width: f64,
     /// The Agents panel's share of the sidebar (plan 080 D8). UI-set via
     /// `set_agents_panel_fraction`; `None` until one is set.
@@ -468,8 +464,7 @@ pub enum WorkspaceEvent {
     },
     /// Fired after `reorder_tabs`. `tab_ids` is the post-reorder
     /// display order — the supplied prefix followed by any
-    /// unlisted siblings in their prior position order. Mirrors
-    /// the Mac side's `Workspace.Event.tabsReordered`.
+    /// unlisted siblings in their prior position order.
     TabsReordered {
         #[serde(with = "roost_ipc::messages::string_int64")]
         project_id: i64,
@@ -571,7 +566,7 @@ pub struct VersionedWorkspaceEvent {
 /// What a workspace retains for `events.subscribe {from_revision}`.
 ///
 /// Opted into with [`Workspace::with_replay`] and **off by default**:
-/// the UI, the facade tests and every local path build workspaces that
+/// the UI and every local path build workspaces that
 /// never serve a subscription, and they pay neither the clone nor the
 /// memory. Only the host session turns it on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -756,8 +751,7 @@ pub enum WorkspaceError {
 /// by a pre-#80 build (which allocated from `len()`) survives every
 /// relaunch. Walk the projects in display order — `(position, id)`,
 /// the same comparator the sidebar sorts by — and push each one to at
-/// least `previous + 1`. The mirror of the Swift
-/// `normalizedProjectPositions`; keep the two in step.
+/// least `previous + 1`.
 ///
 /// The seed is `None`, not `-1`, so the walk is a true no-op on
 /// already-unique input **including negative positions**: `position`
@@ -792,8 +786,7 @@ fn normalize_project_positions(projects: &mut [ProjectSnapshot]) {
     // the order rows are inserted into the id-keyed `projects` map.
     // `state.json` is user-editable, so two rows can share an `id` and
     // collapse last-write-wins — reordering the slice here would
-    // silently change which one survives, and Swift's
-    // `normalizedProjectPositions` returns file order to match.
+    // silently change which one survives.
     let mut order: Vec<&mut ProjectSnapshot> = projects.iter_mut().collect();
     order.sort_by_key(|p| (p.position, p.id));
     let mut previous: Option<i32> = None;
@@ -1083,8 +1076,7 @@ impl Workspace {
     }
 
     /// The sidebar's persisted collapsed state. The UI reads this at
-    /// startup to restore the user's hide/show choice (Rust UI adapter
-    /// (Iced) parity with the Mac UI's `RoostSidebarVisible`).
+    /// startup to restore the user's hide/show choice.
     pub fn sidebar_collapsed(&self) -> bool {
         self.inner.lock().unwrap().sidebar_collapsed
     }
@@ -1104,8 +1096,7 @@ impl Workspace {
     }
 
     /// The sidebar's persisted width in logical points. The UI reads
-    /// this at startup to restore the user's drag (Rust UI adapter
-    /// (Iced) parity with the Mac UI's `RoostSidebarWidth`).
+    /// this at startup to restore the user's drag.
     pub fn sidebar_width(&self) -> f64 {
         self.inner.lock().unwrap().sidebar_width
     }
@@ -1396,18 +1387,6 @@ impl Workspace {
     pub fn snapshot_with_revision(&self) -> (u64, Vec<Project>) {
         let inner = self.inner.lock().unwrap();
         (inner.revision, self.snapshot_locked(&inner))
-    }
-
-    #[cfg(feature = "facade")]
-    pub(crate) fn snapshot_parts(&self) -> (u64, Vec<Project>, i64, i64, bool) {
-        let inner = self.inner.lock().unwrap();
-        (
-            inner.revision,
-            self.snapshot_locked(&inner),
-            inner.active_project_id,
-            inner.active_tab_id,
-            inner.sidebar_collapsed,
-        )
     }
 
     fn snapshot_locked(&self, inner: &Inner) -> Vec<Project> {
@@ -3578,10 +3557,9 @@ fn derive_title(cwd: &str) -> String {
         return "shell".into();
     }
     // Special-case "/": Path::file_name() returns None for the root,
-    // and the prior "shell" fallback diverges from the Swift twin
-    // (NSString.lastPathComponent("/") returns "/") and from what
-    // shell integration's __roost_title would emit ("/"). Return "/"
-    // explicitly to keep both UIs in lockstep and avoid the surprising
+    // and the prior "shell" fallback diverges from what shell
+    // integration's __roost_title would emit ("/"). Return "/"
+    // explicitly to keep the two in lockstep and avoid the surprising
     // "you're at root, but the tab title says 'shell'" UX on
     // un-integrated shells.
     if cwd == "/" {
@@ -4726,12 +4704,11 @@ mod tests {
         assert_eq!(ws.tab(tid).unwrap().title, "usr");
     }
 
-    /// Cross-platform parity: `derive_title("/")` returns `"/"`,
-    /// matching the Swift twin's `(cwd as NSString).lastPathComponent`
-    /// for the root case and what shell integration's `__roost_title`
-    /// would emit. Without this special-case Path::file_name() returns
-    /// None and the fallback `"shell"` diverges from the Mac UI on
-    /// `cd /` — the model fix now exercises this routinely.
+    /// `derive_title("/")` returns `"/"`, matching what shell
+    /// integration's `__roost_title` would emit. Without this
+    /// special-case Path::file_name() returns None and the fallback
+    /// `"shell"` diverges from it on `cd /` — the model fix now
+    /// exercises this routinely.
     #[test]
     fn derive_title_root_returns_slash() {
         assert_eq!(derive_title("/"), "/");
@@ -6170,10 +6147,7 @@ mod tests {
 
     #[test]
     fn sidebar_collapsed_persists_across_reopen() {
-        // Rust UI adapter (Iced) parity with the Mac UI's
-        // RoostSidebarVisible: the user's hide/show choice survives quit
-        // + relaunch. Backs the locally-run
-        // e2e `test_sidebar_collapsed_state_survives_relaunch`.
+        // The user's hide/show choice survives quit + relaunch.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         {
@@ -6200,8 +6174,7 @@ mod tests {
 
     #[test]
     fn sidebar_width_persists_across_reopen() {
-        // Rust UI adapter (Iced) parity with the Mac UI's
-        // RoostSidebarWidth: the user's drag survives quit + relaunch.
+        // The user's drag survives quit + relaunch.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         {
@@ -6657,10 +6630,7 @@ mod tests {
     /// captured for #262 holds `[2, 3, 3]` — and the restore layout is
     /// the order the bootstrap re-opens tabs in, so the tie decides the
     /// restored tab strip. `sort_by_key` is stable, which makes that
-    /// order the file's; Swift's `sorted(by:)` is documented as *not*
-    /// stable, so its twin
-    /// `restoreLayoutBreaksTiedTabPositionsByFileOrder` needs an explicit
-    /// index tiebreak to land here. The fixture's file order is neither
+    /// order the file's. The fixture's file order is neither
     /// ascending nor descending in `position`, so a sort that ignored the
     /// index could not pass by luck.
     #[test]
@@ -6749,7 +6719,7 @@ mod tests {
     // collision self-heals. Persisted *projects* load their position
     // verbatim, so a collision written by a pre-#80 GTK build survives
     // every relaunch until `normalize_project_positions` breaks the
-    // tie. The Swift `WorkspaceStatePersistenceTests` mirror these.
+    // tie.
 
     /// Load a hand-written `state.json` and return the restored
     /// `(name, position)` pairs in display order.
@@ -6912,8 +6882,7 @@ mod tests {
     /// supported state, so the arithmetic degrades to a tie rather than
     /// panicking at launch. The repair is a *uniqueness* pass below the
     /// ceiling and a *survival* pass at it — it is explicitly **not** a
-    /// uniqueness guarantee. The Swift
-    /// `ceilingRepairDegradesToATieOnTheNextAllocation` mirrors this.
+    /// uniqueness guarantee.
     #[test]
     fn ceiling_repair_degrades_to_a_tie_on_the_next_allocation() {
         let dir = tempfile::tempdir().unwrap();
@@ -6967,8 +6936,7 @@ mod tests {
     ///
     /// File order `C@5, A@0, B@5`; display order `A@0, C@5, B@5`. The
     /// tie is between C and B, and only the walk order reveals which
-    /// of them moves. The Swift
-    /// `fileOrderDifferingFromDisplayOrderRepairsAndRestores` mirrors it.
+    /// of them moves.
     #[test]
     fn file_order_differing_from_display_order_repairs_and_restores() {
         let dir = tempfile::tempdir().unwrap();
@@ -7010,11 +6978,7 @@ mod tests {
     /// id-keyed map collapses them last-write-wins, so **insertion
     /// order picks the survivor**, and insertion order is the file's.
     /// The collapse itself is pre-existing and out of scope; what this
-    /// pins is that the load-path repair does not change it, and that
-    /// Swift agrees. `duplicateProjectIDsKeepTheFileOrderSurvivor`
-    /// asserts the same literal fixture on the Mac side; if the two
-    /// ever disagree, the same `state.json` yields a different project
-    /// identity, metadata and tab layout per platform.
+    /// pins is that the load-path repair does not change it.
     #[test]
     fn duplicate_project_ids_keep_the_file_order_survivor() {
         let restored = restored_project_positions(&project_json(&[(7, "high", 10), (7, "low", 0)]));
@@ -7042,7 +7006,7 @@ mod tests {
         cut.replay.iter().map(|batch| batch.revision).collect()
     }
 
-    /// The default: the UI, the facade tests and every local path pay
+    /// The default: the UI and every local path pay
     /// nothing, and the one resume that still works is the degenerate
     /// "I am already at the fence".
     #[test]

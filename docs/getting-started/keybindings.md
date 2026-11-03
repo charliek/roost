@@ -26,10 +26,10 @@ Every binding is overridable in `config.conf` (see [Custom keybindings](#custom-
 | `Cmd-Shift-R`        | Rename the active project                   |
 | `Cmd-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Cmd-B`              | Toggle the projects sidebar                 |
-| `Cmd-Shift-A`        | Toggle the sidebar's Agents panel (in the Swift app, the agent rows under each project) |
+| `Cmd-Shift-A`        | Toggle the sidebar's Agents panel |
 | `Cmd-Shift-U`        | Jump to the next tab with a pending notification (active project first, then others) |
-| `Cmd-Shift-→`        | Cycle to the next project in the sidebar (skips projects with no tabs; stops at the last project; no wrap-around). Roost-Iced only |
-| `Cmd-Shift-←`        | Cycle to the previous project in the sidebar (skips projects with no tabs; stops at the first project; no wrap-around). Roost-Iced only |
+| `Cmd-Shift-→`        | Cycle to the next project in the sidebar (skips projects with no tabs; stops at the last project; no wrap-around) |
+| `Cmd-Shift-←`        | Cycle to the previous project in the sidebar (skips projects with no tabs; stops at the first project; no wrap-around) |
 | `Cmd-1` … `Cmd-9`    | Switch to the project at sidebar position 1 .. 9 |
 
 ### Commands
@@ -143,7 +143,7 @@ Anything not bound as an app shortcut flows to the focused terminal through libg
 
 App shortcuts are resolved **before** the keystroke is offered to the terminal, on both UIs. That's why `Cmd-T` (or `Alt-T` on Linux) works while the terminal is focused: the shortcut table is consulted first, the action dispatches, and the keystroke never reaches the shell. Anything not in the table falls through to the terminal as usual.
 
-On macOS this is the AppKit main menu plus the window's own key handling. On Linux the iced UI handles every key press in one place: the terminal widget deliberately never *captures* keyboard events, so they arrive at the app-level handler (`App::keyboard` in `crates/roost-iced/src/app.rs`), which walks a fixed order — an open modal or inline rename first, then the command palette, then the keybinding table, and only then the terminal. There is no toolkit focus-traversal to fight: Tab and Shift-Tab are ordinary keys that fall straight through to the encoder.
+On macOS there is also an AppKit main menu. The iced UI handles every key press in one place: the terminal widget deliberately never *captures* keyboard events, so they arrive at the app-level handler (`App::keyboard` in `crates/roost-iced/src/app.rs`), which walks a fixed order — an open modal or inline rename first, then the command palette, then the keybinding table, and only then the terminal. There is no toolkit focus-traversal to fight: Tab and Shift-Tab are ordinary keys that fall straight through to the encoder.
 
 ## Mouse
 
@@ -164,7 +164,7 @@ Selection clears automatically on any PTY output, on resize, and on a new click.
 
 Hold the **link modifier** and hover a URL to highlight it (underline + hand cursor); click while holding it to open the URL in your default browser. This works for both OSC 8 hyperlinks (what tools like Claude Code emit) and plain `https://…` text matched on screen.
 
-The modifier is platform-native by default — **Cmd on macOS, Alt on Linux** — and configurable via `link-modifier` in `config.conf`. **Linux users who prefer the conventional Ctrl+click** set `link-modifier = ctrl`. (Some Linux WMs grab `Alt`+drag to move windows, so Ctrl can be the more reliable choice.) The `link-modifier` setting is honored by the iced UI; the Swift Mac app is fixed to Cmd. See [`config.md`](../reference/config.md#link-modifier) for details and the broader "prefer Ctrl on Linux" recipe.
+The modifier is platform-native by default — **Cmd on macOS, Alt on Linux** — and configurable via `link-modifier` in `config.conf`. **Linux users who prefer the conventional Ctrl+click** set `link-modifier = ctrl`. (Some Linux WMs grab `Alt`+drag to move windows, so Ctrl can be the more reliable choice.) The `link-modifier` setting is honored by the iced UI. See [`config.md`](../reference/config.md#link-modifier) for details and the broader "prefer Ctrl on Linux" recipe.
 
 Pressing any input-producing key when the viewport is scrolled back snaps the viewport to the bottom before delivering the keystroke — same behavior as every other terminal multiplexer.
 
@@ -254,11 +254,9 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 
 `toggle_secure_input` flips the always-on Secure Keyboard Entry setting on macOS (`macos-secure-keyboard-entry`), the same as Roost → Secure Keyboard Entry in the menu bar and "Toggle Secure Keyboard Entry" in the command palette; Roost writes the choice to `config.conf`. It has no default shortcut. On Linux the action is accepted and does nothing. See [Secure Keyboard Entry](../reference/config.md#secure-keyboard-entry).
 
-`cycle_project_prev` and `cycle_project_next` are honored by Roost-Iced; the Swift Mac app (Roost.app) does not have them and logs the names as unknown actions.
+`take_size` makes this window the size owner of the host tab on screen, which its session then resizes to the window's grid — the tab band's **Take size** button, and "Take Size" in the command palette. It has no default shortcut.
 
-`take_size` makes this window the size owner of the host tab on screen, which its session then resizes to the window's grid — the tab band's **Take size** button, and "Take Size" in the command palette. It has no default shortcut. Roost-Iced only.
-
-`cycle_agent_panel_sort` steps the sidebar Agents panel's sort — grouped, priority, recent, and back — and writes the choice to `agent-panel-sort` in `config.conf`. It has no default shortcut; the command palette has it as "Cycle Agent Panel Sort". Roost-Iced only, like project cycling.
+`cycle_agent_panel_sort` steps the sidebar Agents panel's sort — grouped, priority, recent, and back — and writes the choice to `agent-panel-sort` in `config.conf`. It has no default shortcut; the command palette has it as "Cycle Agent Panel Sort".
 
 Defaults with multiple triggers (`cycle_tab_*`, `paste`, `copy`) keep both triggers; an `unbind` line removes only the listed one.
 

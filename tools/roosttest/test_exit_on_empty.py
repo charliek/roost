@@ -49,13 +49,6 @@ def test_deleting_the_last_project_exits_cleanly_and_flushes_state(roost, target
     redundant but not the only proof any more. Kept as the assertion here
     regardless: an exit code is a coarser signal that costs no log parsing.)
     """
-    if target != "iced":
-        pytest.skip(
-            "exit-on-empty is an iced behavior this slice: mac already "
-            "terminates on the last project's window close (the now-removed "
-            "GTK UI kept its empty-workspace state instead — recorded "
-            "divergence)"
-        )
     if not runs_alone(request):
         pytest.skip(
             "ends the UI it drives, so it must be its own pytest "

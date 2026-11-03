@@ -4,7 +4,7 @@
 newline-delimited JSON protocol over a Unix-domain stream socket. The protocol
 is local-only — there is no network deployment.
 
-The UI binary (Swift `Roost.app`, or the Rust/iced binary — `roost` as
+The UI binary (the Rust/iced binary — `Roost.app` on macOS, `roost` as
 installed on Linux, `roost-iced` from a dev tree) is the IPC server.
 `roostctl` is the only first-party client; the contract here is what any
 other automation should implement.
@@ -12,8 +12,8 @@ other automation should implement.
 The socket path is the bundle profile's `socket_path` (see
 [`paths.md`](paths.md)):
 
-* Mac (Swift `Roost.app`):    `~/Library/Caches/Roost/roost.sock`
-* Iced on Mac (`Roost-Iced.app` or a dev build): `~/Library/Caches/Roost-iced/roost.sock`
+* Mac (`Roost.app`):    `~/Library/Caches/Roost/roost.sock`
+* Mac dev build (`Roost-Iced.app`): `~/Library/Caches/Roost-iced/roost.sock`
 * Installed `roost` on Linux (XDG): `$XDG_RUNTIME_DIR/roost/roost.sock`
 * Iced dev build on Linux (XDG):    `$XDG_RUNTIME_DIR/roost-iced/roost.sock`
 * Linux fallback:             `/tmp/roost[-iced]-<uid>/roost.sock`
@@ -45,12 +45,6 @@ answers `unknown-op` for every `session.*` op, and serves
 `events.subscribe` only while it runs its tabs in-process, and only live —
 see [On a UI socket](#on-a-ui-socket).
 
-The Swift Mac app (`Roost.app`) does not do three things this page
-describes for agent tooling: it answers `unknown-op` to
-[`project.ensure`](#projectensure), its [`identify`](#identify) reply
-has no `ops` and no `instance_id`, and it answers `not-implemented` to
-[`events.subscribe`](#eventssubscribe).
-
 A session socket also carries a second, **binary** protocol on its own
 connections — the per-tab attach stream a client renders a remote
 terminal from. It shares the socket path but not the framing; see
@@ -68,8 +62,7 @@ terminal from. It shares the socket path but not the framing; see
   `id` is a **string-wrapped 64-bit integer**, because JSON numbers
   lose precision past 2^53; the legacy proto schema used `int64` for
   tab/project ids and we preserve that range. Rust uses
-  `#[serde(with = "string_int64")]`; Swift's `Codable` uses a custom
-  encoder that emits `String(describing: int64)`.
+  `#[serde(with = "string_int64")]`.
 * **Response envelope (success):**
   `{"id": "<string>", "ok": true, "result": {...}}`.
 * **Response envelope (error):**
@@ -90,22 +83,18 @@ terminal from. It shares the socket path but not the framing; see
 * **Unknown fields:** strict on the **server** side (rejected with
   `unknown-field` error). Permissive on the **client** side (clients
   ignore unknown fields so the server can add fields without breaking
-  older clients). Swift's `Codable` is permissive by default and the
-  client-side request encoders match that policy unchanged. On Rust,
-  `serde` is permissive by default — server-side request structs in
+  older clients). `serde` is permissive by default — server-side request structs in
   `roost-ipc` carry `#[serde(deny_unknown_fields)]` to opt in to the
   strict server policy; client-side response structs do not, matching
   the client-side permissive policy.
 * **Concurrency:** the server is single-actor — every request is
-  dispatched onto the UI's main thread (Swift `@MainActor`; in the iced
-  UI the handler forwards the request onto the single engine→UI feed and
+  dispatched onto the UI's main thread (the handler forwards the request onto the single engine→UI feed and
   awaits a oneshot reply, so it is applied from `update` on the winit
   event-loop thread). Responses are delivered in completion order, which
   is not guaranteed to match request order. Clients correlate by `id`.
 * **Schema drift mitigation:** `tests/ipc-vectors/*.json` is a directory
-  of canonical message exemplars (one file per op/event). Both
-  `cargo test -p roost-ipc` (Rust) and Swift's `XCTest` target load
-  these vectors and assert decode → re-encode → byte-equal.
+  of canonical message exemplars (one file per op/event). `cargo test -p roost-ipc` loads
+  these vectors and asserts decode → re-encode → byte-equal.
 * **Errors:** stable kebab-case codes. Current set:
   `unknown-op`, `unknown-field`, `missing-param`, `invalid-param`,
   `parse-error`, `frame-too-large`, `duplicate-id`, `not-found`,
@@ -206,14 +195,13 @@ exposed — the server always picks a concrete state.
 
 `ShellState` is a JSON string with values: `"unknown"`, `"at_prompt"`,
 `"foreground_process"` — written only by OSC 133 shell marks. On a
-session tab and a Roost-Iced in-process tab the marks are read by
+session tab and an in-process tab the marks are read by
 libghostty, from the same ordered stream as
 [`program_status`](#tabprogram_status-osc-7501), so a secondary prompt
 (`133;A;k=s`), a malformed body (`133;Axyz`) or one over libghostty's
 2048-byte OSC buffer writes nothing, while `133;P;k=i`, `133;N` and
 `133;I` count as a prompt; a host tab's mirror carries the session's
-value. The Swift Mac app reads marks with its own scanner, by first
-letter ([which marks count](../guides/agents.md#which-marks-count)).
+value ([which marks count](../guides/agents.md#which-marks-count)).
 `AgentLifecycle` is a JSON string with values: `"inactive"`,
 `"working"`, `"waiting"`, `"finished"`, `"failed"` — written only by
 agent adapters through `tab.agent_report` (below). The two axes are
@@ -276,9 +264,8 @@ A program can report its own status with OSC 7501 (state, kind,
 message, app, title, progress, and an `id` for child records). The
 tab's authoritative terminal answers the `OSC 7501 ; ?` probe and keeps
 the tab's records: a session tab's, inside the session, and an
-in-process tab's, inside Roost-Iced. A Roost-Iced window showing a host
-tab mirrors the session's summary and keeps none of its own; the Swift
-app keeps none. Prompt marks (OSC 133 `A`, `B`, `D`) drop `working` and `blocked`
+in-process tab's, inside the UI. A window showing a host
+tab mirrors the session's summary and keeps none of its own. Prompt marks (OSC 133 `A`, `B`, `D`) drop `working` and `blocked`
 records. While a `working` or `blocked` record exists, or a root record
 no prompt mark has followed, the records decide what the tab shows and
 the hook layer keeps only its identity.
@@ -341,9 +328,8 @@ records; otherwise both come from `shell_state` + `agent_lifecycle` +
 
 **`tab.state` stays a closed four-value enum — it does not gain a
 fifth `failed` value.** This is a pinned compatibility constraint, not
-an oversight: both Swift decoders (`IPCTabState`, `Workspace.TabState`)
-are closed `String` enums with no fallback case, so a fifth wire value
-throws a `DecodingError` on the Mac client, and the **Versioning**
+an oversight: clients decode it as a closed enum, so a fifth wire value
+can fail to decode, and the **Versioning**
 section below classifies a new enum value as a breaking protocol
 change. `agent_lifecycle: "failed"` therefore projects onto
 `state: "needs_input"` on the wire — the closest of the four legacy
@@ -410,15 +396,14 @@ launched with `ROOST_TEST_MODE=1` lists its test seams** —
 `tab.feed_pty_bytes`, `app.dialog_answer` and the rest — which are
 harness drivers, not a surface an agent should use. Read the list for
 membership: a name that is absent means this server does not serve that
-op, and a reply with no `ops` field at all is an older server or the
-Swift Mac app, which a client treats the same way. The contents are not
+op, and a reply with no `ops` field at all is an older server, which a
+client treats the same way. The contents are not
 a compatibility promise.
 
 `instance_id` names this UI process: 63 random bits as 16 lowercase hex
 digits, minted once at launch, so a restarted UI has a new one. A
 session socket's `identify` omits it — a session's identity is
-[`session.identify.session_id`](#sessionidentify) — and so does the
-Swift Mac app.
+[`session.identify.session_id`](#sessionidentify).
 
 `persist_error` is present only when the last attempt to write
 `state.json` failed — the message of that write, and absent otherwise.
@@ -428,9 +413,8 @@ says what the value means.
 
 `local_backend` (plan 063 §D1) is `"in-process"` or `"session"` — which
 backend this UI's own local tabs run on, the [`local-backend` config
-key](config.md#local-backend)'s live value. Absent from a Swift Mac
-reply, which decodes to `"in-process"`: Swift always runs its tabs
-in-process and never reads the key. `local_session_socket` is the local
+key](config.md#local-backend)'s live value. Absent from a reply of a server that predates it, which decodes to
+`"in-process"`. `local_session_socket` is the local
 `roost-session`'s own socket path, present only under `session` — a
 client that wants the event stream this socket does not serve under
 `session` (`events.subscribe` answers
@@ -605,8 +589,7 @@ When nothing resolves — no such tab, or neither candidate is a
 directory — it is **not an error**: `cwd` is used as sent, and one
 that is empty or not a directory resolves through the usual chain
 above. The result's `tab.cwd` carries the cwd the tab started in.
-Served by sessions, Roost-Iced's UI socket and the Swift Mac app's
-socket. A server that predates the field — `Roost.app` through v0.0.20
+Served by sessions and the UI socket. A server that predates the field — `Roost.app` through v0.0.20
 among them — answers `unknown-field`; see
 [the compatibility matrix](ipc-compatibility.md#the-compatibility-matrix).
 From the CLI: `--cwd-from-tab <id>` on `tab open` (plan 072, #536), or
@@ -651,11 +634,10 @@ than its two is `unknown-field`, naming that key. All of it is checked
 before anything else, so a refused request opens no tab and, with
 `project_id: "0"`, creates no project. An omitted field is not sent, so
 a request without them is the bytes it always was. Served by sessions
-and Roost-Iced's UI socket; on a UI socket under [`local-backend =
+and the UI socket; on a UI socket under [`local-backend =
 session`](#a-ui-socket-under-local-backend-session) the request is
 forwarded to the local session as it arrived, so the session resolves
-the original caller's fields. The Swift Mac app answers either field
-`unknown-field`.
+the original caller's fields.
 
 Response: `{"tab": <Tab>}`.
 
@@ -685,8 +667,8 @@ projects. It is the fence a client pairs with
 every `EventBatch` whose `revision` is `<=` this one, apply the rest,
 and the first batch it keeps is exactly `revision + 1`. A UI socket
 under `local-backend = session` omits the key entirely (not `null`),
-and so does the Swift Mac app: neither serves an event stream, so there
-would be nothing to fence against.
+and so does a server that predates the stream: neither serves an event
+stream, so there would be nothing to fence against.
 
 ### `tab.write`
 
@@ -721,13 +703,7 @@ local paths are pasted, which is what a file drop has always done. UI
 socket only, ungated. The same function the native drop handler calls —
 the op *is* the drop, minus the window event.
 
-**Served by the iced UI only.** The Swift `Roost.app` answers
-`unknown-op`: it has no host sessions, so there is nothing to upload to,
-and this op's whole point is the crossing. (The protocol integer that
-moved for this work is `session_protocol`, which governs *session*
-sockets; the UI socket's own `protocol_version` is unchanged, so a Mac
-UI is not claiming to serve this.) The Mac fold-in is described in the
-plan's §3.7 and waits on Mac host sessions.
+
 
 Request:
 ```json
@@ -883,7 +859,7 @@ the grid.
 Read the tab's live terminal *viewport* as text — the determinism
 backbone for automated tests (assert on exact content instead of
 OCR/pixel-matching a screenshot) — plus however many rows of history
-above it the request asks for. Both UIs walk libghostty-vt's render
+above it the request asks for. The UI walks libghostty-vt's render
 state on the main thread.
 
 Request: `{"params": {"tab_id": "3"}}`, or with history:
@@ -1031,7 +1007,7 @@ placements identically.
 Pixel values other than `source` and the image size are the terminal's
 cell pixels, so a terminal with no cell size lists nothing. The image's
 generation is not on the wire: it is local to one process. The field is
-additive (no protocol bump), and the frozen Swift app never sends it.
+additive (no protocol bump).
 
 Also served on a **host-session socket**, from the server Terminal.
 Both sockets run the same resolver — the densifier and `resolve_colors`
@@ -1051,8 +1027,7 @@ it the same way.
 What one tab's terminal holds, as libghostty measures it: pages,
 bytes, and the share of each that compression or images account for,
 per screen. Ungated — it is a read. Served by a host-session socket
-and by the iced UI; the Swift Mac app has no case for it and answers
-`unknown-op`. CLI: `roostctl tab memory`.
+and by the iced UI. CLI: `roostctl tab memory`.
 
 Request: `{"params": {"tab_id": "h3.7"}}`. Params are strict: an
 unknown field is `unknown-field`.
@@ -1222,9 +1197,7 @@ way. Response: `{}`.
 The op routes by the UI's active keyboard route, not directly by
 `tab_id`: `tab_id` must match the tab currently holding the route, or
 the call fails `invalid-param` rather than silently feeding the wrong
-tab. Implemented by the iced UI only; the Swift Mac app has no case for
-this op and answers `unknown-op` (it does support IME input, via AppKit's
-own `interpretKeyEvents` — there is just no IPC op to drive it).
+tab. Implemented by the iced UI.
 
 ### `tab.expand_selection_at` *(test-only — gated)*
 
@@ -1255,16 +1228,14 @@ to nothing (never an error by itself).
 
 Errors: `not-found` — either the tab has no live terminal, or `(col,
 row)` has no word/line span (whitespace under a double-click, or a row
-out of range). The iced UI reports these as two distinct messages under
-the same code; the Swift app reports one combined message.
+out of range). The UI reports these as two distinct messages under
+the same code.
 
 `tab_id` is a bare `string_int64`, not the `h<host>.<id>` wire spelling
 `tab.dump` accepts — under `local-backend = session` the UI resolves it
 against the slot itself rather than needing a host-qualified id; see [A
 UI socket under `local-backend =
 session`](#a-ui-socket-under-local-backend-session).
-
-Implemented by both UIs.
 
 ### `tab.dispatch_mouse_event` *(test-only — gated)*
 
@@ -1319,17 +1290,13 @@ A press while a context menu is open is dropped too.
 Response: `{}`. Errors: `invalid-param` for an unrecognized `kind` or
 `button`.
 
-On the iced UI, `mods` also decides whether the *link* modifier is
+`mods` also decides whether the *link* modifier is
 held, so a left press on a hyperlink opens it through the UI's own
-launcher exactly as a real click does — a Linux-only effect in
-practice, since the Mac UI drives the mouse-tracking encoder alone and
-does not run this path (`TerminalView.emitMouseTracking`).
+launcher exactly as a real click does.
 
 `tab_id` is a bare `string_int64`; under `local-backend = session` it
 resolves against the slot the same way [`tab.expand_selection_at`
 above](#tabexpand_selection_at-test-only-gated) does.
-
-Implemented by both UIs.
 
 ### `project.create`
 
@@ -1340,9 +1307,8 @@ Response: `{"project": <Project>}` — `tabs` is empty.
 
 ### `project.ensure`
 
-Find the project with this exact name, or create it. Served by the iced
-UI and by a host session; the Swift Mac app has no case for this op and
-answers `unknown-op`.
+Find the project with this exact name, or create it. Served by the UI
+and by a host session.
 
 Request:
 ```json
@@ -1428,8 +1394,7 @@ Order is leftmost first. Ids not belonging to `project_id` are rejected
 with `invalid-param`. Tabs in the project not listed keep their
 relative order after the listed ones. Ids are the **canonical**
 spelling: a non-canonical integer (`"+4"`, `"04"`) is refused rather
-than normalized, on the iced UI socket, a session socket, and the
-Swift Mac socket alike.
+than normalized, on the UI socket and a session socket alike.
 
 Response: `{}`.
 
@@ -1746,10 +1711,8 @@ none — a headless embedder, or a session with no UI attached — sends
 nothing and still answers `{}`: a fire-and-forget no-op rather than an
 error.
 
-Implemented only by the iced UI (`crates/roost-iced/src/main.rs`'s
-second-launch path is the only sender); the Swift Mac app has no case
-for this op and answers `unknown-op` — its own single-instance path
-does not dial the socket.
+Implemented only by the UI (`crates/roost-iced/src/main.rs`'s
+second-launch path is the only sender).
 
 ### `app.screenshot`
 
@@ -1797,8 +1760,7 @@ Request: `{"params": {}}`.
 `terminal_top` and `terminal_font_family` are optional for wire compatibility
 (omitted, not `null`, when an adapter has nothing to report). The iced UI
 reports the exact application-owned top edge of its terminal viewport (the
-chrome-band height above it), always; the Mac UI reports the AppKit terminal
-view's top offset, measured from the content view's top edge. Consumers that
+chrome-band height above it), always. Consumers that
 require exact coordinates must reject a missing, non-finite, or non-positive
 value instead of copying a chrome-height constant. `terminal_font_family` is
 the resolved family the live terminal is actually rendering with
@@ -1821,15 +1783,14 @@ Accessibility frame, so a real click lands on a known cell without measuring
 pixels.
 
 `scale_factor` is the window's device pixels per logical point (`2.0` on a
-Retina display), optional in the same way: the iced UI always reports it, the
-Mac UI does not. A terminal's cell size in pixels is `round(cell_width ×
+Retina display), optional in the same way: the UI always reports it. A terminal's cell size in pixels is `round(cell_width ×
 scale_factor)` by `round(cell_height × scale_factor)`, at least 1. That is the
 size an in-process tab's terminal and PTY winsize state, what the terminal's
 size reports (CSI 14t/16t, mode 2048) quote, and the cell size the window
 advertises to a session whose tabs it sizes.
 
 `window_focused` and `native_focus_losses` are optional in the same way: the
-iced UI always reports them and the Mac UI does not. `window_focused` is the
+UI always reports them. `window_focused` is the
 focus the UI acts on: the last native focus event, or a later
 `app.set_window_focus`. A selection auto-scroll runs only while it is true.
 `native_focus_losses` counts the times the OS has taken focus from the window
@@ -1855,7 +1816,7 @@ this window's own client; it is omitted when nobody sizes the tab.
 ### `app.sidebar_dump`
 
 Read the sidebar's **last-rendered** agent rows, per project, plus the
-`show-sidebar-agents` toggle. Both UIs keep an explicit
+`show-sidebar-agents` toggle. The UI keeps an explicit
 `rendered_agents` cache per project, written in the same refresh pass
 that rebuilds the sidebar widgets; this op reads that cache rather than
 re-deriving the rows from the workspace snapshot, so a refresh a UI
@@ -1909,9 +1870,8 @@ retained, still under the incarnation that published them; a host that
 has never connected has an empty `projects`.
 
 `hosts` is **omitted entirely** when there are none, so read it as
-absent-tolerant: host sessions are iced-only, and the Swift Mac app
-answers this op without the field at all. A UI with no host sections
-therefore returns byte-identical bodies on both.
+absent-tolerant: a UI with no host sections returns the same body it
+did before host sessions existed.
 
 #### `sections` — the section strip, presence-derived (plan 063 §D2)
 
@@ -1965,12 +1925,12 @@ Each entry:
 
 `sections` is **empty, and so omitted**, whenever the sidebar draws its
 classic single sticky `PROJECTS` header instead of a strip:
-`in-process` with no saved hosts, which is also every Swift Mac reply —
-the same absent-tolerant contract `hosts` uses, for the same reason.
+`in-process` with no saved hosts — the same absent-tolerant contract
+`hosts` uses, for the same reason.
 
 #### `agent_panel` — the Agents panel (plan 080)
 
-Roost-Iced's sidebar lists its agents in one panel below the projects:
+The sidebar lists its agents in one panel below the projects:
 every agent on every host the sidebar draws, in the order the panel's
 sort puts them. `agent_panel` is that list, derived from the same row
 cache the panel paints from at the moment of the read — so a sort
@@ -2024,8 +1984,7 @@ change shows in the very next dump, with no event in between.
 
 Every text field is the full string, never the width-elided one the
 panel draws. Under `local-backend = session` the in-process workspace is
-not drawn, so its agents are not listed. The Swift Mac app has no panel
-and **omits** `agent_panel`, so read it as absent-tolerant.
+not drawn, so its agents are not listed.
 
 Ungated, read-only — always available, matching `app.window_metrics`.
 
@@ -2082,7 +2041,7 @@ Request: `{"params": {}}`. Response:
   the same notice comes back, so two dumps with the same `kind` and
   `subject` under different generations are two different showings.
 
-Ungated and read-only. The Swift Mac app answers `unknown-op`.
+Ungated and read-only.
 
 ### `app.notice_answer` *(test-only — gated)*
 
@@ -2109,8 +2068,6 @@ runs.
 | `session_ended` | `start` | Starts a new session on `subject`, the Connect the sidebar's ↻ runs. |
 | `local_session_cannot_start` | `reconnect` | Tries the local session again, the Connect the sidebar's ↻ runs. |
 | `local_session_cannot_start` | `use_in_process` | Raises the **Use in-process local tabs?** confirm card, as the palette's row does. Nothing switches until the card is confirmed. |
-
-The Swift Mac app answers `unknown-op`.
 
 ### `app.key_event` *(test-only — gated)*
 
@@ -2144,8 +2101,6 @@ The release follows the press at once, so the key is never left held
 and never repeats. The keystroke cannot drive an input method's
 composition; that path is `tab.feed_ime`'s.
 
-The Swift Mac app answers `unknown-op`.
-
 ### `app.set_window_focus` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
@@ -2166,13 +2121,9 @@ When mode 1004 (focus reporting) is negotiated, the UI writes `\x1b[I`
 channel; tests pick it up via
 [`tab.capture_pty_input`](#tabcapture_pty_input-test-only-gated).
 
-**The two UIs disagree with no active tab.** The iced UI still applies
-every other side effect of a focus change (workspace state, drag/IME/
-rename teardown) and answers `{}` regardless; the Swift app answers
-`not-found` ("no active tab to drive focus on"). A harness driving both
-UIs should open a tab before calling this op.
-
-Implemented by both UIs.
+**With no active tab** the UI still applies every other side effect of a
+focus change (workspace state, drag/IME/rename teardown) and answers
+`{}`.
 
 ### `app.cursor_shape`
 
@@ -2194,8 +2145,6 @@ params envelope is empty and strict. `internal: no UI attached` with no
 UI behind the socket. Used by the e2e suite to assert an OSC 22 request
 actually applied.
 
-Implemented by both UIs.
-
 ### `app.active_terminal_focused`
 
 Ungated read of whether the active tab's terminal currently owns the
@@ -2211,9 +2160,6 @@ Request: `{"params": {}}`. Response:
 ```
 
 `internal: no UI attached` with no UI behind the socket.
-
-Implemented only by the iced UI; the Swift Mac app has no case for this
-op and answers `unknown-op`.
 
 ### `app.selected_tab_id`
 
@@ -2234,17 +2180,11 @@ take (plan 063 §D10); see [A UI socket under `local-backend =
 session`](#a-ui-socket-under-local-backend-session). `internal: no UI
 attached` with no UI behind the socket.
 
-Implemented only by the iced UI; the Swift Mac app has no case for this
-op and answers `unknown-op`.
-
 ### `app.render_stats` *(iced UI only)*
 
 Read the running UI's render-path counters. This is the only way to
 measure the real draw path: `TerminalWidget::draw` needs a live
 renderer, which unit tests cannot construct.
-
-Implemented by the iced UI; the Swift Mac app has no case for this op
-and answers `unknown-op`.
 
 Request: `{"params": {"reset": false}}`. `reset` defaults to `false`,
 so `{"params": {}}` — or no `params` at all — is a plain read.
@@ -2291,8 +2231,7 @@ CLI: `roostctl render-stats [--reset]`.
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
 Without it the server returns `not-enabled`. Reads the macOS Dock
-tile's live badge label — the parity port of `App.swift`'s
-`refreshDockBadge()`, which mirrors the notification-inbox count onto
+tile's live badge label — the UI mirrors the notification-inbox count onto
 `NSApp.dockTile.badgeLabel` and writes `nil` at zero.
 
 Request: `{"params": {}}`. Response:
@@ -2309,9 +2248,8 @@ write reached the Dock. Because the badge write rides the update loop
 asynchronously, callers poll rather than reading once —
 `tools/roosttest/test_dock_badge.py` is the reference use.
 
-Implemented only by the iced UI on macOS. The iced UI on Linux answers
-`not-implemented`, and the Swift Mac app has no case for it at all, so
-its dispatcher answers `unknown-op`. There is no Dock off macOS, and
+Implemented only on macOS. The Linux UI answers
+`not-implemented`. There is no Dock off macOS, and
 answering a plausible `null` there would read as "the badge is cleared"
 and pass a test that never ran.
 
@@ -2319,7 +2257,7 @@ and pass a test that never ran.
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
 Without it the server returns `not-enabled`. Reads back the macOS
-iced UI's live native menu bar — walks the actual `NSApp.mainMenu`
+UI's live native menu bar — walks the actual `NSApp.mainMenu`
 AppKit holds, not a re-derivation from the keybind table, so the
 e2e suite can assert table↔menu agreement rather than trusting the
 menu-building code to have gotten it right.
@@ -2430,7 +2368,7 @@ Request: `{"params": {}}`. Response:
 `framework_loaded` is whether `Contents/Frameworks/Sparkle.framework/
 Sparkle` was found beside the executable and `dlopen`ed — false for
 every bare-binary build, because the framework only ever ships inside
-`Roost-Iced.app`. `updater` is `"started"` once `-startUpdater:`
+`Roost.app` (or the dev `Roost-Iced.app`). `updater` is `"started"` once `-startUpdater:`
 succeeded and `"unavailable"` otherwise, with `reason` carrying the
 why (no framework, a refused start). `last_check` is `null` until a
 check completes; its `outcome` is `"found"` (a newer version is in the
@@ -2477,9 +2415,8 @@ Implemented only by the iced UI on macOS, same as `app.menu_dump`.
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
 Without it the server returns `not-enabled`. Reads back the calling
-UI's `UNUserNotificationCenter` backend state — the iced UI from
-`crates/roost-iced/src/macos/notifications.rs`, the Swift app from
-`DesktopNotifications.status()` in `mac/Sources/Roost/DesktopNotifications.swift`.
+UI's `UNUserNotificationCenter` backend state, from
+`crates/roost-iced/src/macos/notifications.rs`.
 
 Request: `{"params": {}}`. Response:
 
@@ -2492,19 +2429,12 @@ installed — a bundled launch that has reached `window_opened` — and
 `"unavailable"` otherwise: every bare-binary build (no app bundle, so
 UN is never touched), and a bundled app before its first window opens.
 `reason` names why it is unavailable (`"not running from an app
-bundle"`, `"window not opened yet"`), or `null` once available. The
-Swift app has no such gate — its `UNUserNotificationCenter` delegate is
-installed at construction, and a build that could not do that would
-have aborted at launch rather than produced a running process to query
-— so it always reports `backend: "available"` with a `null` `reason`.
-`authorized` is the user's answer to the authorization prompt on both
-UIs, always `false` while `backend` is `"unavailable"` — CI's TCC
+bundle"`, `"window not opened yet"`), or `null` once available.
+`authorized` is the user's answer to the authorization prompt, always `false` while `backend` is `"unavailable"` — CI's TCC
 authorization state is unknowable, so the automated suite never asserts
 this `true`; the real prompt/click is the morning checklist (#285).
 
-Implemented by both UIs, macOS only — unlike `app.menu_dump` above and
-the other macOS-gated ops around it, which are iced only and have no
-Swift counterpart.
+Implemented on macOS only.
 
 ### `app.secure_input` *(test-only — gated)*
 
@@ -2549,8 +2479,7 @@ reads as stale here.
 
 Answered by the iced UI on every OS. Off macOS every field is `false`:
 Secure Keyboard Entry does not exist there, and the
-`toggle_secure_input` action does nothing. The Swift Mac app answers
-`unknown-op`.
+`toggle_secure_input` action does nothing.
 
 ### Notification raise test ops (`app.notification_activate` / `app.last_activation`) *(test-only — gated)*
 
@@ -2601,8 +2530,6 @@ answered.
 The focus request still follows in every case, and is what raises an
 X11 or macOS window.
 
-Implemented by the iced UI only; the Swift app answers `unknown-op`.
-
 ### `window.resize` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
@@ -2614,8 +2541,7 @@ pinned without a real pointer or window-manager event.
 Request: `{"params": {"width": 1100.0, "height": 700.0}}`. Response: `{}`.
 
 `width` / `height` are the window's logical **content** size (matches
-iced's `set_inner_size`; the Mac handler converts to the outer frame so
-both UIs land on the same content rect for the same call). Both must be
+iced's `set_inner_size`). Both must be
 finite and `> 0` — `invalid-param` otherwise, checked before the gate,
 so a malformed size is rejected the same way whether or not test mode
 is on.
@@ -2628,8 +2554,6 @@ event afterward remains authoritative if one arrives.
 Under `local-backend = session` this stays UI-owned — the window
 belongs to this process, not the slot; see [A UI socket under
 `local-backend = session`](#a-ui-socket-under-local-backend-session).
-
-Implemented by both UIs.
 
 ### `sidebar.set_width` *(test-only — gated)*
 
@@ -2651,8 +2575,7 @@ values are rejected with `invalid-param` before reaching the UI.
 While the sidebar is collapsed the op still succeeds: it persists the
 width and updates what expanding will reveal. `app.window_metrics`
 reports a collapsed sidebar as `sidebar_width < 1.0` until it is
-expanded: the iced UI reports a literal `0.0`, while the Mac UI reports
-the collapsed pane's real frame width. Assert `< 1.0`, not `== 0.0`.
+expanded. Assert `< 1.0`, not `== 0.0`.
 
 Two authority caveats, mirroring `window.resize`'s "the compositor
 remains authoritative" stance: the persisted value is the *requested*
@@ -2687,8 +2610,6 @@ The fraction is kept as given within that band: the floors listed under
 how it is drawn, so a short window shows less than a stored `0.85`. The op
 ends a divider drag in flight, committing one that has moved first, so the
 op's fraction stands until the next press.
-
-Implemented by the iced UI only; the Swift app answers `unknown-op`.
 
 ### Host bootstrap test ops (`app.dialog_dump` / `app.dialog_answer` / `app.keybind_dispatch`) *(test-only — gated)*
 
@@ -2935,8 +2856,6 @@ owning input are each refused `invalid-param`. On macOS the menu is
 the native popup, which no test op opens, so the op answers
 `not-supported` there.
 
-The Swift Mac app answers `unknown-op` to all three.
-
 ### `agent.set_hooks`
 
 Set *this* machine's own `agent-hooks` key — the consent dialog's Apply
@@ -3004,17 +2923,8 @@ reads that same `config.conf`. Raising it would be the UI raising
 itself — and since a raise can only ever widen, a local "switch codex
 off" would come straight back on that session's next connect.
 
-Served by the UI socket only, by both UIs. The Linux (iced) UI links
-the install engine and does the work in process. The Mac app has no
-Swift binding for it, so it spawns `roostctl agent set --local <list|off>
---json` — the same binary, the same `config.conf`, the same state record
-— and answers from that JSON, with this app's own `HOME` and
-`ROOST_CONFIG` handed to the child so it cannot resolve a different
-config file. `hosts` is always `[]` there: the Mac app holds no host
-connections and answers `unknown-op` to every `host.*` op. One further
-consequence of spawning the CLI: its `wired` is *this run's* writes
-rather than the record's never-announced list, because that is what the
-CLI can honestly report.
+Served by the UI socket only. The UI links the install engine and does
+the work in process.
 
 ### Command palette (`palette.*`)
 
@@ -3065,8 +2975,8 @@ render, so this row can never disagree with them. `metrics_text` is
 present once resolved — `"—"` for a clean repo, a non-repo cwd, or any
 probe failure/timeout; otherwise `"<n>f +<adds> -<dels>"` (minus is
 ASCII `-`) — so pending vs. resolved is observable on the wire. Activating
-an `agent:<id>` row jumps to that tab (Roost-Iced leaves a collapsed
-sidebar collapsed; the Swift app reveals it); the empty-state row
+an `agent:<id>` row jumps to that tab (a collapsed sidebar stays
+collapsed); the empty-state row
 (`"agents:empty"`) is not actionable.
 
 | Op | Request params | Notes |
@@ -3149,7 +3059,7 @@ state live on the UI side.
 
 Client-side saved-host bookkeeping for [host sessions](../guides/host-sessions.md) — a UI-only op family, like `palette.*`: it manages `Workspace.hosts` (the `{id, label, target, last_connected}` array persisted in the UI's own `state.json`, plan 037 §3.5), not a session's own workspace. `host.connect` / `host.disconnect` / `host.status` additionally reach into the UI's live connection set, so they answer with connection state rather than only a registry mutation — and they require a UI to be attached at all (`internal: no UI attached` on a headless engine embedder, the same honest failure every other `UiRequest`-backed op gives).
 
-A session socket answers `unknown-op` for every verb here — the same "no shadow registry in the daemon" rule `host.add --verify`'s own dial depends on. So does the Swift Mac app's socket: **`roostctl host *` against `--target mac` is a documented, permanent `unknown-op`**, not a gap to be filled — host sessions are iced-only (plan 037 §3.1), and the Swift app never grows this surface.
+A session socket answers `unknown-op` for every verb here — the same "no shadow registry in the daemon" rule `host.add --verify`'s own dial depends on.
 
 | Op | Request params | Notes |
 |---|---|---|
@@ -3473,8 +3383,8 @@ what `roostctl wait` does:
 1. **Pick the socket.** Call [`identify`](#identify) on the UI socket. If
    `local_session_socket` is present, use that socket for everything
    below; else, if `ops` names `events.subscribe`, use the UI socket;
-   else the server has no stream (the Swift Mac app, an older Roost):
-   poll `tab.list`.
+   else the server has no stream (an older Roost): stop — there is
+   nothing to follow.
 2. **Subscribe first**, on connection A. Keep the ack's `revision` and
    `session_id`. A subscribe refused `busy` met a local-backend switch:
    poll `identify` until `local_backend_switch` is absent, then start
@@ -4167,8 +4077,7 @@ asked. `tab_id` is a bare id (the local session's tab under
 its own grid, `{"cols", "rows"}` like any other: it always follows this
 window. An id no tab has is `not-found`. It is the op behind the tab band's **Take
 size** button, the palette's **Take Size** and the `take_size` keybind
-action, and `roostctl tab take-size` sends it. The Swift app answers
-`unknown-op`.
+action, and `roostctl tab take-size` sends it.
 
 ### `tab.release_size`
 
@@ -4373,10 +4282,7 @@ masked by a later one: protocol, then the typed decode, then
 then an eligible one, then the grid, then `client_id`, then the
 session's connection bound, and only then the size decision.
 
-**Scope:** this sniff exists on Rust-served sockets only. The Mac UI's
-Swift IPC server has no data plane and is untouched — a handshake line
-there gets the `parse-error` it always got. A Rust **UI** socket
-recognizes the shape and answers `not-supported`, which is a different
+**Scope:** a **UI** socket recognizes the shape and answers `not-supported`, which is a different
 and more useful thing to tell a client than "your JSON is bad".
 
 The reply is one JSON line. Accepted:

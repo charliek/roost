@@ -21,9 +21,8 @@ first would strand the other. `util.runs_alone` enforces this itself,
 shared with `test_exit_on_empty.py`, rather than trusting the
 Makefile/ci.yml wiring to keep them apart.
 
-darwin+iced only: `app.menu_activate` is macOS-iced-only (plan 028
-§ 3.12) — the experimental Roost-Iced.dmg build. Swift Mac and
-Linux iced both skip.
+macOS only: `app.menu_activate` drives the native menu bar (plan 028
+§ 3.12), which Linux does not have.
 """
 
 from __future__ import annotations
@@ -55,7 +54,7 @@ def test_menu_quit_ends_the_app_cleanly(roost, project, target, request):
     live layout (the `project` fixture's throwaway project), not a torn
     or stale file.
     """
-    if sys.platform != "darwin" or target != "iced":
+    if sys.platform != "darwin":
         pytest.skip(
             "app.menu_activate is macOS-iced-only (plan 028 § 3.12)"
         )

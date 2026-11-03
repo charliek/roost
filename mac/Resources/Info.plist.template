@@ -2,54 +2,53 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Info.plist for Roost.app — Phase 6a M7.
+  Info.plist for the iced macOS app, in both of the identities
+  `mac/scripts/bundle-iced.sh` assembles (ROOST_BUNDLE_IDENTITY):
 
-  `mac/scripts/bundle.sh` copies this file into the .app bundle and
-  substitutes @VERSION@ with the value of `mac/Package.swift`'s
-  product version (or the goal-doc default 0.1.0 until we cut a real
-  release tag in Phase 8).
+    production  Roost.app — ai.stridelabs.Roost / Roost. The shipped
+                app. Its id is the one the Swift Roost.app used, so it
+                updates that app in place and resolves the same `Mac`
+                profile paths (roost-ipc's BundleProfile).
+    dev         Roost-Iced.app — ai.stridelabs.Roost.iced / Roost-Iced.
+                Runs beside an installed Roost.app: the id, the Dock name
+                and the process name all differ, so `pgrep -x Roost` never
+                matches it.
 
-  Sparkle auto-update (issue #122):
-    * SUFeedURL       — the appcast on GitHub Pages.
-    * SUPublicEDKey   — the EdDSA public key updates are verified
-                        against. The matching private key is a repo
-                        secret (SPARKLE_ED_PRIVATE_KEY) used by
-                        release.yml to sign each DMG. Sparkle requires
-                        this key to be present in EVERY shipped build:
-                        an update whose new bundle lacks the key is
-                        rejected ("public key found in old bundle but
-                        not in new update").
-    * SUEnableAutomaticChecks — false for now so background checks
-                        never pop an "update available" panel during
-                        the release pipeline's E2E run (the E2E bundle
-                        can be older than the published appcast). Users
-                        invoke updates via the "Check for Updates…"
-                        menu item; revisit enabling silent checks once
-                        E2E launches Roost with checks disabled.
+  `bundle-lib.sh`'s roost_stamp_plist fills the three `@`-wrapped
+  placeholders below — VERSION (the workspace version, see
+  `roost_workspace_version`), BUNDLE_ID and APP_NAME — and fails on any
+  placeholder it leaves behind.
+
+  Sparkle: the template carries NO SUFeedURL and NO SUPublicEDKey.
+  bundle-iced.sh inserts both from ROOST_BUNDLE_SPARKLE_FEED_URL +
+  ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY (both or neither; see
+  roost_insert_sparkle_feed in bundle-lib.sh). A production build
+  requires them; a dev build without them is feedless and never checks.
+  SUEnableAutomaticChecks is present and false: with the updater
+  instantiated, an ABSENT key would trigger Sparkle's first-run "check
+  automatically?" permission prompt — the explicit false suppresses
+  scheduled checks and that prompt; checks stay strictly user-invoked.
 
   Device-permission purpose strings (NSMicrophone/Camera/AppleEvents
   UsageDescription): paired with the capture entitlements in
-  Roost.entitlements. macOS shows these when a program hosted in a Roost
-  tab requests the microphone/camera (the request is attributed to Roost,
-  the TCC responsible app). Both must be present — the entitlement to
-  permit the request under the hardened runtime, the string for the
-  prompt — matching ghostty and cmux.
-
-  Out of scope for M7 (separate Phase 8 work):
-    * Code-signing certificate / `LSApplicationCategoryType`
+  Roost.entitlements. macOS shows these when a program hosted in a
+  tab requests the microphone/camera (the request is attributed to this
+  app, the TCC responsible app). Both must be present — the entitlement
+  to permit the request under the hardened runtime, the string for the
+  prompt.
 -->
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleIdentifier</key>
-  <string>ai.stridelabs.Roost</string>
+  <string>@BUNDLE_ID@</string>
   <key>CFBundleName</key>
-  <string>Roost</string>
+  <string>@APP_NAME@</string>
   <key>CFBundleDisplayName</key>
-  <string>Roost</string>
+  <string>@APP_NAME@</string>
   <key>CFBundleExecutable</key>
-  <string>Roost</string>
+  <string>@APP_NAME@</string>
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleIconName</key>
@@ -72,19 +71,15 @@
   <true/>
   <key>LSUIElement</key>
   <false/>
+  <key>SUEnableAutomaticChecks</key>
+  <false/>
   <key>NSHumanReadableCopyright</key>
   <string>Copyright © 2026 Charlie Knudsen. MIT-licensed.</string>
   <key>NSMicrophoneUsageDescription</key>
-  <string>A program running in Roost would like to use the microphone.</string>
+  <string>A program running in @APP_NAME@ would like to use the microphone.</string>
   <key>NSCameraUsageDescription</key>
-  <string>A program running in Roost would like to use the camera.</string>
+  <string>A program running in @APP_NAME@ would like to use the camera.</string>
   <key>NSAppleEventsUsageDescription</key>
-  <string>A program running in Roost would like to use AppleScript.</string>
-  <key>SUFeedURL</key>
-  <string>https://charliek.github.io/roost/appcast.xml</string>
-  <key>SUPublicEDKey</key>
-  <string>P2VexGJQtk6cptdgKi3skMV9+WcmcZMAKjSPrKhylJA=</string>
-  <key>SUEnableAutomaticChecks</key>
-  <false/>
+  <string>A program running in @APP_NAME@ would like to use AppleScript.</string>
 </dict>
 </plist>

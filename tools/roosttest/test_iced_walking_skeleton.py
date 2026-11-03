@@ -19,8 +19,13 @@ import pytest
 from client import Roost, scaled_timeout
 from conftest import skip_on_live_wayland_desktop
 import ui
-from test_sidebar_collapse_persistence import _toggle_to_collapsed, _toggle_to_visible
-from util import drain_until_match, wait_tab_attached, wait_tab_quiet
+from util import (
+    drain_until_match,
+    set_sidebar_collapsed,
+    show_sidebar,
+    wait_tab_attached,
+    wait_tab_quiet,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
 import pngtool  # noqa: E402 — pure stdlib PNG decoder, imported not shelled out
@@ -32,12 +37,6 @@ TERMINAL_PADDING = 0
 ORIGIN_MARKER = (17, 201, 93)
 
 
-@pytest.fixture(autouse=True)
-def _iced_only(target):
-    if target != "iced":
-        pytest.skip("Iced walking-skeleton milestone is specific to the iced adapter")
-
-
 # Only the renderer-geometry test below reads pixels; the other three in
 # this module assert over IPC/log state and are unaffected by the
 # compositor (issue #488).
@@ -46,9 +45,9 @@ _skip_wayland = skip_on_live_wayland_desktop(
 )
 
 
-def test_iced_identity_and_real_pty(roost, project, target):
+def test_iced_identity_and_real_pty(roost, project):
     identity = roost.identify()
-    assert identity["app_id"] == "ai.stridelabs.Roost.iced"
+    assert identity["app_id"] == ui.iced_app_id()
 
     tab = roost.open_tab(project, cwd="/tmp", title="Iced PTY")
     marker = f"ICED_WALK_{uuid.uuid4().hex[:8]}"
@@ -102,7 +101,7 @@ def test_iced_terminal_widget_uses_its_layout_origin_and_full_extent(
     # not serialize with PTY output still in flight, so seeding at attach can
     # land ahead of the shell's prompt and be overwritten by it.
     wait_tab_quiet(roost, tab)
-    _toggle_to_visible(roost)
+    show_sidebar(roost)
     # The sidebar transition re-grids the PTY, which can repaint the prompt
     # after the wait above — quiet again so the seed can't be overwritten.
     wait_tab_quiet(roost, tab)
@@ -254,10 +253,10 @@ def test_iced_terminal_widget_uses_its_layout_origin_and_full_extent(
 
     try:
         assert_geometry(collapsed=False)
-        _toggle_to_collapsed(roost)
+        set_sidebar_collapsed(roost, True)
         assert_geometry(collapsed=True)
     finally:
-        _toggle_to_visible(roost)
+        show_sidebar(roost)
 
 
 def test_iced_screenshot_scale_and_queued_clients(roost, target):

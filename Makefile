@@ -1,14 +1,13 @@
 # Roost — common dev tasks. Run `make` (or `make help`) to list them.
 #
-# Two native UIs around libghostty-vt: Swift + AppKit (mac/) and Rust +
-# iced (crates/roost-iced, what the Linux package ships), plus the
-# roostctl CLI. See docs/development/vision.md for the architecture +
-# north star.
+# One desktop UI around libghostty-vt: Rust + iced (crates/roost-iced), the
+# Linux package and the macOS Roost.app (packaged by mac/scripts), plus the
+# roostctl CLI and the roost-session daemon. See docs/development/vision.md
+# for the architecture + north star.
 
 .DEFAULT_GOAL := help
 
 MAC_DIR     := mac
-APP         := $(MAC_DIR)/build/Roost.app
 GHOSTTY_LIB := third_party/ghostty/out/lib/libghostty-vt.a
 
 # ---- help -------------------------------------------------------------
@@ -32,48 +31,39 @@ ghostty-force:  ## Rebuild libghostty-vt from scratch (after a Ghostty SHA bump)
 	third_party/ghostty/build.sh --force
 
 # File rule: bootstraps libghostty-vt on a fresh clone so the first
-# `make build` / `make build-mac` just works.
+# `make build` / `make bundle-iced` just works.
 $(GHOSTTY_LIB):
 	third_party/ghostty/build.sh
 
 # ---- build ------------------------------------------------------------
 
-.PHONY: build build-iced build-mac bundle bundle-iced build-all
+.PHONY: build build-iced bundle-iced build-all
 build: $(GHOSTTY_LIB)  ## cargo build the workspace (Iced UI + roostctl)
 	cargo build
 
 build-iced: $(GHOSTTY_LIB)  ## Build the isolated Iced UI binary
 	cargo build -p roost-iced
 
-build-mac: $(GHOSTTY_LIB)  ## swift build the Mac app
-	cd $(MAC_DIR) && swift build
-
-bundle: $(GHOSTTY_LIB)  ## Build + assemble Roost.app (debug)
-	cd $(MAC_DIR) && ./scripts/bundle.sh debug
-
-bundle-iced: $(GHOSTTY_LIB)  ## Build + assemble Roost-Iced.app (debug)
+bundle-iced: $(GHOSTTY_LIB)  ## Build + assemble the dev Roost-Iced.app (debug; macOS)
 	cd $(MAC_DIR) && ./scripts/bundle-iced.sh debug
 
-build-all: build bundle  ## Build both UIs + the Mac bundle
+build-all: build bundle-iced  ## Build the workspace + the dev macOS bundle
 
 # ---- run --------------------------------------------------------------
 
-.PHONY: run-iced run-mac
+.PHONY: run-iced
 run-iced: build-iced  ## Launch the Iced UI (Roost-iced profile)
 	ROOST_BUNDLE_PROFILE=iced ./target/debug/roost-iced
 
-run-mac: bundle  ## Launch the bundled Mac app
-	open $(APP)
-
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust which-runner test-iced test-mac test-harness test-linux-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-local-spawn e2e-host-local-spawn-ci e2e-host-localhost e2e-host-localhost-ci e2e-local-backend e2e-local-backend-ci e2e-old-session e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle e2e-iced-real-input-mac mac-real-input-check smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust which-runner test-iced test-harness test-linux-scripts test-mac-scripts e2e e2e-iced e2e-iced-exit e2e-iced-renderer e2e-iced-menu-quit e2e-iced-clipboard e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-local-spawn e2e-host-local-spawn-ci e2e-host-localhost e2e-host-localhost-ci e2e-local-backend e2e-local-backend-ci e2e-old-session e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-iced-bundle e2e-iced-sparkle e2e-iced-real-input-mac mac-real-input-check smoke-iced test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
-ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_notification_raise.py tools/roosttest/test_agent_lifecycle.py tools/roosttest/test_agent_hooks.py tools/roosttest/test_agent_hooks_dialog.py tools/roosttest/test_agent_palette.py tools/roosttest/test_agent_panel.py tools/roosttest/test_doctor.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_window_geometry_persistence.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_palette_256.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_cursor_pixels.py tools/roosttest/test_kitty_pixels.py tools/roosttest/test_kitty_images.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_tab_dump_scrollback.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py tools/roosttest/test_shell_integration.py tools/roosttest/test_newtab_cwd.py tools/roosttest/test_boot_failure.py tools/roosttest/test_quit_with_foreground_job.py tools/roosttest/test_open_external.py tools/roosttest/test_context_menu.py tools/roosttest/test_password_input.py tools/roosttest/test_secure_input.py tools/roosttest/test_device_queries.py tools/roosttest/test_selection_autoscroll.py tools/roosttest/test_program_status.py tools/roosttest/test_memory_usage.py tools/roosttest/test_tab_env.py
-# `test_tab_dump_scrollback.py` needs no lane entry for Mac: `e2e-mac`
-# collects the whole `tools/roosttest` directory (minus the two daemon
-# markers), so a new UI-socket module runs on both required gates the
-# moment it exists — this list is the iced half, which is curated.
+ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_notification_raise.py tools/roosttest/test_agent_lifecycle.py tools/roosttest/test_agent_hooks.py tools/roosttest/test_agent_hooks_dialog.py tools/roosttest/test_agent_palette.py tools/roosttest/test_agent_panel.py tools/roosttest/test_doctor.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_sidebar_agents.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_window_geometry_persistence.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_palette_256.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_cursor_pixels.py tools/roosttest/test_kitty_pixels.py tools/roosttest/test_kitty_images.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_tab_dump_scrollback.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py tools/roosttest/test_shell_integration.py tools/roosttest/test_newtab_cwd.py tools/roosttest/test_boot_failure.py tools/roosttest/test_quit_with_foreground_job.py tools/roosttest/test_open_external.py tools/roosttest/test_context_menu.py tools/roosttest/test_password_input.py tools/roosttest/test_secure_input.py tools/roosttest/test_device_queries.py tools/roosttest/test_selection_autoscroll.py tools/roosttest/test_program_status.py tools/roosttest/test_memory_usage.py tools/roosttest/test_tab_env.py
+# Curated: a new UI-socket module runs nowhere until it is listed here AND in
+# ci.yml's three functional steps (X11, Wayland, macOS) — which
+# tools/roosttest_unit/test_e2e_lists.py enforces, along with every module on
+# disk being in some lane.
 # `test_sparkle.py`'s two classes split by lane: the bare-binary class
 # runs here (no framework beside a cargo binary ⇒ updater unavailable)
 # and its bundle class self-skips — `make e2e-iced-sparkle` is where the
@@ -91,6 +81,9 @@ ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walkin
 # pasteboard, so `test_selection.py` belongs in the list above and runs
 # under headless Wayland too. Only files that read/write the real
 # clipboard go here.
+# The tiny-skia cells' whole lane (D8): every module of ICED_E2E_TESTS that
+# reads ICED_BACKEND or checks pixels. The full list runs on wgpu only.
+ICED_RENDERER_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_agent_panel.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_cursor_pixels.py tools/roosttest/test_kitty_pixels.py tools/roosttest/test_kitty_images.py tools/roosttest/test_ime.py
 ICED_CLIPBOARD_TESTS := tools/roosttest/test_osc52.py tools/roosttest/test_paste_files.py tools/roosttest/test_context_menu_clipboard.py
 # Its OWN invocation, never a member of ICED_E2E_TESTS: this module deletes
 # the last project, which now ends the app (plan 026 D8) — inside the shared
@@ -198,26 +191,24 @@ OLD_SESSION_E2E_TESTS := tools/roosttest/test_old_session.py
 # three share the incarnation probe that cannot tell two connected hosts'
 # tabs apart.
 BOOTSTRAP_E2E_TESTS := tools/roosttest/test_host_bootstrap.py
-# Every whole-directory pytest run must deselect BOTH daemon lanes: those
-# runs drive a UI, nothing in them builds `roost-session`, and the first
-# session or host-client case would therefore `cargo build` mid-test on a
-# shared runner. The Mac (Swift) app additionally answers `unknown-op` to
-# every `host.*` op, so the host-client lane could never pass there at all.
+# Every shared-UI pytest run must deselect BOTH daemon lanes: those runs
+# drive a UI, nothing in them builds `roost-session`, and the first session
+# or host-client case would therefore `cargo build` mid-test on a shared
+# runner.
 #
 # Expressed as MARKERS, not a path list, so the exclusion has one source of
 # truth — the same `session_daemon` marker `conftest.py` keys its "does this
-# invocation need a UI" decision off, plus `host_client`. A second module in
-# either lane needs no edit here or in the workflows.
+# invocation need a UI" decision off, plus `host_client`. A module that
+# lands in a curated list by mistake is still kept out of the shared lane.
 #
-# The curated iced lists (`e2e-iced`, `e2e-iced-ci`) carry it too, for the
-# one module with cases in both lanes (`test_password_input.py`).
+# The curated iced lists (`e2e-iced`, `e2e-iced-ci`) carry it for the one
+# module with cases in both lanes (`test_password_input.py`).
 #
 # MIRRORS (keep the expression identical, move together):
-#   * .github/workflows/ci.yml       — the `e2e-mac` job's pytest step, the
-#                                      three iced functional cells (X11,
-#                                      Wayland, macOS), and the macOS bundle
-#                                      / sparkle cells (which deselect only
-#                                      `host_client`)
+#   * .github/workflows/ci.yml       — the three iced functional cells
+#                                      (X11, Wayland, macOS), and the macOS
+#                                      bundle / sparkle cells (which
+#                                      deselect only `host_client`)
 #   * .github/workflows/release.yml  — "E2E against the release bundle"
 # Neither can reference a Makefile variable, so they restate the flag —
 # the same hand-mirrored-constant arrangement `smoke-deb`'s `expect_exec`
@@ -229,7 +220,7 @@ DAEMON_E2E_DESELECT := -m 'not session_daemon and not host_client'
 # resolve means a stray launch of this bundle can't reach anything.
 SPARKLE_TEST_PUBLIC_KEY := tools/roosttest/fixtures/sparkle/TEST-ONLY-public-ed-key.txt
 SPARKLE_TEST_PLACEHOLDER_FEED := http://127.0.0.1:1/placeholder
-test: test-rust test-mac test-harness test-linux-scripts test-mac-scripts  ## All unit/integration tests (Rust + Swift + harness)
+test: test-rust test-harness test-linux-scripts test-mac-scripts  ## All unit/integration tests (Rust + harness + release scripts)
 
 # `cargo test` runs this workspace's 78 test binaries strictly one after
 # another, and the suite is mostly *asleep* — PTY children, timeout budgets,
@@ -272,9 +263,6 @@ which-runner:  ## Say which test runner `make test-rust` will use, and why it ma
 test-iced:  ## Iced unit tests (renderer + input + adapter)
 	cargo test -p roost-iced
 
-test-mac:  ## swift test (Mac)
-	cd $(MAC_DIR) && swift test
-
 test-harness:  ## Fast unit tests for target/path/capability harness wiring
 	python3 -m unittest discover -s tools/roosttest_unit -v
 
@@ -282,22 +270,15 @@ test-linux-scripts:  ## Shell tests for linux/scripts/*.sh release-artifact + CI
 	./linux/scripts/stage-session-artifact_test.sh
 	./linux/scripts/ci-apt-install_test.sh
 
-test-mac-scripts:  ## Shell tests for mac/scripts/notarize.sh against fake ditto/xcrun shims (no macOS needed)
+test-mac-scripts:  ## Shell tests for mac/scripts release helpers: notarize.sh and verify-sparkle-key.sh against fakes (no macOS needed; the key test needs uv)
 	./mac/scripts/notarize_test.sh
+	./mac/scripts/verify-sparkle-key_test.sh
 
-# `e2e` dispatches rather than running a bare full-dir suite: the full
+# `e2e` runs the curated lane rather than a bare full-dir suite: the full
 # `tools/roosttest` dir includes `test_exit_on_empty.py` / `test_menu_quit.py`,
-# which end the UI they drive (plan 026 D8 / plan 028 C3) — under the iced
-# default that would strand every module the session-scoped harness fixture
-# runs after them. `e2e-iced`'s `ICED_E2E_TESTS` curated list (below) is the
-# safe iced lane; `mac` still runs the full directory (nothing in it ends the
-# Mac app).
-e2e:  ## pytest E2E suite dispatch (ROOST_TARGET=mac|iced, default iced) -> e2e-mac or the curated e2e-iced lane
-	@case "$${ROOST_TARGET:-iced}" in \
-		mac) $(MAKE) e2e-mac ;; \
-		iced) $(MAKE) e2e-iced ;; \
-		*) echo "ROOST_TARGET=$${ROOST_TARGET} is not supported by 'make e2e' (want mac or iced)"; exit 1 ;; \
-	esac
+# which end the UI they drive (plan 026 D8 / plan 028 C3), and would strand
+# every module the session-scoped harness fixture runs after them.
+e2e: e2e-iced  ## pytest E2E suite: the curated e2e-iced lane
 
 # `roostctl` is built first because `tools/roosttest/util.py` only builds
 # one when the binary is *missing*: without this the lane either charges
@@ -310,6 +291,10 @@ e2e-iced:  ## Required functional E2E against Iced
 	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \
 	ROOST_TEST_MODE=1 uv run --group test pytest $$tests $(DAEMON_E2E_DESELECT) --roost-target iced
 
+e2e-iced-renderer:  ## Renderer-sensitive subset of the Iced E2E (fresh + isolated state); set ICED_BACKEND=tiny-skia|wgpu
+	cargo build -p roost-cli
+	ROOST_TEST_MODE=1 uv run --group test pytest $(ICED_RENDERER_E2E_TESTS) $(DAEMON_E2E_DESELECT) --roost-target iced --roost-fresh
+
 e2e-iced-exit:  ## Iced exit-on-empty E2E in its own lane (DESTRUCTIVE: force-quits a running Iced UI, and the UI it launches exits)
 	ROOST_TEST_MODE=1 uv run --group test pytest $(ICED_EXIT_E2E_TESTS) --roost-target iced --roost-fresh
 
@@ -318,9 +303,6 @@ e2e-iced-menu-quit:  ## Iced menu-Quit E2E in its own lane (DESTRUCTIVE: force-q
 
 e2e-iced-clipboard:  ## Native Iced clipboard/OSC E2E (macOS or Linux X11; not headless Wayland)
 	uv run --group test pytest $(ICED_CLIPBOARD_TESTS) --roost-target iced
-
-e2e-mac:  ## E2E against the Mac app
-	uv run --group test pytest tools/roosttest $(DAEMON_E2E_DESELECT) --roost-target mac
 
 # No display — the lane spawns daemons rather than windows — but it does
 # need libghostty-vt: `roost-session` enables `roost-engine/server-vt`,
@@ -446,19 +428,22 @@ e2e-iced-release-ci:  ## Release-profile Iced E2E gate: curated subset against a
 	done
 	ROOST_TEST_MODE=1 uv run --group test pytest $(ICED_RELEASE_E2E_TESTS) --roost-target iced --roost-fresh
 
-e2e-mac-ci:  ## Mac E2E at CI parity. DESTRUCTIVE: force-quits any running Roost.app
-	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest $(DAEMON_E2E_DESELECT) --roost-target mac --roost-fresh
-
-e2e-iced-bundle:  ## macOS-only: assemble Roost-Iced.app + run the curated bundle smoke against it (ROOST_ICED_APP)
-	@[ "$$(uname -s)" = "Darwin" ] || { echo "e2e-iced-bundle is macOS-only: it launches Roost-Iced.app via LaunchServices (open)"; exit 1; }
-	$(MAKE) bundle-iced
-	ROOST_ICED_APP=mac/build/Roost-Iced.app ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_menu_bar.py --roost-target iced --roost-fresh
+# ICED_APP names the bundle under test. The default dev Roost-Iced.app is
+# assembled first; any other bundle is driven as already built, e.g. a
+# production one: `make e2e-iced-bundle ICED_APP=mac/build/Roost.app
+# ROOST_TEST_ALLOW_PRODUCTION_IDENTITY=1` (outside CI the harness refuses
+# that identity without the opt-in — tools/roosttest/README.md).
+ICED_APP ?= mac/build/Roost-Iced.app
+e2e-iced-bundle:  ## macOS-only: run the curated bundle smoke against $(ICED_APP) (default: assemble the dev Roost-Iced.app first)
+	@[ "$$(uname -s)" = "Darwin" ] || { echo "e2e-iced-bundle is macOS-only: it launches the bundle via LaunchServices (open)"; exit 1; }
+	@if [ "$(ICED_APP)" = "mac/build/Roost-Iced.app" ]; then $(MAKE) bundle-iced; fi
+	ROOST_ICED_APP="$(ICED_APP)" ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_menu_bar.py --roost-target iced --roost-fresh
 
 e2e-iced-sparkle:  ## macOS-only: assemble a TEST-KEYED Roost-Iced.app + run the Sparkle E2E against a loopback appcast
 	@[ "$$(uname -s)" = "Darwin" ] || { echo "e2e-iced-sparkle is macOS-only: it launches Roost-Iced.app via LaunchServices (open)"; exit 1; }
 	@test -f $(SPARKLE_TEST_PUBLIC_KEY) || { echo "missing $(SPARKLE_TEST_PUBLIC_KEY)"; exit 1; }
-	ROOST_ICED_SPARKLE_FEED_URL=$(SPARKLE_TEST_PLACEHOLDER_FEED) \
-	ROOST_ICED_SPARKLE_ED_PUBLIC_KEY="$$(cat $(SPARKLE_TEST_PUBLIC_KEY))" \
+	ROOST_BUNDLE_SPARKLE_FEED_URL=$(SPARKLE_TEST_PLACEHOLDER_FEED) \
+	ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY="$$(cat $(SPARKLE_TEST_PUBLIC_KEY))" \
 		$(MAKE) bundle-iced
 	ROOST_ICED_APP=mac/build/Roost-Iced.app ROOST_TEST_MODE=1 \
 		uv run --group test pytest tools/roosttest/test_sparkle.py --roost-target iced --roost-fresh
@@ -483,16 +468,6 @@ mac-real-input-check:  ## macOS-only: can this Mac take real input now? (grants,
 smoke-iced:  ## Screenshot-driven UI smoke against a running Iced UI
 	tools/screenshot/smoke.sh iced
 
-smoke-mac:  ## Screenshot-driven UI smoke against a running Mac app
-	tools/screenshot/smoke.sh mac
-
-visual-parity:  ## DESTRUCTIVE: close live target UIs, then capture a hermetic comparison fixture
-	python3 tools/screenshot/parity.py
-
-smoke-mac-launch:  ## Clean-install launch check (bundles Roost.app, hides build-tree resources, asserts it starts)
-	./mac/scripts/bundle.sh debug
-	./mac/scripts/smoke-launch.sh
-
 test-iced-real-input: build-iced  ## Iced real clipboard input (self-contained Linux Xvfb+xdotool)
 	ROOST_REQUIRE_REAL_INPUT=1 uv run --group test python tools/input/linux/iced_clipboard_check.py
 
@@ -507,7 +482,7 @@ perf-render-stats:  ## Render-path counters for a running Iced UI (tools/perf/re
 
 # ---- code quality -----------------------------------------------------
 
-.PHONY: fmt fmt-check clippy themes-check check
+.PHONY: fmt fmt-check clippy check
 fmt:  ## Format Rust (cargo fmt --all)
 	cargo fmt --all
 
@@ -548,10 +523,7 @@ check-iced: fmt-check test-iced  ## Iced formatting, lint, tests, and dependency
 	@cargo tree -p roost-iced | grep -q 'swash v0.2.10 (.*third_party/swash)' || \
 		( echo "swash [patch.crates-io] not applied"; exit 1 )
 
-themes-check:  ## Assert the Rust + Mac bundled-theme copies are byte-identical
-	diff -r crates/roost-ui-model/src/resources/themes mac/Sources/Roost/Resources/themes
-
-check: fmt-check clippy themes-check test  ## Pre-push gate: fmt-check + clippy + themes-check + tests
+check: fmt-check clippy test  ## Pre-push gate: fmt-check + clippy + tests
 
 # ---- docs -------------------------------------------------------------
 
@@ -565,6 +537,6 @@ docs-serve:  ## Serve the docs locally with live reload
 # ---- clean ------------------------------------------------------------
 
 .PHONY: clean
-clean:  ## Remove build artifacts (cargo target, Roost.app, site-build)
+clean:  ## Remove build artifacts (cargo target, mac/build, site-build)
 	cargo clean
 	rm -rf $(MAC_DIR)/build site-build

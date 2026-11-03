@@ -5,8 +5,6 @@ clipboard queue, so this reads it back with `clipboard.dump` — which
 needs a clipboard the harness can own: the X11 lane and the macOS cell,
 not headless Wayland (`ICED_CLIPBOARD_TESTS`). The rest of the menu is
 `test_context_menu.py`.
-
-Skipped under `--roost-target mac`: the Swift app has no context-menu ops.
 """
 
 from __future__ import annotations
@@ -27,12 +25,6 @@ pytestmark = pytest.mark.skipif(
     not TEST_MODE,
     reason="the app.context_menu_* ops require ROOST_TEST_MODE=1",
 )
-
-
-@pytest.fixture(autouse=True)
-def _iced_only(target):
-    if target != "iced":
-        pytest.skip("the context-menu ops are iced's; Roost.app answers unknown-op")
 
 
 def _copied(roost, target: dict, action: str, expected: str) -> None:

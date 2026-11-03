@@ -4,10 +4,15 @@
 its module list. A module added to one place and not the other runs on some
 gates and silently not on others. Every list is located by name; one that is
 missing or parses empty is a failure, never an empty set.
+
+Every module on disk is in a lane, and every lane is executed (plan 089 D5):
+a Makefile list that no CI step runs, directly or through a `make` target,
+is a lane nothing gates.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 import unittest
 from pathlib import Path
@@ -19,17 +24,9 @@ ROOSTTEST = REPO / "tools" / "roosttest"
 
 MODULE = re.compile(r"tools/roosttest/test_\w+\.py")
 
-# macOS runs ICED_E2E_TESTS + ICED_CLIPBOARD_TESTS minus these. Neither has a
-# self-skip or marker that confines it to Linux: both docstrings say they run
-# on every target, and `git log -S` shows they entered the Linux lists first
-# and the macOS list never took them. The omission is historical, not a
-# recorded reason: they are exceptions here so the gap is explicit, and
-# closing it is a separate decision.
+# macOS runs ICED_E2E_TESTS + ICED_CLIPBOARD_TESTS minus these, each confined
+# to Linux by its own module-level skip.
 MACOS_EXCEPTIONS = {
-    # No Linux-only skip or marker; its Linux/macOS login-shell split asserts on sys.platform.
-    "tools/roosttest/test_shell_integration.py",
-    # No skip or marker; the module docstring says it is real on Linux and macOS.
-    "tools/roosttest/test_newtab_cwd.py",
     # `sys.platform != "linux"` module-level skip (/proc sweep, sun_path sizing).
     "tools/roosttest/test_boot_failure.py",
     # `sys.platform != "linux"` module-level skip (/proc sweep of the UI's processes).
@@ -38,6 +35,7 @@ MACOS_EXCEPTIONS = {
 
 # Makefile variables that name a dedicated lane, each run by its own invocation.
 DEDICATED_VARIABLES = {
+    "ICED_RENDERER_E2E_TESTS",
     "ICED_EXIT_E2E_TESTS",
     "ICED_MENU_QUIT_E2E_TESTS",
     "ICED_RELEASE_E2E_TESTS",
@@ -52,23 +50,23 @@ DEDICATED_VARIABLES = {
     "BOOTSTRAP_E2E_TESTS",
 }
 
-# Swift-only modules: `e2e-mac` collects the whole directory (Makefile
-# `e2e-mac`), so they need no list entry; the iced lanes do not run them.
-SWIFT_SWEEP_ONLY = {
-    "test_launcher",
-    "test_ordering",
-    "test_sidebar_agents",
-    "test_sidebar_collapse_persistence",
-    "test_sidebar_layout",
-    "test_terminal",
-    "test_test_ops",
-    "test_word_selection",
-}
-
 X11_STEP = "Run Iced functional E2E (Linux X11)"
 WAYLAND_STEP = "Run Iced functional E2E (Linux Wayland)"
 MACOS_STEP = "Run Iced functional E2E (macOS)"
 REAL_INPUT_TARGET = "e2e-iced-real-input-mac"
+RENDERER_STEPS = (
+    "Run Iced renderer E2E (Linux X11)",
+    "Run Iced renderer E2E (Linux Wayland)",
+    "Run Iced renderer E2E (macOS)",
+)
+RENDERER_TARGET = "e2e-iced-renderer"
+
+# Calls `screenshot` but asserts nothing about the picture, so the renderer is
+# irrelevant to it.
+RENDERER_EXEMPT = {
+    # An autouse fixture takes one screenshot only to know a window exists.
+    "tools/roosttest/test_notification_raise.py",
+}
 
 
 def logical_lines(text: str) -> list[str]:
@@ -155,6 +153,83 @@ def makefile_recipe_modules(target: str) -> list[str]:
     return parse_recipe_modules(MAKEFILE.read_text(), target)
 
 
+MAKE_CALL = re.compile(r"(?<![\w$-])make((?:\s+[a-z][a-z0-9-]*)+)")
+
+
+def parse_recipe_lists(text: str, target: str) -> list[str]:
+    """The `*_TESTS` variables a target's recipe references."""
+    lines = logical_lines(text)
+    start = next((i for i, line in enumerate(lines) if line.startswith(f"{target}:")), None)
+    if start is None:
+        raise AssertionError(f"Makefile has no target {target!r}")
+    names: list[str] = []
+    for line in lines[start + 1 :]:
+        if not line.startswith("\t"):
+            break
+        names += re.findall(r"\$[({]([A-Z][A-Z0-9_]*_TESTS)[)}]", line)
+    return names
+
+
+RUN_KEY = re.compile(r"^(\s*)(?:- )?run:\s*(.*)$")
+
+
+def run_block_lines(ci: str) -> list[str]:
+    """The lines of every step's `run:` script — the key's own line and the
+    block under it — and nothing else: a module named in a cache key's
+    `hashFiles(...)` or an `env:` value is not a module the step runs."""
+    lines: list[str] = []
+    indent: int | None = None
+    for line in ci.splitlines():
+        if indent is not None:
+            if not line.strip() or len(line) - len(line.lstrip()) > indent:
+                lines.append(line)
+                continue
+            indent = None
+        if match := RUN_KEY.match(line):
+            indent = len(match.group(1))
+            lines.append(match.group(2))
+    return lines
+
+
+def ci_executed_modules(ci: str, makefile: str) -> set[str]:
+    """Every module a CI step runs: named in a `run:` script outright, or
+    reached through a `make` target whose recipe names it or a list holding
+    it. Comments never count."""
+    lists = parse_makefile_lists(makefile)
+    executed: set[str] = set()
+    for line in run_block_lines(ci):
+        if line.lstrip().startswith("#"):
+            continue
+        code = re.split(r"\s#", line, maxsplit=1)[0]
+        executed |= set(MODULE.findall(code))
+        for call in MAKE_CALL.finditer(code):
+            for target in call.group(1).split():
+                executed |= set(parse_recipe_modules(makefile, target))
+                for name in parse_recipe_lists(makefile, target):
+                    if name not in lists:
+                        raise AssertionError(f"make {target} references an undefined {name}")
+                    executed |= set(lists[name])
+    return executed
+
+
+def reads_the_renderer(path: Path) -> bool:
+    """Whether a module's code (not its prose) selects the renderer by
+    `ICED_BACKEND` or calls a screenshot/pixel helper: `.screenshot(...)`,
+    the shared `_capture`, or `pngtool`."""
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Constant) and node.value == "ICED_BACKEND":
+            return True
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "screenshot":
+                return True
+            if isinstance(func, ast.Name) and func.id == "_capture":
+                return True
+        if isinstance(node, ast.Name) and node.id == "pngtool":
+            return True
+    return False
+
+
 def on_disk() -> set[str]:
     return {f"tools/roosttest/{path.name}" for path in ROOSTTEST.glob("test_*.py")}
 
@@ -211,6 +286,27 @@ class MakefileParserTests(unittest.TestCase):
         text = f"t:\n\tpytest {LANE} \\\n\t  {OTHER}\n"
         self.assertEqual(parse_recipe_modules(text, "t"), [LANE, OTHER])
 
+    def test_a_make_call_in_ci_executes_its_recipes_lists(self) -> None:
+        makefile = f"X_TESTS := {LANE}\nlane:\n\tpytest $(X_TESTS)\nother:\n\tpytest {OTHER}\n"
+        ci = "        run: make lane\n        # make other\n"
+        self.assertEqual(ci_executed_modules(ci, makefile), {LANE})
+        ci = "        run: >\n          xvfb-run -a\n          make other lane\n"
+        self.assertEqual(ci_executed_modules(ci, makefile), {LANE, OTHER})
+
+    def test_only_run_scripts_execute_a_module(self) -> None:
+        ci = (
+            "      - name: Cache\n"
+            "        with:\n"
+            f"          key: x-${{{{ hashFiles('{OTHER}') }}}}\n"
+            "      - name: Lane\n"
+            "        env:\n"
+            f"          NOTE: {OTHER}\n"
+            "        run: >\n"
+            f"          pytest {LANE}\n"
+            "        timeout-minutes: 5\n"
+        )
+        self.assertEqual(ci_executed_modules(ci, ""), {LANE})
+
     def test_ci_step_comments_do_not_count(self) -> None:
         text = (
             "      - name: Lane\n"
@@ -252,6 +348,42 @@ class ListTests(unittest.TestCase):
         expected = self.make("ICED_E2E_TESTS") | self.make("ICED_CLIPBOARD_TESTS")
         self.assertLane(MACOS_STEP, actual, expected - MACOS_EXCEPTIONS)
 
+    def test_the_renderer_lane_is_the_same_in_every_tiny_skia_step_and_the_target(self) -> None:
+        expected = self.make("ICED_RENDERER_E2E_TESTS")
+        for step in RENDERER_STEPS:
+            actual = self.nonempty_unique(step, ci_step_modules(step))
+            self.assertLane(step, actual, expected)
+        self.assertIn("ICED_RENDERER_E2E_TESTS", parse_recipe_lists(MAKEFILE.read_text(), RENDERER_TARGET))
+
+    def test_every_display_gated_step_names_its_renderer(self) -> None:
+        lines = CI.read_text().splitlines()
+        start = next(i for i, line in enumerate(lines) if line == "  iced-build-e2e:")
+        end = next(i for i in range(start + 1, len(lines)) if re.match(r"  [a-z][\w-]*:$", lines[i]))
+        name = None
+        gated: list[str] = []
+        for line in lines[start:end]:
+            if match := re.match(r"      - (?:name|uses): (.*)", line):
+                name = match.group(1)
+            if match := re.match(r"        if: (.*)", line):
+                condition = match.group(1)
+                gated_on = "matrix.display" in condition or "runner.os == 'macOS'" in condition
+                if gated_on and "matrix.renderer" not in condition:
+                    gated.append(str(name))
+        self.assertEqual(gated, [], "display-gated steps with no renderer condition: they run in the tiny-skia cells too")
+
+    def test_the_renderer_lane_is_a_subset_of_the_functional_lane(self) -> None:
+        self.assertLessEqual(self.make("ICED_RENDERER_E2E_TESTS"), self.make("ICED_E2E_TESTS"))
+
+    def test_every_renderer_sensitive_module_is_in_the_renderer_lane(self) -> None:
+        functional = self.make("ICED_E2E_TESTS") | self.make("ICED_CLIPBOARD_TESTS")
+        sensitive = {m for m in functional - RENDERER_EXEMPT if reads_the_renderer(REPO / m)}
+        self.assertTrue(sensitive, "the renderer-sensitivity detector matched nothing")
+        self.assertEqual(
+            sorted(sensitive - self.make("ICED_RENDERER_E2E_TESTS")),
+            [],
+            "modules that read ICED_BACKEND or check pixels, missing from ICED_RENDERER_E2E_TESTS",
+        )
+
     def test_the_macos_exceptions_are_real_modules_in_the_makefile(self) -> None:
         iced = self.make("ICED_E2E_TESTS")
         for module in MACOS_EXCEPTIONS:
@@ -272,10 +404,15 @@ class ListTests(unittest.TestCase):
         real_input = makefile_recipe_modules(REAL_INPUT_TARGET)
         self.assertEqual(real_input, ["tools/roosttest/test_real_input_mac.py"])
         classified |= set(real_input)
-        classified |= {f"tools/roosttest/{name}.py" for name in SWIFT_SWEEP_ONLY}
         disk = on_disk()
         self.assertEqual(sorted(disk - classified), [], "modules in no lane and no named class")
         self.assertEqual(sorted(classified - disk), [], "a list names a module that does not exist")
+
+    def test_every_module_on_disk_is_executed_by_ci(self) -> None:
+        executed = ci_executed_modules(CI.read_text(), MAKEFILE.read_text())
+        disk = on_disk()
+        self.assertEqual(sorted(disk - executed), [], "modules no CI step runs")
+        self.assertEqual(sorted(executed - disk), [], "ci.yml runs a module that does not exist")
 
 
 if __name__ == "__main__":

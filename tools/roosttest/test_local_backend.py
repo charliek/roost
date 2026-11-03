@@ -33,9 +33,8 @@ own session is then not merely left alone but unreachable.
 The import-time environment poisons every module imported after it in
 the same process, and this lane relaunches the UI under a *different*
 `local-backend` for most of its cases — which no other lane expects.
-`pytestmark = pytest.mark.host_client` keeps it out of whole-directory
-runs (and off the Swift target, which answers `unknown-op` to every
-`host.*` op).
+`pytestmark = pytest.mark.host_client` keeps it out of the shared-UI
+lanes.
 
 Condition waits only.
 """
@@ -1638,8 +1637,7 @@ def test_an_in_process_relaunch_keeps_the_tab_each_project_last_showed(lane: Lan
 
     `P1` is kept off the first row: the harness's readiness probe opens
     and closes a tab in the first project at every launch, which moves
-    that project's memory and the selection with it. The Swift half
-    (plan 072 C15) is not reachable from this lane, which is iced-only.
+    that project's memory and the selection with it.
     """
     dirs = {name: _ROOT / "d6" / name for name in ("a", "b", "c", "x")}
     for path in dirs.values():
@@ -2444,9 +2442,9 @@ def test_a_host_qualified_ref_is_never_re_addressed_to_the_slot(lane: Lane):
 #
 # Each case puts a recording relay (`relay.py`) between `roostctl` and the
 # socket it dials, so what the CLI *did* — which ops, on which connection —
-# is asserted, not inferred from timing. A `forced_poll` relay answers
-# `identify` the way the Mac app does, which is the forced-poll lane: the
-# same `wait`, against the same UI, taking its poll loop.
+# is asserted, not inferred from timing. A `no_stream` relay answers
+# `identify` the way a Roost with no stream does: the same `wait`, against
+# the same UI, is refused before it reads anything.
 
 
 def roostctl_in_background(*args: str) -> subprocess.Popen:
@@ -2477,89 +2475,54 @@ def reap(*procs: subprocess.Popen | None) -> None:
             proc.communicate()
 
 
-def test_a_wait_on_the_stream_never_dumps_and_the_forced_poll_lane_passes_the_same_wait(
-    lane: Lane,
-):
+def test_a_wait_on_the_stream_never_dumps_and_one_without_a_stream_is_refused(lane: Lane):
     """AC2: `wait --state` on an in-process UI's stream makes no `tab.dump`
-    call, and the same wait through a forced-poll relay polls `tab.list`
-    and passes too. Each lane then checks `--timeout 0` once: satisfied
-    exits 0, not satisfied exits 4 at once."""
-    roost = lane.start("in-process")
-    tab = roost.open_tab(int(roost.list()[0]["id"]), cwd="/tmp")
-    for lane_name, forced_poll in (("stream", False), ("poll", True)):
-        roost.set_state(tab, "running")
-        path = _ROOT / f"relay-{lane_name}.sock"
-        with Relay(ui.socket_path(lane.target), path, forced_poll=forced_poll) as relay:
-            waiting = roostctl_in_background(
-                "--socket", relay.path, "wait", "--tab", str(tab),
-                "--state", "idle", "--timeout", "60", "--json",
-            )
-            # Armed: the wait holds a snapshot that says `running`.
-            relay.wait_for_response("tab.list")
-            roost.set_state(tab, "idle")
-            out, err = finished(waiting)
-            assert waiting.returncode == 0, (lane_name, out, err)
-            answer = json.loads(out)
-            assert answer["tab_id"] == str(tab), answer
-            assert answer["satisfied"] == {"state": "idle", "text": None, "gone": None}, answer
-            assert isinstance(answer["after_ms"], int), answer
-
-            asked = relay.requests()
-            if forced_poll:
-                assert "events.subscribe" not in asked, asked
-                assert asked.count("tab.list") >= 2, asked
-            else:
-                assert "events.subscribe" in asked, asked
-                assert "tab.dump" not in asked, asked
-
-            once = ["--socket", relay.path, "wait", "--tab", str(tab), "--timeout", "0"]
-            held = roostctl(*once, "--state", "idle")
-            assert held.returncode == 0, (lane_name, held)
-            started = time.monotonic()
-            unheld = roostctl(*once, "--state", "needs_input", "--json")
-            assert unheld.returncode == 4, (lane_name, unheld)
-            assert json.loads(unheld.stderr)["error"]["code"] == "timeout", unheld
-            assert time.monotonic() - started < scaled_timeout(10.0), lane_name
-
-
-def test_a_wait_on_the_stream_sees_a_change_before_a_polling_wait_does(lane: Lane):
-    """AC1: an in-process UI-socket subscriber has the `tab.state_changed`
-    before a forced-poll control observes the change.
-
-    Both waits are armed on a `running` snapshot, the control with an
-    interval far longer than a stream needs. When the stream wait returns,
-    the control has still asked `tab.list` exactly once — the answer it is
-    sleeping on predates the change, so it has not observed it."""
+    call, and then checks `--timeout 0` once: satisfied exits 0, not
+    satisfied exits 4 at once. The same waits through a `no_stream` relay
+    exit 1 `unsupported` off the one `identify` each, even the one whose
+    condition already holds — `wait` does not poll."""
     roost = lane.start("in-process")
     tab = roost.open_tab(int(roost.list()[0]["id"]), cwd="/tmp")
     roost.set_state(tab, "running")
-    interval = scaled_timeout(8.0)
-    argv = ["wait", "--tab", str(tab), "--state", "idle", "--timeout", "120"]
-    socket = ui.socket_path(lane.target)
-    with (
-        Relay(socket, _ROOT / "relay-stream.sock") as streamed,
-        Relay(socket, _ROOT / "relay-poll.sock", forced_poll=True) as polled,
-    ):
-        polling = roostctl_in_background(
-            "--socket", polled.path, *argv, "--interval-ms", str(int(interval * 1000))
+    with Relay(ui.socket_path(lane.target), _ROOT / "relay-stream.sock") as relay:
+        waiting = roostctl_in_background(
+            "--socket", relay.path, "wait", "--tab", str(tab),
+            "--state", "idle", "--timeout", "60", "--json",
         )
-        streaming = roostctl_in_background("--socket", streamed.path, *argv)
-        try:
-            polled.wait_for_response("tab.list")
-            streamed.wait_for_response("tab.list")
-            changed = time.monotonic()
-            roost.set_state(tab, "idle")
-            out, err = finished(streaming)
-            took = time.monotonic() - changed
-            assert streaming.returncode == 0, (out, err)
-            assert polling.poll() is None, "the poll control finished first"
-            assert polled.requests().count("tab.list") == 1, (
-                f"the poll control asked again before the stream wait returned: "
-                f"{polled.requests()}"
+        # Armed: the wait holds a snapshot that says `running`.
+        relay.wait_for_response("tab.list")
+        roost.set_state(tab, "idle")
+        out, err = finished(waiting)
+        assert waiting.returncode == 0, (out, err)
+        answer = json.loads(out)
+        assert answer["tab_id"] == str(tab), answer
+        assert answer["satisfied"] == {"state": "idle", "text": None, "gone": None}, answer
+        assert isinstance(answer["after_ms"], int), answer
+
+        asked = relay.requests()
+        assert "events.subscribe" in asked, asked
+        assert "tab.dump" not in asked, asked
+
+        once = ["--socket", relay.path, "wait", "--tab", str(tab), "--timeout", "0"]
+        held = roostctl(*once, "--state", "idle")
+        assert held.returncode == 0, held
+        started = time.monotonic()
+        unheld = roostctl(*once, "--state", "needs_input", "--json")
+        assert unheld.returncode == 4, unheld
+        assert json.loads(unheld.stderr)["error"]["code"] == "timeout", unheld
+        assert time.monotonic() - started < scaled_timeout(10.0)
+
+    with Relay(ui.socket_path(lane.target), _ROOT / "relay-none.sock", no_stream=True) as relay:
+        for condition in (("--state", "idle"), ("--state", "needs_input")):
+            refused = roostctl(
+                "--socket", relay.path, "wait", "--tab", str(tab), *condition,
+                "--timeout", "60", "--json",
             )
-            assert took < interval, took
-        finally:
-            reap(polling)
+            assert refused.returncode == 1, (condition, refused)
+            error = json.loads(refused.stderr)["error"]
+            assert error["code"] == "unsupported", error
+            assert error["message"].startswith("this Roost serves no event stream"), error
+        assert relay.requests() == ["identify", "identify"], relay.requests()
 
 
 def test_a_wait_across_a_backend_switch_ends_rather_than_reading_the_sessions_ids(lane: Lane):

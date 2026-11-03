@@ -1,4 +1,4 @@
-"""Shell-integration E2E (runs against both --roost-target mac and iced).
+"""Shell-integration E2E.
 
 P1 — shell type follows Ghostty's platform split: Roost spawns the
 default shell as a LOGIN shell (via `-l`) on **macOS** (so
@@ -8,8 +8,7 @@ Terminal.app), but as a **non-login interactive** shell on **Linux** (so
 ~/.bashrc loads — where prompts/aliases live; a Linux login shell would
 read the profile chain and let a stray .bash_profile shadow .bashrc).
 The expected state keys off the UI host OS (`sys.platform`), since the
-Rust default-shell logic gates `-l` on `cfg!(target_os = "macos")`: the
-Mac app and a macOS iced dev build are login, Linux iced is non-login.
+default-shell logic gates `-l` on `cfg!(target_os = "macos")`.
 
 Assertion technique: the asserted substring must appear ONLY in command
 *output*, never in the echoed command line. We print the result through
@@ -55,10 +54,8 @@ _LOGIN_PROBE = (
 def test_default_shell_login_matches_platform(roost, project):
     """A plain new tab's shell is a login shell on macOS, non-login on
     Linux — Ghostty's platform split (see module docstring). The host OS
-    decides because the Rust logic gates `-l` on
-    `cfg!(target_os = "macos")`; the Mac app only ever runs on darwin,
-    and a macOS iced dev build is login too, so `sys.platform` is the
-    correct determinant for either target."""
+    decides because the logic gates `-l` on `cfg!(target_os = "macos")`,
+    so `sys.platform` is the correct determinant."""
     expect_login = sys.platform == "darwin"
     want = "yes" if expect_login else "no"
     other = "no" if expect_login else "yes"
@@ -116,8 +113,8 @@ def test_native_cwd_inherits_cd(roost, project, palette):
     P3 fallback that fixes Cmd-T for shells without Roost integration.
 
     Uses /usr (not a symlink on macOS or Linux) so the native read's
-    physical path matches the logical path. e2e-mac (proc_pidinfo) and
-    the iced lanes (/proc) cover the real read in CI.
+    physical path matches the logical path. The macOS lane (proc_pidinfo)
+    and the Linux lanes (/proc) cover the real read in CI.
     """
     # Bare shell: no rc, no profile, no integration -> no OSC 7 emitted.
     active = roost.open_tab(project, cwd="/tmp",
@@ -192,7 +189,7 @@ def test_env_injected(roost, project):
     # output-only readiness sentinel + re-send-under-load loop (it appends its
     # own `roost_done=<uuid>` marker); waiting on a literal `ENV_done` here
     # would match the echo mid-render and dump before the output lands — the
-    # bug that made this the dominant e2e-mac flake.
+    # bug that made this the dominant macOS-lane flake.
     fields = [
         ("ENV_tp", "$TERM_PROGRAM"),
         ("ENV_si", "$ROOST_SHELL_INTEGRATION"),
@@ -258,8 +255,12 @@ def test_documented_rooster_override(roost, project):
     escaping (`\\~`) just flips which version breaks. The cd-to-$HOME step
     below runs on both runners (Apple bash 3.2 on Mac, bash 5.x on Linux),
     so it catches a regression to either non-portable form."""
+    # Apple's bash 3.2 readline, in the C locale, takes the emoji's high
+    # bytes for Meta keys and drops the rest of the line, and a tab inherits
+    # whatever locale launched the app (an ssh session on a Mac is LC_ALL=C).
+    locale = ["/usr/bin/env", "LC_ALL=en_US.UTF-8"] if sys.platform == "darwin" else []
     tab = roost.open_tab(project, cwd="/tmp",
-                         argv=["/bin/bash", "--norc", "--noprofile"])
+                         argv=[*locale, "/bin/bash", "--norc", "--noprofile"])
     # The exact function from docs/guides/cwd-tracking.md, as a one-liner.
     fancy = (
         r'''__roost_fancy_title() { [ -n "$ROOST_TAB_ID" ] || return; '''
@@ -357,22 +358,21 @@ def test_osc133_records_shell_axis_under_an_agent_owner(roost, project):
     assert roost.hook_active(tab) is False
 
 
-# Plan 083 D-B3: OSC 133 forms the two implementations read differently.
-# Roost-Iced's hook layer takes its marks from libghostty's stream (a
-# prompt start for `P;k=i` and `N`, an input start for `I`, nothing for a
-# secondary prompt or a letter with no `;` after it); Roost.app keeps its
-# own scanner and the first-letter rule. Each value is what the form does
-# to a tab a hook owner holds, Waiting, at a prompt.
-_FORMS_BY_TARGET = {
-    b"P;k=i": {"iced": "prompt", "mac": "ignored"},
-    b"N": {"iced": "prompt", "mac": "ignored"},
-    b"I": {"iced": "prompt", "mac": "ignored"},
-    b"A;k=s": {"iced": "ignored", "mac": "prompt"},
-    b"Axyz": {"iced": "ignored", "mac": "prompt"},
-    b"Cxyz": {"iced": "ignored", "mac": "command"},
-    b"D0": {"iced": "ignored", "mac": "prompt"},
-    b"A": {"iced": "prompt", "mac": "prompt"},
-    b"C": {"iced": "command", "mac": "command"},
+# Plan 083 D-B3: the hook layer takes its OSC 133 marks from libghostty's
+# stream — a prompt start for `P;k=i` and `N`, an input start for `I`,
+# nothing for a secondary prompt or a letter with no `;` after it. Each
+# value is what the form does to a tab a hook owner holds, Waiting, at a
+# prompt.
+_FORMS = {
+    b"P;k=i": "prompt",
+    b"N": "prompt",
+    b"I": "prompt",
+    b"A;k=s": "ignored",
+    b"Axyz": "ignored",
+    b"Cxyz": "ignored",
+    b"D0": "ignored",
+    b"A": "prompt",
+    b"C": "command",
 }
 _FORM_EFFECT = {
     "prompt": ("at_prompt", "inactive"),
@@ -385,12 +385,11 @@ _FORM_EFFECT = {
     not _TEST_MODE,
     reason="feeding OSC 133 needs ROOST_TEST_MODE=1 in the UI's launch env",
 )
-def test_osc133_forms_follow_each_targets_rule(roost, project, target):
-    """Each target's rule for the forms where they part (plan 083 D-B3):
-    Roost-Iced reads OSC 133 the way libghostty does, Roost.app keeps the
-    first-letter rule. A `D` and a fresh claim put the tab back at a
-    prompt under a Waiting owner before each form; the OSC 0 title after
-    it is the ordering barrier."""
+def test_osc133_forms_follow_libghosttys_rule(roost, project):
+    """OSC 133 is read the way libghostty does (plan 083 D-B3), including
+    the forms a first-letter scanner would read otherwise. A `D` and a
+    fresh claim put the tab back at a prompt under a Waiting owner before
+    each form; the OSC 0 title after it is the ordering barrier."""
     tab = roost.open_tab(project, cwd="/tmp", argv=["/bin/sh", "-c", "exec sleep 300"])
     roost.open_tab(project, cwd="/tmp")  # steals active
     wait_tab_attached(roost, tab)
@@ -403,12 +402,12 @@ def test_osc133_forms_follow_each_targets_rule(roost, project, target):
             what=f"OSC 0 barrier {title}",
         )
 
-    for i, (body, by_target) in enumerate(_FORMS_BY_TARGET.items()):
+    for i, (body, effect) in enumerate(_FORMS.items()):
         fed_then_titled(b"\x1b]133;D\x07", f"osc133-reset-{i}")
         roost.agent_report(tab, "claude", "claim", session_id="s1", lifecycle="waiting")
         fed_then_titled(b"\x1b]133;" + body + b"\x07", f"osc133-form-{i}")
         listed = roost.tab(tab)
-        want = _FORM_EFFECT[by_target[target]]
+        want = _FORM_EFFECT[effect]
         assert (listed["shell_state"], listed["agent_lifecycle"]) == want, (body, listed)
 
 

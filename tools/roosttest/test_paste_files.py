@@ -46,12 +46,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(autouse=True)
-def _iced_only(target):
-    if target != "iced":
-        pytest.skip("clipboard.write_files is an iced test seam; Roost.app answers unknown-op")
-
-
 def _quiet_tab(roost, project) -> int:
     tab = roost.open_tab(project, cwd="/tmp", title="paste-files", argv=QUIET_ARGV)
     wait_tab_attached(roost, tab)

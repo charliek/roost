@@ -27,15 +27,10 @@ TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
 
 @pytest.fixture(autouse=True)
-def _mac_iced_only(target):
-    """Skip unless BOTH halves hold.
-
-    `make e2e-mac` runs this whole directory on macOS, so an OS-only skip
-    would aim an iced-only op at the Swift app (whose dispatcher answers
-    `unknown-op`). And the iced UI also builds for Linux, where there is
-    no Dock at all — so a target-only skip would fail every Linux lane.
-    """
-    if sys.platform != "darwin" or target != "iced":
+def _mac_iced_only():
+    """macOS only: the iced UI also builds for Linux, where there is no
+    Dock at all."""
+    if sys.platform != "darwin":
         pytest.skip("app.dock_badge is macOS-iced-only (roadmap M6 § 6b seam)")
 
 

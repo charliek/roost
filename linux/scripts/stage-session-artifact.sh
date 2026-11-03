@@ -8,8 +8,8 @@
 # copies that existing product to the exact name the release-asset install
 # rung of the client (`asset_name`/`checksum_name` in
 # crates/roost-ipc/src/bootstrap.rs) requests, and writes the checksum
-# sidecar that rung verifies before install. release.yml's mac-iced job
-# runs it too, with `--os darwin`, on the copy Roost-Iced.app bundles.
+# sidecar that rung verifies before install. release.yml's mac job runs
+# it too, with `--os darwin`, on the copy Roost.app bundles.
 #
 # Factored out of release.yml (plan 039 §3.7) so it can be exercised by a
 # shell test (stage-session-artifact_test.sh) without cutting a release.

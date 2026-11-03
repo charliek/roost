@@ -44,8 +44,8 @@ SESSION_TEST_KNOBS = ("ROOST_TEST_PASSWD_HOME", "ROOST_TEST_OLD_SESSION_DIR")
 def default_socket(launching: bool) -> pathlib.Path:
     """The iced UI's socket. Attach mode matches CLAUDE.md's canonical
     resolution for `--target iced`: the isolated dev profile on macOS
-    (`Roost-iced`, distinct from the Swift app's `Roost` namespace so
-    both can run side by side), the shared production namespace on
+    (`Roost-iced`, distinct from the installed Roost.app's `Roost`
+    namespace so both can run side by side), the shared production namespace on
     Linux (`roost/`, the same socket the packaged `/usr/bin/roost`
     binary uses). `--launch` forces `ROOST_BUNDLE_PROFILE=iced`, which
     on Linux resolves to a *separate* `roost-iced/` runtime dir

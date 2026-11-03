@@ -23,9 +23,8 @@ use roost_osc::{OscEvent, OscScanner};
 pub type OscRgb = (u8, u8, u8);
 
 /// One full set of terminal colors — a theme seed for
-/// [`OscColorState`], or the values it currently holds. Keeping this DTO
-/// independent of `roost-vt` lets a future Swift adapter supply colors
-/// from its native render state.
+/// [`OscColorState`], or the values it currently holds. Kept independent
+/// of `roost-vt`, so a caller can supply colors from any render state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OscColorSnapshot {
     pub foreground: OscRgb,

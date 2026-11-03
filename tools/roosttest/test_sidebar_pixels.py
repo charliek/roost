@@ -1,24 +1,19 @@
-"""Sidebar agent-row pixel guards — plan 007, both targets
-(`--roost-target mac|iced`). The only two things about the rendered rows
-that `app.sidebar_dump` cannot see: the lifecycle DOT COLOUR and the
-column the dots line up in. On iced the rows are the Agents panel's at the
-bottom of the sidebar (plan 080); on mac they sit under each project.
+"""Sidebar agent-row pixel guards — plan 007. The only two things about
+the rendered rows that `app.sidebar_dump` cannot see: the lifecycle DOT
+COLOUR and the column the dots line up in. The rows are the Agents
+panel's, at the bottom of the sidebar (plan 080).
 
 Low-flake by construction, so the scope is deliberately narrow:
 
 *Asserted* — the four lifecycle colours (`#5fa3f0` working, `#f0a040`
 waiting, `#7a7a7a` finished, `#e05252` failed), which are our own
-constants spelled in `crates/roost-iced` and `ProjectRollup.swift`,
-and the dots' shared LEFT EDGE, which comes from layout constraints
-(Mac: `dot.leadingAnchor + 8` inside the row's leading inset; Iced:
-fixed row padding in its sidebar layout). Neither depends on font
-metrics or on the theme.
+constants spelled in `crates/roost-iced`, and the dots' shared LEFT EDGE,
+which comes from the fixed row padding of the sidebar layout. Neither
+depends on font metrics or on the theme.
 
 *Not asserted*, on purpose — whole-image golden diffs (antialiasing and
 font rasterization differ per machine), anything derived from text
-position or size, row heights derived from text, and the Mac project
-row's selection pill (it uses the system `controlAccentColor`, which is
-a per-user preference).
+position or size, and row heights derived from text.
 
 The dots are found by colour, then reduced to *solid blobs* (a
 connected component at least `MIN_DOT_SIDE` px on both axes). That
@@ -31,7 +26,7 @@ and on iced to the panel's dot column, since a waiting or failed row's
 status text wears its dot's colour too.
 
 `window.resize` is test-mode-gated, so the file skips without
-`ROOST_TEST_MODE=1` — same convention as `test_sidebar_layout.py`.
+`ROOST_TEST_MODE=1` — same convention as `test_sidebar_resize.py`.
 """
 
 from __future__ import annotations
@@ -45,9 +40,12 @@ import pytest
 from client import RoostError, Timeout
 from conftest import skip_on_live_wayland_desktop
 from test_agent_palette import _seed
-from test_sidebar_agents import _agent_row, _set_agents_visible
-from test_sidebar_collapse_persistence import _toggle_to_visible
-from util import BARE_SHELL_ARGV
+from util import (
+    BARE_SHELL_ARGV,
+    set_sidebar_agents_visible,
+    show_sidebar,
+    sidebar_agent_row,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
 import pngtool  # noqa: E402  — pure stdlib PNG decoder, imported not shelled out
@@ -63,9 +61,7 @@ TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 # small.
 WINDOW_W, WINDOW_H = 1100.0, 700.0
 
-# The four lifecycle colours, verbatim from `resources/style.css`
-# (`.roost-sidebar-agent-dot.agent-*`) and `rollupColor` in
-# `ProjectRollup.swift`. `inactive` is deliberately absent: it renders at
+# The four lifecycle colours, verbatim from the UI's own constants. `inactive` is deliberately absent: it renders at
 # 50% alpha over the sidebar background, so it has no fixed RGB.
 LIFECYCLE_COLORS: dict[str, tuple[int, int, int]] = {
     "working": (0x5F, 0xA3, 0xF0),
@@ -76,33 +72,29 @@ LIFECYCLE_COLORS: dict[str, tuple[int, int, int]] = {
 ICED_ACTIVE_PROJECT = (0x13, 0x50, 0x9D)
 
 # Left edge (x, in the screenshot's pixels — `app.screenshot` at scale 1
-# renders one pixel per logical point on both UIs) shared by every agent
-# dot: the centre of the band it must fall in, per target.
-#
-# The dot sits a fixed distance inside its ROW (our own margin+padding),
-# but the row's own origin is set by the toolkit's padding, and AppKit
-# does not vary that way, so mac keeps a tight band.
+# renders one pixel per logical point) shared by every agent dot: the
+# centre of the band it must fall in.
 #
 # This is deliberately a coarse guard. The precise, platform-independent
 # invariant — every dot on one edge — is asserted exactly below; this
 # band only catches gross indentation, which is the regression it exists
 # for (the dot was 10px past the project name and still is caught).
 #
-# Iced's is the Agents panel's dot (plan 080 D5): the row's 6px inset, its
-# 12px leading padding and the 3px that centre the 8px dot in its 14px slot.
-DOT_LEFT_X = {"iced": 21, "mac": 25}
-DOT_LEFT_TOLERANCE = {"iced": 2, "mac": 3}
-# How far either side of iced's dot column the scan reaches — enough for
-# the tolerance band, never as far as the name or status text beside it.
+# It is the Agents panel's dot (plan 080 D5): the row's 6px inset, its 12px
+# leading padding and the 3px that centre the 8px dot in its 14px slot.
+DOT_LEFT_X = 21
+DOT_LEFT_TOLERANCE = 2
+# How far either side of the dot column the scan reaches — enough for the
+# tolerance band, never as far as the name or status text beside it.
 ICED_DOT_COLUMN_SLACK = 4
 DOT_SIZE = 8
 
-# Both UIs draw an 8x8 rounded dot (AppKit uses a 4px radius; Iced uses
-# 3px to retain a solid renderer-neutral edge). The saturated core is
-# at least 5x5, while the project lifecycle stripe is only 3px wide.
+# The dot is 8x8 with a 3px radius, which keeps a solid renderer-neutral
+# edge. The saturated core is at least 5x5, while the project lifecycle
+# stripe is only 3px wide.
 MIN_DOT_SIDE = 5
 # Colour match tolerance for *finding* a dot. 0 and 2 select identical
-# pixels on both targets today; 2 leaves room for compositing rounding
+# pixels today; 2 leaves room for compositing rounding
 # without reaching a neighbouring shade. The colour itself is then
 # asserted exactly, at the blob's centre.
 COLOR_TOL = 2
@@ -165,12 +157,10 @@ def _blobs(
     ]
 
 
-def _dot_column(target: str, sidebar_w: int) -> tuple[int, int]:
+def _dot_column(sidebar_w: int) -> tuple[int, int]:
     """The x range [x0, x1) the dots are looked for in."""
-    if target != "iced":
-        return 0, sidebar_w
-    left = DOT_LEFT_X["iced"] - ICED_DOT_COLUMN_SLACK
-    return left, min(sidebar_w, DOT_LEFT_X["iced"] + DOT_SIZE + ICED_DOT_COLUMN_SLACK)
+    left = DOT_LEFT_X - ICED_DOT_COLUMN_SLACK
+    return left, min(sidebar_w, DOT_LEFT_X + DOT_SIZE + ICED_DOT_COLUMN_SLACK)
 
 
 def _dot_blobs(shot, x0: int, x1: int) -> dict[str, list[tuple[int, int, int, int]]]:
@@ -230,7 +220,7 @@ def _seed_one_per_lifecycle(roost, project) -> dict[str, int]:
     # to reach the sidebar's rendered cache.
     for lifecycle, tab in tabs.items():
         roost._wait(
-            lambda t=tab: _agent_row(roost.sidebar_dump(), project, t) is not None,
+            lambda t=tab: sidebar_agent_row(roost.sidebar_dump(), project, t) is not None,
             10.0,
             f"{lifecycle} agent row for tab {tab} reaches the sidebar dump",
         )
@@ -241,17 +231,17 @@ def _seed_one_per_lifecycle(roost, project) -> dict[str, int]:
     not TEST_MODE,
     reason="window.resize requires ROOST_TEST_MODE=1 in the UI's launch env",
 )
-def test_lifecycle_dot_colors_and_shared_left_edge(roost, project, target, tmp_path):
+def test_lifecycle_dot_colors_and_shared_left_edge(roost, project, tmp_path):
     """One agent per lifecycle, so all four dot colours are on screen in
     a single capture: each colour must be present as a dot-sized blob
     whose centre is EXACTLY the constant, and every dot in the sidebar
-    must start at the same x — the per-target expected column."""
-    _set_agents_visible(roost, True)
-    _toggle_to_visible(roost)
+    must start at the same x — the expected column."""
+    set_sidebar_agents_visible(roost, True)
+    show_sidebar(roost)
     _seed_one_per_lifecycle(roost, project)
 
     # Pin the window (best-effort: a constraining WM may grant less, and
-    # the dots are left-anchored either way — see test_sidebar_layout.py
+    # the dots are left-anchored either way — see test_sidebar_resize.py
     # for why a refused resize must never fail a test).
     roost.window_resize(WINDOW_W, WINDOW_H)
 
@@ -271,7 +261,7 @@ def test_lifecycle_dot_colors_and_shared_left_edge(roost, project, target, tmp_p
         shot = _capture(roost, shot_path)
         if shot is None:
             return False
-        blobs = _dot_blobs(shot, *_dot_column(target, sidebar_w))
+        blobs = _dot_blobs(shot, *_dot_column(sidebar_w))
         state["shot"], state["blobs"] = shot, blobs
         return all(blobs[name] for name in LIFECYCLE_COLORS)
 
@@ -286,7 +276,7 @@ def test_lifecycle_dot_colors_and_shared_left_edge(roost, project, target, tmp_p
         ) from exc
 
     shot, blobs = state["shot"], state["blobs"]
-    expected_x = DOT_LEFT_X[target]
+    expected_x = DOT_LEFT_X
 
     for name, want in LIFECYCLE_COLORS.items():
         for minx, miny, maxx, maxy in blobs[name]:
@@ -305,54 +295,52 @@ def test_lifecycle_dot_colors_and_shared_left_edge(roost, project, target, tmp_p
     # they are all positioned by the same rule.
     observed = sorted({x for xs in edges.values() for x in xs})
     assert len(observed) == 1, (
-        f"agent dots must all share one left edge on {target}; got {edges} "
+        f"agent dots must all share one left edge; got {edges} "
         f"(screenshot: {shot_path})"
     )
 
-    # That shared edge sits at the target's column (`DOT_LEFT_X`). Compared
-    # with a tolerance rather than exactly: the dot's offset is our own inset
-    # nested inside the toolkit's own row padding, and the renderers round a
-    # dot's edge differently, so it can shift a pixel or two. The regression
+    # That shared edge sits at the expected column (`DOT_LEFT_X`). Compared
+    # with a tolerance rather than exactly: the renderers round a dot's edge
+    # differently, so it can shift a pixel or two. The regression
     # this guards — a dot indented 10px past where it belongs — is still
     # caught. Asserting a label's own edge instead would mean measuring
     # antialiased text, which is genuinely flaky.
-    tolerance = DOT_LEFT_TOLERANCE[target]
+    tolerance = DOT_LEFT_TOLERANCE
     assert abs(observed[0] - expected_x) <= tolerance, (
-        f"agent dots start at x={observed[0]} on {target}, expected "
+        f"agent dots start at x={observed[0]}, expected "
         f"{expected_x}±{tolerance} (screenshot: {shot_path})"
     )
 
-    if target == "iced":
-        # The active project's failed rollup is a 3x22 rail at the true sidebar
-        # edge: `chrome::ROW_HEIGHT` (32) less the 5px gap top and bottom that
-        # keeps adjacent active projects discrete. Its 2px corner radius eats
-        # the ends of the exact-color centreline, so require the bulk of it.
-        stripe_run = _longest_vertical_run(shot, 0, LIFECYCLE_COLORS["failed"])
-        assert stripe_run >= 18, (
-            f"Iced project rollup must occupy the true sidebar edge at x=0 "
-            f"for approximately 22px; longest failed-color run was {stripe_run}px "
-            f"(screenshot: {shot_path})"
-        )
-        sidebar_w = round(float(roost.window_metrics()["sidebar_width"]))
-        # The pill spans the row less its 6px horizontal inset, and stands 30px
-        # tall in the 32px row — both far larger than any dot or badge, which
-        # is all this filter has to exclude.
-        selections = [
-            bounds
-            for bounds in _color_components(shot, sidebar_w, ICED_ACTIVE_PROJECT)
-            if bounds[2] - bounds[0] >= 100 and bounds[3] - bounds[1] >= 15
-        ]
-        assert len(selections) == 1, (
-            f"expected one Iced active-project selection pill, got {selections} "
-            f"(screenshot: {shot_path})"
-        )
-        left, _top, right, _bottom = selections[0]
-        right_inset = sidebar_w - 1 - right
-        # Mac parity: `bounds.insetBy(dx: 6, dy: 1)`. The right inset is read
-        # against the divider column the sidebar reserves inside its own width,
-        # so it measures one larger than the geometric 6.
-        assert abs(left - 6) <= 1 and abs(right_inset - 7) <= 1, (
-            f"Iced project selection must be inset 6px inside the row, clear of "
-            f"the rollup rail and the divider; got left={left}, right "
-            f"inset={right_inset} (screenshot: {shot_path})"
-        )
+    # The active project's failed rollup is a 3x22 rail at the true sidebar
+    # edge: `chrome::ROW_HEIGHT` (32) less the 5px gap top and bottom that
+    # keeps adjacent active projects discrete. Its 2px corner radius eats
+    # the ends of the exact-color centreline, so require the bulk of it.
+    stripe_run = _longest_vertical_run(shot, 0, LIFECYCLE_COLORS["failed"])
+    assert stripe_run >= 18, (
+        f"Iced project rollup must occupy the true sidebar edge at x=0 "
+        f"for approximately 22px; longest failed-color run was {stripe_run}px "
+        f"(screenshot: {shot_path})"
+    )
+    sidebar_w = round(float(roost.window_metrics()["sidebar_width"]))
+    # The pill spans the row less its 6px horizontal inset, and stands 30px
+    # tall in the 32px row — both far larger than any dot or badge, which
+    # is all this filter has to exclude.
+    selections = [
+        bounds
+        for bounds in _color_components(shot, sidebar_w, ICED_ACTIVE_PROJECT)
+        if bounds[2] - bounds[0] >= 100 and bounds[3] - bounds[1] >= 15
+    ]
+    assert len(selections) == 1, (
+        f"expected one Iced active-project selection pill, got {selections} "
+        f"(screenshot: {shot_path})"
+    )
+    left, _top, right, _bottom = selections[0]
+    right_inset = sidebar_w - 1 - right
+    # The pill is inset 6px each side. The right inset is read against the
+    # divider column the sidebar reserves inside its own width, so it
+    # measures one larger than the geometric 6.
+    assert abs(left - 6) <= 1 and abs(right_inset - 7) <= 1, (
+        f"Iced project selection must be inset 6px inside the row, clear of "
+        f"the rollup rail and the divider; got left={left}, right "
+        f"inset={right_inset} (screenshot: {shot_path})"
+    )

@@ -7,7 +7,7 @@ square, and writes every packaging target in one run:
   - packaging/icons/hicolor/256x256/apps/roost.png   (Linux .deb hicolor)
   - packaging/icons/hicolor/512x512/apps/roost.png   (Linux .deb hicolor)
   - mac/AppIcon.icon/                                 (macOS Tahoe glass icon —
-        Icon Composer source; bundle.sh compiles it with actool)
+        Icon Composer source; bundle-iced.sh compiles it with actool)
   - mac/Resources/AppIcon.icns                        (macOS flat fallback for
         pre-Tahoe / no-actool builds — needs iconutil)
 
@@ -157,8 +157,8 @@ def build_icon_composer(owl: Image.Image, bg: tuple[int, int, int]) -> None:
     *inset* on that tile — a gray frame around our art. Only a compiled .icon
     catalog fills the tile edge-to-edge (what ghostty/cmux ship). We emit the
     .icon *source* here — a solid brand-color fill with the white owl as the
-    foreground layer; mac/scripts/bundle.sh compiles it with `actool` into the
-    Assets.car the app ships. The Linux PNGs are unaffected (no such tile).
+    foreground layer; mac/scripts/bundle-iced.sh compiles it with `actool` into
+    the Assets.car the app ships. The Linux PNGs are unaffected (no such tile).
 
     Hand-authored JSON (not Icon Composer.app) so the whole icon regenerates
     from the SVG with one command. 1024 = Icon Composer's design canvas; the

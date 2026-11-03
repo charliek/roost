@@ -2,13 +2,12 @@
 //!
 //! `roost-ipc` is the canonical home of `BundleProfile`. `roost-common`
 //! re-exports the type as a compatibility shim until the daemon
-//! goes away in M7. The Swift companion at
-//! `mac/Sources/Roost/BundleProfile.swift` mirrors this resolver
-//! byte-for-byte **on macOS** — the only OS it runs on — and the two
-//! implementations are tested in lockstep there. Off macOS this
-//! resolver diverges by design: the Linux profile's app id collapses
-//! onto the production `ai.stridelabs.Roost`, matching how its paths
-//! already collapse.
+//! goes away in M7. On macOS the `Mac` profile's paths are the ones the
+//! retired Swift `Roost.app` used, byte for byte, so the iced `Roost.app`
+//! that replaces it keeps an upgrading user's socket, state, locks and
+//! logs; `mac_profile_paths_are_pinned` holds them. Off macOS the Linux
+//! profile's app id collapses onto the production `ai.stridelabs.Roost`,
+//! matching how its paths already collapse.
 //!
 //! # Two locks
 //!
@@ -51,9 +50,7 @@
 //! The session profile alone answers to [`SESSION_SOCKET_DIR_ENV`] and
 //! to two debug-only test knobs, [`TEST_PASSWD_HOME_ENV`] and
 //! [`TEST_OLD_SESSION_DIR_ENV`], and it refuses a test-shaped process
-//! the default socket path (see `session_socket`). The frozen Swift
-//! mirror (`BundleProfile.swift`) honours none of them, and still
-//! resolves the macOS default only.
+//! the default socket path (see `session_socket`).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -67,7 +64,8 @@ use anyhow::Context;
 /// namespace so it can run beside a packaged install.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BundleProfileKind {
-    /// The Swift `Roost.app`. App id: `ai.stridelabs.Roost`.
+    /// The shipped macOS `Roost.app` (the iced UI, bundle id
+    /// `ai.stridelabs.Roost`). App id: `ai.stridelabs.Roost`.
     Mac,
     /// The packaged Linux UI (`/usr/bin/roost`). Its app id is
     /// platform-resolved: `ai.stridelabs.Roost` on Linux, shared with
@@ -76,10 +74,10 @@ pub enum BundleProfileKind {
     /// on macOS, where the kind stays resolvable but nothing ships or
     /// launches it.
     Linux,
-    /// The Rust + Iced build run from a dev tree (and the experimental
-    /// macOS `Roost-Iced.app`). App id: `ai.stridelabs.Roost.iced`.
-    /// Always isolated from the production Mac/Linux namespace,
-    /// including on Linux.
+    /// A dev build: the iced binary run from a dev tree, and a dev macOS
+    /// `Roost-Iced.app`. App id: `ai.stridelabs.Roost.iced`. Always
+    /// isolated from the production Mac/Linux namespace, including on
+    /// Linux, so it runs beside an installed Roost.
     Iced,
     /// The headless `roost-session` daemon. App id:
     /// `ai.stridelabs.Roost.session`. Not a UI, and reachable through
@@ -683,7 +681,7 @@ fn honoured_state_dir(raw: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
 /// value (non-empty + non-absolute) is ignored with a warn; empty/unset
 /// falls back silently (mirrors the HOME handling in `resolve_paths`).
 /// Existence isn't checked — like the default dir, it's created on first
-/// write. KEEP IN SYNC with `BundleProfile.swift`'s override.
+/// write.
 fn apply_state_dir_override(default: PathBuf, raw: Option<std::ffi::OsString>) -> PathBuf {
     let Some(raw) = raw.filter(|v| !v.is_empty()) else {
         return default;
@@ -752,11 +750,9 @@ fn resolve_paths_mac(
 #[cfg(target_os = "macos")]
 fn mac_default_paths(app_label: &str, home: Option<&OsStr>) -> (PathBuf, PathBuf, PathBuf) {
     // Sandboxed launchd processes can inherit `HOME=""` (set but
-    // empty) or no HOME at all. Mirror the Swift companion's
-    // `/tmp/<appLabel>/...` fallback rather than erroring — the
-    // alternative is the process refusing to launch at all in that
-    // environment. The two implementations are tested against each
-    // other to stay in lockstep.
+    // empty) or no HOME at all. Fall back to `/tmp/<appLabel>/...`, as
+    // the Swift app did, rather than erroring — the alternative is the
+    // process refusing to launch at all in that environment.
     if let Some(raw) = home {
         let home = PathBuf::from(raw);
         if !home.as_os_str().is_empty() && home.is_absolute() {
@@ -1863,8 +1859,7 @@ mod tests {
 
     /// The macOS half of the session path contract, pinned literally over
     /// an injected environment — an override or `HOME` the test process
-    /// happens to carry must not move it. Mirrored by `RoostTests.swift`'s
-    /// `bundleProfileSession*` tests.
+    /// happens to carry must not move it.
     #[cfg(target_os = "macos")]
     #[test]
     fn session_paths_live_under_their_own_mac_library_dirs() {
@@ -2497,6 +2492,55 @@ mod tests {
         assert!(resolve_cache_dir_linux(BundleProfileKind::Session, &homeless).is_err());
     }
 
+    /// The paths an upgrading Swift `Roost.app` user already has, which the
+    /// iced `Roost.app` must adopt unchanged: moving any one of them strands
+    /// that user's state, or lets two instances run on one `state.json`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_profile_paths_are_pinned() {
+        let home = env_of(&[("HOME", "/Users/tester")]);
+        let (socket_path, state_dir, log_dir) =
+            resolve_paths_mac(BundleProfileKind::Mac, "Roost", &home).expect("resolve");
+        let profile = BundleProfile {
+            socket_path,
+            state_dir,
+            log_dir,
+            ..BundleProfile::mac().expect("mac profile")
+        };
+        assert_eq!(profile.app_label, "Roost");
+        assert_eq!(profile.app_id, "ai.stridelabs.Roost");
+        assert_eq!(
+            profile.socket_path,
+            PathBuf::from("/Users/tester/Library/Caches/Roost/roost.sock")
+        );
+        assert_eq!(
+            profile.socket_lock_path(),
+            PathBuf::from("/Users/tester/Library/Caches/Roost/roost.lock")
+        );
+        assert_eq!(
+            profile.state_json_path(),
+            PathBuf::from("/Users/tester/Library/Application Support/Roost/state.json")
+        );
+        assert_eq!(
+            profile.state_lock_path(),
+            PathBuf::from("/Users/tester/Library/Application Support/Roost/state.lock")
+        );
+        assert_eq!(
+            profile.log_path(),
+            PathBuf::from("/Users/tester/Library/Logs/Roost/roost.log")
+        );
+
+        let homeless = env_of(&[]);
+        assert_eq!(
+            resolve_paths_mac(BundleProfileKind::Mac, "Roost", &homeless).expect("resolve"),
+            (
+                PathBuf::from("/tmp/Roost/roost.sock"),
+                PathBuf::from("/tmp/Roost"),
+                PathBuf::from("/tmp/Roost"),
+            )
+        );
+    }
+
     /// The macOS half. `~/Library/Caches` and not
     /// `~/Library/Application Support`: the state dir has a space in
     /// it, and every byte of this path has to survive being pasted
@@ -2601,7 +2645,6 @@ mod tests {
     }
 
     // ROOST_STATE_DIR override policy (pure helper — no env mutation).
-    // Mirrored by BundleProfileTests.swift; kept in lockstep.
 
     #[test]
     fn state_dir_override_absolute_replaces() {

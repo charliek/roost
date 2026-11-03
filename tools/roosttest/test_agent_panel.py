@@ -6,10 +6,6 @@ through `app.sidebar_dump`'s `agent_panel`, which is derived from the same
 row cache the panel paints from, in the same order, with every text field
 in full (the panel draws them elided to the sidebar's width).
 
-Iced-only: the Swift app has no panel and answers the dump without
-`agent_panel`, and `make e2e-mac` collects this whole directory — so the
-module skips off `--roost-target`, as `test_view_perf.py` does.
-
 Assertions are scoped to the agents a test seeded, by tab, and to their
 relative order: a reused dev UI may have other agents open. The sort and
 the toggle are written back to `config.conf`, so the cases that change
@@ -42,21 +38,18 @@ import ui
 from client import Roost, RoostError
 from conftest import skip_on_live_wayland_desktop
 from test_agent_palette import _seed
-from test_sidebar_agents import _palette_agent_tab_ids, _set_agents_visible
-from test_sidebar_collapse_persistence import _toggle_to_visible
 from test_sidebar_pixels import _blobs, _capture
-from util import BARE_SHELL_ARGV, is_fresh, skip_on_ci, wait_for_config_line
+from util import (
+    BARE_SHELL_ARGV,
+    is_fresh,
+    palette_agent_tab_ids,
+    set_sidebar_agents_visible,
+    show_sidebar,
+    skip_on_ci,
+    wait_for_config_line,
+)
 
 SEPARATOR = " › "
-
-
-@pytest.fixture(autouse=True)
-def _iced_only(target):
-    if target != "iced":
-        pytest.skip(
-            "the sidebar Agents panel is Roost-Iced only (plan 080); the Swift "
-            "app answers app.sidebar_dump without agent_panel"
-        )
 
 
 @pytest.fixture
@@ -80,7 +73,7 @@ def owned_config(roost):
         yield config
     finally:
         _set_sort(roost, panel["sort"])
-        _set_agents_visible(roost, panel["visible"])
+        set_sidebar_agents_visible(roost, panel["visible"])
 
 
 def _panel(roost) -> dict:
@@ -156,7 +149,7 @@ def _keys(tabs: dict[str, int]) -> set[str]:
 
 
 def _palette_order(roost, keys: set[str]) -> list[str]:
-    ids = [str(tab) for tab in _palette_agent_tab_ids(roost.palette_items("agents"))]
+    ids = [str(tab) for tab in palette_agent_tab_ids(roost.palette_items("agents"))]
     return [key for key in ids if key in keys]
 
 
@@ -276,16 +269,16 @@ def test_recent_lists_the_newest_event_first(roost, project, project2, owned_con
 def test_hiding_the_panel_keeps_its_entries(roost, project, owned_config):
     tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     _seed(roost, tab, lifecycle="working", name="panel-hidden")
-    _set_agents_visible(roost, True)
+    set_sidebar_agents_visible(roost, True)
     _wait_listed(roost, {str(tab)})
 
-    _set_agents_visible(roost, False)
+    set_sidebar_agents_visible(roost, False)
     panel = _panel(roost)
     assert panel["visible"] is False
     assert roost.sidebar_dump()["agents_visible"] is False
     assert _agents(panel, {str(tab)}), "a hidden panel still lists its agents"
 
-    _set_agents_visible(roost, True)
+    set_sidebar_agents_visible(roost, True)
     assert _panel(roost)["visible"] is True
 
 
@@ -444,13 +437,13 @@ def test_set_agents_fraction_reports_clamps_and_persists(roost, kept_share):
 
 @needs_test_mode
 def test_hiding_the_panel_keeps_its_share(roost, owned_config, kept_share):
-    _set_agents_visible(roost, True)
+    set_sidebar_agents_visible(roost, True)
     roost.sidebar_set_agents_fraction(0.3)
-    _set_agents_visible(roost, False)
+    set_sidebar_agents_visible(roost, False)
     panel = _panel(roost)
     assert panel["visible"] is False
     assert panel["fraction_permille"] == 300
-    _set_agents_visible(roost, True)
+    set_sidebar_agents_visible(roost, True)
     assert _permille(roost) == 300
 
 
@@ -561,9 +554,9 @@ def test_the_floors_clamp_only_what_is_drawn(
     tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     _seed(roost, tab, lifecycle="working", name="panel-floors")
     _wait_listed(roost, {str(tab)})
-    _set_agents_visible(roost, True)
+    set_sidebar_agents_visible(roost, True)
     _set_sort(roost, "grouped")
-    _toggle_to_visible(roost)
+    show_sidebar(roost)
     before = roost.window_metrics()
     path = tmp_path / "split.png"
     held = False
@@ -596,9 +589,9 @@ def test_an_empty_panel_keeps_its_divider_at_the_share(
             "an empty Agents panel needs a fresh harness-owned instance "
             "(--roost-fresh); a dev UI likely has agents open"
         )
-    _set_agents_visible(roost, True)
+    set_sidebar_agents_visible(roost, True)
     _set_sort(roost, "grouped")
-    _toggle_to_visible(roost)
+    show_sidebar(roost)
     roost._wait(lambda: _panel(roost)["entries"] == [], 10.0, "the Agents panel to empty")
     path = tmp_path / "split.png"
     for permille in (kept_share, MIN_PERMILLE, 600):

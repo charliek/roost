@@ -12,8 +12,8 @@ Rust workspace for the Roost UIs and supporting crates:
 - `roost-ui-model` — toolkit-neutral config, themes, keybinds, palettes, providers, and projections.
 - `roost-client` — host-session client core (state machine, mirror, reconnect, op queue,
   uploads); `roost-iced` is its consumer.
-- `roost-iced` — iced adapter over the shared Rust engine; what the packaged Linux `.deb`
-  ships as `/usr/bin/roost`, and what the experimental macOS `Roost-Iced.app` runs.
+- `roost-iced` — iced adapter over the shared Rust engine; the one desktop UI: the packaged Linux `.deb`
+  ships it as `/usr/bin/roost`, and macOS as `Roost.app` (`Roost-Iced.app` for dev builds).
 - `roost-vt` / `roost-osc` — libghostty-vt FFI wrapper + OSC scanner.
 
 The daemon-era crates (`roost-core`, `roost-proto`, `roost-common`,

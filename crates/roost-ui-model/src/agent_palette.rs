@@ -13,9 +13,6 @@
 //! the tab pill, the TabPage icon, and the sidebar rollup render, so the
 //! palette can never disagree with them. Ordering reuses
 //! [`agent::rank`], the shipped definition of "most urgent".
-//!
-//! To be mirrored by the Mac side — `mac/Sources/Roost/` has no agents
-//! frame yet, so this is the reference implementation of the mapping.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -361,9 +358,8 @@ pub fn compose_title(project: &str, name: &str) -> String {
 /// `source` is an open string by design (AD-8): a third-party adapter
 /// that isn't one of the five renders **verbatim** rather than being
 /// hidden or mislabeled, so this table can never gate whether an
-/// agent's row appears — only how its name is spelled. Mirrored by
-/// `mac/Sources/Roost/AgentPalette.swift`'s `agentDisplayName`, tested
-/// against the same fixture (`tests/agent-display-name-fixtures/`).
+/// agent's row appears — only how its name is spelled. Pinned by
+/// `tests/agent-display-name-fixtures/`.
 pub fn agent_display_name(source: &str) -> &str {
     match source {
         "claude" => "Claude Code",
@@ -428,8 +424,8 @@ fn token_role(token: &str) -> MetricsRole {
     }
 }
 
-/// The colour a role renders in — Mac-only today: `AgentPalette.swift`'s
-/// `metricsColor` uses these exact hexes. iced does not read this
+/// The colour a role renders in, as the retired Swift app's
+/// `AgentPalette.swift` `metricsColor` painted it. iced does not read this
 /// function; it paints the metrics + elapsed-time strings in a single
 /// flat chrome `muted_text` (`#a0a4b0`), with no per-role split. The
 /// now-removed GTK UI's `.palette-agent-time` CSS class happened to

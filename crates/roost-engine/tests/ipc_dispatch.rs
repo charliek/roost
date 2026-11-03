@@ -70,14 +70,16 @@ async fn identify_create_project_open_tab_list() {
         .expect("project.create");
     assert_eq!(proj.project.name, "Hello");
 
-    // tab.open — spawn a short-lived shell so the test doesn't leak.
+    // tab.open — a child that outlives the listing: one that exits at
+    // once can be reaped inside `tab.open`, which then closes its row
+    // (#640), and the listing below would find no tab.
     let tab: TabOpenResult = client
         .call(
             ops::TAB_OPEN,
             TabOpenParams {
                 project_id: proj.project.id,
                 cwd: "/tmp".into(),
-                argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
+                argv: vec!["/bin/cat".into()],
                 cols: 80,
                 rows: 24,
                 title: "".into(),
@@ -100,10 +102,8 @@ async fn identify_create_project_open_tab_list() {
     assert_eq!(list.projects.len(), 1);
     assert_eq!(list.projects[0].tabs.len(), 1);
 
-    // Let the shell exit + supervisor reap it. Not asserting on
-    // it (timing-sensitive) — the spawn+exit smoke is already
-    // covered in pty_smoke.rs.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let report = supervisor.shutdown_all(Duration::from_secs(10)).await;
+    assert_eq!(report.reaped, [tab.tab.id], "{report:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

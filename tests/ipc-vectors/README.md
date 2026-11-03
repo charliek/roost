@@ -32,19 +32,17 @@ apart from an op precisely by its having no `op`. The `.request` files
 are handshake lines and `.accepted` / `.rejected` are the two arms of
 the single line that answers one.
 
-Both the Rust side (`cargo test -p roost-ipc`) and the Swift side
-(`swift test --package-path mac`, post-M4) load these files: every
-vector is round-tripped schema-agnostically, and selected vectors are
-decoded into the typed structs on each side, which pins field names and
-shapes and guards against schema drift between the two languages. (The
-byte-exact assertions live in `wire_types_test.rs` against in-file
-literal exemplars; the on-disk files are compared semantically, not
-byte-for-byte.)
+`cargo test -p roost-ipc` loads these files: every vector is
+round-tripped schema-agnostically, and selected vectors are decoded
+into the typed structs, which pins field names and shapes against
+schema drift. (The byte-exact assertions live in `wire_types_test.rs`
+against in-file literal exemplars; the on-disk files are compared
+semantically, not byte-for-byte.)
 
 When you add a new op or event, drop a new vector file here. The
 loader is intentionally schema-agnostic — it round-trips raw
-`serde_json::Value` / Swift `Any` JSON — so adding a vector doesn't
-require touching the test code.
+`serde_json::Value` — so adding a vector doesn't require touching the
+test code.
 
 Whitespace policy: vectors should be formatted with two-space
 indentation and a trailing newline. The loader normalizes whitespace

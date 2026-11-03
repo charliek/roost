@@ -39,9 +39,7 @@ use crate::{Error, GridRef, Point, Result, Terminal, TrackedRef};
 /// Both copy paths honor this constant — libghostty's formatter here,
 /// and the render-state walk in `selection.rs` that handles a selection
 /// entirely inside the viewport — so the two agree whichever way it is
-/// set, and a copy never depends on scroll position. Its Swift twin is
-/// `SelectionFormatter.unwrapSoftWrappedLines`; the two must match or
-/// the Mac and Linux UIs copy differently.
+/// set, and a copy never depends on scroll position.
 pub const UNWRAP_SOFT_WRAPPED_LINES: bool = true;
 
 /// RAII owner of the buffer

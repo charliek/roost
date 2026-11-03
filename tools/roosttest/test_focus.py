@@ -30,15 +30,6 @@ from util import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _logical_focus_port_only(target):
-    """Iced exposes the logical focus port. The Mac UI already has the
-    reference behavior; exposing this test-only read port there remains
-    a follow-up."""
-    if target != "iced":
-        pytest.skip("app.active_terminal_focused is implemented by Iced only")
-
-
 def _wait_terminal_focused(roost, what: str, timeout: float = 2.0) -> None:
     """Poll until the active terminal holds logical focus. Focus can
     settle a main-loop tick after a navigation (the project-switch grab

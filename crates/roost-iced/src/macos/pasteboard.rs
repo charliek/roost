@@ -3,11 +3,12 @@
 //!
 //! macOS has no PRIMARY, and `window_clipboard`'s macOS backend leaves the
 //! primary-selection calls unimplemented, so `copy-on-select` wrote nowhere
-//! and middle-click pasted nothing. The Swift app answers both with a
+//! and middle-click pasted nothing. The Swift app answered both with a
 //! private named pasteboard (`TerminalView.swift`'s `selectionPasteboard`),
 //! and this is that pasteboard under the same name. Named pasteboards are
-//! per user session, so while both apps ship, a selection made in one
-//! middle-click-pastes in the other — the sharing PRIMARY gives on Linux.
+//! per user session, so a selection made in one Roost build
+//! middle-click-pastes in another running beside it — the sharing PRIMARY
+//! gives on Linux.
 //!
 //! **The exception to `macos/mod.rs`'s main-thread rule.** Every call here
 //! is a cross-process round trip to the pasteboard server that can block,

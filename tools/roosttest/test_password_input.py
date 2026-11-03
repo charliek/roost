@@ -11,8 +11,8 @@ interactive shell: bash's readline and zsh's ZLE run the terminal raw
 (canonical mode off) while they edit a line, so `stty -echo` at a prompt
 never reads as one.
 
-Unmarked cases drive the harness UI's in-process tabs (and skip on the
-Swift target, which never reports the field); `session_daemon` cases drive
+Unmarked cases drive the harness UI's in-process tabs; `session_daemon`
+cases drive
 a headless `roost-session` — the Makefile's `SESSION_E2E_TESTS` says how
 the two lanes split the module. The `local-backend = session` UI restart
 is in `test_local_backend.py`.
@@ -73,13 +73,7 @@ def answer_and_clear(roost: Roost, tab: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def iced(target):
-    if target != "iced":
-        pytest.skip("the Swift app never reports password_input")
-
-
-def test_a_prompt_with_echo_off_reads_true_until_it_is_answered(iced, roost, project):
+def test_a_prompt_with_echo_off_reads_true_until_it_is_answered(roost, project):
     tab = roost.open_tab(project, cwd="/tmp", argv=prompt_argv())
     try:
         roost.wait_text(tab, READY)
@@ -89,7 +83,7 @@ def test_a_prompt_with_echo_off_reads_true_until_it_is_answered(iced, roost, pro
         roost.close_tab_if_present(tab)
 
 
-def test_read_s_in_bash_reads_true(iced, roost, project):
+def test_read_s_in_bash_reads_true(roost, project):
     """`read -s` is bash's own silent read: it clears echo and leaves
     canonical mode on, so it is a prompt — outside a line editor, which
     is what `-c` runs it in."""

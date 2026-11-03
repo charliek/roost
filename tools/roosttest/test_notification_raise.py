@@ -7,8 +7,7 @@ outcome is worked out from the display the lane runs on and from what the
 compositor's registry reports, not written in per lane: Xvfb comes to
 `not-wayland`, weston to `no-global`. Either way the click focuses its tab.
 
-Skipped on macOS, whose banners carry no token, and under
-`--roost-target mac`: the Swift app has no such ops.
+Skipped on macOS, whose banners carry no token.
 """
 
 from __future__ import annotations
@@ -35,13 +34,7 @@ pytestmark = [
 
 
 @pytest.fixture(autouse=True)
-def _iced_only(target):
-    if target != "iced":
-        pytest.skip("the raise test ops are iced's; Roost.app answers unknown-op")
-
-
-@pytest.fixture(autouse=True)
-def _window_open(_iced_only, roost):
+def _window_open(roost):
     """The UI answers IPC before its window opens, and a click that lands
     first raises nothing, so it settles nothing either. A screenshot is
     served only once there is a window to capture."""
