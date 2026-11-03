@@ -21,15 +21,10 @@ the same way:
   refusal (`ROOST_AGENT_HOOKS_FORCE=1`), and everything it can reach is
   inside the jail. `Jail.assert_jailed` runs on the merged environment
   immediately before every spawn.
-
-`iced_only`: `make e2e-mac` collects this whole directory, and the Mac
-app has no dialog test ops at all (C8 mirrors this card as an `NSAlert`
-sheet and brings its own coverage).
 """
 
 from __future__ import annotations
 
-import pytest
 from agent_jail import (
     INSTALLABLE_AGENTS,
     Jail,
@@ -39,12 +34,6 @@ from agent_jail import (
     wait_for_log_line,
 )
 from client import Roost, scaled_timeout
-
-
-@pytest.fixture
-def iced_only(target):
-    if target != "iced":
-        pytest.skip("the Mac app has no app.dialog_* ops; C8 covers its sheet")
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +99,7 @@ def assert_untouched(jail: Jail) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_an_unanswered_key_raises_the_card_once(short_root, iced_only):
+def test_an_unanswered_key_raises_the_card_once(short_root):
     """The card, its five rows, and the latch that keeps it to one.
 
     All five agents get a row whether or not they are installed — an
@@ -184,7 +173,7 @@ def test_an_unanswered_key_raises_the_card_once(short_root, iced_only):
 
 
 def test_confirming_writes_the_key_and_only_the_agents_that_are_here(
-    short_root, iced_only
+    short_root
 ):
     """Apply: the key, the files, the receipt — and the one agent that is
     named but not installed.
@@ -239,7 +228,7 @@ def test_confirming_writes_the_key_and_only_the_agents_that_are_here(
     )
 
 
-def test_no_agent_here_asks_nothing(short_root, iced_only):
+def test_no_agent_here_asks_nothing(short_root):
     """A machine with none of the five installed is asked nothing, and
     the key stays absent.
 
@@ -264,7 +253,7 @@ def test_no_agent_here_asks_nothing(short_root, iced_only):
     assert_untouched(jail)
 
 
-def test_an_answered_key_asks_nothing(short_root, iced_only):
+def test_an_answered_key_asks_nothing(short_root):
     """`off` and an allow-list are both answers, so neither is asked
     again.
 
@@ -297,7 +286,7 @@ def test_an_answered_key_asks_nothing(short_root, iced_only):
     assert "ROOST_AGENT_HOOK" in (allowed.agent_dirs["claude"] / "settings.json").read_text()
 
 
-def test_the_test_mode_fence_stops_the_card(short_root, iced_only):
+def test_the_test_mode_fence_stops_the_card(short_root):
     """`ROOST_TEST_MODE=1` without `ROOST_AGENT_HOOKS_FORCE=1` asks
     nothing.
 
@@ -332,7 +321,7 @@ def open_preferences(roost: Roost) -> dict:
     return wait_for_card(roost, "preferences")
 
 
-def test_preferences_reads_the_key_and_the_agents_off_disk(short_root, iced_only):
+def test_preferences_reads_the_key_and_the_agents_off_disk(short_root):
     """Opening the card re-reads `agent-hooks` **from disk**, not from
     the snapshot this process launched with.
 
@@ -387,7 +376,7 @@ def test_preferences_reads_the_key_and_the_agents_off_disk(short_root, iced_only
         assert not any(jail.agent_dirs[agent].iterdir()), f"cancel wrote into {agent}"
 
 
-def test_a_survey_does_not_steal_the_screen_from_another_dialog(short_root, iced_only):
+def test_a_survey_does_not_steal_the_screen_from_another_dialog(short_root):
     """A survey finishes in the background. If the user has opened
     something else in the meantime it stands down — a card that appears
     over a question somebody is already answering takes the screen away
@@ -423,7 +412,7 @@ def test_a_survey_does_not_steal_the_screen_from_another_dialog(short_root, iced
 
 
 def test_preferences_reports_what_is_wired_and_can_turn_it_all_off(
-    short_root, iced_only
+    short_root
 ):
     """The status line after a real wiring, and the zero case.
 

@@ -1,9 +1,9 @@
 name: CI
 
-# CI for Roost (Rust + Swift). Runs on main + PRs targeting main. A
-# `changes` job (path filter) gates the rust/swift/iced jobs so they run only when
-# code that impacts them changes; `ci-success` is the single aggregated required
-# check (stable regardless of which jobs run).
+# CI for Roost (Rust). Runs on main + PRs targeting main. A `changes` job
+# (path filter) gates the jobs so they run only when code that impacts them
+# changes; `ci-success` is the single aggregated required check (stable
+# regardless of which jobs run).
 
 on:
   push:
@@ -49,7 +49,6 @@ jobs:
     timeout-minutes: 10
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
-      mac: ${{ steps.filter.outputs.mac }}
       linux: ${{ steps.filter.outputs.linux }}
       fixtures: ${{ steps.filter.outputs.fixtures }}
       tests: ${{ steps.filter.outputs.tests }}
@@ -83,17 +82,13 @@ jobs:
               - 'third_party/jetbrains-mono/**'
             rust:
               - *rustcore
-            mac:
-              - *rustcore
-              - 'mac/**'
             linux:
               - *rustcore
               - 'linux/**'
               - 'packaging/**'
-            # repo-root shared fixture corpora (parity gates for both UIs),
-            # consumed only by the unit-test jobs (rust-build, swift-mac) —
-            # distinct from the `tests` output below, which means
-            # tools/roosttest/**
+            # repo-root shared fixture corpora, consumed by the Rust unit-test
+            # job (rust-build) — distinct from the `tests` output below, which
+            # means tools/roosttest/**
             fixtures:
               - 'tests/**'
               # Rust tests exec these: bootstrap_test symlinks
@@ -128,13 +123,12 @@ jobs:
               - 'mac/scripts/update-appcast.py'
               - 'mac/scripts/bundle-lib.sh'
               - 'mac/scripts/bundle-iced.sh'
-              - 'mac/Resources/Info-iced.plist.template'
+              - 'mac/Resources/Info.plist.template'
               # The production identity's Sparkle key and its release check.
               - 'mac/keys/**'
               - 'mac/scripts/verify-sparkle-key.sh'
-              # test_osc7_emitters.py sources all four in real bash and zsh.
+              # test_osc7_emitters.py sources them in real bash and zsh.
               - 'crates/roost-engine/resources/shell-integration/**'
-              - 'mac/Sources/Roost/Resources/shell-integration/**'
             # Inputs of harness-unit's own tests only (test_release_dry_run.py reads
             # release.yml through tools/release/dry_run.py; test_agent_status_capture.py
             # imports tools/agent-status/capture.py), kept out of `tests` so they
@@ -143,8 +137,8 @@ jobs:
               - 'tools/release/**'
               - '.github/workflows/release.yml'
               - 'tools/agent-status/**'
-              # test_sparkle_plist.py stamps the plist template; the
-              # entitlements are read beside it.
+              # test_sparkle_plist.py stamps the plist template;
+              # test_mac_entitlements.py reads the entitlements beside it.
               - 'mac/Resources/**'
             # roost-cli's `doc_anchors_resolve` test reads the site nav and
             # every page it links, so those files are inputs to a RUST test
@@ -194,22 +188,21 @@ jobs:
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
             # Narrow on purpose: gates the `iced-build-e2e` macOS cells'
-            # bundle-assembly + bundle-smoke steps. The broad `mac` output
-            # folds in *rustcore, so using it here would make every
-            # Swift-only PR pay the 2x2 iced matrix. `Makefile` is
-            # deliberately not repeated — it's already in `tests`, which
-            # is already OR'd into iced-build-e2e's `if`.
+            # bundle-assembly + bundle-smoke steps without dragging in
+            # *rustcore. `Makefile` is deliberately not repeated — it's
+            # already in `tests`, which is already OR'd into
+            # iced-build-e2e's `if`.
             macbundle:
               - 'mac/scripts/bundle-lib.sh'
               - 'mac/scripts/bundle-iced.sh'
-              - 'mac/Resources/Info-iced.plist.template'
-              # Direct bundle-iced.sh inputs shared with the Swift bundle —
-              # without them an icon- or helper-entitlements-only PR would
-              # skip the job that assembles Roost-Iced.app.
+              - 'mac/Resources/Info.plist.template'
+              # The rest of bundle-iced.sh's direct inputs — without them an
+              # icon- or entitlements-only PR would skip the job that
+              # assembles the app.
               - 'mac/Resources/roostctl.entitlements'
               - 'mac/Resources/AppIcon.icns'
               - 'mac/AppIcon.icon/**'
-              - 'mac/Resources/Roost-Iced.entitlements'
+              - 'mac/Resources/Roost.entitlements'
               # Iced-only: the nested roost-session daemon (HS-4b) is
               # signed with this file during the assemble.
               - 'mac/Resources/roost-session.entitlements'
@@ -319,22 +312,6 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Shell tests for linux/scripts + mac/scripts release helpers
         run: make test-linux-scripts test-mac-scripts
-
-  themes-parity:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.mac == 'true' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      # The bundled themes live in two trees (Rust crate + Mac SwiftPM
-      # bundle) because SwiftPM `.copy` can't reach outside mac/. Guard
-      # the copies against drift — adding a theme to one UI only is a
-      # classic miss.
-      - name: Bundled themes byte-identical across UIs
-        run: diff -r crates/roost-ui-model/src/resources/themes mac/Sources/Roost/Resources/themes
 
   rust-build:
     needs: changes
@@ -557,178 +534,6 @@ jobs:
           fi
           echo "roost-client dependency isolation OK"
 
-  swift-mac:
-    needs: changes
-    if: needs.changes.outputs.mac == 'true' || needs.changes.outputs.fixtures == 'true' || needs.changes.outputs.ci == 'true'
-    runs-on: macos-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Show Swift toolchain
-        run: swift --version
-
-      - uses: jdx/mise-action@v4
-
-      - name: Cache vendored libghostty-vt
-        id: cache-ghostty
-        uses: actions/cache@v5
-        with:
-          path: |
-            third_party/ghostty/out
-            third_party/ghostty/src
-          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
-
-      - name: Build libghostty-vt
-        if: steps.cache-ghostty.outputs.cache-hit != 'true'
-        run: ./third_party/ghostty/build.sh
-
-      - name: Cache SwiftPM artifacts
-        uses: actions/cache@v5
-        with:
-          path: |
-            mac/.build
-            ~/Library/Caches/org.swift.swiftpm
-          key: swiftpm-${{ runner.os }}-${{ hashFiles('mac/Package.swift', 'mac/Package.resolved') }}
-          restore-keys: swiftpm-${{ runner.os }}-
-
-      - name: Cache cargo registry + target (for embedded roost-cli build)
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-swiftmac-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-swiftmac-
-
-      - name: swift build
-        working-directory: mac
-        run: swift build -v
-
-      - name: Assert no dynamic ghostty-vt link (regression guard)
-        working-directory: mac
-        run: |
-          # shellcheck disable=SC2044  # binary names are fixed ('Roost'/'RoostPackageTests'), no spaces
-          for bin in $(find .build -type f -perm -u+x -name 'Roost' -o -name 'RoostPackageTests'); do
-            if otool -L "$bin" 2>/dev/null | grep -q '@rpath/libghostty-vt'; then
-              echo "FAIL: $bin is dynamically linked to libghostty-vt; reintroduces the dyld @rpath bug fixed in Package.swift's positional-archive linkerSettings."
-              otool -L "$bin"
-              exit 1
-            fi
-          done
-
-      - name: swift test
-        working-directory: mac
-        run: swift test
-
-      - name: bundle .app (release) + embed roostctl
-        run: ./mac/scripts/bundle.sh release
-
-      - name: Verify embedded roostctl
-        run: |
-          set -euo pipefail
-          BIN="mac/build/Roost.app/Contents/Resources/bin/roostctl"
-          test -x "$BIN" || { echo "FAIL: $BIN not embedded"; exit 1; }
-          "$BIN" --version
-          codesign -dvv "$BIN" 2>&1 | grep -E 'adhoc|Format=' || true
-
-      - name: Verify themes resource bundle shipped (clean-install guard)
-        run: |
-          set -euo pipefail
-          # v0.0.2 crashed on every clean install because the themes bundle
-          # wasn't where the running app looks. Assert it ships under
-          # Contents/Resources, which is where `Bundle.roostResources`
-          # (Theme.swift) resolves it. A deterministic file check — stronger
-          # and faster than inferring from a launch. GUI-launch coverage is
-          # the required e2e-mac job; the clean-install live launch is the
-          # local `make smoke-mac-launch` / pre-release step.
-          THEMES="mac/build/Roost.app/Contents/Resources/Roost_Roost.bundle/themes"
-          test -d "$THEMES" || { echo "FAIL: $THEMES missing — themes can't load on a clean install (the v0.0.2 crash)"; exit 1; }
-          count=$(find "$THEMES" -type f | wc -l | tr -d ' ')
-          [ "$count" -gt 0 ] || { echo "FAIL: $THEMES shipped empty"; exit 1; }
-          echo "OK: $count theme files shipped under Contents/Resources"
-
-      - name: Verify TCC capture entitlements + usage strings (signed bundle)
-        run: |
-          set -euo pipefail
-          # The signed bundle is the source of truth: the EntitlementsTests
-          # swift test guards the source templates, but only this proves
-          # bundle.sh actually signed the keys in. Without the capture
-          # entitlements, programs hosted in a Roost tab lose mic/camera/
-          # apple-events access *silently* under the hardened runtime.
-          APP="mac/build/Roost.app"
-          ROOSTCTL="$APP/Contents/Resources/bin/roostctl"
-          INFO="$APP/Contents/Info.plist"
-          work=$(mktemp -d)
-          trap 'rm -rf "$work"' EXIT
-          # Extract each binary's entitlements as a real plist. codesign's text
-          # dump format is unstable across macOS versions (XML on some, a
-          # [Key] listing on others), so we force --xml and parse with
-          # PlistBuddy for exact, substring-proof key lookup.
-          app_ent="$work/app.plist"; ctl_ent="$work/roostctl.plist"
-          # No `|| true`: a failed extraction (unsigned/unreadable binary) must
-          # fail the job — otherwise the negative-only roostctl check below
-          # would pass vacuously on an empty plist.
-          codesign -d --entitlements - --xml "$APP"      2>/dev/null > "$app_ent"
-          codesign -d --entitlements - --xml "$ROOSTCTL" 2>/dev/null > "$ctl_ent"
-
-          has_key() { /usr/libexec/PlistBuddy -c "Print :$2" "$1" >/dev/null 2>&1; }
-          plist_value() { /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null || true; }
-          # Each takes: $1=label $2=plist; remaining args=exact key names.
-          require_true() {  # key must exist AND be boolean true (not just present)
-            local label="$1" plist="$2"; shift 2
-            for key in "$@"; do
-              [ "$(plist_value "$plist" "$key")" = "true" ] \
-                || { echo "FAIL: $label must carry $key=true"; exit 1; }
-            done
-          }
-          require_nonempty() {  # key must exist AND be a non-whitespace string
-            local label="$1" plist="$2"; shift 2
-            for key in "$@"; do
-              [ -n "$(plist_value "$plist" "$key" | tr -d '[:space:]')" ] \
-                || { echo "FAIL: $label missing non-empty $key"; exit 1; }
-            done
-          }
-          forbid_keys() {  # key must be absent
-            local label="$1" plist="$2"; shift 2
-            for key in "$@"; do
-              if has_key "$plist" "$key"; then
-                echo "FAIL: $label unexpectedly carries $key"; exit 1
-              fi
-            done
-          }
-
-          CAPTURE=(
-            com.apple.security.device.audio-input
-            com.apple.security.device.camera
-            com.apple.security.automation.apple-events
-          )
-          # Broad / unneeded keys kept out of the app (blast-radius control).
-          BROAD=(
-            com.apple.security.personal-information.addressbook
-            com.apple.security.personal-information.calendars
-            com.apple.security.personal-information.location
-            com.apple.security.personal-information.photos-library
-            com.apple.security.cs.allow-jit
-            com.apple.security.cs.allow-unsigned-executable-memory
-            com.apple.security.app-sandbox
-            com.apple.security.network.client
-            com.apple.security.network.server
-          )
-
-          require_true "app" "$app_ent" "${CAPTURE[@]}"      # app MUST carry the capture set (=true)
-          forbid_keys  "app" "$app_ent" "${BROAD[@]}"        # app MUST NOT carry broad keys
-          forbid_keys  "roostctl" "$ctl_ent" "${CAPTURE[@]}" # helper MUST NOT inherit capture
-          # The signed bundle's Info.plist MUST carry the paired purpose strings.
-          require_nonempty "Info.plist" "$INFO" \
-            NSMicrophoneUsageDescription \
-            NSCameraUsageDescription \
-            NSAppleEventsUsageDescription
-          echo "OK: capture entitlements (=true) + usage strings present; helper + broad keys excluded"
-
   # Iced walking skeleton: exact released Iced + libghostty-vt on both host
   # platforms, with the common IPC harness driving a real PTY-backed window.
   # The Linux leg selects X11 under Xvfb; its wgpu renderer uses Mesa's
@@ -866,6 +671,7 @@ jobs:
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
           tools/roosttest/test_tab_strip_pixels.py
+          tools/roosttest/test_sidebar_agents.py
           tools/roosttest/test_focus.py
           tools/roosttest/test_palette.py
           tools/roosttest/test_z_typography.py
@@ -951,9 +757,9 @@ jobs:
       # `make e2e-host-client` is its own target — the module spawns and
       # reaps daemons per test, which the shared-session lane above knows
       # nothing about, and it needs the `roost-session` binary the build
-      # step now produces. Marked `host_client`, so the whole-directory
-      # runs (`e2e-mac`, release.yml) and the macOS cells deselect it;
-      # see the Makefile's DAEMON_E2E_DESELECT for every mirror.
+      # step now produces. Marked `host_client`, so the shared-UI lanes
+      # (the functional cells, release.yml) deselect it; see the
+      # Makefile's DAEMON_E2E_DESELECT for every mirror.
       - name: Run host-client E2E (Linux X11)
         if: matrix.display == 'x11'
         env:
@@ -1154,6 +960,7 @@ jobs:
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
           tools/roosttest/test_tab_strip_pixels.py
+          tools/roosttest/test_sidebar_agents.py
           tools/roosttest/test_focus.py
           tools/roosttest/test_palette.py
           tools/roosttest/test_z_typography.py
@@ -1350,6 +1157,24 @@ jobs:
           tools/roosttest/test_host_bootstrap.py
           --roost-target iced --roost-fresh -v
 
+      # `test_shell_integration.py`'s `test_bash_auto_bootstrap_tracks_cwd`
+      # needs bash >= 4.4 for its `--posix` + ENV auto-bootstrap path;
+      # Apple's /bin/bash is 3.2, SIP-locked. Brew lands modern bash at
+      # /opt/homebrew/bin/bash on ARM runners, /usr/local/bin/bash on Intel
+      # (the test's `_modern_bash()` probes both). The idempotent
+      # `list || install` form is robust to runner images that ship bash
+      # preinstalled; the version probe makes a future preinstall regression
+      # loud in CI logs rather than silently re-triggering the test's
+      # `precondition("no modern bash")` failure.
+      - name: Install modern bash + version probe (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list bash >/dev/null 2>&1 || brew install bash
+          which bash || true
+          for p in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+            if [ -x "$p" ]; then "$p" --version; fi
+          done
+
       # The three macOS iced cells (this one, the bundle smoke and the
       # Sparkle lane below) all deselect `host_client`. Nothing ships a
       # macOS `roost-session`, so HS-2's host lane is a Linux gate — and
@@ -1384,6 +1209,7 @@ jobs:
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
           tools/roosttest/test_tab_strip_pixels.py
+          tools/roosttest/test_sidebar_agents.py
           tools/roosttest/test_focus.py
           tools/roosttest/test_palette.py
           tools/roosttest/test_z_typography.py
@@ -1404,6 +1230,8 @@ jobs:
           tools/roosttest/test_menu_bar.py
           tools/roosttest/test_sparkle.py
           tools/roosttest/test_view_perf.py
+          tools/roosttest/test_shell_integration.py
+          tools/roosttest/test_newtab_cwd.py
           tools/roosttest/test_open_external.py
           tools/roosttest/test_context_menu.py
           tools/roosttest/test_device_queries.py
@@ -1503,7 +1331,7 @@ jobs:
           # A dev bundle ships the Sparkle MECHANICS with no feed: the
           # default assemble must never carry a feed URL or public key, so
           # it can never offer or accept an update. Feed enablement is the
-          # explicit ROOST_SPARKLE_* env pair at bundle time.
+          # explicit ROOST_BUNDLE_SPARKLE_* env pair at bundle time.
           for key in SUFeedURL SUPublicEDKey; do
             if has_key "$INFO" "$key"; then
               echo "FAIL: Info.plist unexpectedly carries $key (default assemble must stay feedless)"; exit 1
@@ -1579,8 +1407,7 @@ jobs:
 
           # Extract entitlements as a real plist (codesign's text dump
           # format is unstable across macOS versions) and parse with
-          # PlistBuddy for exact, substring-proof key lookup — same
-          # technique as the swift-mac job's TCC-entitlements check.
+          # PlistBuddy for exact, substring-proof key lookup.
           work=$(mktemp -d)
           trap 'rm -rf "$work"' EXIT
           ent="$work/entitlements.plist"
@@ -1598,8 +1425,8 @@ jobs:
           done
           echo "OK: entitlements carry the three capture keys (all true)"
           # Required by the ad-hoc-signed embedded Sparkle under the
-          # hardened runtime (Roost-Iced.entitlements rationale;
-          # REMOVE-once-team-signed).
+          # hardened runtime (mac/Resources/Roost.entitlements gives the
+          # reasoning).
           val=$(/usr/libexec/PlistBuddy -c "Print :com.apple.security.cs.disable-library-validation" "$ent" 2>/dev/null) \
             || { echo "FAIL: entitlements missing com.apple.security.cs.disable-library-validation"; exit 1; }
           [ "$val" = "true" ] \
@@ -1897,10 +1724,11 @@ jobs:
           echo "OK: codesign --verify --deep --strict passed"
 
           # libghostty-vt is linked statically on purpose: a dynamic link
-          # reintroduces the dyld @rpath failure the Swift build once hit
-          # (swift-mac's guard, ported). Every Mach-O either bundle ships is
-          # checked, and otool's output is captured first so a binary it
-          # cannot read fails here rather than reading as "no ghostty".
+          # reintroduces the dyld @rpath failure the retired Swift app's
+          # build once hit (its CI guard, ported). Every Mach-O either
+          # bundle ships is checked, and otool's output is captured first so
+          # a binary it cannot read fails here rather than reading as "no
+          # ghostty".
           for bundle in "$APP" mac/build/Roost-Iced.app; do
             for bin in "$bundle"/Contents/MacOS/* "$bundle/Contents/Resources/bin/roostctl"; do
               deps="$(otool -L "$bin")" || { echo "FAIL: otool -L could not read $bin"; exit 1; }
@@ -2478,128 +2306,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # Functional E2E against the real Swift app, driven through the IPC op set
-  # by the pytest harness (tools/roosttest) — the Mac twin of the Linux
-  # functional lanes inside iced-build-e2e. Required (in ci-success). The harness clears any stale instance before
-  # launch (tools/roosttest/ui.py) and timeouts scale up for the slower
-  # shared runner; see docs/development/test-automation.md.
-  e2e-mac:
-    needs: changes
-    if: needs.changes.outputs.mac == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - uses: jdx/mise-action@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
-      - name: Install modern bash + version probe
-        # `test_bash_auto_bootstrap_tracks_cwd` needs bash >= 4.4 for its
-        # `--posix` + ENV auto-bootstrap path; Apple's /bin/bash is 3.2,
-        # SIP-locked. Brew lands modern bash at /opt/homebrew/bin/bash on
-        # ARM runners, /usr/local/bin/bash on Intel (the test's
-        # `_modern_bash()` probes both). The idempotent `list || install`
-        # form is robust to runner images that ship bash preinstalled;
-        # the version probe makes a future preinstall-regression loud in
-        # CI logs rather than silently re-triggering the test's
-        # `precondition("no modern bash")` failure.
-        run: |
-          brew list bash >/dev/null 2>&1 || brew install bash
-          which bash || true
-          for p in /opt/homebrew/bin/bash /usr/local/bin/bash; do
-            if [ -x "$p" ]; then "$p" --version; fi
-          done
-
-      - name: Cache vendored libghostty-vt
-        id: cache-ghostty
-        uses: actions/cache@v5
-        with:
-          path: |
-            third_party/ghostty/out
-            third_party/ghostty/src
-          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
-
-      - name: Build libghostty-vt
-        if: steps.cache-ghostty.outputs.cache-hit != 'true'
-        run: ./third_party/ghostty/build.sh
-
-      - name: Cache SwiftPM artifacts
-        uses: actions/cache@v5
-        with:
-          path: |
-            mac/.build
-            ~/Library/Caches/org.swift.swiftpm
-          key: swiftpm-${{ runner.os }}-${{ hashFiles('mac/Package.swift', 'mac/Package.resolved') }}
-          restore-keys: swiftpm-${{ runner.os }}-
-
-      - name: Cache cargo registry + target
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-swiftmac-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-swiftmac-
-
-      - name: Bundle Roost.app
-        run: ./mac/scripts/bundle.sh debug
-
-      - name: Run E2E (Mac app)
-        env:
-          ROOST_TEST_TIMEOUT_SCALE: "3"   # shared macos-latest runner is slower/variable
-          # Unlocks the test-only IPC ops in the bundled Mac app
-          # (tools/roosttest/ui.py forwards this via `open --env`).
-          # See the Iced E2E steps above for full rationale.
-          ROOST_TEST_MODE: "1"
-        # --roost-fresh: own a hermetic instance with an isolated, throwaway
-        # ROOST_STATE_DIR (replaces the old ROOST_TEST_RESET_STATE clean-slate
-        # hack — the harness no longer deletes the real state.json).
-        #
-        # The marker expression deselects both daemon lanes, which have
-        # their own jobs/steps: the headless host-session lane
-        # (`session-e2e`) and HS-2's host-client lane (`iced-build-e2e`'s
-        # Linux steps). This whole-directory run builds no
-        # `roost-session`, so collecting either here would make the first
-        # case `cargo build` mid-test on a shared macOS runner — and the
-        # Swift app answers `unknown-op` to every `host.*` op besides.
-        # Mirror of the Makefile's DAEMON_E2E_DESELECT — see the comment
-        # there.
-        run: >
-          uv run --group test pytest tools/roosttest
-          -m 'not session_daemon and not host_client'
-          --roost-target mac --roost-fresh -v
-          --junitxml=test-results/e2e-mac.xml
-
-      # On failure, salvage what makes a red blocking check debuggable: the
-      # app's own log, any macOS crash report, and a best-effort live
-      # screenshot (only lands if the app is still up). Staged into one dir
-      # because upload-artifact doesn't expand `~`/globs.
-      - name: Collect failure diagnostics
-        if: failure()
-        run: |
-          mkdir -p diagnostics
-          cp "$HOME/Library/Logs/Roost/roost.log" diagnostics/ 2>/dev/null || true
-          cp "$HOME"/Library/Logs/DiagnosticReports/Roost*.ips diagnostics/ 2>/dev/null || true
-          cp "$HOME"/Library/Logs/DiagnosticReports/Roost*.crash diagnostics/ 2>/dev/null || true
-          "mac/build/Roost.app/Contents/Resources/bin/roostctl" screenshot --out diagnostics/screen.png 2>/dev/null || true
-          ls -la diagnostics || true
-
-      - name: Upload E2E diagnostics + JUnit
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: e2e-mac-diagnostics
-          path: |
-            diagnostics/
-            test-results/
-          if-no-files-found: ignore
-
   # Functional E2E against the headless host-session daemon: the pytest lane
   # spawns real `roost-session` processes on throwaway profiles and drives
   # them over the same IPC op set `roostctl` speaks (tools/roosttest/
@@ -2737,7 +2443,11 @@ jobs:
   # Single required check. Always runs; passes iff no gated job failed (skipped
   # jobs are fine — that's the path-filter doing its job).
   ci-success:
-    needs: [changes, rust-lint, harness-unit, scripts, themes-parity, rust-build, swift-mac, iced-build-e2e, iced-release, e2e-mac, session-e2e]
+    # Every job but e2e-iced-wayland-drag, which is deliberately NOT here:
+    # it is a non-blocking signal lane (see its job comment).
+    # tools/roosttest_unit/test_ci_contract.py fails if any other job is
+    # missing, so adding a job is this one line.
+    needs: [changes, rust-lint, harness-unit, scripts, rust-build, iced-build-e2e, iced-release, session-e2e]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -2759,28 +2469,14 @@ jobs:
           echo "${NEEDS}" | jq -r 'to_entries[] | "  \(.key): \(.value.result)"'
 
           # Deriving membership from `needs` means a job DELETED from that
-          # list silently stops being gated — the gate would still pass, just
-          # over less. A floor catches that. It is one integer rather than a
-          # second copy of the list, so it cannot drift the way the old
-          # hand-written `results` string did; adding a gate is free (the
-          # count only rises), and lowering this number should be a
-          # deliberate act with a reason. `release.yml`'s ci-gate trusts this
-          # check, so "fewer gates than we think" has to be loud.
-          # 12 -> 9 in plan 031: the gtk UI and its three CI jobs (gtk-build,
-          # e2e-gtk, e2e-gtk-wayland) were deleted with crates/roost-linux.
-          # e2e-iced-wayland-drag is deliberately NOT in `needs` — it is a
-          # non-blocking signal lane (see its job comment).
-          # 9 -> 10 in plan 035: `session-e2e` gates the headless
-          # host-session daemon lane.
-          # 10 -> 11 in plan 060: `scripts` gates the shell tests for
-          # linux/scripts + mac/scripts (notarize.sh), previously run by
-          # no workflow at all.
-          required_jobs=11
-          count="$(echo "${NEEDS}" | jq -r 'length')"
-          if [ "${count}" -lt "${required_jobs}" ]; then
-            echo "::error::ci-success is gating ${count} jobs but expects at least ${required_jobs} — a job was removed from its needs list. If that was deliberate, lower required_jobs in the same commit."
-            exit 1
-          fi
+          # list would silently stop being gated — the gate would still pass,
+          # just over less. That is caught before merge, statically:
+          # tools/roosttest_unit/test_ci_contract.py (harness-unit) fails
+          # unless every job in this file is in `needs` or on its explicit
+          # non-blocking list. It replaced an integer floor here (plan 089),
+          # which every job added or removed had to bump by hand.
+          # `release.yml`'s ci-gate trusts this check, so "fewer gates than
+          # we think" has to be loud.
 
           # Allowlist, not a denylist. A denylist of failure/cancelled let
           # `abandoned` through — the status GitHub assigns when its own

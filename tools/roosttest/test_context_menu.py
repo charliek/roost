@@ -17,8 +17,6 @@ Copy Path reads the native clipboard, so it is in
 On Linux, `app.context_menu_open` shows the overlay a right-click shows,
 and the last cases drive it with `app.key_event`. macOS draws a native
 popup instead, which the op does not open.
-
-Skipped under `--roost-target mac`: the Swift app has no context-menu ops.
 """
 
 from __future__ import annotations
@@ -56,12 +54,6 @@ pytestmark = pytest.mark.skipif(
     not TEST_MODE,
     reason="the app.context_menu_* ops require ROOST_TEST_MODE=1",
 )
-
-
-@pytest.fixture(autouse=True)
-def _iced_only(target):
-    if target != "iced":
-        pytest.skip("the context-menu ops are iced's; Roost.app answers unknown-op")
 
 
 def tab_target(tab: int) -> dict:

@@ -33,10 +33,8 @@
 # The inject block is adapted from Ghostty's ghostty.bash (GPLv3 header
 # below); the integration body is Roost's.
 #
-# KEEP IN SYNC (shared functions only — __roost_osc7, __roost_title,
-# __roost_marks) with mac/Sources/Roost/Resources/shell-integration/roost.bash;
-# the inject block and prompt default are Linux/iced-only and needn't match.
-# tools/roosttest_unit/test_osc7_emitters.py compares the shared bodies.
+# tools/roosttest_unit/test_osc7_emitters.py pins the bytes __roost_osc7 and
+# __roost_title emit.
 #
 # Parts of the inject block are based on Ghostty's bash integration, which
 # is based on Kitty's. Kitty is distributed under GPLv3, so that block is

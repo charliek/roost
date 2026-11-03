@@ -2,14 +2,12 @@
 
 Runs the real script via subprocess against temp appcast files + a fake
 sign_update output — not a Python port of its logic — the same convention
-as test_sparkle_plist.py. No network, no cargo/swift build.
+as test_sparkle_plist.py. No network, no cargo build.
 
-Covers the two invocation shapes the DMG-generalization work (C3) adds:
-the unchanged Swift default (ROOST_DMG_NAME unset -> "Roost-{version}.dmg")
-and the iced override (ROOST_DMG_NAME set), plus the fresh-channel shape a
-committed docs/appcast-iced.xml seed will have (zero <item>s, C4), and the
-existing dedupe-by-version behavior (re-running the same version replaces
-rather than duplicates).
+Covers both invocation shapes: the release default (ROOST_DMG_NAME unset ->
+"Roost-{version}.dmg") and the override (ROOST_DMG_NAME set), plus a
+channel with zero <item>s and the dedupe-by-version behavior (re-running
+the same version replaces rather than duplicates).
 """
 
 from __future__ import annotations
@@ -93,7 +91,7 @@ class UpdateAppcastTests(unittest.TestCase):
         assert channel is not None
         return channel
 
-    def test_default_swift_shape_enclosure_name_and_signature(self) -> None:
+    def test_default_shape_enclosure_name_and_signature(self) -> None:
         appcast = self._write_appcast(APPCAST_WITH_ONE_ITEM)
         sign_file = self._write_sign_file(sig="NEWSIG-abc123", length="9999")
         result = self._run(

@@ -28,9 +28,7 @@ def _grid(roost, tab_id: int) -> tuple[int, int]:
     return dump["cols"], dump["rows"]
 
 
-def _require_owned_rust(target: str):
-    if target != "iced":
-        pytest.skip("shared typography adapters are exercised by the Rust UI")
+def _require_owned_rust():
     config_path = ui.owned_session_config_path()
     if config_path is None:
         pytest.skip("typography persistence requires a harness-owned config copy")
@@ -40,9 +38,9 @@ def _require_owned_rust(target: str):
 
 
 @pytest.fixture
-def owned_rust_config(target):
+def owned_rust_config():
     """Prove ownership before any typography test mutates shared UI state."""
-    return _require_owned_rust(target)
+    return _require_owned_rust()
 
 
 @pytest.fixture

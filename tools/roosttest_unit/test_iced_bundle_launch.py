@@ -131,7 +131,22 @@ class IcedBundleAppValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             app = _make_bundle(Path(root))
             with patch.dict(os.environ, {"ROOST_ICED_APP": str(app)}):
-                self.assertEqual(ui.iced_bundle_app(), app)
+                self.assertEqual(ui.iced_bundle_app(), app.resolve())
+
+    @patch("ui.platform.system", return_value="Darwin")
+    def test_a_bundle_reached_through_a_symlink_owns_its_real_executable(self, _system) -> None:
+        """`ps -o comm=` reports the executable's resolved path, so a bundle
+        named through a symlinked directory must resolve too, or the harness
+        refuses to adopt the process it launched."""
+        with tempfile.TemporaryDirectory() as root:
+            real = Path(root).resolve() / "real"
+            real.mkdir()
+            app = _make_bundle(real)
+            (Path(root) / "link").symlink_to(real, target_is_directory=True)
+            with patch.dict(os.environ, {"ROOST_ICED_APP": str(Path(root) / "link" / app.name)}):
+                bundle = ui.iced_bundle()
+            assert bundle is not None
+            self.assertTrue(bundle.runs_inside(str(app / "Contents" / "MacOS" / "Roost-Iced")))
 
     @patch("ui.platform.system", return_value="Darwin")
     def test_relative_path_resolves_against_repo_root(self, _system) -> None:
@@ -145,7 +160,7 @@ class IcedBundleAppValidationTests(unittest.TestCase):
                 ):
                     self.assertEqual(
                         ui.iced_bundle_app(),
-                        Path(root) / "mac" / "build" / "Roost-Iced.app",
+                        (Path(root) / "mac" / "build" / "Roost-Iced.app").resolve(),
                     )
 
 
@@ -620,10 +635,10 @@ class QuitDispatchTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "survived SIGKILL"):
                 ui._quit_iced_bundle()
 
-    def test_a_pid_reused_by_the_swift_roost_during_the_grace_period_is_never_killed(
+    def test_a_pid_reused_by_an_installed_roost_during_the_grace_period_is_never_killed(
         self,
     ) -> None:
-        """The bundle exits during the SIGTERM grace period and the Swift
+        """The bundle exits during the SIGTERM grace period and an installed
         Roost.app gets its pid: ownership is proven again before SIGKILL, so
         the escalation never reaches it."""
         with (
@@ -637,7 +652,7 @@ class QuitDispatchTests(unittest.TestCase):
                     "/Applications/Roost.app/Contents/MacOS/Roost",
                 ],
             ),
-            # The SIGTERM window ends with the pid alive (the Swift app's now);
+            # The SIGTERM window ends with the pid alive (the installed app's now);
             # a SIGKILL, were one sent, would "work".
             patch("ui._wait_pid_gone", side_effect=[False, True]),
             patch("ui.subprocess.run") as run,

@@ -5,7 +5,7 @@
 # a labeled PNG per step into an output dir alongside a manifest.md that
 # says what each shot should show.
 #
-#   tools/screenshot/smoke.sh mac                  # default outdir
+#   tools/screenshot/smoke.sh iced                 # default outdir
 #   tools/screenshot/smoke.sh iced /tmp/roost-iced # custom outdir
 #
 # The screenshots are the verification surface: an agent (or human)
@@ -16,7 +16,7 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
-TARGET="${1:?usage: smoke.sh <mac|iced> [outdir]}"
+TARGET="${1:?usage: smoke.sh iced [outdir]}"
 ut_init "${TARGET}"
 OUT="${2:-/tmp/roost-uitest-${TARGET}-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "${OUT}"

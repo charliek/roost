@@ -16,9 +16,6 @@ Cells are located with the walking-skeleton marker: an explicit-background
 cell at (0, 0) pins the grid origin and measures one cell. A corner pixel
 must be exact, since quads paint opaque colors; the ink checks leave room
 for antialiased glyph edges, never for the ink itself.
-
-Iced-only: the pixel geometry is the iced adapter's (walking-skeleton
-precedent), so the module skips under `--roost-target mac`.
 """
 
 from __future__ import annotations
@@ -32,9 +29,8 @@ import pytest
 import ui
 from client import Roost
 from conftest import skip_on_live_wayland_desktop
-from test_sidebar_collapse_persistence import _toggle_to_visible
 from test_sidebar_pixels import _capture
-from util import BARE_SHELL_ARGV, wait_for_config_line, wait_tab_quiet
+from util import BARE_SHELL_ARGV, show_sidebar, wait_for_config_line, wait_tab_quiet
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
@@ -81,12 +77,6 @@ FOREGROUND_TOL = 8
 INK_TOL = 48
 
 
-@pytest.fixture(autouse=True)
-def _iced_only(target):
-    if target != "iced":
-        pytest.skip("cell-paint pixel geometry is the iced adapter's (plan 073 D6)")
-
-
 _skip_wayland = skip_on_live_wayland_desktop()
 
 
@@ -115,7 +105,7 @@ def _color_run(shot, x: int, y: int, dx: int, dy: int, color) -> int:
 
 
 def _scene_tab(roost, project) -> int:
-    _toggle_to_visible(roost)
+    show_sidebar(roost)
     tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     wait_tab_quiet(roost, tab)
     return tab

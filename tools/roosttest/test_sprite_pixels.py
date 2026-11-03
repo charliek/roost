@@ -25,9 +25,8 @@ of hardcoding it. wgpu writes exact fg for opaque quads (C3 evidence);
 `COLOR_TOL` leaves room for compositing rounding only — a real AA band
 sits far outside it and fails the no-intermediate assertion.
 
-Iced-target-only (walking-skeleton precedent): the now-removed GTK
-sprite path had its own byte-exact Cairo suite + golden-hash fixture,
-and the Mac path is covered by `Sprite.swift`'s reference tests.
+(The now-removed GTK sprite path had its own byte-exact Cairo suite +
+golden-hash fixture.)
 """
 
 from __future__ import annotations
@@ -39,9 +38,8 @@ import pytest
 
 from client import Roost
 from conftest import skip_on_live_wayland_desktop
-from test_sidebar_collapse_persistence import _toggle_to_visible
 from test_sidebar_pixels import _capture
-from util import BARE_SHELL_ARGV, wait_tab_quiet
+from util import BARE_SHELL_ARGV, show_sidebar, wait_tab_quiet
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
@@ -72,12 +70,6 @@ SCENE_ROWS: dict[int, str] = {
     LIGHT_ROW: "─" * RUN_CELLS,
     DOUBLE_ROW: "═" * RUN_CELLS,
 }
-
-
-@pytest.fixture(autouse=True)
-def _iced_only(target):
-    if target != "iced":
-        pytest.skip("sprite pixel e2e pins the iced sprite adapter (plan 020 C4)")
 
 
 # Both tests in this module capture pixels; no other tests here to spare
@@ -211,7 +203,7 @@ class TestSpritePixels:
         )
 
     def test_sprite_seams_and_internal_edges(self, roost, project, tmp_path):
-        _toggle_to_visible(roost)
+        show_sidebar(roost)
         tab = _scene_tab(roost, project)
 
         metrics = roost.window_metrics()

@@ -44,9 +44,8 @@ it, and the UI already carries the directory `ui.claim_session_isolation`
 gave the whole pytest process, as the twin's does.
 
 `pytestmark = pytest.mark.host_client` (as `test_host_ssh.py` does) so
-a whole-directory run — `make e2e-mac` in particular, where the Swift
-app answers `unknown-op` to every `host.*` op — deselects it rather
-than failing it.
+the shared-UI lanes deselect it (the Makefile's `DAEMON_E2E_DESELECT`)
+rather than run it beside their own UI.
 
 Condition waits only.
 """

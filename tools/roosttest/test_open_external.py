@@ -6,8 +6,6 @@ editor or a browser: they raise the toast `Would open <target>` instead,
 which `app.notice_dump` reads back. The "zero launches" property itself is
 pinned by a Rust test over an injected runner (`url_launcher.rs`); this
 module proves the rows are wired to that path end to end.
-
-Skipped under `--roost-target mac`: the Swift app has neither action.
 """
 
 from __future__ import annotations
@@ -23,12 +21,6 @@ from client import Timeout
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
 DOCS_URL = "https://charliek.github.io/roost/"
-
-
-@pytest.fixture(autouse=True)
-def _iced_only(target):
-    if target != "iced":
-        pytest.skip("Open Settings File / Open Documentation / Toggle Full Screen are iced-only")
 
 
 pytestmark = pytest.mark.skipif(

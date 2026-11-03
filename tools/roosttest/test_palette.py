@@ -1,13 +1,9 @@
 """Command-palette E2E — drives the palette overlay over IPC (open,
-introspect, filter, activate a row, dismiss) against either UI via
-`--roost-target`.
+introspect, filter, activate a row, dismiss).
 
 Activating a palette row dispatches the *same* command its keybind
 would (a command row's id IS the KeybindAction id), so these also
-exercise command dispatch end-to-end — the north star. Assertions use
-only the command ids both UIs expose; the Mac-only `jump_to_unread` and
-the `close_project`/`delete_project` split are a known parity gap (see
-the harness README), deliberately not asserted here.
+exercise command dispatch end-to-end — the north star.
 """
 
 from __future__ import annotations
@@ -27,10 +23,8 @@ from util import (
 # The shared `palette` fixture (drive from closed, leave closed) lives in
 # conftest.py so the notification + launcher suites reuse it.
 
-# Curated command rows present in BOTH UIs with the same wire id. The
-# two UIs are kept at parity, so this is the full command-palette set
-# (minus the dynamic notification rows) — `close_project` + `jump_to_unread`
-# were unified/ported in the P8 parity pass.
+# Curated command rows: the full command-palette set (minus the dynamic
+# notification rows).
 COMMON_COMMAND_IDS = (
     "new_tab",
     "close_tab",
@@ -50,8 +44,7 @@ COMMON_COMMAND_IDS = (
 )
 
 
-# Roost-Iced only: the Swift app is frozen without project cycling, which
-# is why these are not in COMMON_COMMAND_IDS.
+# The Next/Previous Project rows (plan 077), asserted on their own.
 PROJECT_CYCLE_IDS = ("cycle_project_next", "cycle_project_prev")
 
 
@@ -64,9 +57,7 @@ def test_open_lists_common_commands(palette):
     assert not missing, f"command rows missing {missing}; got {ids}"
 
 
-def test_open_lists_project_cycle_commands(target, palette):
-    if target != "iced":
-        pytest.skip("project cycling is Roost-Iced only; the Swift app is frozen")
+def test_open_lists_project_cycle_commands(palette):
     ids = palette.palette_item_ids(palette.palette_open())
     missing = [c for c in PROJECT_CYCLE_IDS if c not in ids]
     assert not missing, f"command rows missing {missing}; got {ids}"
@@ -80,7 +71,7 @@ def _active_project(roost) -> int:
     return roost.identify()["active_project_id"]
 
 
-def test_cycle_project_walks_sidebar_order_and_stops_at_the_ends(target, roost, palette):
+def test_cycle_project_walks_sidebar_order_and_stops_at_the_ends(roost, palette):
     """Next/Previous Project step through the sidebar, walk past a project
     with no tabs, and stop at the first and last project rather than wrap.
 
@@ -94,8 +85,6 @@ def test_cycle_project_walks_sidebar_order_and_stops_at_the_ends(target, roost, 
     the sidebar draws no section strip: a saved host or `local-backend =
     session` puts rows on the ring that list never shows.
     """
-    if target != "iced":
-        pytest.skip("project cycling is Roost-Iced only; the Swift app is frozen")
     if roost.sidebar_sections():
         pytest.skip("the sidebar has host sections, so project.list is not the whole ring")
     tag = uuid.uuid4().hex[:6]
@@ -236,14 +225,14 @@ def test_activate_new_tab_dispatches_command(roost, project, palette):
 
 @pytest.mark.parametrize("command", ["rename_project", "rename_tab"])
 def test_activate_rename_command_enters_chrome_without_mutating(
-    target, roost, project, palette, command
+    roost, project, palette, command
 ):
     """Rename command rows close the palette and enter native inline editing.
 
     The functional harness deliberately does not synthesize text editing here;
     physical X11 coverage owns replacement typing, Enter, Escape, and PTY-byte
-    isolation. This target-neutral check pins command routing and the absence of
-    an optimistic workspace mutation.
+    isolation. This check pins command routing and the absence of an optimistic
+    workspace mutation.
     """
     tab = roost.open_tab(project, cwd="/tmp", title="rename-command-tab")
     # `tab.open` titles are initially shell-derived and may race an OSC 7 cwd
@@ -251,24 +240,22 @@ def test_activate_rename_command_enters_chrome_without_mutating(
     # does not mutate either authoritative label.
     roost.set_title(tab, "rename-command-tab")
     roost.focus(tab)
-    if target != "mac":
-        roost._wait(
-            roost.app_active_terminal_focused,
-            5.0,
-            "live terminal owns logical keyboard route before rename activation",
-        )
+    roost._wait(
+        roost.app_active_terminal_focused,
+        5.0,
+        "live terminal owns logical keyboard route before rename activation",
+    )
     before_project = roost.project(project)["name"]
     before_title = roost.tab(tab)["title"]
     palette.palette_open()
     state = palette.palette_activate(command)
     assert state["open"] is False
-    if target != "mac":
-        roost._wait(
-            lambda: not roost.app_active_terminal_focused(),
-            5.0,
-            "rename activation transfers logical keyboard ownership to the "
-            "native inline editor",
-        )
+    roost._wait(
+        lambda: not roost.app_active_terminal_focused(),
+        5.0,
+        "rename activation transfers logical keyboard ownership to the "
+        "native inline editor",
+    )
     assert roost.project(project)["name"] == before_project
     assert roost.tab(tab)["title"] == before_title
 
@@ -279,7 +266,7 @@ def test_open_launcher_frame(palette):
     assert st["frame"] == "launcher"
 
 
-def test_theme_frame_keeps_selection_in_view(target, palette):
+def test_theme_frame_keeps_selection_in_view(palette):
     """The theme list opens pre-positioned on the active theme; the palette
     must scroll that row into the viewport so its highlight is visible.
 
@@ -289,10 +276,7 @@ def test_theme_frame_keeps_selection_in_view(target, palette):
     list to the selection. The bundled theme set overflows the palette
     viewport and a fresh instance's default active theme (`roost-dark`)
     sorts last, so the pre-selected row starts off-screen — exercising
-    the scroll. Iced reports measured geometry; the Mac UI scrolls
-    correctly but does not expose the field."""
-    if target == "mac":
-        pytest.skip("selected_in_view geometry is not exposed by the Mac UI")
+    the scroll, which the UI reports as measured geometry."""
     palette.palette_open()
     st = palette.palette_activate("select_theme")
     assert st["frame"] == "themes"

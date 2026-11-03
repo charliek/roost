@@ -17,7 +17,7 @@
 #      (default: release) via `cargo build -p roost-iced`.
 #   2. Assembles the .app with the standard macOS bundle layout —
 #      Contents/MacOS/<name>, Contents/Info.plist, Contents/Resources/.
-#   3. Stamps `mac/Resources/Info-iced.plist.template` with the workspace
+#   3. Stamps `mac/Resources/Info.plist.template` with the workspace
 #      version (or $ROOST_VERSION) and the identity's id and name, then
 #      inserts the Sparkle feed keys when they are given.
 #   4. Installs the app icon and the SIL OFL texts of the two fonts
@@ -93,7 +93,7 @@ BUNDLE_ID="${ROOST_BUNDLE_ID}"
 # `bundle-iced.sh debug` reports the same version the .deb and
 # `roostctl identify` do.
 VERSION="${ROOST_VERSION:-$(roost_workspace_version "${REPO_ROOT}")}"
-TEMPLATE_PLIST="${MAC_DIR}/Resources/Info-iced.plist.template"
+TEMPLATE_PLIST="${MAC_DIR}/Resources/Info.plist.template"
 ICON_SRC="${MAC_DIR}/Resources/AppIcon.icns"
 ICON_COMPOSER_SRC="${MAC_DIR}/AppIcon.icon"
 
@@ -169,10 +169,10 @@ cp -R "${SPARKLE_FW_SRC}" "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
 # outer signature: embedded roostctl and roost-session, then the Sparkle chain
 # (itself strictly inner→outer — see codesign_sparkle_or_die in bundle-lib.sh),
 # then the .app.
-ENT_FILE="${MAC_DIR}/Resources/Roost-Iced.entitlements"
-# The bundled roostctl helper gets the same narrower entitlements file
-# bundle.sh uses: it never records audio/video or sends Apple events,
-# so it must not inherit the app's capture entitlements.
+ENT_FILE="${MAC_DIR}/Resources/Roost.entitlements"
+# The bundled roostctl helper gets a narrower entitlements file: it never
+# records audio/video or sends Apple events, so it must not inherit the
+# app's capture entitlements.
 ROOSTCTL_ENT_FILE="${MAC_DIR}/Resources/roostctl.entitlements"
 # The nested roost-session daemon gets an empty entitlements dict: the
 # hardened runtime comes from --options runtime, and the daemon needs no
@@ -180,8 +180,7 @@ ROOSTCTL_ENT_FILE="${MAC_DIR}/Resources/roostctl.entitlements"
 SESSION_ENT_FILE="${MAC_DIR}/Resources/roost-session.entitlements"
 
 # roost_setup_signing preflights the app's + roostctl's entitlements files;
-# its signature is shared with the Swift bundle.sh (no daemon there) and must
-# not grow a third, so this file is preflighted here with the same semantics.
+# the daemon's is preflighted here with the same semantics.
 # On the bypass branch nothing gets signed at all — an unsigned Mach-O in
 # Contents/MacOS/ sealed under a signed .app fails codesign --verify --deep,
 # so a partially-signed bundle is worse than an unsigned one.

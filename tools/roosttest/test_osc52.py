@@ -16,9 +16,8 @@ The selection target is PRIMARY on Linux and, on macOS, the private
 — so the selection cases run on every clipboard lane, including the
 macOS iced cell. The middle-click case is iced-only.
 
-Run against either UI:
+Run it directly:
 
-    pytest -q tools/roosttest/test_osc52.py --roost-target mac
     pytest -q tools/roosttest/test_osc52.py --roost-target iced
 """
 
@@ -121,20 +120,14 @@ def test_osc52_read_request_does_not_clobber_clipboard(roost, project):
     assert roost.clipboard_dump("system") == baseline
 
 
-def test_middle_click_pastes_selection(roost, project, target):
+def test_middle_click_pastes_selection(roost, project):
     """A middle press on a tab that is not tracking the mouse pastes the
     selection clipboard into it, bracketed like any paste (plan 073 D1,
     #575 — on macOS it used to be compiled out).
 
-    Driven through `tab.dispatch_mouse_event`, which takes the iced UI's
-    production pointer route. iced only: the Swift app's op drives its
-    mouse-tracking encoder alone, never the `otherMouseDown` that pastes
-    there, so under `--roost-target mac` it cannot reach this gesture.
+    Driven through `tab.dispatch_mouse_event`, which takes the UI's
+    production pointer route.
     """
-    if target != "iced":
-        pytest.skip(
-            "Roost.app's tab.dispatch_mouse_event bypasses its middle-click paste"
-        )
     if not TEST_MODE:
         pytest.skip("tab.dispatch_mouse_event requires ROOST_TEST_MODE=1")
     tab = roost.open_tab(

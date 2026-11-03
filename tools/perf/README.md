@@ -98,15 +98,14 @@ driving W1 and W2 toward 0 while W3 stays high.
 ```bash
 tools/perf/render-stats.sh iced           # interactive: prompt before reading
 tools/perf/render-stats.sh iced 10        # reset, sleep 10s, read
-tools/perf/render-stats.sh mac            # errors — app.render_stats is iced-only
 ```
 
 Resets the counters, waits for you to exercise the running UI (either
 interactively or for a fixed duration), then prints `roostctl
-render-stats`'s delta since the reset. `--target` follows the rest of
-`tools/`: `mac|iced` (see [`../screenshot/README.md`](../screenshot/README.md)
-for the per-target launch/socket details this script reuses via
-`../screenshot/lib.sh`).
+render-stats`'s delta since the reset. It drives the dev `iced` profile,
+as the rest of `tools/` does (see
+[`../screenshot/README.md`](../screenshot/README.md) for the launch/socket
+details this script reuses via `../screenshot/lib.sh`).
 
 This is the *only* way to read `draw_calls` / `draw_nanos` /
 `fill_text_calls` — they require a live iced `Renderer`, which only a

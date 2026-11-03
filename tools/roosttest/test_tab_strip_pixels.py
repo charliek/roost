@@ -59,9 +59,8 @@ import pytest
 
 from client import Timeout
 from conftest import skip_on_live_wayland_desktop
-from test_sidebar_collapse_persistence import _toggle_to_collapsed, _toggle_to_visible
 from test_sidebar_pixels import COLOR_TOL, _blobs, _capture, _pixel
-from util import BARE_SHELL_ARGV
+from util import BARE_SHELL_ARGV, set_sidebar_collapsed, show_sidebar
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
 import pngtool  # noqa: E402  — pure stdlib PNG decoder, imported not shelled out
@@ -216,9 +215,7 @@ def _rightmost_title_pixel(shot, x0: int, x1: int, y1: int) -> int:
     not TEST_MODE,
     reason="window.resize requires ROOST_TEST_MODE=1 in the UI's launch env",
 )
-def test_overflowing_tab_strip_paints_no_scrollbar_band(roost, project, target, tmp_path):
-    if target != "iced":
-        pytest.skip("#281 is an iced scrollable artifact; mac's strip is native")
+def test_overflowing_tab_strip_paints_no_scrollbar_band(roost, project, tmp_path):
 
     tabs = [
         roost.open_tab(
@@ -288,7 +285,7 @@ def test_overflowing_tab_strip_paints_no_scrollbar_band(roost, project, target, 
     not TEST_MODE,
     reason="window.resize requires ROOST_TEST_MODE=1 in the UI's launch env",
 )
-def test_sidebar_divider_hairline_only_while_expanded(roost, target, tmp_path):
+def test_sidebar_divider_hairline_only_while_expanded(roost, tmp_path):
     """The divider is one 1px column at the sidebar's trailing edge, drawn
     inside `sidebar_width` (plan 016 W1.3) so the terminal grid keeps every
     pixel the sidebar leaves it — a divider that grew its own layout column
@@ -298,11 +295,9 @@ def test_sidebar_divider_hairline_only_while_expanded(roost, target, tmp_path):
     Pixel oracle by design: like the rest of this module (#281/#291), the
     subject is renderer-only chrome with no textual IPC surface — the
     narrow, documented exception to roosttest's text-not-pixels rule."""
-    if target != "iced":
-        pytest.skip("iced chrome hairline; mac uses NSSplitView's divider")
 
     roost.window_resize(WINDOW_W, WINDOW_H)
-    _toggle_to_visible(roost)
+    show_sidebar(roost)
 
     artifact_dir = os.environ.get("ROOST_E2E_ARTIFACT_DIR")
     base = Path(artifact_dir) if artifact_dir else tmp_path
@@ -333,7 +328,7 @@ def test_sidebar_divider_hairline_only_while_expanded(roost, target, tmp_path):
         ) from exc
 
     try:
-        _toggle_to_collapsed(roost)
+        set_sidebar_collapsed(roost, True)
 
         def _collapsed_repainted() -> bool:
             shot = _capture(roost, collapsed_path)
@@ -359,14 +354,14 @@ def test_sidebar_divider_hairline_only_while_expanded(roost, target, tmp_path):
             f"(screenshot: {collapsed_path})"
         )
     finally:
-        _toggle_to_visible(roost)
+        show_sidebar(roost)
 
 
 @pytest.mark.skipif(
     not TEST_MODE,
     reason="window.resize requires ROOST_TEST_MODE=1 in the UI's launch env",
 )
-def test_notification_dots_paint_the_accent(roost, project, target, tmp_path):
+def test_notification_dots_paint_the_accent(roost, project, tmp_path):
     """Both notification dots — the tab-pill badge and the sidebar
     project-row dot — render `chrome::NOTIFICATION_BADGE` (#007aff, the
     Mac's `controlAccentColor`), and the tab badge sits inside its own
@@ -378,11 +373,9 @@ def test_notification_dots_paint_the_accent(roost, project, target, tmp_path):
     fixed — the dots drawn in `NOTIFICATION` (#4e9af1) instead of the
     accent — is invisible to every dump op.
     """
-    if target != "iced":
-        pytest.skip("iced chrome fill; mac reads controlAccentColor live")
 
     roost.window_resize(WINDOW_W, WINDOW_H)
-    _toggle_to_visible(roost)
+    show_sidebar(roost)
     metrics = roost.window_metrics()
     assert metrics["sidebar_collapsed"] is False, (
         f"the sidebar must be expanded for the project-row dot: {metrics}"

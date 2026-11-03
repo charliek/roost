@@ -37,19 +37,14 @@ a pure typing-latency measurement. That is deliberate: it is the stricter
 of the two, and it is the path the `tools/perf/echo-latency.py` probe
 rides too.
 
-Iced-only: `view_calls`/`elide_calls` are iced instrumentation (plan 029
-C1). The now-removed GTK UI reported structurally-uniform zeros, which
-would have greened this module vacuously, and the Mac handler does not
-send the fields at all — so the whole module skips off
-`--roost-target`, the way `test_tab_strip_pixels.py` guards its
-iced-only chrome assertions.
+`view_calls`/`elide_calls` are iced instrumentation (plan 029 C1). The
+now-removed GTK UI reported structurally-uniform zeros, which would have
+greened this module vacuously.
 """
 
 from __future__ import annotations
 
 import time
-
-import pytest
 
 from client import Timeout, scaled_timeout
 
@@ -66,15 +61,6 @@ SECOND_BURST_KEYSTROKES = 30
 # The quiescence probe: two consecutive zero-delta reads this far apart.
 SETTLE_INTERVAL = 0.25
 SETTLE_TIMEOUT = 20.0
-
-
-@pytest.fixture(autouse=True)
-def _iced_only(target):
-    if target != "iced":
-        pytest.skip(
-            "view/elide render-stats counters are iced instrumentation "
-            "(plan 029 C1); mac omits the fields"
-        )
 
 
 def _stats(roost, reset: bool = False) -> dict[str, int]:

@@ -49,12 +49,6 @@ TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 IME_COMMIT_CASES = ["é", "é", "你好", "👍"]
 
 
-@pytest.fixture(autouse=True)
-def _iced_only(target):
-    if target != "iced":
-        pytest.skip("tab.feed_ime is iced-only for now (plan 021)")
-
-
 # Only the two tests that capture screenshots need the controlled
 # compositor; the rest of the class asserts over PTY bytes/IPC errors
 # (issue #488).

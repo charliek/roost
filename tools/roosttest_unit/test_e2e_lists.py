@@ -4,6 +4,10 @@
 its module list. A module added to one place and not the other runs on some
 gates and silently not on others. Every list is located by name; one that is
 missing or parses empty is a failure, never an empty set.
+
+Every module on disk is in a lane, and every lane is executed (plan 089 D5):
+a Makefile list that no CI step runs, directly or through a `make` target,
+is a lane nothing gates.
 """
 
 from __future__ import annotations
@@ -19,17 +23,9 @@ ROOSTTEST = REPO / "tools" / "roosttest"
 
 MODULE = re.compile(r"tools/roosttest/test_\w+\.py")
 
-# macOS runs ICED_E2E_TESTS + ICED_CLIPBOARD_TESTS minus these. Neither has a
-# self-skip or marker that confines it to Linux: both docstrings say they run
-# on every target, and `git log -S` shows they entered the Linux lists first
-# and the macOS list never took them. The omission is historical, not a
-# recorded reason: they are exceptions here so the gap is explicit, and
-# closing it is a separate decision.
+# macOS runs ICED_E2E_TESTS + ICED_CLIPBOARD_TESTS minus these, each confined
+# to Linux by its own module-level skip.
 MACOS_EXCEPTIONS = {
-    # No Linux-only skip or marker; its Linux/macOS login-shell split asserts on sys.platform.
-    "tools/roosttest/test_shell_integration.py",
-    # No skip or marker; the module docstring says it is real on Linux and macOS.
-    "tools/roosttest/test_newtab_cwd.py",
     # `sys.platform != "linux"` module-level skip (/proc sweep, sun_path sizing).
     "tools/roosttest/test_boot_failure.py",
     # `sys.platform != "linux"` module-level skip (/proc sweep of the UI's processes).
@@ -50,19 +46,6 @@ DEDICATED_VARIABLES = {
     "LOCAL_BACKEND_E2E_TESTS",
     "OLD_SESSION_E2E_TESTS",
     "BOOTSTRAP_E2E_TESTS",
-}
-
-# Swift-only modules: `e2e-mac` collects the whole directory (Makefile
-# `e2e-mac`), so they need no list entry; the iced lanes do not run them.
-SWIFT_SWEEP_ONLY = {
-    "test_launcher",
-    "test_ordering",
-    "test_sidebar_agents",
-    "test_sidebar_collapse_persistence",
-    "test_sidebar_layout",
-    "test_terminal",
-    "test_test_ops",
-    "test_word_selection",
 }
 
 X11_STEP = "Run Iced functional E2E (Linux X11)"
@@ -155,6 +138,65 @@ def makefile_recipe_modules(target: str) -> list[str]:
     return parse_recipe_modules(MAKEFILE.read_text(), target)
 
 
+MAKE_CALL = re.compile(r"(?<![\w$-])make((?:\s+[a-z][a-z0-9-]*)+)")
+
+
+def parse_recipe_lists(text: str, target: str) -> list[str]:
+    """The `*_TESTS` variables a target's recipe references."""
+    lines = logical_lines(text)
+    start = next((i for i, line in enumerate(lines) if line.startswith(f"{target}:")), None)
+    if start is None:
+        raise AssertionError(f"Makefile has no target {target!r}")
+    names: list[str] = []
+    for line in lines[start + 1 :]:
+        if not line.startswith("\t"):
+            break
+        names += re.findall(r"\$[({]([A-Z][A-Z0-9_]*_TESTS)[)}]", line)
+    return names
+
+
+RUN_KEY = re.compile(r"^(\s*)(?:- )?run:\s*(.*)$")
+
+
+def run_block_lines(ci: str) -> list[str]:
+    """The lines of every step's `run:` script — the key's own line and the
+    block under it — and nothing else: a module named in a cache key's
+    `hashFiles(...)` or an `env:` value is not a module the step runs."""
+    lines: list[str] = []
+    indent: int | None = None
+    for line in ci.splitlines():
+        if indent is not None:
+            if not line.strip() or len(line) - len(line.lstrip()) > indent:
+                lines.append(line)
+                continue
+            indent = None
+        if match := RUN_KEY.match(line):
+            indent = len(match.group(1))
+            lines.append(match.group(2))
+    return lines
+
+
+def ci_executed_modules(ci: str, makefile: str) -> set[str]:
+    """Every module a CI step runs: named in a `run:` script outright, or
+    reached through a `make` target whose recipe names it or a list holding
+    it. Comments never count."""
+    lists = parse_makefile_lists(makefile)
+    executed: set[str] = set()
+    for line in run_block_lines(ci):
+        if line.lstrip().startswith("#"):
+            continue
+        code = re.split(r"\s#", line, maxsplit=1)[0]
+        executed |= set(MODULE.findall(code))
+        for call in MAKE_CALL.finditer(code):
+            for target in call.group(1).split():
+                executed |= set(parse_recipe_modules(makefile, target))
+                for name in parse_recipe_lists(makefile, target):
+                    if name not in lists:
+                        raise AssertionError(f"make {target} references an undefined {name}")
+                    executed |= set(lists[name])
+    return executed
+
+
 def on_disk() -> set[str]:
     return {f"tools/roosttest/{path.name}" for path in ROOSTTEST.glob("test_*.py")}
 
@@ -210,6 +252,27 @@ class MakefileParserTests(unittest.TestCase):
     def test_recipe_continuations_join(self) -> None:
         text = f"t:\n\tpytest {LANE} \\\n\t  {OTHER}\n"
         self.assertEqual(parse_recipe_modules(text, "t"), [LANE, OTHER])
+
+    def test_a_make_call_in_ci_executes_its_recipes_lists(self) -> None:
+        makefile = f"X_TESTS := {LANE}\nlane:\n\tpytest $(X_TESTS)\nother:\n\tpytest {OTHER}\n"
+        ci = "        run: make lane\n        # make other\n"
+        self.assertEqual(ci_executed_modules(ci, makefile), {LANE})
+        ci = "        run: >\n          xvfb-run -a\n          make other lane\n"
+        self.assertEqual(ci_executed_modules(ci, makefile), {LANE, OTHER})
+
+    def test_only_run_scripts_execute_a_module(self) -> None:
+        ci = (
+            "      - name: Cache\n"
+            "        with:\n"
+            f"          key: x-${{{{ hashFiles('{OTHER}') }}}}\n"
+            "      - name: Lane\n"
+            "        env:\n"
+            f"          NOTE: {OTHER}\n"
+            "        run: >\n"
+            f"          pytest {LANE}\n"
+            "        timeout-minutes: 5\n"
+        )
+        self.assertEqual(ci_executed_modules(ci, ""), {LANE})
 
     def test_ci_step_comments_do_not_count(self) -> None:
         text = (
@@ -272,10 +335,15 @@ class ListTests(unittest.TestCase):
         real_input = makefile_recipe_modules(REAL_INPUT_TARGET)
         self.assertEqual(real_input, ["tools/roosttest/test_real_input_mac.py"])
         classified |= set(real_input)
-        classified |= {f"tools/roosttest/{name}.py" for name in SWIFT_SWEEP_ONLY}
         disk = on_disk()
         self.assertEqual(sorted(disk - classified), [], "modules in no lane and no named class")
         self.assertEqual(sorted(classified - disk), [], "a list names a module that does not exist")
+
+    def test_every_module_on_disk_is_executed_by_ci(self) -> None:
+        executed = ci_executed_modules(CI.read_text(), MAKEFILE.read_text())
+        disk = on_disk()
+        self.assertEqual(sorted(disk - executed), [], "modules no CI step runs")
+        self.assertEqual(sorted(executed - disk), [], "ci.yml runs a module that does not exist")
 
 
 if __name__ == "__main__":

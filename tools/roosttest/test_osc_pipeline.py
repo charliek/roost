@@ -5,8 +5,7 @@ Closes both coverage gaps that #142 and #145 left open:
 * **#142** (`bold-color`): the existing resolver tests pass
   `boldColor` explicitly into `resolve_cell_colors` /
   `resolveCellColors`. They don't exercise the production
-  call sites (`crates/roost-iced/src/terminal_widget.rs::draw` /
-  `mac/Sources/Roost/TerminalView.swift::draw`). A revert to
+  call site (`crates/roost-iced/src/terminal_widget.rs::draw`). A revert to
   `None`/`nil` would still pass the unit tests. The
   `tab.dump_resolved` IPC op walks the SAME `resolve_cell_colors`
   call with the live `theme.bold_color`, so asserting on its
@@ -16,7 +15,7 @@ Closes both coverage gaps that #142 and #145 left open:
   drains onto the tab's PTY input after `vt_write` (see
   `docs/reference/terminal-queries.md`). The unit tests cover the
   pieces; only this suite drives PTY bytes → the UI's drain → reply
-  bytes on PTY stdin, on BOTH UIs. `tab.feed_pty_bytes` +
+  bytes on PTY stdin. `tab.feed_pty_bytes` +
   `tab.capture_pty_input` make the full chain testable.
 
   Every color-query case here also asserts **exactly one** reply.
@@ -28,8 +27,8 @@ Closes both coverage gaps that #142 and #145 left open:
 Plus parity coverage for the other OSC-routed behaviors (title /
 cwd / notification) that are currently unit-tested only.
 
-Every UI target runs these in CI (e2e-mac and the iced lanes) with
-`ROOST_TEST_MODE: "1"` set in the workflow env block.
+CI's iced lanes run these with `ROOST_TEST_MODE: "1"` set in the workflow
+env block.
 """
 
 from __future__ import annotations
@@ -96,19 +95,13 @@ class TestOscPipeline:
         assert non_bold_cell["bold"] is False, non_bold_cell
 
     def test_bold_default_foreground_takes_the_theme_bold_color(
-        self, roost, project, target
+        self, roost, project
     ):
         """Bold text with no foreground of its own takes the theme's
         `bold-color`; plain text keeps the default foreground (plan 073
         D6). roost-dark's `bold-color` equals its foreground, so OSC 10
         moves the default foreground first to tell the two apart.
-
-        Iced-only: Swift paints the same rule, but its `tab.dump_resolved`
-        resolves against `theme.foreground` rather than the terminal's
-        OSC 10 default, so its plain cell would read `#ffffff`.
         """
-        if target != "iced":
-            pytest.skip("Swift's tab.dump_resolved ignores an OSC 10 default foreground")
         tab = roost.open_tab(project, cwd="/tmp")
         wait_tab_quiet(roost, tab)
         roost.tab_feed_pty_bytes(
@@ -246,7 +239,7 @@ class TestOscPipeline:
 
     def test_osc11_same_chunk_set_query_replies_sequentially(self, roost, project):
         """SET + QUERY in ONE chunk answers with the JUST-SET color, and
-        answers exactly once — pinned behavior on both UIs.
+        answers exactly once — pinned behavior.
 
         This case has moved twice. It started as a skipped "known #145
         limitation" slot; plan 026's D10 moved iced's scan onto the PTY
@@ -291,7 +284,7 @@ class TestOscPipeline:
     def test_osc7_cwd_updates_tab_metadata(self, roost, project):
         """OSC 7 (current working directory). The scanner parses
         `file:///path` → `/path` and the workspace records it as
-        `tab.cwd`. Existing test_terminal.py covers this via a real
+        `tab.cwd`. test_shell_integration.py covers this via a real
         shell `cd`; this test pins the wire path independently so a
         regression in the OSC dispatch surfaces without depending on
         shell integration."""

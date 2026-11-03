@@ -1,8 +1,8 @@
 """pytest fixtures for the Roost E2E suite.
 
-Parameterized by target UI (`--roost-target mac|iced`, default `$ROOST_TARGET`
-or `iced`). A session fixture ensures the UI is running (launching it if
-needed, and quitting only what it launched). Each test gets a fresh
+Parameterized by target UI (`--roost-target iced`, the one target; also
+`$ROOST_TARGET`). A session fixture ensures the UI is running (launching it
+if needed, and quitting only what it launched). Each test gets a fresh
 `roost` client and a throwaway `project` that's cascade-cleaned after.
 """
 
@@ -35,7 +35,7 @@ def pytest_report_header(config):
 def pytest_addoption(parser):
     parser.addoption(
         "--roost-target", action="store", default=None, choices=list(ui.TARGETS),
-        help="which UI to drive (mac|iced); default $ROOST_TARGET or iced",
+        help="which UI to drive (iced, the only one); default $ROOST_TARGET or iced",
     )
     parser.addoption(
         "--roost-fresh", action="store_true", default=False,
@@ -77,7 +77,7 @@ def pytest_collection_modifyitems(config, items):
     throwaway profiles and never dials a UI socket. Launching a UI for it
     would be pure cost — and destructive under `--roost-fresh`, which
     force-quits the developer's running instance. An `owns_ui` module (the
-    Mac real-input suite) launches, verifies and quits its own UI, so the
+    macOS real-input suite) launches, verifies and quits its own UI, so the
     shared one would only be a second window in its way — and an inherited
     `ROOST_TEST_FRESH=1` would quit whatever answers the target's socket. So
     the autouse fixture below stands down when *every* collected test is a

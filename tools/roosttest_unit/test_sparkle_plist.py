@@ -27,7 +27,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUNDLE_LIB = REPO_ROOT / "mac" / "scripts" / "bundle-lib.sh"
-TEMPLATE_PLIST = REPO_ROOT / "mac" / "Resources" / "Info-iced.plist.template"
+TEMPLATE_PLIST = REPO_ROOT / "mac" / "Resources" / "Info.plist.template"
 PLISTBUDDY = Path("/usr/libexec/PlistBuddy")
 
 FEED_URL = "https://example.invalid/roost-iced/appcast.xml"

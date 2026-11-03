@@ -1,10 +1,9 @@
 """Plan 070 D7: the harness never leaves a UI it launched behind when the
 boot wait fails.
 
-The iced path runs real stub executables, because what is pinned is that a
-live process dies. Each test also records the stub's own `Popen` and kills it
-in cleanup, so a bug in the code under test cannot leak a process. The Mac
-path is `open`-launched, so it is pinned with mocks.
+It runs real stub executables, because what is pinned is that a live
+process dies. Each test also records the stub's own `Popen` and kills it in
+cleanup, so a bug in the code under test cannot leak a process.
 """
 
 from __future__ import annotations
@@ -188,45 +187,6 @@ class StopOwnedUiKillsTheStubTests(_IsolatedIcedLaunchTestCase):
             "launch() raised but the SIGTERM-ignoring stub is still running "
             "(SIGKILL should have ended it)",
         )
-
-
-class MacLaunchStopsTheAppTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.addCleanup(mock.patch.stopall)
-        saved_offset = ui._MAC_LOG_OFFSET
-        self.addCleanup(setattr, ui, "_MAC_LOG_OFFSET", saved_offset)
-
-    def test_both_attempts_timing_out_stops_the_app_before_reraising(self) -> None:
-        with (
-            mock.patch("ui._mac_cleanup"),
-            mock.patch("ui.subprocess.run"),
-            mock.patch("ui.wait_alive", side_effect=TimeoutError("did not boot")),
-            mock.patch("ui._quit_mac_process") as quit_mac,
-        ):
-            with self.assertRaises(TimeoutError):
-                ui._launch_mac(Path("/Applications/Roost.app"))
-        quit_mac.assert_called_once_with()
-
-    def test_any_other_boot_error_stops_the_app_before_reraising(self) -> None:
-        with (
-            mock.patch("ui._mac_cleanup"),
-            mock.patch("ui.subprocess.run"),
-            mock.patch("ui.wait_alive", side_effect=RuntimeError("refused")),
-            mock.patch("ui._quit_mac_process") as quit_mac,
-        ):
-            with self.assertRaises(RuntimeError):
-                ui._launch_mac(Path("/Applications/Roost.app"))
-        quit_mac.assert_called_once_with()
-
-    def test_a_retry_that_succeeds_never_stops_the_app(self) -> None:
-        with (
-            mock.patch("ui._mac_cleanup"),
-            mock.patch("ui.subprocess.run"),
-            mock.patch("ui.wait_alive", side_effect=[TimeoutError("did not boot"), None]),
-            mock.patch("ui._quit_mac_process") as quit_mac,
-        ):
-            ui._launch_mac(Path("/Applications/Roost.app"))  # must not raise
-        quit_mac.assert_not_called()
 
 
 if __name__ == "__main__":

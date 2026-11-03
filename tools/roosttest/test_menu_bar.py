@@ -1,7 +1,7 @@
 """Native macOS menu bar E2E — plan 028 C3 (`app.menu_dump` /
 `app.menu_activate`).
 
-darwin+iced only: see `_mac_iced_only`. Covers the static menu shape and
+macOS only: see `_mac_iced_only`. Covers the static menu shape and
 key-equivalent policy C1/C2 built (`crates/roost-iced/src/macos/menu.rs`,
 the parity port of `mac/Sources/Roost/App.swift`'s `installMainMenu()`),
 plus dispatch, the dynamic Window menu, and the gating matrix.
@@ -59,14 +59,10 @@ UPDATES_ITEM = "Check for Updates…"
 
 
 @pytest.fixture(autouse=True)
-def _mac_iced_only(target):
-    """Skip unless BOTH halves hold — same reasoning as
-    `test_dock_badge.py`'s `_mac_iced_only`: `make e2e-mac` runs this
-    whole directory on macOS too (Swift has no case for these ops, so
-    it would answer `unknown-op`), and the iced UI also builds for
-    Linux, which has no native menu bar at all.
-    """
-    if sys.platform != "darwin" or target != "iced":
+def _mac_iced_only():
+    """macOS only: the iced UI also builds for Linux, which has no
+    native menu bar at all."""
+    if sys.platform != "darwin":
         pytest.skip(
             "app.menu_dump/app.menu_activate are macOS-iced-only (plan 028 § 3.12)"
         )

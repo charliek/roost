@@ -13,15 +13,10 @@
 # ones the in-crate `cargo test -p roost-iced --release -- --ignored
 # --nocapture` harness measures without a UI — reach for that instead
 # when you don't need the draw-path numbers.
-#
-# --target follows the rest of tools/: mac|iced (see ../screenshot/), but
-# `app.render_stats` is iced-only today — the Mac UI doesn't implement the
-# op at all, so pointing this script at `mac` errors rather than reading
-# counters.
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../screenshot" && pwd)/lib.sh"
 
-TARGET="${1:?usage: render-stats.sh <mac|iced> [duration_seconds]}"
+TARGET="${1:?usage: render-stats.sh iced [duration_seconds]}"
 DURATION="${2:-}"
 
 ut_init "${TARGET}"

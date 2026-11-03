@@ -203,8 +203,8 @@ class TestSparkleBundle:
     loopback appcast reports the fixture's version."""
 
     @pytest.fixture(autouse=True)
-    def _bundle_only(self, target):
-        if not _is_bundle_lane() or target != "iced":
+    def _bundle_only(self):
+        if not _is_bundle_lane():
             pytest.skip(
                 "the Sparkle bundle lane needs a launched Roost-Iced.app "
                 "(ROOST_ICED_APP) — `make e2e-iced-sparkle`"
@@ -252,8 +252,8 @@ class TestSparkleBareBinary:
     updater — and a permanently greyed menu item."""
 
     @pytest.fixture(autouse=True)
-    def _bare_only(self, target):
-        if sys.platform != "darwin" or target != "iced":
+    def _bare_only(self):
+        if sys.platform != "darwin":
             pytest.skip("the Sparkle seam is macOS-iced-only (plan 028 § 3.8)")
         if _is_bundle_lane():
             pytest.skip(

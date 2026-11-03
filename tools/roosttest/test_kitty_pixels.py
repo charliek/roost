@@ -16,8 +16,6 @@ capture marks in a colour no earlier capture used, so only a frame drawn
 after this scene was fed can show it: a previous test's identical scene
 never passes for this one's. A cell's pixels are read one pixel in from
 its edges.
-
-Iced only: the frozen Swift app draws no images.
 """
 
 from __future__ import annotations
@@ -33,8 +31,8 @@ from conftest import skip_on_live_wayland_desktop
 from test_cursor_pixels import INK_TOL, _artifact, _color_run, _dist, _pixel
 from test_cursor_pixels import _Grid as _CellGrid
 from test_kitty_images import cell_px, free, placeholders, quiet_tab, virtual
-from test_sidebar_collapse_persistence import _toggle_to_visible
 from test_sidebar_pixels import _capture
+from util import show_sidebar
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
@@ -64,12 +62,6 @@ BELOW_BACKGROUND_Z = -1073741825
 
 #: Kitty's chunk size for a direct transmission's base64.
 CHUNK = 4096
-
-
-@pytest.fixture(autouse=True)
-def _iced_only(target):
-    if target != "iced":
-        pytest.skip("only roost-iced draws Kitty images (plan 088)")
 
 
 def solid(color, width: int, height: int) -> bytes:
@@ -148,7 +140,7 @@ def _capture_grid(roost, tab, path) -> _Grid:
 
 def _scene(roost, project) -> tuple[int, tuple[int, int]]:
     """A quiet tab with its cursor hidden, and its terminal's cell px."""
-    _toggle_to_visible(roost)
+    show_sidebar(roost)
     tab = quiet_tab(roost, project)
     roost.tab_feed_pty_bytes(tab, b"\x1b[?25l\x1b[2J")
     return tab, cell_px(roost.window_metrics())
@@ -268,7 +260,7 @@ def test_an_image_past_the_last_column_leaves_the_padding(roost, project, tmp_pa
     running off the grid's right edge stops there. The sidebar is widened
     by half a cell to make that padding, since a window resize isn't
     honoured by every headless compositor."""
-    _toggle_to_visible(roost)
+    show_sidebar(roost)
     before = roost.window_metrics()
     cell_w = before["cell_width"]
 

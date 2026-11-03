@@ -33,9 +33,8 @@ own session is then not merely left alone but unreachable.
 The import-time environment poisons every module imported after it in
 the same process, and this lane relaunches the UI under a *different*
 `local-backend` for most of its cases — which no other lane expects.
-`pytestmark = pytest.mark.host_client` keeps it out of whole-directory
-runs (and off the Swift target, which answers `unknown-op` to every
-`host.*` op).
+`pytestmark = pytest.mark.host_client` keeps it out of the shared-UI
+lanes.
 
 Condition waits only.
 """
@@ -1638,8 +1637,7 @@ def test_an_in_process_relaunch_keeps_the_tab_each_project_last_showed(lane: Lan
 
     `P1` is kept off the first row: the harness's readiness probe opens
     and closes a tab in the first project at every launch, which moves
-    that project's memory and the selection with it. The Swift half
-    (plan 072 C15) is not reachable from this lane, which is iced-only.
+    that project's memory and the selection with it.
     """
     dirs = {name: _ROOT / "d6" / name for name in ("a", "b", "c", "x")}
     for path in dirs.values():

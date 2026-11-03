@@ -1,7 +1,6 @@
-"""Sidebar resize contract — `sidebar.set_width` on both UIs.
+"""Sidebar resize contract — `sidebar.set_width`.
 
-The programmatic twin of dragging the seam (plan 011). One op, two
-arms (Iced, Mac; the now-removed GTK UI made three), one behavioral
+The programmatic twin of dragging the seam (plan 011). One behavioral
 contract pinned here:
 
 * the applied width is observable on `app.window_metrics` and reaches
@@ -10,22 +9,27 @@ contract pinned here:
 * non-positive widths are rejected with `invalid-param`;
 * a set while collapsed persists silently and lands on expand;
 * a non-default width survives a window resize (the sidebar-hold
-  invariant of `test_sidebar_layout.py`, re-asserted off the default);
+  invariant: the terminal pane absorbs the delta, not the sidebar);
 * and it survives a quit → relaunch (the persistence half).
 
 `sidebar.set_width` is test-mode-gated, so the whole file is skipped
 when `ROOST_TEST_MODE` is unset — the bare attempt would fail with
-`not-enabled` and produce noisy "wrong reason" failures. Same
-convention as `test_sidebar_layout.py`.
+`not-enabled` and produce noisy "wrong reason" failures.
 
-Tolerance: 1pt, matching `test_sidebar_layout.py`. Divider thickness
-and HiDPI rounding shift the measured pane width sub-point; every
-assertion here is against a >= 20pt intended change.
+Tolerance: 1pt. Divider thickness and HiDPI rounding shift the measured
+pane width sub-point; every assertion here is against a >= 20pt intended
+change.
+
+A resize only lands if the environment honors it up to the available
+screen: a tiling or constraining compositor, or a small screen, may grant
+only a partial resize or none. So the resize case measures the window
+delta it achieved and skips, never fails, when that is too small to
+mean anything (`_resize_settle`).
 
 Non-finite widths (`nan`, `inf`) are rejected by the same server-side
 guard as `0`/`-50`, but JSON has no literal for them, so they can't be
-driven from this harness — `crates/roost-engine` and the Swift handler
-cover that arm in unit tests.
+driven from this harness — `crates/roost-engine` covers that arm in
+unit tests.
 """
 
 from __future__ import annotations
@@ -37,8 +41,13 @@ import pytest
 
 import ui
 from client import Roost, RoostError, Timeout
-from test_sidebar_collapse_persistence import _toggle_to_collapsed, _toggle_to_visible
-from util import BARE_SHELL_ARGV, skip_on_ci, wait_tab_attached
+from util import (
+    BARE_SHELL_ARGV,
+    set_sidebar_collapsed,
+    show_sidebar,
+    skip_on_ci,
+    wait_tab_attached,
+)
 
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
@@ -48,8 +57,7 @@ WIDTH_TOLERANCE_PT = 1.0
 USABLE_DELTA_PT = 200.0
 
 # The clamp band, verbatim from `SIDEBAR_MIN_WIDTH`/`SIDEBAR_MAX_WIDTH`
-# (crates/roost-engine/src/workspace.rs) and `sidebarMinWidth`/
-# `sidebarMaxWidth` (mac/Sources/Roost/App.swift).
+# (crates/roost-engine/src/workspace.rs).
 MIN_WIDTH_PT = 160.0
 MAX_WIDTH_PT = 400.0
 
@@ -68,9 +76,7 @@ def _sidebar_width_is(roost: Roost, expected: float) -> bool:
     from workspace state the moment a toggle/resize lands (no separate
     idle layout pass, unlike the now-removed GTK UI), but polling both
     still guards against reading `window_metrics` mid-IPC-round-trip,
-    before a preceding mutation has actually landed — see
-    `test_sidebar_layout._window_and_sidebar_settled` for the same
-    reasoning.
+    before a preceding mutation has actually landed.
     """
     m = roost.window_metrics()
     if m["sidebar_collapsed"]:
@@ -104,7 +110,7 @@ def _seed_baseline(roost: Roost) -> None:
     """Every test starts from the same explicit state — expanded, at
     `BASELINE_WIDTH_PT` — rather than inheriting whatever the previous
     test (or the attached developer UI) left behind."""
-    _toggle_to_visible(roost)
+    show_sidebar(roost)
     roost.sidebar_set_width(BASELINE_WIDTH_PT)
     _wait_sidebar_width(roost, BASELINE_WIDTH_PT)
 
@@ -175,9 +181,8 @@ def _window_and_sidebar_settled(roost: Roost, target_width: float) -> bool:
 def _resize_settle(roost: Roost, target_width: float) -> dict:
     """Request `target_width` and return the settled metrics. Does NOT
     fail if the WM refuses, only partially grants, or stalls the resize —
-    the caller gates on the achieved delta. Verbatim in spirit from
-    `test_sidebar_layout._resize_settle`; see that file for why a refused
-    resize must never fail a test.
+    the caller gates on the achieved delta (the module docstring says why
+    a refused resize must never fail a test).
     """
     roost.window_resize(target_width, 700)
     try:
@@ -211,23 +216,23 @@ def _restore_sidebar(target):
     """
     with Roost(ui.socket_path(target)) as client:
         original_collapsed = bool(client.window_metrics()["sidebar_collapsed"])
-        # `_toggle_to_visible` waits for a non-zero allocation, so the
+        # `show_sidebar` waits for a non-zero allocation, so the
         # read below can't catch the `visible=True, width=0` transient.
-        _toggle_to_visible(client)
+        show_sidebar(client)
         original_width = float(client.window_metrics()["sidebar_width"])
         if original_collapsed:
-            _toggle_to_collapsed(client)
+            set_sidebar_collapsed(client, True)
 
     yield
 
     with Roost(ui.socket_path(target)) as client:
         # Expand first either way: the width has to be applied against a
         # laid-out pane for the metrics poll to confirm it landed.
-        _toggle_to_visible(client)
+        show_sidebar(client)
         client.sidebar_set_width(original_width)
         _wait_sidebar_width(client, original_width)
         if original_collapsed:
-            _toggle_to_collapsed(client)
+            set_sidebar_collapsed(client, True)
 
 
 @pytest.mark.skipif(
@@ -246,12 +251,10 @@ class TestSidebarResize:
 
         tab = _live_tab(roost, project)
 
-        # One-op-set parity (issue #287): with a terminal live and mounted
-        # (guaranteed by `_live_tab` above — Mac omits the fields until one
-        # is), every UI answers `terminal_font_family` as a non-empty string
-        # on `app.window_metrics` (iced resolves the active family, Mac
-        # reports `TerminalView.font`'s family; the now-removed GTK UI
-        # reported the family it fell back to). `terminal_top` stays
+        # Issue #287: with a terminal live and mounted (guaranteed by
+        # `_live_tab` above), the UI answers `terminal_font_family` as a
+        # non-empty string on `app.window_metrics` (the active family; the
+        # now-removed GTK UI reported the family it fell back to). `terminal_top` stays
         # optional — the now-removed GTK UI omitted the KEY entirely; an
         # explicit `null` (also what serde emits for a non-finite f64) is
         # a contract violation, so the omitted-vs-null distinction is
@@ -297,8 +300,7 @@ class TestSidebarResize:
     def test_set_width_clamps_to_band(self, roost):
         """Out-of-band widths land on the nearest bound, not an error.
 
-        The clamp lives in the workspace (Rust) / the bridge (Swift), so
-        both ends of the band are asserted through the same op the seam
+        The clamp lives in the workspace, so both ends of the band are asserted through the same op the seam
         drag routes through — a UI that clamped only in its own widget
         would persist an out-of-band value and restore it on relaunch.
         """
@@ -338,7 +340,7 @@ class TestSidebarResize:
         on expand" rather than "expand implicitly".
         """
         _seed_baseline(roost)
-        _toggle_to_collapsed(roost)
+        set_sidebar_collapsed(roost, True)
 
         roost.sidebar_set_width(350)
         # No wait needed: `call` is a synchronous round-trip and the UI
@@ -349,25 +351,21 @@ class TestSidebarResize:
             f"sidebar.set_width must not expand a collapsed sidebar; "
             f"got {collapsed_metrics}"
         )
-        # `< 1` rather than `== 0`: the Rust UIs report a literal 0.0 while
-        # collapsed, but the Mac UI reports the pane's real frame width and
-        # *defines* collapsed as `< 1pt`. Either way, nothing of the 350
-        # just set may be visible.
+        # `< 1` rather than `== 0`: nothing of the 350 just set may be
+        # visible, whatever sub-point frame a toolkit reports.
         assert collapsed_metrics["sidebar_width"] < 1.0, (
             f"a collapsed sidebar must not reveal the stored width; "
             f"got {collapsed_metrics}"
         )
 
-        _toggle_to_visible(roost)
+        show_sidebar(roost)
         _wait_sidebar_width(roost, 350)
 
     def test_sidebar_holds_nondefault_width_on_window_resize(self, roost):
-        """The `test_sidebar_layout.py` hold-invariant, off the default.
-
-        That file pins the invariant at whatever width the UI launched
-        with; a UI that hardcoded its launch width into the layout pass
-        would pass it and still snap a user-chosen width back on the
-        next window resize. This seeds a non-default width first.
+        """The sidebar-hold invariant, off the default: a UI that
+        hardcoded its launch width into the layout pass would hold that
+        width and still snap a user-chosen one back on the next window
+        resize. This seeds a non-default width first.
         """
         _seed_baseline(roost)
         roost.sidebar_set_width(WIDER_WIDTH_PT)
@@ -393,26 +391,22 @@ class TestSidebarResize:
                 f"(metrics {after})"
             )
         finally:
-            # Leave the window where `test_sidebar_layout.py` leaves it
-            # rather than at 1800 — later files in the session read
-            # geometry too.
+            # Leave the window at 1100 rather than 1800 — later files in
+            # the session read geometry too.
             _resize_settle(roost, 1100)
 
     def test_width_survives_relaunch(self, roost, target):
         """The persistence half: a chosen width outlives the process.
 
-        Iced writes it through to `state.json` (`sidebar_width`), the
-        Mac UI to `RoostSidebarWidth` in UserDefaults. Both must restore
-        it at launch — a UI that only persisted on drag-release, or that
-        overwrote the stored value with its launch default, fails here.
+        The UI writes it through to `state.json` (`sidebar_width`) and
+        must restore it at launch — a UI that only persisted on
+        drag-release, or that overwrote the stored value with its launch
+        default, fails here.
         """
         # Ownership gate, BEFORE anything is mutated. `quit + launch` is
         # destructive and only meaningful against an instance the harness
         # started: attached to a developer's own UI it would close their
-        # session and relaunch a differently-configured one (on Mac the
-        # relaunch always passes ROOST_DEFAULTS_SUITE, so the width would
-        # be read back out of the isolated test suite it was never written
-        # to — a spurious persistence failure on top of the destruction).
+        # session and relaunch a differently-configured one.
         # `owned_session_config_path()` is None exactly when the harness
         # reused a running UI instead of launching one.
         if ui.owned_session_config_path() is None:
@@ -424,8 +418,7 @@ class TestSidebarResize:
         skip_on_ci(
             "quit + relaunch is unreliable on CI: iced xvfb has no WM, and the slow "
             "macOS LaunchServices respawn pushes wait_alive past its 90s budget",
-            alt_coverage="Rust sidebar_width_persists_across_reopen + "
-            "Swift sidebarWidthPersistsClampedValue",
+            alt_coverage="Rust sidebar_width_persists_across_reopen",
         )
         _seed_baseline(roost)
         roost.sidebar_set_width(WIDER_WIDTH_PT)

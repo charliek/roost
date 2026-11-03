@@ -11,14 +11,12 @@ official release artifact into the gitignored `out/` on demand:
   `shasum -a 256 -c` on every download)
 
 Why 2.9.x and not 2.8.1 (the version the shed reference embedding
-validated): the Swift Roost.app's SwiftPM resolution is already on
-2.9.x, and later 2.9.x releases carry security fixes — for an *update*
+validated): the retired Swift Roost.app's SwiftPM resolution was
+already on 2.9.x, and later 2.9.x releases carry security fixes — for an *update*
 framework, shipping a known-older line to match a reference repo would
 be backwards. shed's signing-order lessons (the strict inner→outer
 chain in `mac/scripts/bundle-lib.sh::codesign_sparkle_or_die`) are
-version-stable and carry over; its version pin does not. The pin here
-is independent of the Swift app's SwiftPM resolution — separate
-products, drift is fine and recorded.
+version-stable and carry over; its version pin does not.
 
 Staged layout (`fetch.sh`, idempotent via `out/.stamp`):
 

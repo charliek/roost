@@ -1,12 +1,11 @@
 # shellcheck shell=bash
 # Shared helpers for the Roost UI test harness.
 #
-# Both UIs (Swift Mac and Iced) speak the same JSON IPC surface, so the
-# driver is one `roostctl` parameterized by `--target {mac,iced}`. Only
-# *launch* and *quit* differ per UI; this file isolates those so the
-# scenario scripts stay UI-agnostic.
+# The driver is `roostctl --target iced` against a dev `roost-iced` build;
+# this file owns its launch and quit so the scenario scripts stay about
+# the scenario.
 #
-# Source it, then call `ut_init <target>` before anything else.
+# Source it, then call `ut_init [iced]` before anything else.
 
 set -euo pipefail
 
@@ -30,16 +29,12 @@ ut_resolve_roostctl() {
   fi
 }
 
-# Per-target socket path (matches roost-ipc's BundleProfile resolver).
-# macOS uses two `~/Library/Caches/Roost*` namespaces. Linux keeps the
-# isolated iced dev profile on `roost-iced/`; the production `roost/`
-# namespace (the packaged iced UI's default profile — formerly owned by
-# the retired gtk profile, byte-identical since the rename) is pinned by
-# the Rust golden-path tests in `crates/roost-ipc/tests/`, not by this
-# harness.
+# The dev profile's socket path (matches roost-ipc's BundleProfile
+# resolver): `Roost-iced` on macOS, `roost-iced/` on Linux. The
+# production namespaces are pinned by the Rust golden-path tests in
+# `crates/roost-ipc/`, not by this harness.
 ut_socket_for() {
   case "$1" in
-    mac) echo "${HOME}/Library/Caches/Roost/roost.sock" ;;
     iced)
       if [[ "$(uname -s)" == "Darwin" ]]; then
         echo "${HOME}/Library/Caches/Roost-iced/roost.sock"
@@ -49,18 +44,17 @@ ut_socket_for() {
         echo "/tmp/roost-iced-$(id -u)/roost.sock"
       fi
       ;;
-    *) echo "error: unknown target '$1' (want mac|iced)" >&2; return 1 ;;
+    *) echo "error: unknown target '$1' (want iced)" >&2; return 1 ;;
   esac
 }
 
 # --- init ---------------------------------------------------------------
 
-# ut_init <mac|iced> — sets UT_TARGET, UT_RC (roostctl path), UT_SOCK.
+# ut_init [iced] — sets UT_TARGET, UT_RC (roostctl path), UT_SOCK.
 ut_init() {
-  UT_TARGET="${1:?usage: ut_init <mac|iced>}"
-  case "${UT_TARGET}" in mac|iced) ;; *)
-    echo "error: target must be mac or iced, got '${UT_TARGET}'" >&2; return 1 ;;
-  esac
+  UT_TARGET="${1:-iced}"
+  [[ "${UT_TARGET}" == iced ]] || {
+    echo "error: target must be iced, got '${UT_TARGET}'" >&2; return 1; }
   UT_RC="$(ut_resolve_roostctl)"
   UT_SOCK="$(ut_socket_for "${UT_TARGET}")"
   export UT_TARGET UT_RC UT_SOCK
@@ -259,31 +253,20 @@ ut_launch() {
     echo "==> ${UT_TARGET} UI already running (pid $(rc identify 2>/dev/null | sed -n 's/^pid=//p'))"
     return 0
   fi
-  case "${UT_TARGET}" in
-    mac)
-      [[ "$(uname -s)" == "Darwin" ]] || { echo "error: mac target needs macOS" >&2; return 1; }
-      local app="${UT_REPO_ROOT}/mac/build/Roost.app"
-      [[ -d "${app}" ]] || { echo "==> bundling Roost.app"; ( cd "${UT_REPO_ROOT}/mac" && ./scripts/bundle.sh debug >/dev/null ); }
-      echo "==> launching Roost.app"
-      open "${app}"
-      ;;
-    iced)
-      ut_session_dir_cleanup || {
-        echo "error: an earlier launch's session is still running; not launching over its record" >&2
-        return 1
-      }
-      local bin="${UT_REPO_ROOT}/target/debug/roost-iced"
-      [[ -x "${bin}" ]] || { echo "==> building roost-iced"; ( cd "${UT_REPO_ROOT}" && cargo build -p roost-iced >/dev/null ); }
-      echo "==> launching roost-iced"
-      local cfg; cfg="$(ut_pinned_config)"
-      local sessions
-      sessions="$(ut_session_dir_new)" || return 1
-      [[ -n "${sessions}" ]] || { echo "error: no session socket dir; not launching" >&2; return 1; }
-      ( cd "${UT_REPO_ROOT}" && env -u ROOST_TEST_PASSWD_HOME -u ROOST_TEST_OLD_SESSION_DIR \
-        ROOST_SESSION_SOCKET_DIR="${sessions}" ROOST_BUNDLE_PROFILE=iced ROOST_CONFIG="${cfg}" \
-        RUST_LOG="${RUST_LOG:-info}" "${bin}" >/tmp/roost-iced-uitest.log 2>&1 & )
-      ;;
-  esac
+  ut_session_dir_cleanup || {
+    echo "error: an earlier launch's session is still running; not launching over its record" >&2
+    return 1
+  }
+  local bin="${UT_REPO_ROOT}/target/debug/roost-iced"
+  [[ -x "${bin}" ]] || { echo "==> building roost-iced"; ( cd "${UT_REPO_ROOT}" && cargo build -p roost-iced >/dev/null ); }
+  echo "==> launching roost-iced"
+  local cfg; cfg="$(ut_pinned_config)"
+  local sessions
+  sessions="$(ut_session_dir_new)" || return 1
+  [[ -n "${sessions}" ]] || { echo "error: no session socket dir; not launching" >&2; return 1; }
+  ( cd "${UT_REPO_ROOT}" && env -u ROOST_TEST_PASSWD_HOME -u ROOST_TEST_OLD_SESSION_DIR \
+    ROOST_SESSION_SOCKET_DIR="${sessions}" ROOST_BUNDLE_PROFILE=iced ROOST_CONFIG="${cfg}" \
+    RUST_LOG="${RUST_LOG:-info}" "${bin}" >/tmp/roost-iced-uitest.log 2>&1 & )
   ut_wait_alive
   echo "==> ${UT_TARGET} UI up (pid $(rc identify 2>/dev/null | sed -n 's/^pid=//p'))"
 }
@@ -291,23 +274,18 @@ ut_launch() {
 # ut_quit — cleanly stop the target UI (exercises the fsync-on-exit path).
 ut_quit() {
   if ! ut_alive; then
-    [[ "${UT_TARGET}" != iced ]] || ut_session_dir_cleanup || true
+    ut_session_dir_cleanup || true
     echo "==> ${UT_TARGET} UI not running"
     return 0
   fi
-  case "${UT_TARGET}" in
-    mac) osascript -e 'tell application "Roost" to quit' >/dev/null 2>&1 || true ;;
-    iced)
-      local pid; pid="$(rc identify 2>/dev/null | sed -n 's/^pid=//p')"
-      [[ -n "${pid}" ]] && kill "${pid}" 2>/dev/null || true
-      ;;
-  esac
+  local pid; pid="$(rc identify 2>/dev/null | sed -n 's/^pid=//p')"
+  [[ -n "${pid}" ]] && kill "${pid}" 2>/dev/null || true
   local waited=0
   while ut_alive; do
     sleep 0.5; waited=$((waited + 1))
     (( waited > 20 )) && { echo "warning: ${UT_TARGET} UI still up after 10s" >&2; return 0; }
   done
-  [[ "${UT_TARGET}" != iced ]] || ut_session_dir_cleanup || true
+  ut_session_dir_cleanup || true
   echo "==> ${UT_TARGET} UI stopped"
 }
 

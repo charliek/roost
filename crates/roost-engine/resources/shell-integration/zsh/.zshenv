@@ -11,9 +11,6 @@
 # Known limitation: a system /etc/zshenv that hard-sets ZDOTDIR runs
 # before this file and defeats the injection; such users source roost.zsh
 # manually instead.
-#
-# The Mac copy under mac/Sources/Roost/Resources/shell-integration/zsh/.zshenv
-# is frozen for this release and has diverged from this one.
 
 if [[ -n "${ROOST_ZSH_ZDOTDIR+X}" ]]; then
     export ZDOTDIR="$ROOST_ZSH_ZDOTDIR"

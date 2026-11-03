@@ -17,7 +17,6 @@ what it holds, and whether the tab band draws the lock.
 * **Linux iced:** the feature does not exist, and the action must still be
   harmless: the bound chord is consumed and writes nothing, the palette
   has no row, and `app.secure_input` reads all false at a prompt.
-* **The Swift app (`--roost-target mac`)** has none of this; skipped.
 
 Every macOS case asserts the formula against the inputs the op reports,
 never an outcome: a bare binary on a CI runner may never be the active
@@ -75,19 +74,13 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture
-def iced(target):
-    if target != "iced":
-        pytest.skip("the Swift app has no Secure Keyboard Entry and no app.secure_input")
-
-
-@pytest.fixture
-def mac(iced):
+def mac():
     if sys.platform != "darwin":
         pytest.skip("Secure Keyboard Entry is macOS-only")
 
 
 @pytest.fixture
-def linux(iced):
+def linux():
     if sys.platform == "darwin":
         pytest.skip("the off-macOS no-op")
 

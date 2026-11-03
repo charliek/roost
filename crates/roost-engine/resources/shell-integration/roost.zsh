@@ -20,10 +20,8 @@
 # accept LANG LC_*; users may need to extend `AcceptEnv` server-side
 # for the env to take effect).
 #
-# KEEP IN SYNC (shared functions only — __roost_osc7, __roost_title,
-# __roost_mark_c, __roost_mark_d) with
-# mac/Sources/Roost/Resources/shell-integration/roost.zsh.
-# tools/roosttest_unit/test_osc7_emitters.py compares the shared bodies.
+# tools/roosttest_unit/test_osc7_emitters.py pins the bytes __roost_osc7 and
+# __roost_title emit.
 
 [[ -o interactive ]] || return 0
 [[ -n "${ROOST_TAB_ID:-}" ]] || return 0

@@ -14,9 +14,6 @@ A host tab on the UI socket — the session's figure, the window's copy as
 `mirror`, and the echoed `h<n>.<id>` — is the host-client lane's
 (`test_host_client.py`).
 
-The Mac app does not serve the op (`unknown-op`, pinned by a Swift unit
-test), so every case is iced-only.
-
 Condition waits only.
 """
 
@@ -44,12 +41,6 @@ MEMORY_LINE = re.compile(
     r"(terminal|mirror): (\d+) bytes resident, (\d+) bytes virtual, "
     r"(\d+) pages \(primary (\d+), alternate (\d+)\)"
 )
-
-
-@pytest.fixture(autouse=True)
-def iced_only(target):
-    if target != "iced":
-        pytest.skip("the Mac app does not serve tab.memory_usage (plan 082 D6.2)")
 
 
 def assert_consistent(usage: dict) -> None:

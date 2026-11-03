@@ -1,4 +1,4 @@
-"""256-color palette rendering tests (both UIs).
+"""256-color palette rendering tests.
 
 Regression: roost left the xterm 256-color cube (16-231) + grayscale
 ramp (232-255) as a flat placeholder, so every `SGR 48;5;N` cell
@@ -7,7 +7,7 @@ COLORTERM is unset in a shed) backgrounds with `48;5;232` (#080808) and
 rendered an unreadable gray. Feed known indices and assert the
 production color resolver (`tab.dump_resolved`) returns the correct RGB.
 
-Runs on both targets in CI (iced-build-e2e + e2e-mac).
+Runs in CI's iced lanes (iced-build-e2e).
 """
 
 from __future__ import annotations

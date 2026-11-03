@@ -80,13 +80,11 @@ def roostctl_path() -> str:
 
     Checked in the order a developer's tree makes them available: an
     explicit override, the cargo debug build (what CI's iced job builds),
-    the binary embedded in the Mac bundle (what CI's Mac job builds),
     then PATH. The cargo fallback mirrors `ui.launch`, which builds the
     iced UI the same way when it's missing."""
     candidates = [
         os.environ.get("ROOST_ROOSTCTL", ""),
         str(REPO_ROOT / "target/debug/roostctl"),
-        str(REPO_ROOT / "mac/build/Roost.app/Contents/Resources/bin/roostctl"),
         shutil.which("roostctl") or "",
     ]
     for path in candidates:
@@ -604,6 +602,75 @@ def set_sidebar_collapsed(roost, collapsed: bool) -> None:
         lambda: roost.window_metrics()["sidebar_collapsed"] == collapsed,
         timeout=2.0,
         what="the sidebar to " + ("collapse" if collapsed else "expand"),
+    )
+
+
+def show_sidebar(roost) -> None:
+    """Expand the sidebar (`set_sidebar_collapsed`), then wait until it also
+    has a non-zero width. Waits even when it was already expanded: the
+    caller may be a relaunch's teardown, whose palette round trip may still
+    be in flight, and a next test that inherits `collapsed=False, width=0`
+    reads a sidebar that is not there."""
+    set_sidebar_collapsed(roost, False)
+
+    def allocated() -> bool:
+        metrics = roost.window_metrics()
+        return not metrics["sidebar_collapsed"] and metrics["sidebar_width"] > 0
+
+    Roost._wait(allocated, timeout=2.0, what="the sidebar to settle visible with a non-zero width")
+
+
+def sidebar_project_row(dump: dict, project_id: int) -> dict | None:
+    """`project_id`'s row in an `app.sidebar_dump`, or None."""
+    return next((p for p in dump["projects"] if int(p["project_id"]) == project_id), None)
+
+
+def sidebar_agent_row(dump: dict, project_id: int, tab_id: int) -> dict | None:
+    """`tab_id`'s agent row under `project_id` in an `app.sidebar_dump`, or None."""
+    project = sidebar_project_row(dump, project_id)
+    if project is None:
+        return None
+    return next((a for a in project["agents"] if int(a["tab_id"]) == tab_id), None)
+
+
+def palette_agent_tab_id(item: dict) -> int | None:
+    """The tab id an agent palette row activates, or None for any other row —
+    the Python twin of `agent_tab_id` in `agent_palette.rs`. The empty
+    sentinel (`agents:empty`) deliberately doesn't parse."""
+    rest = item["id"].removeprefix("agent:")
+    return int(rest) if rest != item["id"] and rest.isdigit() else None
+
+
+def palette_agent_tab_ids(items: list[dict]) -> list[int]:
+    """The agent palette's flat list as tab ids, in wire order."""
+    return [t for t in (palette_agent_tab_id(it) for it in items) if t is not None]
+
+
+def toggle_sidebar_agents(roost) -> dict:
+    """Flip the sidebar's agent rows through the command palette, the way a
+    user or `roostctl` would (plan 007 §3.7). Leaves the palette closed."""
+    roost.palette_dismiss()
+    roost.palette_open()
+    state = roost.palette_activate("toggle_sidebar_agents")
+    roost.palette_dismiss()
+    return state
+
+
+def sidebar_agents_visible(roost) -> bool:
+    return bool(roost.sidebar_dump()["agents_visible"])
+
+
+def set_sidebar_agents_visible(roost, want: bool) -> None:
+    """Toggle until `agents_visible` matches `want`, restoring the instance
+    to a known state (tests call it at start and end so the toggle is never
+    left flipped for whatever runs next)."""
+    if sidebar_agents_visible(roost) == want:
+        return
+    toggle_sidebar_agents(roost)
+    roost._wait(
+        lambda: sidebar_agents_visible(roost) == want,
+        5.0,
+        f"agents_visible becomes {want}",
     )
 
 

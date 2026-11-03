@@ -2838,7 +2838,7 @@ def test_a_session_resolves_the_config_the_ui_wrote_however_it_was_launched(sess
 
 
 def test_agent_set_hooks_answers_per_host_without_touching_the_local_half(
-    short_root, target
+    short_root
 ):
     """Plan 064 §7 W4: two connected hosts, one of which cannot write its
     own config, and the reply carries one `result`, one `error`, and a
@@ -2855,8 +2855,6 @@ def test_agent_set_hooks_answers_per_host_without_touching_the_local_half(
     are exactly what a lone `set` would have left, with a broken host
     beside it.
     """
-    if target != "iced":
-        pytest.skip("the jailed client UI is launched as a bare iced binary")
 
     ui_jail = Jail(short_root, agent_hooks=None)
     healthy = sessionlib.make_env()
