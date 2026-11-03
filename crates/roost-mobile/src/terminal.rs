@@ -231,7 +231,7 @@ impl TabTerminal {
             rendered_generation: 0,
             render: RenderState::new()?,
             basis: FrameBasis::default(),
-            keys: KeyEncoder::new()?,
+            keys: crate::keys::new_encoder()?,
             mouse: MouseEncoder::new()?,
             scroll: TerminalScroll::new(),
         })

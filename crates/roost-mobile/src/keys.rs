@@ -3,7 +3,7 @@
 //! uses, synced from the terminal's modes (DECCKM, Kitty flags, …).
 
 use roost_ui_model::bracketed_paste;
-use roost_vt::{ffi, key_action, mods, Key, KeyEncoder, KeyEvent, Terminal};
+use roost_vt::{ffi, key_action, mods, Key, KeyEncoder, KeyEvent, OptionAsAlt, Terminal};
 
 /// One key press as Flutter reports it. `key` is
 /// `LogicalKeyboardKey.keyLabel`-style: `"Enter"`, `"Escape"`,
@@ -230,6 +230,15 @@ fn encode_press(
 /// modifier, Caps Lock) encodes to nothing. `terminal` is the one the
 /// tab draws, whose modes pick the encoding; `None` encodes as a
 /// terminal at its defaults would.
+/// The encoder every mobile terminal uses. Alt is always Alt: a phone or a
+/// tablet keyboard has no macOS text-modifier Option, and libghostty's macOS
+/// build (the desktop dev target) would otherwise drop the ESC prefix.
+pub fn new_encoder() -> roost_vt::Result<KeyEncoder> {
+    let mut encoder = KeyEncoder::new()?;
+    encoder.set_macos_option_as_alt(OptionAsAlt::True);
+    Ok(encoder)
+}
+
 pub fn encode_key(
     encoder: &mut KeyEncoder,
     terminal: Option<&Terminal>,
@@ -335,7 +344,7 @@ mod tests {
     }
 
     fn encode(terminal: &Terminal, input: &KeyInput) -> Vec<u8> {
-        let mut encoder = KeyEncoder::new().expect("encoder");
+        let mut encoder = new_encoder().expect("encoder");
         encode_key(&mut encoder, Some(terminal), input).expect("encode")
     }
 
@@ -435,7 +444,7 @@ mod tests {
     #[test]
     fn committed_text_is_its_utf8_and_line_breaks_are_enter() {
         let t = terminal();
-        let mut encoder = KeyEncoder::new().expect("encoder");
+        let mut encoder = new_encoder().expect("encoder");
         assert_eq!(
             encode_text(&mut encoder, Some(&t), "héllo 中").expect("encode"),
             "héllo 中".as_bytes()
