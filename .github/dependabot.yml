@@ -1,0 +1,31 @@
+# Dependabot version updates, written by Nocturn's onboarding: every package
+# ecosystem and directory in the repository, weekly, with each ecosystem's
+# minor and patch updates grouped into one pull request.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories:
+      - /
+      - /tools/input/mac/roost-input-mac
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      uv-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
