@@ -114,12 +114,12 @@ Frame frameFromFixtureJson(Map<String, Object?> json) {
     defaultFg: intOf(pick(json, ['default_fg', 'fg'])),
     defaultBg: intOf(pick(json, ['default_bg', 'bg'])),
     cursorColor: intOf(json['cursor_color'] ?? cursor['color']),
-    cursorCol: intOf(pick(cursor, ['col', 'x'])),
-    cursorRow: intOf(pick(cursor, ['row', 'y'])),
-    cursorStyle: styleOf(cursor['style']),
-    scrollTotal: intOf(scroll['total']),
-    scrollOffset: intOf(scroll['offset']),
-    scrollLen: intOf(pick(scroll, ['len', 'length'])),
+    cursorCol: intOf(pick(cursor, ['col', 'x']) ?? json['cursor_col']),
+    cursorRow: intOf(pick(cursor, ['row', 'y']) ?? json['cursor_row']),
+    cursorStyle: styleOf(cursor['style'] ?? json['cursor_style']),
+    scrollTotal: intOf(scroll['total'] ?? json['scroll_total']),
+    scrollOffset: intOf(scroll['offset'] ?? json['scroll_offset']),
+    scrollLen: intOf(pick(scroll, ['len', 'length']) ?? json['scroll_len']),
     rowData: [
       for (final r in rowList.map(mapOf))
         FrameRow(
