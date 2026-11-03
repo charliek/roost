@@ -234,7 +234,9 @@ def fetch(request: pytest.FixtureRequest, which: str) -> Release | str:
     match its `.sha256` — fails the run: those are not outages."""
     if which == "latest":
         resolved = subprocess.run(
-            ["bash", str(FETCH), "--resolve", which], capture_output=True, text=True, timeout=60
+            # Past fetch.sh's own retry budget (three 30 s tries, each with
+            # a 5 s kill grace), so its outage skip is reached, not a timeout.
+            ["bash", str(FETCH), "--resolve", which], capture_output=True, text=True, timeout=150
         )
         version = dict(
             line.partition("=")[::2] for line in resolved.stdout.splitlines() if "=" in line

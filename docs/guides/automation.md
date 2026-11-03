@@ -64,9 +64,11 @@ roostctl identify --json
 ```
 
 `identify.ops` lists the operations this socket serves *right now*.
-`wait`, `events` and `tab prompt` refuse `unsupported` when `ops` lacks
-`events.subscribe` and there's no session backing the local tabs, which
-only a Roost older than your `roostctl` does. `identify.instance_id` names the process: it changes on
+When `ops` lacks `events.subscribe`, `wait` and `tab prompt` refuse
+`unsupported` before doing anything, and `events` passes on the server's
+own refusal (`not-implemented`). That happens with a Roost older than your
+`roostctl`, or with a UI set to `local-backend = session` that can't
+resolve its session socket (`roostctl session status` says why). `identify.instance_id` names the process: it changes on
 every restart, and a resumed `wait`/`events` connection checks it to
 tell "the same Roost, still running" from "a different one answered".
 

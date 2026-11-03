@@ -205,7 +205,7 @@ PR pays only for what it touches.
 | `harness-unit` | `tools/roosttest_unit` — target/path/capability wiring, the E2E list contracts, and the `ci-success` contract (`test_ci_contract.py`) | ✅ |
 | `scripts` | Shell tests for the `linux/scripts` and `mac/scripts` release helpers (notarize, Sparkle key check) | ✅ |
 | `rust-build` | `cargo build`/`test` on Linux + macOS, plus the `roost-vt` ffi pass | ✅ |
-| `iced-build-e2e` | Six cells: ubuntu × (wgpu, tiny-skia) × (X11, Wayland), and macOS × (wgpu, tiny-skia). Each builds; the X11 and macOS cells also run the unit tests, clippy and the toolkit-boundary check. Then functional E2E under the cell's display: X11 (xvfb) or **Wayland** (headless weston), each in its own cell so the two run in parallel. Plus the exit-on-empty, menu-quit and (X11) real-input clipboard lanes, the six host-session client lanes (below), and (macOS) bundle-identity + smoke lanes | ✅ |
+| `iced-build-e2e` | Six cells: ubuntu × (wgpu, tiny-skia) × (X11, Wayland), and macOS × (wgpu, tiny-skia). Each builds. The **wgpu** cells carry the full coverage: the X11 and macOS wgpu cells also run the unit tests, clippy and the toolkit-boundary check; then functional E2E under the cell's display (X11 via xvfb, **Wayland** via headless weston, or macOS), plus the exit-on-empty, menu-quit and (X11) real-input clipboard lanes, the six host-session client lanes (below), and (macOS) the bundle-identity, smoke, DMG and Sparkle lanes. The **tiny-skia** cells (the GPU-less fallback renderer) run only `ICED_RENDERER_E2E_TESTS` (`make e2e-iced-renderer`): smoke, the pixel modules, Kitty images, IME and the agent panel's divider check | ✅ |
 | `iced-release` | Release-profile build, the real `.deb`, a release-binary E2E subset, packaged-profile assertion, artifact smoke, dependency-closure check | ✅ |
 | `session-e2e` | The headless host-session lanes — `roost-session` driven with no UI and no display (`SESSION_E2E_TESTS`, marker-based rather than an enumerated CI list) | ✅ |
 | `e2e-iced-wayland-drag` | `roost-iced` fullscreen under `cage` with a real `/dev/uinput` seat — the pointer-drag + system-clipboard guard the IPC-driven Wayland lane cannot cover | ❌ soft (`continue-on-error`, absent from `ci-success`) |
@@ -217,7 +217,7 @@ need a UI *and* a `roost-session` daemon, so they are in neither
 `e2e-host-local-spawn` (added by plan 044 for #397),
 `e2e-host-localhost` (added by plan 058 for #460: the literal
 `localhost` target, its ↻ Restart verb, and the restart behind it) and
-`e2e-host-bootstrap`, each with an X11 and a Wayland twin (in the X11
+`e2e-host-bootstrap`, each with an X11 and a Wayland twin (in the wgpu X11
 and Wayland cells respectively). Within a cell they run
 **serialized, never beside one another**: they share the client's
 incarnation counter and the default session socket, so two at once bind
