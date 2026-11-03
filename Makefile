@@ -57,7 +57,7 @@ run-iced: build-iced  ## Launch the Iced UI (Roost-iced profile)
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust which-runner test-iced test-harness test-linux-scripts test-mac-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-local-spawn e2e-host-local-spawn-ci e2e-host-localhost e2e-host-localhost-ci e2e-local-backend e2e-local-backend-ci e2e-old-session e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-iced-bundle e2e-iced-sparkle e2e-iced-real-input-mac mac-real-input-check smoke-iced test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust which-runner test-iced test-harness test-linux-scripts test-mac-scripts e2e e2e-iced e2e-iced-exit e2e-iced-renderer e2e-iced-menu-quit e2e-iced-clipboard e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-local-spawn e2e-host-local-spawn-ci e2e-host-localhost e2e-host-localhost-ci e2e-local-backend e2e-local-backend-ci e2e-old-session e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-iced-bundle e2e-iced-sparkle e2e-iced-real-input-mac mac-real-input-check smoke-iced test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
 ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_notification_raise.py tools/roosttest/test_agent_lifecycle.py tools/roosttest/test_agent_hooks.py tools/roosttest/test_agent_hooks_dialog.py tools/roosttest/test_agent_palette.py tools/roosttest/test_agent_panel.py tools/roosttest/test_doctor.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_sidebar_agents.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_window_geometry_persistence.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_palette_256.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_cursor_pixels.py tools/roosttest/test_kitty_pixels.py tools/roosttest/test_kitty_images.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_tab_dump_scrollback.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py tools/roosttest/test_shell_integration.py tools/roosttest/test_newtab_cwd.py tools/roosttest/test_boot_failure.py tools/roosttest/test_quit_with_foreground_job.py tools/roosttest/test_open_external.py tools/roosttest/test_context_menu.py tools/roosttest/test_password_input.py tools/roosttest/test_secure_input.py tools/roosttest/test_device_queries.py tools/roosttest/test_selection_autoscroll.py tools/roosttest/test_program_status.py tools/roosttest/test_memory_usage.py tools/roosttest/test_tab_env.py
 # Curated: a new UI-socket module runs nowhere until it is listed here AND in
@@ -81,6 +81,9 @@ ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walkin
 # pasteboard, so `test_selection.py` belongs in the list above and runs
 # under headless Wayland too. Only files that read/write the real
 # clipboard go here.
+# The tiny-skia cells' whole lane (D8): every module of ICED_E2E_TESTS that
+# reads ICED_BACKEND or checks pixels. The full list runs on wgpu only.
+ICED_RENDERER_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_agent_panel.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_cursor_pixels.py tools/roosttest/test_kitty_pixels.py tools/roosttest/test_kitty_images.py tools/roosttest/test_ime.py
 ICED_CLIPBOARD_TESTS := tools/roosttest/test_osc52.py tools/roosttest/test_paste_files.py tools/roosttest/test_context_menu_clipboard.py
 # Its OWN invocation, never a member of ICED_E2E_TESTS: this module deletes
 # the last project, which now ends the app (plan 026 D8) — inside the shared
@@ -287,6 +290,10 @@ e2e-iced:  ## Required functional E2E against Iced
 	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
 	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \
 	ROOST_TEST_MODE=1 uv run --group test pytest $$tests $(DAEMON_E2E_DESELECT) --roost-target iced
+
+e2e-iced-renderer:  ## Renderer-sensitive subset of the Iced E2E (fresh + isolated state); set ICED_BACKEND=tiny-skia|wgpu
+	cargo build -p roost-cli
+	ROOST_TEST_MODE=1 uv run --group test pytest $(ICED_RENDERER_E2E_TESTS) $(DAEMON_E2E_DESELECT) --roost-target iced --roost-fresh
 
 e2e-iced-exit:  ## Iced exit-on-empty E2E in its own lane (DESTRUCTIVE: force-quits a running Iced UI, and the UI it launches exits)
 	ROOST_TEST_MODE=1 uv run --group test pytest $(ICED_EXIT_E2E_TESTS) --roost-target iced --roost-fresh

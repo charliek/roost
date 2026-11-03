@@ -12,6 +12,7 @@ is a lane nothing gates.
 
 from __future__ import annotations
 
+import ast
 import re
 import unittest
 from pathlib import Path
@@ -34,6 +35,7 @@ MACOS_EXCEPTIONS = {
 
 # Makefile variables that name a dedicated lane, each run by its own invocation.
 DEDICATED_VARIABLES = {
+    "ICED_RENDERER_E2E_TESTS",
     "ICED_EXIT_E2E_TESTS",
     "ICED_MENU_QUIT_E2E_TESTS",
     "ICED_RELEASE_E2E_TESTS",
@@ -52,6 +54,19 @@ X11_STEP = "Run Iced functional E2E (Linux X11)"
 WAYLAND_STEP = "Run Iced functional E2E (Linux Wayland)"
 MACOS_STEP = "Run Iced functional E2E (macOS)"
 REAL_INPUT_TARGET = "e2e-iced-real-input-mac"
+RENDERER_STEPS = (
+    "Run Iced renderer E2E (Linux X11)",
+    "Run Iced renderer E2E (Linux Wayland)",
+    "Run Iced renderer E2E (macOS)",
+)
+RENDERER_TARGET = "e2e-iced-renderer"
+
+# Calls `screenshot` but asserts nothing about the picture, so the renderer is
+# irrelevant to it.
+RENDERER_EXEMPT = {
+    # An autouse fixture takes one screenshot only to know a window exists.
+    "tools/roosttest/test_notification_raise.py",
+}
 
 
 def logical_lines(text: str) -> list[str]:
@@ -197,6 +212,24 @@ def ci_executed_modules(ci: str, makefile: str) -> set[str]:
     return executed
 
 
+def reads_the_renderer(path: Path) -> bool:
+    """Whether a module's code (not its prose) selects the renderer by
+    `ICED_BACKEND` or calls a screenshot/pixel helper: `.screenshot(...)`,
+    the shared `_capture`, or `pngtool`."""
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Constant) and node.value == "ICED_BACKEND":
+            return True
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "screenshot":
+                return True
+            if isinstance(func, ast.Name) and func.id == "_capture":
+                return True
+        if isinstance(node, ast.Name) and node.id == "pngtool":
+            return True
+    return False
+
+
 def on_disk() -> set[str]:
     return {f"tools/roosttest/{path.name}" for path in ROOSTTEST.glob("test_*.py")}
 
@@ -314,6 +347,42 @@ class ListTests(unittest.TestCase):
         actual = self.nonempty_unique(MACOS_STEP, ci_step_modules(MACOS_STEP))
         expected = self.make("ICED_E2E_TESTS") | self.make("ICED_CLIPBOARD_TESTS")
         self.assertLane(MACOS_STEP, actual, expected - MACOS_EXCEPTIONS)
+
+    def test_the_renderer_lane_is_the_same_in_every_tiny_skia_step_and_the_target(self) -> None:
+        expected = self.make("ICED_RENDERER_E2E_TESTS")
+        for step in RENDERER_STEPS:
+            actual = self.nonempty_unique(step, ci_step_modules(step))
+            self.assertLane(step, actual, expected)
+        self.assertIn("ICED_RENDERER_E2E_TESTS", parse_recipe_lists(MAKEFILE.read_text(), RENDERER_TARGET))
+
+    def test_every_display_gated_step_names_its_renderer(self) -> None:
+        lines = CI.read_text().splitlines()
+        start = next(i for i, line in enumerate(lines) if line == "  iced-build-e2e:")
+        end = next(i for i in range(start + 1, len(lines)) if re.match(r"  [a-z][\w-]*:$", lines[i]))
+        name = None
+        gated: list[str] = []
+        for line in lines[start:end]:
+            if match := re.match(r"      - (?:name|uses): (.*)", line):
+                name = match.group(1)
+            if match := re.match(r"        if: (.*)", line):
+                condition = match.group(1)
+                gated_on = "matrix.display" in condition or "runner.os == 'macOS'" in condition
+                if gated_on and "matrix.renderer" not in condition:
+                    gated.append(str(name))
+        self.assertEqual(gated, [], "display-gated steps with no renderer condition: they run in the tiny-skia cells too")
+
+    def test_the_renderer_lane_is_a_subset_of_the_functional_lane(self) -> None:
+        self.assertLessEqual(self.make("ICED_RENDERER_E2E_TESTS"), self.make("ICED_E2E_TESTS"))
+
+    def test_every_renderer_sensitive_module_is_in_the_renderer_lane(self) -> None:
+        functional = self.make("ICED_E2E_TESTS") | self.make("ICED_CLIPBOARD_TESTS")
+        sensitive = {m for m in functional - RENDERER_EXEMPT if reads_the_renderer(REPO / m)}
+        self.assertTrue(sensitive, "the renderer-sensitivity detector matched nothing")
+        self.assertEqual(
+            sorted(sensitive - self.make("ICED_RENDERER_E2E_TESTS")),
+            [],
+            "modules that read ICED_BACKEND or check pixels, missing from ICED_RENDERER_E2E_TESTS",
+        )
 
     def test_the_macos_exceptions_are_real_modules_in_the_makefile(self) -> None:
         iced = self.make("ICED_E2E_TESTS")

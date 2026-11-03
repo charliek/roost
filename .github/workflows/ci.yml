@@ -568,13 +568,13 @@ jobs:
             fonts-noto-cjk libclang-dev libxkbcommon-x11-0 libwayland-client0 \
             mesa-vulkan-drivers weston xvfb xdotool zsh
 
-      # A Wayland cell runs neither `cargo test` nor clippy, so what it
-      # would save lacks their artifacts; only the cells that run them save.
+      # Only the wgpu cells that run `cargo test` and clippy save: a Wayland
+      # cell lacks their artifacts, and a tiny-skia cell runs neither.
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-shared-key: iced-debug
-          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.display != 'wayland' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.display != 'wayland' && matrix.renderer == 'wgpu' }}
 
       - uses: jdx/mise-action@v4
 
@@ -602,7 +602,7 @@ jobs:
         run: cargo build -p roost-iced -p roost-cli -p roost-session
 
       - name: Test and lint Iced
-        if: matrix.display != 'wayland'
+        if: matrix.display != 'wayland' && matrix.renderer == 'wgpu'
         run: |
           cargo test -p roost-iced
           cargo clippy -p roost-iced --all-targets -- -D warnings
@@ -615,7 +615,7 @@ jobs:
           cargo clippy -p roost-iced --features linux-package --all-targets -- -D warnings
 
       - name: Verify toolkit dependency boundaries
-        if: matrix.display != 'wayland'
+        if: matrix.display != 'wayland' && matrix.renderer == 'wgpu'
         shell: bash
         run: |
           set -euo pipefail
@@ -641,8 +641,87 @@ jobs:
             exit 1
           fi
 
+      # The tiny-skia cells (the fallback renderer on GPU-less machines) run
+      # only the modules that read ICED_BACKEND or check pixels
+      # (`ICED_RENDERER_E2E_TESTS`); the full functional lanes below run on
+      # wgpu alone. `tools/roosttest_unit/test_e2e_lists.py` keeps this list,
+      # the Makefile's and the pixel-reading modules in agreement.
+      - name: Run Iced renderer E2E (Linux X11)
+        if: matrix.display == 'x11' && matrix.renderer == 'tiny-skia'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-renderer-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-renderer-logs
+        run: >
+          xvfb-run -a --server-args="-screen 0 1920x1080x24"
+          uv run --group test pytest
+          tools/roosttest/test_smoke.py
+          tools/roosttest/test_iced_walking_skeleton.py
+          tools/roosttest/test_sidebar_pixels.py
+          tools/roosttest/test_tab_strip_pixels.py
+          tools/roosttest/test_agent_panel.py
+          tools/roosttest/test_sprite_pixels.py
+          tools/roosttest/test_cursor_pixels.py
+          tools/roosttest/test_kitty_pixels.py
+          tools/roosttest/test_kitty_images.py
+          tools/roosttest/test_ime.py
+          -m 'not session_daemon and not host_client'
+          --roost-target iced --roost-fresh -v
+
+      - name: Run Iced renderer E2E (Linux Wayland)
+        if: matrix.display == 'wayland' && matrix.renderer == 'tiny-skia'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-renderer-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-renderer-logs
+        run: >
+          tools/wayland/weston-run.sh
+          uv run --group test pytest
+          tools/roosttest/test_smoke.py
+          tools/roosttest/test_iced_walking_skeleton.py
+          tools/roosttest/test_sidebar_pixels.py
+          tools/roosttest/test_tab_strip_pixels.py
+          tools/roosttest/test_agent_panel.py
+          tools/roosttest/test_sprite_pixels.py
+          tools/roosttest/test_cursor_pixels.py
+          tools/roosttest/test_kitty_pixels.py
+          tools/roosttest/test_kitty_images.py
+          tools/roosttest/test_ime.py
+          -m 'not session_daemon and not host_client'
+          --roost-target iced --roost-fresh -v
+
+      - name: Run Iced renderer E2E (macOS)
+        if: runner.os == 'macOS' && matrix.renderer == 'tiny-skia'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-renderer-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-renderer-logs
+        run: >
+          uv run --group test pytest
+          tools/roosttest/test_smoke.py
+          tools/roosttest/test_iced_walking_skeleton.py
+          tools/roosttest/test_sidebar_pixels.py
+          tools/roosttest/test_tab_strip_pixels.py
+          tools/roosttest/test_agent_panel.py
+          tools/roosttest/test_sprite_pixels.py
+          tools/roosttest/test_cursor_pixels.py
+          tools/roosttest/test_kitty_pixels.py
+          tools/roosttest/test_kitty_images.py
+          tools/roosttest/test_ime.py
+          -m 'not session_daemon and not host_client'
+          --roost-target iced --roost-fresh -v
+
       - name: Run Iced functional E2E (Linux X11)
-        if: matrix.display == 'x11'
+        if: matrix.display == 'x11' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -710,7 +789,7 @@ jobs:
       # module deletes the last project, which ends the app (plan 026 D8),
       # so it must own the instance it drives.
       - name: Run Iced exit-on-empty E2E (Linux X11)
-        if: matrix.display == 'x11'
+        if: matrix.display == 'x11' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -733,7 +812,7 @@ jobs:
       # all three lanes anyway for structural symmetry with the
       # exit-on-empty step above.
       - name: Run Iced menu-Quit E2E (Linux X11)
-        if: matrix.display == 'x11'
+        if: matrix.display == 'x11' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -756,7 +835,7 @@ jobs:
       # (the functional cells, release.yml) deselect it; see the
       # Makefile's DAEMON_E2E_DESELECT for every mirror.
       - name: Run host-client E2E (Linux X11)
-        if: matrix.display == 'x11'
+        if: matrix.display == 'x11' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -778,7 +857,7 @@ jobs:
       # tell two connected hosts' tabs apart (`make e2e-host-ssh` carries
       # the same warning).
       - name: Run SSH-transport E2E (Linux X11)
-        if: matrix.display == 'x11'
+        if: matrix.display == 'x11' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -801,7 +880,7 @@ jobs:
       # host lane in this UI would attempt (`make e2e-host-missing-daemon`
       # carries the same warning).
       - name: Run missing-daemon E2E (Linux X11)
-        if: matrix.display == 'x11'
+        if: matrix.display == 'x11' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -825,7 +904,7 @@ jobs:
       # answers there (`make e2e-host-local-spawn` carries the same
       # warning).
       - name: Run local-spawn E2E (Linux X11)
-        if: matrix.display == 'x11'
+        if: matrix.display == 'x11' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -848,7 +927,7 @@ jobs:
       # the incarnation probe that cannot tell two connected hosts' tabs
       # apart (`make e2e-host-localhost` carries the same warning).
       - name: Run localhost E2E (Linux X11)
-        if: matrix.display == 'x11'
+        if: matrix.display == 'x11' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -873,7 +952,7 @@ jobs:
       # `local-backend` no other lane expects, which is the second
       # reason it runs alone.
       - name: Run local-backend switch E2E (Linux X11)
-        if: matrix.display == 'x11'
+        if: matrix.display == 'x11' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -894,7 +973,7 @@ jobs:
       # probe that cannot tell two connected hosts' tabs apart
       # (`make e2e-host-bootstrap` carries the same warning).
       - name: Run bootstrap E2E (Linux X11)
-        if: matrix.display == 'x11'
+        if: matrix.display == 'x11' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -909,7 +988,7 @@ jobs:
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced real-input clipboard (Linux X11)
-        if: matrix.display == 'x11'
+        if: matrix.display == 'x11' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -921,7 +1000,7 @@ jobs:
         run: python3 tools/input/linux/iced_clipboard_check.py
 
       - name: Run Iced functional E2E (Linux Wayland)
-        if: matrix.display == 'wayland'
+        if: matrix.display == 'wayland' && matrix.renderer == 'wgpu'
         # weston's headless backend has no input seat. Iced 0.14's
         # smithay-clipboard correctly refuses wl_data_device ownership without
         # a focused seat/serial, so native clipboard coverage runs in the X11
@@ -993,7 +1072,7 @@ jobs:
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (Linux Wayland)
-        if: matrix.display == 'wayland'
+        if: matrix.display == 'wayland' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1010,7 +1089,7 @@ jobs:
       # See the Linux X11 lane's comment above the same-named step: kept
       # in every lane for structural symmetry, self-skips off macOS.
       - name: Run Iced menu-Quit E2E (Linux Wayland)
-        if: matrix.display == 'wayland'
+        if: matrix.display == 'wayland' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1029,7 +1108,7 @@ jobs:
       # what makes "Linux client support" a tested claim rather than a
       # structural one.
       - name: Run host-client E2E (Linux Wayland)
-        if: matrix.display == 'wayland'
+        if: matrix.display == 'wayland' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1047,7 +1126,7 @@ jobs:
       # The Wayland twin of the X11 SSH-transport step. Same ordering
       # rule: after the host-client step, never beside it.
       - name: Run SSH-transport E2E (Linux Wayland)
-        if: matrix.display == 'wayland'
+        if: matrix.display == 'wayland' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1065,7 +1144,7 @@ jobs:
       # rule: after the SSH-transport step, never beside it or the
       # host-client step.
       - name: Run missing-daemon E2E (Linux Wayland)
-        if: matrix.display == 'wayland'
+        if: matrix.display == 'wayland' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1083,7 +1162,7 @@ jobs:
       # and one more reason for it: this lane owns the runner's default
       # session socket for its duration.
       - name: Run local-spawn E2E (Linux Wayland)
-        if: matrix.display == 'wayland'
+        if: matrix.display == 'wayland' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1101,7 +1180,7 @@ jobs:
       # and the lane the module's private `XDG_RUNTIME_DIR` is riskiest
       # in — `agent_jail.make_private_runtime_dir` says why.
       - name: Run localhost E2E (Linux Wayland)
-        if: matrix.display == 'wayland'
+        if: matrix.display == 'wayland' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1120,7 +1199,7 @@ jobs:
       # for: the press it dispatches goes through the UI's own pointer
       # handler.
       - name: Run local-backend switch E2E (Linux Wayland)
-        if: matrix.display == 'wayland'
+        if: matrix.display == 'wayland' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1138,7 +1217,7 @@ jobs:
       # after the SSH-transport step, never beside it or the host-client
       # step.
       - name: Run bootstrap E2E (Linux Wayland)
-        if: matrix.display == 'wayland'
+        if: matrix.display == 'wayland' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1162,7 +1241,7 @@ jobs:
       # loud in CI logs rather than silently re-triggering the test's
       # `precondition("no modern bash")` failure.
       - name: Install modern bash + version probe (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
         run: |
           brew list bash >/dev/null 2>&1 || brew install bash
           which bash || true
@@ -1181,7 +1260,7 @@ jobs:
       # `test_password_input.py` has cases in both its lanes. Mirrors the
       # Makefile's DAEMON_E2E_DESELECT.
       - name: Run Iced functional E2E (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1243,7 +1322,7 @@ jobs:
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1262,7 +1341,7 @@ jobs:
       # installs its native menu bar the same as a bundled app (plan 028
       # § 3.13 — "NSMenu installs fine on an unbundled process").
       - name: Run Iced menu-Quit E2E (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1287,18 +1366,18 @@ jobs:
       # bump changes the key, and a GitHub release-asset outage can't
       # flake the assemble step on a warm cache (plan 028 § 3.10).
       - name: Cache Sparkle stage
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
         uses: actions/cache@v5
         with:
           path: third_party/sparkle/out
           key: sparkle-stage-${{ hashFiles('third_party/sparkle/fetch.sh') }}
 
       - name: Assemble Roost-Iced.app
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
         run: ./mac/scripts/bundle-iced.sh debug
 
       - name: Assert bundle contents
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
         run: |
           set -euo pipefail
           APP="mac/build/Roost-Iced.app"
@@ -1535,7 +1614,7 @@ jobs:
           echo "OK: roost-session signed with a real, empty entitlements dict (hardened runtime only)"
 
       - name: Run Iced bundle smoke (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1637,7 +1716,7 @@ jobs:
       # e2e-iced-sparkle` (plan 028 § 3.11); cargo artifacts are already
       # built, so the re-assemble is cheap.
       - name: Assemble test-keyed Roost-Iced.app (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
         shell: bash
         env:
           ROOST_BUNDLE_SPARKLE_FEED_URL: http://127.0.0.1:1/placeholder
@@ -1659,7 +1738,7 @@ jobs:
           echo "OK: test-keyed bundle carries SUFeedURL + SUPublicEDKey"
 
       - name: Run Iced Sparkle E2E (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
