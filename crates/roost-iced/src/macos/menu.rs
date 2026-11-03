@@ -534,9 +534,9 @@ pub(crate) fn sync_secure_input_state(_mtm: MainThreadMarker, manual: bool) {
 ///
 /// Two different mechanisms, because they answer two different questions:
 ///
-/// * Palette gating **disables** items — Swift parity, whatever AppKit
-///   does with a disabled item's chord (a greyed item is exactly what the
-///   Swift app shows today).
+/// * Palette gating **disables** items — as the Swift app did, whatever
+///   AppKit does with a disabled item's chord (a greyed item is what it
+///   showed).
 /// * Text capture disables **every** command item — an editor or confirm
 ///   modal already swallows every key today — and additionally **blanks**
 ///   Copy/Paste's key equivalents. Those two are the only chords that
@@ -545,8 +545,9 @@ pub(crate) fn sync_secure_input_state(_mtm: MainThreadMarker, manual: bool) {
 ///   equivalent cannot match in `performKeyEquivalent:` at all, so the
 ///   event provably gets through under either behavior (plan 028 § 3.5).
 ///   Copy/Paste blank while a palette is open too: its search field is an
-///   iced `text_input` as well, and Swift keeps ⌘C/⌘V working there
-///   because its Edit items target `NSText`, not the app delegate.
+///   iced `text_input` as well, and the Swift app kept ⌘C/⌘V working
+///   there because its Edit items targeted `NSText`, not the app
+///   delegate.
 pub(crate) fn sync_gating(gating: MenuGating, _mtm: MainThreadMarker) {
     MENU.with(|cell| {
         let slot = cell.borrow();

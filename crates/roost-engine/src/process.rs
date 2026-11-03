@@ -250,8 +250,8 @@ pub fn set_agent_hook_binary(path: Option<String>) -> bool {
 
 /// The absolute path every spawned tab is told to invoke as
 /// `"$ROOST_AGENT_HOOK" agent-hook <agent>`, or `None` when this build
-/// has nothing to point at (a `swift run`/`cargo run` tree with no CLI
-/// built beside it).
+/// has nothing to point at (a `cargo run` tree with no CLI built beside
+/// it).
 pub fn agent_hook_binary() -> Option<&'static str> {
     AGENT_HOOK_BINARY.get_or_init(roostctl_path).as_deref()
 }

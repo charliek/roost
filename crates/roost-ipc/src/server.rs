@@ -517,13 +517,6 @@ impl<H: Handler> IpcServer<H> {
         // holds the lock for a different runtime dir, from stealing a
         // live socket. Anything other than "refused" or "absent" is
         // treated as live and refused (see `socket_state`).
-        //
-        // The Mac side does the equivalent dance in
-        // `mac/Sources/Roost/IPCServer.swift::bindWithRecovery` (M6);
-        // it gates the unlink on the flock state rather than doing it
-        // unconditionally because Mac's `IPCServer` is sometimes
-        // constructed from contexts that don't own the lock (tests,
-        // `ROOST_ALLOW_MULTI=1`).
         let state = socket_state::probe(&socket_path, socket_state::PROBE_TIMEOUT).await;
         match state {
             SocketState::Missing => {}

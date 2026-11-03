@@ -1,8 +1,5 @@
 //! Load every `tests/word-fixtures/*.txt` and assert byte-exact
-//! agreement with the Rust `word_selection` port. The Swift loader in
-//! `mac/Tests/RoostTests/WordFixtureRoundTripTests.swift` runs against
-//! the same files; drift between the two ports surfaces as a failure
-//! on whichever side regressed.
+//! agreement with `word_selection`.
 //!
 //! Same shape as `roost-url`'s in-crate `fixtures` mod.
 //!

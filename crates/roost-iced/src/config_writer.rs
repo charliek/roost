@@ -5,8 +5,8 @@
 //!
 //! [`roost_ui_model::config::set_key`] takes `config.lock` and waits up
 //! to ten seconds for it. The other holder is an agent-hooks ensure —
-//! this process's own, `roostctl`'s, the Swift app's, or a session
-//! raising the key for a connecting client — and that hold spans a read,
+//! this process's own, `roostctl`'s, or a session raising the key for a
+//! connecting client — and that hold spans a read,
 //! a union, up to five agent-file rewrites and the key write. On a
 //! network-mounted `$HOME` that is seconds. Iced's `update`/`view` is
 //! the winit event-loop thread, so a wait there is a frozen window.

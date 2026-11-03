@@ -15,8 +15,8 @@
 //! `ensure` here is the explicit reconcile — it wires what the key allows
 //! **and takes out what it does not**. `--startup` is the other shape,
 //! the one a UI launch runs: wire and refresh, remove nothing (plan 064
-//! §3.2). The Mac app spawns that one, because a launch must not undo a
-//! hand edit.
+//! §3.2), because a launch must not undo a hand edit. The iced UI runs
+//! that same `ensure` in process at launch.
 //!
 //! Every verb reads the config, and reads the **same** file and parser
 //! the UIs do (`roost-ui-model`), so `agent-hooks` means one thing on
@@ -116,17 +116,15 @@ pub fn run(cmd: &AgentCmd, json: bool) -> Result<i32, CliError> {
         AgentCmd::Ensure { startup } => match configured() {
             // `--startup` passes no mode: `ensure` re-reads the key
             // inside the lock. This read decides only whether there is
-            // an answer to act on at all — the Mac spawns exactly this
-            // at launch, and the key can be answered between its read
-            // and this process's write.
+            // an answer to act on at all — the key can be answered
+            // between its read and this process's write.
             Some(_) if *startup => report(ensure(&home, BY, guard), json),
             Some(mode) => report(reconcile(&home, &mode, BY, guard), json),
             None => {
-                // `--json` is a machine contract — the Mac app spawns
-                // exactly this and decodes stdout — so the unconfigured
+                // `--json` is a machine contract, so the unconfigured
                 // path answers in the shape an ensure would (an empty
                 // outcome) and puts its one human sentence on stderr,
-                // rather than breaking the decode with prose.
+                // rather than breaking a script's decode with prose.
                 let note = "agent-hooks is not configured; nothing was wired. Choose agents \
                             in Roost (Agent Hooks… in the command palette) or run `roostctl \
                             agent set <list|off> --local`.";
@@ -582,8 +580,6 @@ mod tests {
             .cmd
     }
 
-    /// `--json` is `roostctl`'s global flag, so the argv the Mac app
-    /// spawns with it is pinned against the real `Args` in `main.rs`.
     #[test]
     fn the_five_verbs_parse_the_way_the_docs_spell_them() {
         assert!(matches!(

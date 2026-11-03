@@ -1,8 +1,6 @@
 //! Load every `tests/agent-state-fixtures/*.json` and run it against
-//! `roost_ipc::agent`. The Swift loader in
-//! `mac/Tests/RoostTests/AgentStateFixtureTests.swift` runs the same
-//! files, so a divergence between the two ports of the agent state
-//! machine surfaces on whichever side regressed.
+//! `roost_ipc::agent`, so a change to the agent state machine surfaces
+//! against the corpus that pins it.
 //!
 //! Format documented in `tests/agent-state-fixtures/README.md`.
 //! Integration-test form (in `tests/`) because the path walk starts at

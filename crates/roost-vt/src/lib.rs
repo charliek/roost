@@ -3,9 +3,8 @@
 //! libghostty-vt is the VT parser + screen state engine extracted from
 //! Ghostty. Roost uses it (a) on the daemon side for any server-side
 //! OSC semantics that need parsing before the UI sees the bytes, and
-//! (b) on both UIs for in-process VT parse + render. The Mac UI links
-//! libghostty-vt via Swift's bridging header; the Linux UI
-//! (`crates/roost-iced/`) consumes it through this crate.
+//! (b) in the iced UI (`crates/roost-iced/`) for in-process VT parse +
+//! render.
 //!
 //! The FFI layer is gated behind the `ffi` cargo feature so the
 //! workspace builds cleanly before `third_party/ghostty/build.sh` has
@@ -22,10 +21,8 @@
 //!     `Key`, `Mods`, `KeyAction`, and color types so call sites speak
 //!     the same vocabulary as the C API without writing `unsafe`.
 //!   * `pub mod ffi` exposes the raw bindgen output for anything not
-//!     yet wrapped — matches how `mac/Sources/Roost/KeyEncoder.swift`
-//!     still calls a few C symbols directly. Keep this list small; the
-//!     idiomatic path is to add a wrapper here when a new consumer
-//!     needs one.
+//!     yet wrapped. Keep this list small; the idiomatic path is to add a
+//!     wrapper here when a new consumer needs one.
 
 #![allow(clippy::needless_pass_by_value)]
 

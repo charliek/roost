@@ -4,9 +4,8 @@
 //! `Ghostty.Shell.escapeCharacters` (vendored ghostty SHA pinned in
 //! third_party/ghostty/build.sh): backslash, space, and the shell
 //! metacharacters that would otherwise word-split or glob a dropped path at a
-//! raw shell prompt. Mirrors `mac/Sources/Roost/ShellEscape.swift`
-//! (`ShellEscape.escape`); the two implementations share unit-test vectors so
-//! they stay byte-identical.
+//! raw shell prompt. Ported from `mac/Sources/Roost/ShellEscape.swift`
+//! (`ShellEscape.escape`), with its unit-test vectors.
 
 /// Prefix each shell-sensitive character with a backslash. ASCII-only:
 /// non-ASCII codepoints (e.g. the U+202F narrow-no-break space in a macOS
@@ -76,7 +75,7 @@ mod tests {
 
     /// The headline case: a real macOS screenshot filename has regular spaces
     /// (escaped) and a U+202F narrow-no-break space before "PM" (passes
-    /// through, being non-ASCII). Shared verbatim with the Swift
+    /// through, being non-ASCII). Ported verbatim from the Swift
     /// `realScreenshotFilename` test.
     #[test]
     fn real_screenshot_filename() {
@@ -113,7 +112,7 @@ mod tests {
         assert_eq!(escape("\\ "), "\\\\\\ ");
     }
 
-    /// Shared verbatim with the Swift `testEscapeBytePassesThrough` vector: the
+    /// Ported verbatim from the Swift `testEscapeBytePassesThrough` vector: the
     /// escaper never drops input (that would make the escaped string name a
     /// different file), so ESC survives and only the `[` after it is escaped.
     /// ESC-bearing paths are rejected up in `drop_content::resolve`.

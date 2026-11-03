@@ -15,8 +15,6 @@
 //! that to [`UNKNOWN`] (errors are returned, not swallowed; the palette
 //! logs at that boundary). A clean repo renders [`UNKNOWN`] too: "clean"
 //! and "not a repo" deliberately look the same.
-//!
-//! To be mirrored by `mac/Sources/Roost/GitMetrics.swift` (plan 005 C5).
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;

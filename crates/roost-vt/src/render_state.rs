@@ -9,15 +9,6 @@
 //!      changed and consumes the frame's damage.
 //!   4. `cursor()` / `colors()` / `image_placements()` extract additional
 //!      per-frame data.
-//!
-//! `mac/Sources/Roost/RenderState.swift` mirrors the constructor,
-//! walk, and cursor-info shape — but the two have **intentionally
-//! diverged** as of the dirty-tracking API below (`Dirty`, `dirty`,
-//! `mark_full`, `dirty_rows`, `walk_dirty`). Swift deliberately does
-//! not get dirty tracking: it is the daily driver, its full-grid
-//! renderer is adequate, and the macOS-Iced evaluation may retire it,
-//! so investing in its render path is potentially wasted work. Do not
-//! "restore parity" here without that decision changing.
 
 use std::os::raw::{c_int, c_void};
 use std::ptr;

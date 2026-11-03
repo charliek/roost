@@ -2,7 +2,7 @@
 //!
 //! Ports `mac/Sources/Roost/PathDisplay.swift` and the Mac's
 //! `updateWindowTitle` (App.swift) so the iced window title reads the same
-//! as the shipped Swift app. The Mac splits the string across
+//! as the Swift app's did. The Mac splits the string across
 //! `NSWindow.title` + `.subtitle`; toolkits with a single title string
 //! join them with a spaced en dash, which is how AppKit renders the pair.
 //!

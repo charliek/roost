@@ -1,8 +1,7 @@
 //! Is anything listening on this socket path?
 //!
 //! One answer, shared by everything that has to decide it: the UI's
-//! bind path ([`crate::server::IpcServer::bind`]), `roostctl doctor`,
-//! and — mirrored, not shared — `mac/Sources/Roost/IPCServer.swift`.
+//! bind path ([`crate::server::IpcServer::bind`]) and `roostctl doctor`.
 //! Before this module each site had its own copy and they disagreed.
 //!
 //! The rule is **fail-safe**: only `ECONNREFUSED` (nothing is queued

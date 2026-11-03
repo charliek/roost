@@ -3,10 +3,9 @@
 //! [`TabState`] wire field.
 //!
 //! Everything here is I/O-free and takes its input as parameters, so
-//! one definition serves every consumer: the Rust workspace calls these
-//! functions from its mutation path, the Swift port
-//! (`mac/Sources/Roost/AgentState.swift`) mirrors them, and the shared
-//! corpus under `tests/agent-state-fixtures/` pins the two together.
+//! one definition serves every consumer: the workspace calls these
+//! functions from its mutation path, and the corpus under
+//! `tests/agent-state-fixtures/` pins what they answer.
 //!
 //! Three axes persist ([`ShellState`], [`AgentLifecycle`],
 //! [`Ownership`]). Attention is not state but an effect: [`apply_report`]
@@ -291,10 +290,10 @@ pub fn effective_lifecycle(state: &AgentTabState) -> AgentLifecycle {
 /// lossy half of [`effective_lifecycle`].
 ///
 /// `AgentLifecycle::Failed` maps to [`TabState::NeedsInput`] on
-/// purpose. `TabState` stays a **closed four-value enum** — the Swift
-/// decoders (`IPCTabState`, `Workspace.TabState`) have no fallback case,
-/// so a fifth value throws on the Mac client, and `docs/reference/ipc.md`
-/// classifies a new enum value as a breaking protocol change. True
+/// purpose. `TabState` stays a **closed four-value enum** — a client's
+/// decoder with no fallback case throws on a fifth value, and
+/// `docs/reference/ipc.md` classifies a new enum value as a breaking
+/// protocol change. True
 /// failure is observable on the agent lifecycle axis instead. Do not
 /// "fix" this by adding a `Failed` variant to `TabState`.
 pub fn effective(state: &AgentTabState) -> TabState {
@@ -564,9 +563,6 @@ pub fn apply_report(
 /// shell integration the shell axis stays `Unknown`, so claims
 /// supersede as they always did — no prompt mark would ever free a tab
 /// whose owner died.
-///
-/// The Swift port does not carry this rule; it is frozen pending its
-/// retirement.
 fn is_nested_claim(current: &AgentTabState, report: &TabAgentReportParams) -> bool {
     let Some(owner) = &current.ownership else {
         return false;

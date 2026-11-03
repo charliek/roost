@@ -15,12 +15,6 @@ pub mod attach;
 pub mod crash;
 pub mod event_push;
 pub mod events;
-// Experimental Swift-facing boundary (`Engine`/`EngineCommand`/owned
-// snapshots). No production consumer yet — both Rust UIs use the concrete
-// `Workspace`/`LocalClient` APIs — so it stays feature-gated until a UI
-// adopts it and proves the seam (roadmap M5).
-#[cfg(feature = "facade")]
-pub mod facade;
 pub mod git_metrics;
 #[cfg(feature = "vt")]
 pub mod images;
@@ -77,11 +71,6 @@ fn resolve_home(raw: Option<&str>) -> String {
 }
 
 pub use application::{hydrate, Hydration, LocalClient, OnRestoreError};
-#[cfg(feature = "facade")]
-pub use facade::{
-    CommandResult, Engine, EngineCommand, EngineError, EngineEvent, EngineEventStream,
-    EngineSnapshot,
-};
 pub use opener::TabOpener;
 pub use pty::{
     Geometry, PtyError, PtyOutputEvent, PtySupervisor, ShutdownReport, StartGate, SupervisorEvent,

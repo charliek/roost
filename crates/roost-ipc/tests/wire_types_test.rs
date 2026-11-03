@@ -4,11 +4,10 @@
 //!
 //! What pins their shape is this file plus the golden vectors under
 //! `tests/ipc-vectors/` (the identify vector per generation, see
-//! `identify_vector_name`), which the Swift mirror in
-//! `mac/Sources/Roost/IPCMessages.swift` consumes too. The
-//! assertions are deliberately byte-exact against literal JSON:
-//! a field rename or a reordering that a `round_trip` would happily
-//! accept is a cross-language break. These fixtures are a
+//! `identify_vector_name`). The assertions are deliberately byte-exact
+//! against literal JSON: a field rename or a reordering that a
+//! `round_trip` would happily accept is a wire break for a client
+//! written in any language. These fixtures are a
 //! compatibility contract — an existing vector is edited only by a
 //! breaking `SESSION_PROTOCOL_VERSION` bump, in the same commit;
 //! see `docs/reference/ipc-compatibility.md`.
@@ -1263,8 +1262,8 @@ fn identify_carries_a_persist_error_only_when_there_is_one() {
 }
 
 /// Plan 066 §3.1's two fields are additive in the same way: the plain
-/// vectors — an older server's shape, and the Swift app's — decode with
-/// both absent, and the variants carry them.
+/// vectors — an older server's shape — decode with both absent, and the
+/// variants carry them.
 #[test]
 fn identify_carries_ops_and_an_instance_id_only_where_a_server_sends_them() {
     fn result(name: &str) -> IdentifyResult {

@@ -2,8 +2,8 @@
 //!
 //! M3a of the daemon-removal refactor. GApplication's D-Bus
 //! uniqueness check doesn't work on macOS (no system D-Bus session
-//! bus by default), so we use the same flock-on-pidfile mechanism
-//! the Mac UI picked up in M4. One acquisition is:
+//! bus by default), so we use a flock-on-pidfile mechanism on both
+//! platforms. One acquisition is:
 //!
 //! 1. Open the lock file (`O_CREAT | O_RDWR`).
 //! 2. `flock(LOCK_EX | LOCK_NB)`. Fails → another live instance

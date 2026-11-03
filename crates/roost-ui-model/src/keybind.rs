@@ -4,8 +4,8 @@
 //! Defaults use `alt` as Linux's app modifier (Mac uses `super`/`cmd`);
 //! `ctrl` is left to the shell apart from `Ctrl+1‑9` (switch_tab) and
 //! the `Ctrl+Shift+C/V` copy/paste alternates. Everything else —
-//! modifier-alias rules, `unbind` semantics, action namespace — is
-//! shared with the Mac UI so config files apply verbatim across both UIs.
+//! modifier-alias rules, `unbind` semantics, action namespace — is the
+//! same on both platforms, so a config file applies verbatim on either.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -39,15 +39,13 @@ pub enum KeybindAction {
     CycleTabPrev,
     CycleTabNext,
     /// Step through the sidebar's projects, stopping at either end
-    /// ([`crate::host_sidebar::ring_step`]). Roost-Iced only: the Swift
-    /// app does not know these names and logs them as unknown.
+    /// ([`crate::host_sidebar::ring_step`]).
     CycleProjectPrev,
     CycleProjectNext,
     Copy,
     Paste,
     ToggleSidebar,
-    /// Show/hide the sidebar's Agents panel (plan 080 D2; the Swift
-    /// app's per-project agent rows, plan 007 §3.7). Default
+    /// Show/hide the sidebar's Agents panel (plan 080 D2). Default
     /// `projectMod+shift+a` — Cmd+Shift+A on macOS (Iced), Alt+Shift+A
     /// on Linux. Not a picker toggle — `dispatch_action`'s
     /// `is_picker_toggle` allowlist doesn't include it.
@@ -55,8 +53,7 @@ pub enum KeybindAction {
     /// Step the sidebar Agents panel's sort, grouped → priority → recent
     /// (plan 080 D7), and write it to `agent-panel-sort`. **Default
     /// unbound**: the panel header's sort word does the same on a click,
-    /// and the palette reaches it by name. Roost-Iced only: the Swift app
-    /// does not know this name and logs it as unknown.
+    /// and the palette reaches it by name.
     CycleAgentPanelSort,
     /// Open the agent-hooks consent card in preferences mode (plan 064
     /// §3.5) — the same card the first launch raises, with Cancel/Apply
@@ -302,8 +299,7 @@ pub fn parse_trigger(trigger: &str) -> Option<Accel> {
 /// Platform-aware, matching each desktop's "open link" convention and
 /// the app's own keybind scheme:
 ///
-/// * macOS: `Super` (Cmd) — parity with the Swift UI and native Mac
-///   apps (see `TerminalView`'s link-modifier check).
+/// * macOS: `Super` (Cmd) — as native Mac apps do.
 /// * Linux: `Alt` — the Rust UI adapter's (Iced) single "primary"
 ///   modifier (mirrors `default_bindings`), leaving `Ctrl` to the
 ///   shell/readline.

@@ -21,8 +21,8 @@
 //! frame froze — arrives as a [`TransferFacts`] value computed by the
 //! adapter, so every rule below is testable with values in hand.
 //!
-//! The policy itself lives in `roost_ui_model::file_transfer`, which is
-//! mirrored into Swift; nothing here re-decides what that module decided.
+//! The policy itself lives in `roost_ui_model::file_transfer`; nothing
+//! here re-decides what that module decided.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};

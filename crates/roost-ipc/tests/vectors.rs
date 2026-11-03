@@ -5,11 +5,6 @@
 //! * Round-trips via `serde_json::Value` (decode → re-encode →
 //!   semantically equal).
 //!
-//! The Swift companion test (added in M4 with the XCTest target)
-//! will load the same files and assert the same invariants. Drift
-//! between Rust and Swift surfaces immediately because both sides
-//! consume the *same* fixture bytes.
-//!
 //! This file deliberately stays schema-agnostic (it doesn't decode
 //! into typed structs) so adding a new vector file doesn't require
 //! touching test code. Typed-decode coverage lives in
@@ -411,9 +406,9 @@ fn sidebar_dump_vector_decodes_into_its_typed_params() {
     assert!(result.hosts[1].projects.is_empty());
 }
 
-/// The Swift Mac app answers `app.sidebar_dump` without a `hosts` field
-/// at all — host sessions are iced-only — so the vector without it has
-/// to keep decoding into the same struct. Pinned against the real
+/// A UI from before host sessions answers `app.sidebar_dump` without a
+/// `hosts` field at all, so the vector without it has to keep decoding
+/// into the same struct. Pinned against the real
 /// vector with the field stripped, rather than a hand-written body, so
 /// the two can never drift apart.
 #[test]
@@ -530,9 +525,9 @@ fn render_stats_vector_decodes_into_its_typed_params() {
     assert_eq!(result.draw_calls, 377);
     assert_eq!(result.draw_nanos, 94_250_000);
     assert_eq!(result.fill_text_calls, 9_048);
-    // The fixture deliberately omits view_*/elide_* — it models the mac
-    // Swift handler's response, which doesn't send them — so decoding it
-    // must default those fields to 0 rather than fail.
+    // The fixture deliberately omits view_*/elide_* — it models a UI
+    // from before them — so decoding it must default those fields to 0
+    // rather than fail.
     assert_eq!(result.view_calls, 0);
     assert_eq!(result.view_nanos, 0);
     assert_eq!(result.elide_calls, 0);
@@ -578,9 +573,9 @@ fn event_vectors_have_required_envelope_shape() {
 /// *number* on both (revisions are counters, not ids, so the
 /// string-int64 convention deliberately does not apply); the unfenced
 /// vector — what a socket serving no stream answers: a UI under
-/// `local-backend = session`, or the Swift Mac app — has no `revision`
-/// key at all rather than a `null`; and the fenced vector decodes into
-/// the same `TabListResult` an older client would use.
+/// `local-backend = session`, or a server older than the fence — has no
+/// `revision` key at all rather than a `null`; and the fenced vector
+/// decodes into the same `TabListResult` an older client would use.
 #[test]
 fn the_revision_fence_vectors_decode_into_their_typed_results() {
     use roost_ipc::messages::{EventsSubscribeResult, Response, TabListResult};

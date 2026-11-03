@@ -401,11 +401,6 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
-      # The experimental Swift-facing facade is feature-gated with no
-      # production consumer; test it explicitly so the gated code stays green.
-      - name: cargo test (roost-engine with facade)
-        run: cargo test -p roost-engine --features facade
-
       # examples/ipc-consumer is its own workspace (own Cargo.lock, path
       # dep on roost-ipc in-tree; a real consumer pins a git rev — see
       # docs/reference/ipc-compatibility.md). It needs no libghostty-vt:

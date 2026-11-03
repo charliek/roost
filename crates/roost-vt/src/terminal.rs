@@ -6,7 +6,7 @@
 //! at the "owned by one thread at a time" level) but explicitly `!Sync`
 //! — libghostty-vt must not be touched from more than one thread
 //! concurrently, enforcing the main-thread invariant (`CLAUDE.md`
-//! "Threading") that the Mac UI's `@MainActor` discipline also keeps.
+//! "Threading").
 
 use std::marker::PhantomData;
 use std::os::raw::c_void;
@@ -116,9 +116,8 @@ impl Scrollbar {
     }
 }
 
-/// Result of `Terminal::active_screen()`. The Mac UI's scroll handler
-/// uses this to decide between local scrollback and alt-screen arrow
-/// translation.
+/// Result of `Terminal::active_screen()`. A scroll handler uses this to
+/// decide between local scrollback and alt-screen arrow translation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveScreen {
     Primary,
@@ -315,8 +314,7 @@ pub struct Terminal {
     /// `OPT_USERDATA` survives moves of the `Terminal`.
     ctx: NonNull<CallbackCtx>,
     /// `!Sync` marker — libghostty-vt is single-threaded. Using
-    /// `*const ()` makes the type `Send + !Sync`, which matches the
-    /// Mac UI's `@MainActor`-only contract.
+    /// `*const ()` makes the type `Send + !Sync`.
     _not_sync: PhantomData<std::cell::Cell<()>>,
 }
 
@@ -938,7 +936,7 @@ impl Terminal {
                 (&mut cfg) as *mut sys::GhosttyTerminalModeConfig as *mut _,
             )
         };
-        // Treat any non-success as "false" — the Mac UI does the same.
+        // Treat any non-success as "false".
         Error::from_result(rc).ok();
         cfg.value
     }
@@ -1241,8 +1239,7 @@ impl Terminal {
         )
     }
 
-    /// Set the full 256-entry palette in one FFI call. Mirrors the
-    /// Mac UI's M6 P3 path.
+    /// Set the full 256-entry palette in one FFI call.
     pub fn set_color_palette(&mut self, palette: &[crate::ColorRgb; 256]) -> Result<()> {
         // libghostty expects a contiguous array of `GhosttyColorRgb`;
         // our `ColorRgb` is layout-compatible so a transmute slice is

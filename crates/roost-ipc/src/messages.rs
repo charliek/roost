@@ -326,8 +326,8 @@ pub struct IdentifyResult {
     pub ui_version: String,
     pub protocol_version: u32,
     /// Which local backend this UI runs its own tabs on (plan 063 §D1).
-    /// Absent from a Swift reply, which is always in-process — the
-    /// default this deserializes to.
+    /// Absent from a server older than the field, which is always
+    /// in-process — the default this deserializes to.
     #[serde(default)]
     pub local_backend: LocalBackendMode,
     /// The local host session's socket, present only under
@@ -350,13 +350,13 @@ pub struct IdentifyResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persist_error: Option<String>,
     /// The ops this socket would dispatch right now (plan 066 §3.1).
-    /// `None` — an older server, or the Swift app — and a list without
-    /// the name both mean "not served".
+    /// `None` — a server older than the field — and a list without the
+    /// name both mean "not served".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ops: Option<Vec<String>>,
     /// This UI process's identity, minted once at launch. Absent from a
     /// session socket, whose identity is `session.identify.session_id`,
-    /// and from the Swift app.
+    /// and from a server older than the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
 }
@@ -859,10 +859,6 @@ pub struct ClipboardDumpResult {
 /// `missing-param`. `image_png` is the seam the host-paste e2e needs —
 /// there is no other way to put a real image on the clipboard from an
 /// IPC-only harness.
-///
-/// The Mac UI is **text only** (`ipc.md`): its handler has no name for
-/// `image_png` and refuses the key with `unknown-field`, and a request
-/// carrying neither field is `invalid-param` there.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClipboardWriteParams {
@@ -1311,10 +1307,9 @@ pub struct TabExpandSelectionAtParams {
 /// (plan 063 §D11): `mods` therefore also decides whether the *link*
 /// modifier is held, so a left press on a hyperlink opens it through the
 /// UI's own launcher exactly as a real click does, and a press with no
-/// mouse reporting negotiated begins a local selection. The Mac UI still
-/// drives the encoder alone (`TerminalView.emitMouseTracking`), which is
-/// why the link case is a Linux-only E2E — `xdg-open` is resolved
-/// through `PATH` and macOS spawns `/usr/bin/open` by absolute path.
+/// mouse reporting negotiated begins a local selection. The link case is
+/// a Linux-only E2E: `xdg-open` is resolved through `PATH`, and macOS
+/// spawns `/usr/bin/open` by absolute path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabDispatchMouseEventParams {
@@ -1410,7 +1405,7 @@ pub struct AppDockBadgeParams {}
 pub struct AppDockBadgeResult {
     /// The badge text AppKit currently holds — the notification-inbox
     /// count as a decimal string, or `null` when the badge is cleared
-    /// (the UI writes `nil` at zero, matching `App.swift`). Read back
+    /// (the UI writes `nil` at zero). Read back
     /// off the Dock tile, never recomputed from the inbox.
     pub label: Option<String>,
 }
@@ -1538,11 +1533,8 @@ pub struct UpdateCheckDump {
 pub struct AppUpdateCheckParams {}
 
 /// `app.notification_status` request: read back the calling UI's
-/// `UNUserNotificationCenter` backend state — the iced UI from
-/// `crates/roost-iced/src/macos/notifications.rs`, the Swift app from
-/// `DesktopNotifications.status()`. Both answer one wire shape; only
-/// the reason a backend is unavailable differs (the Swift app installs
-/// its delegate at construction and so is always available). Gated on
+/// `UNUserNotificationCenter` backend state, from
+/// `crates/roost-iced/src/macos/notifications.rs`. Gated on
 /// `ROOST_TEST_MODE=1` like `app.menu_dump`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -2315,10 +2307,10 @@ pub struct SidebarDumpResult {
     /// listed with the rows it retained; a host that has never
     /// connected has no projects.
     ///
-    /// `default` + `skip_serializing_if` because the Swift Mac app
-    /// answers this op too and never emits `hosts` (host sessions are
-    /// iced-only): its response has to keep decoding into this type,
-    /// and a UI with no host sections stays byte-identical on both.
+    /// `default` + `skip_serializing_if` because a reply from before
+    /// host sessions carries no `hosts`: it has to keep decoding into
+    /// this type, and a UI with no host sections stays byte-identical to
+    /// that shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<SidebarDumpHost>,
     /// Every band of the section strip, in sidebar order, including the
@@ -2327,11 +2319,11 @@ pub struct SidebarDumpResult {
     ///
     /// Empty, and so omitted, when the sidebar draws its classic single
     /// sticky `PROJECTS` header instead of a strip: `in-process` with no
-    /// saved hosts, which is also every Swift Mac reply.
+    /// saved hosts, which is also every reply from before the strip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<SidebarDumpSection>,
-    /// The sidebar's Agents panel (plan 080 D10). Omitted by the Swift
-    /// Mac app, which has no panel, so its replies keep decoding.
+    /// The sidebar's Agents panel (plan 080 D10). Omitted by a UI from
+    /// before the panel, so its replies keep decoding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_panel: Option<SidebarDumpAgentPanel>,
 }
@@ -2407,7 +2399,7 @@ pub struct AppRenderStatsParams {
 /// clients.
 ///
 /// `view_calls`/`view_nanos`/`elide_calls`/`elide_nanos` carry `default`
-/// on top of `string_int64`: the mac Swift handler doesn't send them, so
+/// on top of `string_int64`: a UI from before them doesn't send them, so
 /// a decode against that response must still succeed (same tolerance
 /// pattern as `TabOpenParams.project_id`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2701,8 +2693,7 @@ pub struct AgentReportChangedEvent {
 /// `DroppedReport.reason` gains `program_status` and `foreign_app`, which
 /// a closed enum makes a break. An `agent_report.changed` without
 /// `program_status` means the tab has no records: a mirror clears its
-/// copy. A Swift UI target keeps no records, so its `Tab.state` is never
-/// composed.
+/// copy.
 ///
 /// And **tab size ownership** in place of "the last interactor sizes the
 /// PTY": a tab has at most one owning attachment, whose grid is the
@@ -4694,7 +4685,7 @@ pub mod ops {
     pub const TAB_DUMP_RESOLVED: &str = "tab.dump_resolved";
     /// A tab's terminal memory, from libghostty (plan 082 D6). Ungated:
     /// a read, served by a session from its own terminal and by the iced
-    /// UI; the Swift app answers `unknown-op`.
+    /// UI.
     pub const TAB_MEMORY_USAGE: &str = "tab.memory_usage";
     /// Test-only word/line selection driver. Same gate as
     /// `tab.feed_pty_bytes`; runs the production `handle_click_count`
@@ -5512,9 +5503,8 @@ mod tests {
     }
 
     /// A `failed` tab must still decode on a client that only knows
-    /// the four legacy states (plan §3.2 / AC 11). `TabState` is the
-    /// closed enum both Swift decoders mirror, so this is the Rust
-    /// half of that guard.
+    /// the four legacy states (plan §3.2 / AC 11): `TabState` is a
+    /// closed enum, and an older client's copy of it has no `failed`.
     #[test]
     fn failed_lifecycle_projects_onto_the_legacy_state_enum() {
         #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -6321,10 +6311,9 @@ mod tests {
         });
     }
 
-    /// The Swift Mac app answers `app.sidebar_dump` too and never emits
-    /// `hosts` — host sessions are iced-only — so its response has to
-    /// keep decoding, and a UI with no host sections has to stay
-    /// byte-identical to the pre-plan-044 shape on both sockets.
+    /// A reply from before host sessions never carries `hosts`, so it
+    /// has to keep decoding, and a UI with no host sections has to stay
+    /// byte-identical to that pre-plan-044 shape.
     #[test]
     fn sidebar_dump_result_hosts_is_absent_both_ways_when_empty() {
         let without: SidebarDumpResult =
@@ -6344,8 +6333,8 @@ mod tests {
 
     /// The band strip (plan 063 §D2) is additive in both directions: a
     /// reply that predates it still decodes, and an empty strip — the
-    /// classic single sticky `PROJECTS` header, and every Swift reply —
-    /// stays off the wire, so the pre-063 shape is byte-identical.
+    /// classic single sticky `PROJECTS` header — stays off the wire, so
+    /// the pre-063 shape is byte-identical.
     #[test]
     fn sidebar_dump_result_round_trips_the_band_strip() {
         let without: SidebarDumpResult =
@@ -6403,16 +6392,16 @@ mod tests {
     }
 
     /// Plan 080 D10: the Agents panel is additive like the strip — a
-    /// Swift reply (no panel) still decodes and re-encodes byte for
+    /// pre-080 reply (no panel) still decodes and re-encodes byte for
     /// byte — and its entries are tagged by `kind`, with the tab in the
     /// host-qualified spelling the tab ops take.
     #[test]
     fn sidebar_dump_result_round_trips_the_agents_panel() {
-        let swift: SidebarDumpResult =
+        let older: SidebarDumpResult =
             serde_json::from_str(r#"{"agents_visible":true,"projects":[]}"#).unwrap();
-        assert_eq!(swift.agent_panel, None);
+        assert_eq!(older.agent_panel, None);
         assert_eq!(
-            serde_json::to_string(&swift).unwrap(),
+            serde_json::to_string(&older).unwrap(),
             r#"{"agents_visible":true,"projects":[]}"#
         );
 
@@ -6533,7 +6522,7 @@ mod tests {
         assert_eq!(r.elide_nanos, 11);
     }
 
-    /// The mac Swift handler doesn't send `view_*`/`elide_*` — those
+    /// A UI from before `view_*`/`elide_*` doesn't send them — those
     /// fields must default to 0 rather than fail the decode, the same
     /// tolerance `TabOpenParams.project_id` relies on.
     #[test]
@@ -7129,13 +7118,12 @@ mod tests {
         assert_eq!(parsed.event, "tab.opened");
     }
 
-    /// The Swift UI answers `identify` from its own struct and has never
-    /// heard of `local_backend`, which is correct of it — the Mac app is
-    /// always in-process. The Rust client has to read that reply anyway,
-    /// so both fields default rather than fail.
+    /// A server older than `local_backend` never sends it, and is always
+    /// in-process. The client has to read that reply anyway, so both
+    /// fields default rather than fail.
     #[test]
     fn an_identify_without_the_local_backend_fields_still_decodes() {
-        let swift = r#"{
+        let older = r#"{
             "socket_path": "/Users/me/Library/Caches/Roost/roost.sock",
             "pid": 12345,
             "active_project_id": "1",
@@ -7145,18 +7133,18 @@ mod tests {
             "ui_version": "0.7.0",
             "protocol_version": 1
         }"#;
-        let parsed: IdentifyResult = serde_json::from_str(swift).expect("decode");
+        let parsed: IdentifyResult = serde_json::from_str(older).expect("decode");
         assert_eq!(parsed.local_backend, LocalBackendMode::InProcess);
         assert_eq!(parsed.local_session_socket, None);
         // Re-encoding adds `local_backend` but still omits the socket:
-        // a Rust in-process reply is the Swift shape plus one field a
+        // an in-process reply is the older shape plus one field a
         // client ignores, which is the additive direction the matrix in
         // `docs/reference/ipc-compatibility.md` allows for free.
         let json = serde_json::to_value(&parsed).unwrap();
         assert_eq!(json["local_backend"], "in-process");
         assert!(json.get("local_session_socket").is_none());
         // Same rule for the switch phase: an idle UI's reply is the
-        // Swift shape, so a recorded vector stays byte-identical.
+        // older shape, so a recorded vector stays byte-identical.
         assert_eq!(parsed.local_backend_switch, None);
         assert!(json.get("local_backend_switch").is_none());
         // And for plan 066's two: absent, not empty.

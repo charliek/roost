@@ -2,7 +2,7 @@
 //!
 //! The acknowledgement rides in `focus_tab`'s own commit, so every
 //! surface that focuses — a click, a keybind, a palette jump, a banner,
-//! IPC `tab.focus`, the facade — clears the badge by construction. The
+//! IPC `tab.focus` — clears the badge by construction. The
 //! versioned stream delivers one message per commit, which is what makes
 //! "same commit, in order" assertable here: a subscriber that sees the
 //! pair in one message could not have seen them split.

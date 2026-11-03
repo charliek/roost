@@ -3,9 +3,7 @@
 //! `Terminal::hyperlink_at` wraps the two-call buffer pattern around
 //! libghostty's `ghostty_grid_ref_hyperlink_uri`. Cells covered by an
 //! OSC 8 hyperlink span report the URI verbatim; cells outside the
-//! span return `None`. The Mac UI mirrors this through a small Swift
-//! helper that calls the same C symbol — keeping both ports honest
-//! against a real terminal fixture, not a mock.
+//! span return `None` — against a real terminal fixture, not a mock.
 //!
 //! Run with:
 //!

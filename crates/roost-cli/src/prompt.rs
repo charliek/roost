@@ -17,9 +17,9 @@ use roost_ipc::messages::{ops, TabState, TabWriteParams};
 use roost_ipc::IpcClient;
 
 use crate::error::CliError;
-use crate::events::{self, Source};
+use crate::events;
 use crate::millis;
-use crate::wait::{self, Bound, Following, Subscribed, Waiting, Want};
+use crate::wait::{self, Bound, Following, Waiting, Want};
 use crate::UiSocket;
 
 #[derive(clap::Args, Debug)]
@@ -158,10 +158,8 @@ async fn submit(ui: &mut UiSocket<'_>, args: Args, tab_id: i64) -> Result<Done, 
     };
 
     let identify = wait::identify(ui, bound, |op| settled.cut(op)).await?;
-    let (source, mut legs) = match settled.subscribe(ui, identify).await? {
-        Subscribed::Legs(source, legs) => (source, *legs),
-        Subscribed::None(source) => return Err(unsupported(&source)),
-    };
+    let (source, legs) = settled.subscribe(ui, identify).await?;
+    let mut legs = *legs;
     // A turn already under way has no start left for the gate to catch.
     // The writes still go through: queueing a prompt behind the one
     // running is the agent's business, not this verb's.
@@ -298,17 +296,6 @@ fn until(states: &[String]) -> Result<Vec<TabState>, CliError> {
         .iter()
         .map(|state| crate::parse_state(state))
         .collect()
-}
-
-fn unsupported(source: &Source) -> CliError {
-    CliError::Unsupported(format!(
-        "{}: tab prompt needs the tabs' event stream (events.subscribe), which this Roost \
-         does not serve — the Swift Mac app today. There is no polling fallback: a poll \
-         cannot see a turn that starts and ends between two tab.list calls, so it would \
-         report a stall that never happened. Send the text with `roostctl tab send` and read \
-         the tab with `roostctl tab dump`.",
-        source.socket.display()
-    ))
 }
 
 async fn write(waiting: &Waiting<'_>, conn: &mut IpcClient, data: Vec<u8>) -> Result<(), CliError> {
@@ -656,17 +643,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_server_without_the_stream_is_unsupported() {
-        let fake = Fake::without_stream("prompt-no-stream");
-        let error = done(&fake, &["--timeout", "5", TEXT])
-            .await
-            .expect_err("no stream");
-        assert_eq!(refused(&error), (1, "unsupported"), "{error:?}");
-        assert!(error.message().contains("events.subscribe"), "{error:?}");
-        assert!(
-            fake.with(|world| world.writes.is_empty()),
-            "nothing is written to a tab this verb cannot then watch"
-        );
+    async fn a_roost_without_the_stream_is_unsupported_and_written_nothing() {
+        for fake in [
+            Fake::without_stream("prompt-no-stream"),
+            Fake::session_backed_without_a_session("prompt-no-session"),
+        ] {
+            let error = done(&fake, &["--timeout", "5", TEXT])
+                .await
+                .expect_err("no stream");
+            assert_eq!(refused(&error), (1, "unsupported"), "{error:?}");
+            assert!(
+                error
+                    .message()
+                    .starts_with("this Roost serves no event stream"),
+                "{error:?}"
+            );
+            assert_eq!(
+                fake.with(|world| world.ops().join(" ")),
+                "identify",
+                "nothing is written to a tab this verb cannot then watch"
+            );
+        }
     }
 
     #[tokio::test]

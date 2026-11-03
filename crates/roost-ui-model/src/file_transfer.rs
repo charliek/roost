@@ -1,11 +1,11 @@
 //! Pure policy for moving a paste or a drop across a host boundary
 //! (plan 047 §3.2).
 //!
-//! This module inspects nothing and touches no filesystem — it is
-//! mirrored by hand into Swift, so it has to be testable with only
-//! values in hand. Something else (`roost-iced`'s blocking-pool
-//! inspector) turns dropped paths into [`Candidate`]s; this module only
-//! decides, given a [`Target`] and a [`Source`], what happens next.
+//! This module inspects nothing and touches no filesystem, so it is
+//! testable with only values in hand. Something else (`roost-iced`'s
+//! blocking-pool inspector) turns dropped paths into [`Candidate`]s; this
+//! module only decides, given a [`Target`] and a [`Source`], what happens
+//! next.
 
 use std::ffi::OsStr;
 use std::path::PathBuf;

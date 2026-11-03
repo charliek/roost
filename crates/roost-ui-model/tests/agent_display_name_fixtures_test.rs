@@ -1,8 +1,7 @@
 //! Load `tests/agent-display-name-fixtures/cases.json` and assert
-//! agreement with `agent_palette::agent_display_name`. The Swift loader
-//! in `mac/Tests/RoostTests/AgentDisplayNameFixtureTests.swift` runs the
-//! same file, so a divergence between the two UIs' source→display-name
-//! tables surfaces here rather than in a user's agents palette.
+//! agreement with `agent_palette::agent_display_name`, so a change to
+//! the source→display-name table surfaces here rather than in a user's
+//! agents palette.
 //!
 //! Format documented in `tests/agent-display-name-fixtures/README.md`.
 //! Integration-test form (in `tests/`) because the path walk starts at

@@ -62,7 +62,8 @@ pub(crate) struct Source {
     pub socket: PathBuf,
     pub identity: Identity,
     /// `identify.ops` names `events.subscribe`, or the stream is the
-    /// session's. `false` is the Mac app or an older server.
+    /// session's. `false` is a server older than the stream, or a UI under
+    /// `local-backend = session` that names no session socket.
     pub serves_stream: bool,
 }
 
@@ -638,9 +639,22 @@ pub(crate) mod fake {
             Self::start(tag, identify(&ops, None), "session-1")
         }
 
-        /// The Mac app, or an older Roost: no `ops`, no stream.
+        /// An in-process UI socket whose `ops` lack the stream.
         pub fn without_stream(tag: &str) -> Self {
-            Self::start(tag, identify(&[], None), "none")
+            Self::start(
+                tag,
+                identify(&["identify", "tab.list"], Some("ui-1")),
+                "ui-1",
+            )
+        }
+
+        /// A UI socket under `local-backend = session` that names no
+        /// session socket — one that could not resolve it — so neither it
+        /// nor anything it points at serves the stream.
+        pub fn session_backed_without_a_session(tag: &str) -> Self {
+            let mut identify = identify(&["identify", "tab.list"], Some("ui-1"));
+            identify["local_backend"] = json!("session");
+            Self::start(tag, identify, "ui-1")
         }
 
         fn start(tag: &str, identify: Value, id: &str) -> Self {

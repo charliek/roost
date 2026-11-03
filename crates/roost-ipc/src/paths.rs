@@ -1859,8 +1859,7 @@ mod tests {
 
     /// The macOS half of the session path contract, pinned literally over
     /// an injected environment — an override or `HOME` the test process
-    /// happens to carry must not move it. Mirrored by `RoostTests.swift`'s
-    /// `bundleProfileSession*` tests.
+    /// happens to carry must not move it.
     #[cfg(target_os = "macos")]
     #[test]
     fn session_paths_live_under_their_own_mac_library_dirs() {

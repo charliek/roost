@@ -2,17 +2,13 @@
 
 Canonical `source → display name` corpus for the agents palette row
 label (plan 046 §3.7 W7) — `agent_display_name` in
-`crates/roost-ui-model/src/agent_palette.rs` (Rust) and
-`AgentPalette.agentDisplayName` in `mac/Sources/Roost/AgentPalette.swift`
-(Swift). Both ports load this file and assert the same mapping, so the
-two UIs cannot drift on spellings like "OpenCode" vs "opencode".
+`crates/roost-ui-model/src/agent_palette.rs`, so a spelling like
+"OpenCode" vs "opencode" is pinned outside the code that renders it.
 
-Loaders:
+Loader:
 
 - Rust: `crates/roost-ui-model/tests/agent_display_name_fixtures_test.rs`
   (`cargo test -p roost-ui-model`).
-- Swift: `mac/Tests/RoostTests/AgentDisplayNameFixtureTests.swift`
-  (`cd mac && swift test`).
 
 Same pattern as [`tests/agent-state-fixtures/`](../agent-state-fixtures/README.md)
 and [`tests/word-fixtures/`](../word-fixtures/README.md).
@@ -47,4 +43,4 @@ One JSON object, `cases.json`:
 ## Adding a case
 
 Append it to `cases.json`. Every case needs a unique, descriptive
-`name`: the loaders report failures by name.
+`name`: the loader reports failures by name.
