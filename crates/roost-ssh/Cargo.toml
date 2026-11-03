@@ -11,6 +11,12 @@ description = "In-process SSH dialer (russh) for reaching a host's roost-session
 [lints]
 workspace = true
 
+[features]
+# `devserver`: a stand-in for Tailscale SSH on a development machine
+# (examples/dev_sshd.rs, tools/mobile/dev-host.sh) and the tests' fixture
+# server. Never enabled by the app.
+dev-server = []
+
 [dependencies]
 roost-client = { path = "../roost-client" }
 roost-ipc    = { path = "../roost-ipc" }
@@ -26,9 +32,12 @@ tokio   = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# This crate itself, so every test and example builds with `devserver`.
+roost-ssh = { path = ".", features = ["dev-server"] }
 # The end-to-end lane runs a real session in-process, the way
 # roost-session's own integration tests do.
 roost-session = { path = "../roost-session" }
 roost-engine  = { path = "../roost-engine" }
 serde_json    = "1"
 tempfile      = "3"
+tracing-subscriber = { workspace = true }

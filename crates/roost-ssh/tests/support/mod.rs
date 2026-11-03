@@ -15,13 +15,12 @@ use bytes::Bytes;
 use roost_client::dial::{DialError, Duplex};
 use roost_ipc::framing::{write_frame, FrameReader};
 use roost_ipc::messages::{ops, RawRequest, Response, SessionIdentify};
-use roost_ssh::{HostKeyPolicy, HostTarget, TailscaleSshDialer};
+use roost_ssh::{devserver, HostKeyPolicy, HostTarget, TailscaleSshDialer};
 use russh::keys::ssh_key::private::Ed25519Keypair;
 use russh::keys::{HashAlg, PrivateKey};
 use russh::server::{self, Auth, Msg, Session};
 use russh::{Channel, ChannelId, ChannelMsg};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UnixStream};
+use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 /// What the server does with an exec'd command.
@@ -33,7 +32,7 @@ pub enum Behavior {
     /// shape of a `client-bridge` that found no session.
     Fail { stderr: String, code: u32 },
     /// Pump the channel to and from the Unix socket at this path, the
-    /// way `client-bridge` does; exit 0 when the socket closes.
+    /// way `client-bridge` does ([`devserver::pipe`]).
     Pipe(PathBuf),
 }
 
@@ -59,13 +58,7 @@ impl Server {
         let behavior = Arc::new(Mutex::new(behavior));
         let key = PrivateKey::from(Ed25519Keypair::from_seed(&[7; 32]));
         let fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
-        let config = Arc::new(server::Config {
-            keys: vec![key],
-            auth_rejection_time: Duration::from_millis(1),
-            auth_rejection_time_initial: Some(Duration::ZERO),
-            inactivity_timeout: None,
-            ..server::Config::default()
-        });
+        let config = devserver::config(key);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let connections = Arc::new(AtomicUsize::new(0));
@@ -234,36 +227,7 @@ async fn serve_channel(
             let _ = write.close().await;
             return;
         }
-        Behavior::Pipe(path) => {
-            let socket = UnixStream::connect(&path).await.expect("dial the session");
-            let (mut from_session, mut to_session) = socket.into_split();
-            tokio::spawn(async move {
-                while let Some(msg) = read.wait().await {
-                    match msg {
-                        ChannelMsg::Data { data } => {
-                            if to_session.write_all(&data).await.is_err() {
-                                return;
-                            }
-                        }
-                        ChannelMsg::Eof => {
-                            let _ = to_session.shutdown().await;
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-            });
-            let mut buf = vec![0; 64 * 1024];
-            while let Ok(n @ 1..) = from_session.read(&mut buf).await {
-                if write
-                    .data_bytes(Bytes::copy_from_slice(&buf[..n]))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        }
+        Behavior::Pipe(path) => return devserver::pipe(read, write, &path).await,
     }
     let _ = write.exit_status(0).await;
     let _ = write.eof().await;

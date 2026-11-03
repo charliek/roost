@@ -14,6 +14,9 @@
 //! fails the dial with its fingerprint for the app to show and pin.
 
 mod channel;
+#[cfg(feature = "dev-server")]
+#[doc(hidden)]
+pub mod devserver;
 mod target;
 
 use std::io;
