@@ -532,20 +532,31 @@ check: fmt-check clippy test  ## Pre-push gate: fmt-check + clippy + tests
 
 ANDROID_TARGETS := aarch64-linux-android x86_64-linux-android
 
-.PHONY: mobile-deps mobile-android-check
+.PHONY: mobile-deps mobile-android-check mobile-apk mobile-dev-host
 mobile-deps:  ## Build libghostty-vt for both Android ABIs into third_party/ghostty/out/<triple>/
 	. tools/mobile/android-env.sh && for t in $(ANDROID_TARGETS); do \
 		third_party/ghostty/build.sh --target $$t || exit 1; \
 	done
 
-# roost-client is checked without its tests: its dev-dependencies
-# (roost-engine -> portable-pty -> termios) do not build for Android.
-mobile-android-check: mobile-deps  ## Cross-check roost-vt (ffi), roost-ipc, roost-ui-model, roost-client for Android; link their test binaries
+# roost-client and roost-ssh are checked without their tests: their
+# dev-dependencies (roost-engine -> portable-pty -> termios) do not build for
+# Android.
+mobile-android-check: mobile-deps  ## Cross-check roost-vt (ffi), roost-ipc, roost-ui-model, roost-client, roost-ssh for Android; link their test binaries
 	. tools/mobile/android-env.sh && for t in $(ANDROID_TARGETS); do \
-		RUSTFLAGS=-Dwarnings cargo check -p roost-client --target $$t && \
+		RUSTFLAGS=-Dwarnings cargo check -p roost-client -p roost-ssh --target $$t && \
 		RUSTFLAGS=-Dwarnings cargo test --no-run -p roost-vt -p roost-ipc -p roost-ui-model \
 			--features roost-vt/ffi --target $$t || exit 1; \
 	done
+
+# Built for the two ABIs libghostty-vt exists for; Flutter's default would
+# add android-arm too.
+mobile-apk:  ## Debug APK (arm64-v8a + x86_64), then the 16 KB page-alignment check on it
+	cd mobile && env -u ROOST_SOCKET -u ROOST_TAB_ID -u ROOST_AGENT_HOOK -u HERDR_ENV \
+		flutter build apk --debug --target-platform android-arm64,android-x64
+	tools/mobile/check-16kb-alignment.sh mobile/build/app/outputs/flutter-apk/app-debug.apk
+
+mobile-dev-host:  ## A private dev roost-session behind dev_sshd, for the app in an emulator (Ctrl-C stops it)
+	tools/mobile/dev-host.sh
 
 # ---- docs -------------------------------------------------------------
 
