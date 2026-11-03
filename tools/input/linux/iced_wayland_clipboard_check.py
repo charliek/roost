@@ -38,6 +38,7 @@ sys.path.insert(0, str(REPO / "tools" / "screenshot"))
 
 import pngtool  # noqa: E402
 import ui  # noqa: E402
+import wayland_output  # noqa: E402
 from iced_clipboard_check import (  # noqa: E402
     AUTOSCROLL_PREFIX,
     TERMINAL_PADDING,
@@ -474,20 +475,20 @@ def main() -> int:
         if not logical_width or not logical_height:
             _skip(f"window_metrics returned invalid size: {metrics!r}")
         # The virtual absolute device is normalized against the compositor
-        # output, not the client's logical/decorated window extent. Cage's
-        # headless output can be wider than `window_metrics` (for example,
-        # 2048 output pixels for a 1920-wide client); using the client extent
-        # shifts every injected point proportionally. A scale-1 product
-        # capture reports the renderer/output extent we must advertise to
-        # uinput while the target coordinates remain logical layout points.
-        _png, width, height = client.screenshot(scale=1)
-        if not width or not height:
-            _skip(f"screenshot returned invalid output size: {(width, height)!r}")
+        # output, not the client's window, so its extent is the output's
+        # current mode, asked of cage itself. Neither the window nor a
+        # capture of it is that size: under cage on the runner the window is
+        # 1280x685 in a 1280x720 output, which put every injected point
+        # lower by 720/685 (#693). Target coordinates stay logical layout
+        # points; cage places the window at the output's origin.
+        _png, capture_width, capture_height = client.screenshot(scale=1)
+        width, height = wayland_output.current_mode(runtime)
         print(
             "Wayland geometry:",
             {
                 "window": (logical_width, logical_height),
-                "capture": (width, height),
+                "capture": (capture_width, capture_height),
+                "output": (width, height),
                 "sidebar": sidebar,
                 "terminal_top": client.terminal_top(metrics),
             },
