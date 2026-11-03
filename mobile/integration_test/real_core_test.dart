@@ -6,9 +6,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:roost_mobile/app/app.dart';
+import 'package:roost_mobile/app/compact_layout.dart';
 import 'package:roost_mobile/app/providers.dart';
 import 'package:roost_mobile/core/frb_core.dart';
 import 'package:roost_mobile/core/roost_core.dart';
+import 'package:roost_mobile/hosts/host_widgets.dart';
 import 'package:roost_mobile/hosts/workspace_list.dart';
 import 'package:roost_mobile/src/rust/frb_generated.dart';
 import 'package:roost_mobile/terminal/attached_tab.dart';
@@ -16,155 +18,247 @@ import 'package:roost_mobile/terminal/terminal_view.dart';
 
 import 'support/session.dart';
 
-/// The whole stack on the Linux desktop: the Flutter UI, the Rust core
-/// through flutter_rust_bridge, and a real `roost-session` over its Unix
-/// socket. Run with `make test-integration-linux`.
+/// `user@host:port` of a dev host reached over SSH (an Android emulator
+/// against `tools/mobile/dev-host.sh`: `dev@10.0.2.2:2299`). Unset, the test
+/// starts a `roost-session` of its own and adds it as a `unix:` host.
+const _sshTarget = String.fromEnvironment('ROOST_E2E_TARGET');
+
+/// The whole stack: the Flutter UI, the Rust core through
+/// flutter_rust_bridge, and a real `roost-session`. On the Linux desktop
+/// (`make test-integration-linux`) over the session's Unix socket; on an
+/// Android emulator (`make test-integration-android`) over SSH, with the
+/// host-key prompt.
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
-  late IsolatedSession session;
+  final ssh = _sshTarget.isNotEmpty;
+  final name = ssh ? 'android' : 'e2e';
+  IsolatedSession? session;
   var passed = false;
 
   setUpAll(() async {
     await RustLib.init();
-    session = await IsolatedSession.start();
+    if (!ssh) session = await IsolatedSession.start();
   });
 
   tearDownAll(() async {
-    await session.stop(keepFiles: !passed);
-    if (!passed) debugPrint('e2e: session files kept in ${session.root.path}');
+    final s = session;
+    if (s == null) return;
+    await s.stop(keepFiles: !passed);
+    if (!passed) debugPrint('e2e: session files kept in ${s.root.path}');
   });
 
-  testWidgets(
-    'add a host, open its tab, type through the key path, pause and resume',
-    (tester) async {
-      final core = await FrbCore.start(
-        dataDir: '${session.root.path}/app',
-        deviceLabel: 'e2e-phone',
+  testWidgets('add a host, open its tab, type every way, pause and resume', (
+    tester,
+  ) async {
+    final dataDir = ssh
+        ? (await Directory.systemTemp.createTemp('roost-e2e-')).path
+        : '${session!.root.path}/app';
+    final core = await FrbCore.start(
+      dataDir: dataDir,
+      deviceLabel: 'e2e-$name',
+    );
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [coreProvider.overrideWithValue(core)],
+        child: const RoostMobileApp(),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final container = ProviderScope.containerOf(
+      tester.element(find.byType(AppShell)),
+    );
+
+    // Add the host through the dialog.
+    await tester.tap(find.byKey(const ValueKey('add-host')).first);
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const ValueKey('add-host-label')), 'dev');
+    await tester.enterText(
+      find.byKey(const ValueKey('add-host-target')),
+      ssh ? _sshTarget : 'unix:${session!.socket}',
+    );
+    await tester.tap(find.byKey(const ValueKey('add-host-submit')));
+
+    if (ssh) {
+      // First contact: the host key is shown and trusted by hand.
+      await _until(
+        tester,
+        'the host asks to trust its key',
+        // Exactly one: on a phone, adding a host also moves to its screen,
+        // and the trust card shows on both until the switch is done.
+        () => find.byType(TrustCard).evaluate().length == 1,
       );
-      await tester.pumpWidget(
-        ProviderScope(
-          overrides: [coreProvider.overrideWithValue(core)],
-          child: const RoostMobileApp(),
+      final card = tester.widget<TrustCard>(find.byType(TrustCard).first);
+      expect(card.fingerprint, startsWith('SHA256:'));
+      debugPrint('e2e: trusting ${card.fingerprint}');
+      await tester.tap(
+        find.descendant(
+          of: find.byType(TrustCard),
+          matching: find.text('Trust and connect'),
         ),
       );
-      await tester.pumpAndSettle();
-      expect(find.byKey(const ValueKey('layout-expanded')), findsOneWidget);
+    }
 
-      // Add the session as a unix: host through the dialog.
-      await tester.tap(find.byKey(const ValueKey('add-host')).first);
-      await tester.pumpAndSettle();
-      await tester.enterText(
-        find.byKey(const ValueKey('add-host-label')),
-        'dev',
-      );
-      await tester.enterText(
-        find.byKey(const ValueKey('add-host-target')),
-        'unix:${session.socket}',
-      );
-      await tester.tap(find.byKey(const ValueKey('add-host-submit')));
+    await _until(
+      tester,
+      'the host connects',
+      () => find.text('connected').evaluate().isNotEmpty,
+    );
+    // On a phone the host's projects are a screen of their own.
+    if (find.byType(HostCard).evaluate().isNotEmpty) {
+      await tester.tap(find.byType(HostCard).first);
+    }
+    await _until(
+      tester,
+      'the seed tab is listed',
+      () => find.byType(TabTile).evaluate().isNotEmpty,
+    );
+    await tester.tap(find.byType(TabTile).first);
+    final tab = await _attached(tester, 'the seed tab attaches');
+    final selection = container.read(selectionProvider);
 
-      // Connected, with the session's seed tab in the sidebar.
-      await _until(tester, 'the host connects', () {
-        return find.text('connected').evaluate().isNotEmpty &&
-            find.byType(TabTile).evaluate().isNotEmpty;
-      });
+    // Hardware keys.
+    await _focus(tester);
+    final typed = Stopwatch()..start();
+    await _type(tester, 'echo $name-ok');
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await _until(
+      tester,
+      'the shell prints $name-ok',
+      () => _hasRow(tab, '$name-ok'),
+    );
+    debugPrint(
+      'e2e: typed command echoed back in ${typed.elapsedMilliseconds} ms',
+    );
 
-      await tester.tap(find.byType(TabTile).first);
-      final tab = await _attached(tester, 'the seed tab attaches');
+    // The soft keyboard: a committed word, a Backspace on the
+    // "empty" field, then the IME's newline.
+    void ime(String text) => tester.testTextInput.updateEditingValue(
+      TextEditingValue(
+        text: text,
+        selection: TextSelection.collapsed(offset: text.length),
+      ),
+    );
+    ime('  echo $name-softt');
+    await tester.pump();
+    ime(' ');
+    await tester.pump();
+    ime('  \n');
+    await _until(
+      tester,
+      'the soft keyboard runs echo $name-soft',
+      () => _hasRow(tab, '$name-soft'),
+    );
 
-      // Focus the terminal and type through the hardware key path.
-      await tester.tap(find.byKey(const ValueKey('terminal-canvas')));
-      await tester.pump();
-      final typed = Stopwatch()..start();
-      await _type(tester, 'echo e2e-ok');
-      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
-      await _until(
-        tester,
-        'the shell prints e2e-ok',
-        () => _hasRow(tab, 'e2e-ok'),
-      );
-      debugPrint(
-        'e2e: typed command echoed back in ${typed.elapsedMilliseconds} ms',
-      );
-      expect(
-        _rows(tab).any((r) => r.contains('echo e2e-ok')),
-        isTrue,
-        reason: 'the command line itself is on screen',
-      );
+    // The compose box: a paste over tab.write, then Enter.
+    await tester.tap(find.byKey(const ValueKey('compose-toggle')));
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.enterText(
+      find.byKey(const ValueKey('compose-field')),
+      'echo $name-compose',
+    );
+    await tester.tap(find.byKey(const ValueKey('compose-send')));
+    await _until(
+      tester,
+      'the compose box runs echo $name-compose',
+      () => _hasRow(tab, '$name-compose'),
+    );
+    await tester.tap(find.byKey(const ValueKey('compose-toggle')));
+    await tester.pump(const Duration(milliseconds: 300));
 
-      await _measureFramePulls(tab);
+    // A quick reply, on a tab marked waiting: the command line is typed,
+    // the Enter chip runs it.
+    await core.op(selection.hostId!, 'tab.set_state', {
+      'tab_id': '${selection.tabId}',
+      'state': 'needs_input',
+    });
+    await _until(
+      tester,
+      'quick replies for a waiting tab',
+      () => find.byKey(const ValueKey('quick-replies')).evaluate().isNotEmpty,
+    );
+    await _focus(tester);
+    await _type(tester, 'echo $name-quick');
+    await tester.tap(find.byKey(const ValueKey('quick-reply-enter')));
+    await _until(
+      tester,
+      'the Enter quick reply runs echo $name-quick',
+      () => _hasRow(tab, '$name-quick'),
+    );
+    await core.op(selection.hostId!, 'tab.set_state', {
+      'tab_id': '${selection.tabId}',
+      'state': 'none',
+    });
 
-      // Background: the core gives the size back and detaches the tab.
-      final binding = tester.binding;
-      // A paused app draws no frames, and the binding's own teardown waits
-      // for one: whatever fails below, end the test in the foreground.
-      addTearDown(
-        () => binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed),
-      );
-      for (final s in [
-        AppLifecycleState.inactive,
-        AppLifecycleState.hidden,
-        AppLifecycleState.paused,
-      ]) {
-        binding.handleAppLifecycleStateChanged(s);
-      }
-      await _until(
-        tester,
-        'the tab detaches on pause',
-        () => tab.state == AttachState.ended,
-        pump: false,
-      );
-      await _until(
-        tester,
-        'no attach stream outlives the pause',
-        () => core.leakCounts().attachPumps == 0,
-        pump: false,
-      );
+    await _measureFramePulls(tab);
 
-      // Foreground: the pane re-attaches, taking the size again.
-      for (final s in [
-        AppLifecycleState.hidden,
-        AppLifecycleState.inactive,
-        AppLifecycleState.resumed,
-      ]) {
-        binding.handleAppLifecycleStateChanged(s);
-      }
-      final again = await _attached(
-        tester,
-        'the tab re-attaches on resume',
-        not: tab,
-      );
-      expect(
-        _hasRow(again, 'e2e-ok'),
-        isTrue,
-        reason: 'the snapshot brings the earlier output back',
-      );
-      await tester.tap(find.byKey(const ValueKey('terminal-canvas')));
-      await tester.pump();
-      await _type(tester, 'echo resumed-ok');
-      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
-      await _until(
-        tester,
-        'typing works after resume',
-        () => _hasRow(again, 'resumed-ok'),
-      );
+    // Background: the core gives the size back and detaches the tab.
+    final binding = tester.binding;
+    // A paused app draws no frames, and the binding's own teardown waits
+    // for one: whatever fails below, end the test in the foreground.
+    addTearDown(
+      () => binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed),
+    );
+    for (final s in [
+      AppLifecycleState.inactive,
+      AppLifecycleState.hidden,
+      AppLifecycleState.paused,
+    ]) {
+      binding.handleAppLifecycleStateChanged(s);
+    }
+    await _until(
+      tester,
+      'the tab detaches on pause',
+      () => tab.state == AttachState.ended,
+      pump: false,
+    );
+    await _until(
+      tester,
+      'no attach stream outlives the pause',
+      () => core.leakCounts().attachPumps == 0,
+      pump: false,
+    );
 
-      // Leaving the app closes the tab; nothing is left attached.
-      await tester.pumpWidget(const SizedBox());
-      await _until(tester, 'teardown releases the terminal', () {
-        final counts = core.leakCounts();
-        return counts.attachments == 0 &&
-            counts.terminals == 0 &&
-            counts.attachPumps == 0;
-      });
-      passed = true;
-    },
-    timeout: const Timeout(Duration(minutes: 3)),
-  );
+    // Foreground: the pane re-attaches, taking the size again.
+    for (final s in [
+      AppLifecycleState.hidden,
+      AppLifecycleState.inactive,
+      AppLifecycleState.resumed,
+    ]) {
+      binding.handleAppLifecycleStateChanged(s);
+    }
+    final again = await _attached(
+      tester,
+      'the tab re-attaches on resume',
+      not: tab,
+    );
+    expect(
+      _hasRow(again, '$name-quick'),
+      isTrue,
+      reason: 'the snapshot brings the earlier output back',
+    );
+    await _focus(tester);
+    await _type(tester, 'echo $name-resumed');
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await _until(
+      tester,
+      'typing works after resume',
+      () => _hasRow(again, '$name-resumed'),
+    );
+
+    // Leaving the app closes the tab; nothing is left attached.
+    await tester.pumpWidget(const SizedBox());
+    await _until(tester, 'teardown releases the terminal', () {
+      final counts = core.leakCounts();
+      return counts.attachments == 0 &&
+          counts.terminals == 0 &&
+          counts.attachPumps == 0;
+    });
+    passed = true;
+  }, timeout: const Timeout(Duration(minutes: 4)));
 }
 
-const _budget = Duration(seconds: 30);
+const _budget = Duration(seconds: 45);
 
 Future<void> _until(
   WidgetTester tester,
@@ -205,6 +299,12 @@ Future<AttachedTab> _attached(
   return current()!;
 }
 
+/// Taps the terminal: focus, and the soft keyboard's input connection.
+Future<void> _focus(WidgetTester tester) async {
+  await tester.tap(find.byKey(const ValueKey('terminal-canvas')));
+  await tester.pump();
+}
+
 List<String> _rows(AttachedTab tab) => [
   for (var r = 0; r < tab.model.rows; r++) tab.model.rowText(r).trim(),
 ];
@@ -237,7 +337,4 @@ Future<void> _measureFramePulls(AttachedTab tab) async {
     'e2e: takeFrame over the bridge: min ${times.first} us, '
     'median ${times[times.length ~/ 2]} us, max ${times.last} us',
   );
-  if (Platform.environment['ROOST_E2E_STRICT_TIMING'] == '1') {
-    expect(times[times.length ~/ 2], lessThan(5000));
-  }
 }

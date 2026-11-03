@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../app/theme.dart';
+import '../hosts/host_widgets.dart';
 
 typedef QuickReply = ({String id, String label, String bytes});
 
@@ -15,6 +16,9 @@ const List<QuickReply> quickReplies = [
   (id: 'up', label: '↑', bytes: '\x1b[A'),
   (id: 'down', label: '↓', bytes: '\x1b[B'),
 ];
+
+/// Below this width the bar drops its label for the keys.
+const compactQuickRepliesWidth = 560.0;
 
 class QuickRepliesBar extends StatelessWidget {
   const QuickRepliesBar({super.key, required this.onReply, this.statusText});
@@ -33,46 +37,62 @@ class QuickRepliesBar extends StatelessWidget {
           border: Border(top: BorderSide(color: RoostColors.waitingBorder)),
         ),
         padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
-        child: Row(
-          children: [
-            Expanded(
-              child: Text(
-                statusText ?? 'Waiting on you',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: text.labelMedium?.copyWith(color: RoostColors.waiting),
-              ),
-            ),
-            Flexible(
-              flex: 3,
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                reverse: true,
-                child: Row(
-                  children: [
-                    for (final r in quickReplies)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 2),
-                        child: OutlinedButton(
-                          key: ValueKey('quick-reply-${r.id}'),
-                          onPressed: () => onReply(r.bytes),
-                          style: OutlinedButton.styleFrom(
-                            minimumSize: const Size(44, 40),
-                            padding: const EdgeInsets.symmetric(horizontal: 10),
-                            foregroundColor: RoostColors.waitingText,
-                            side: const BorderSide(
-                              color: RoostColors.waitingBorder,
+        child: LayoutBuilder(
+          builder: (context, constraints) => Row(
+            children: [
+              // A phone has room for the keys or the words, and the keys are
+              // what the bar is for: there, a dot says why it is showing.
+              if (constraints.maxWidth >= compactQuickRepliesWidth)
+                Expanded(
+                  child: Text(
+                    statusText ?? 'Waiting on you',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: text.labelMedium?.copyWith(
+                      color: RoostColors.waiting,
+                    ),
+                  ),
+                )
+              else
+                const Padding(
+                  padding: EdgeInsets.only(right: 8),
+                  child: StatusDot(
+                    key: ValueKey('quick-replies-dot'),
+                    color: RoostColors.waiting,
+                  ),
+                ),
+              Flexible(
+                flex: 3,
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: [
+                      for (final r in quickReplies)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 2),
+                          child: OutlinedButton(
+                            key: ValueKey('quick-reply-${r.id}'),
+                            onPressed: () => onReply(r.bytes),
+                            style: OutlinedButton.styleFrom(
+                              minimumSize: const Size(44, 40),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                              ),
+                              foregroundColor: RoostColors.waitingText,
+                              side: const BorderSide(
+                                color: RoostColors.waitingBorder,
+                              ),
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                             ),
-                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            child: Text(r.label),
                           ),
-                          child: Text(r.label),
                         ),
-                      ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );

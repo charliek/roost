@@ -64,6 +64,11 @@ void main() {
       await tester.pumpAndSettle();
       expect(core.attaches.single.tabId, 11);
       expect(byKey('quick-replies'), findsOneWidget);
+      // A phone shows a dot for the label, and the keys from 1.
+      expect(byKey('quick-replies-dot'), findsOneWidget);
+      final one = tester.getRect(byKey('quick-reply-1'));
+      expect(one.left, greaterThanOrEqualTo(0));
+      expect(one.right, lessThanOrEqualTo(400));
     });
   });
 

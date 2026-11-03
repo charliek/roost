@@ -33,6 +33,14 @@ void main() {
     ) async {
       final core = await _openTab(tester, 11);
       expect(byKey('quick-replies'), findsOneWidget);
+      expect(
+        find.descendant(
+          of: byKey('quick-replies'),
+          matching: find.text('Permission: edit host_conn.rs'),
+        ),
+        findsOneWidget,
+        reason: 'a tablet has room for why',
+      );
       await tester.tap(byKey('quick-reply-1'));
       await tester.tap(byKey('quick-reply-esc'));
       await tester.tap(byKey('quick-reply-up'));

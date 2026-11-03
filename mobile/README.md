@@ -15,6 +15,7 @@ make rust-check              # clippy + tests for crates/roost-mobile
 make frb-gen                 # regenerate the bridge after changing src/api/
 make frb-check               # the drift guard: regenerating changes nothing
 make test-integration-linux  # the whole stack under Xvfb against a real session
+make test-integration-android  # the same on an emulator, over SSH to a dev host
 make goldens                 # regenerate the painter goldens after a deliberate change
 make build-apk               # debug APK (Android SDK + make mobile-deps)
 ```
@@ -39,6 +40,16 @@ host through the UI, types into its tab through the hardware key path, and
 checks the pause/resume lifecycle and teardown leak counts. It writes its
 own entrypoint into `build/linux/x64/debug/bundle`; rebuild before running
 that bundle by hand.
+
+`test-integration-android` runs the same test file on a booted x86_64
+emulator (`ANDROID_DEVICE`, default `emulator-5554`). It starts
+`tools/mobile/dev-host.sh --port 2299` (a private session behind `dev_sshd`)
+and stops it by PID afterwards; the app adds `dev@10.0.2.2:2299`, trusts the
+host key it is shown, and drives the tab with hardware keys, the soft
+keyboard's input client, the compose box and a quick reply. Give the
+emulator room: the debug APK needs a few hundred MB free on `/data`, and a
+phone AVD with `hw.keyboard=no` behaves like a real phone (the soft
+keyboard comes up).
 
 ## Layout
 

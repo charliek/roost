@@ -93,6 +93,9 @@ class _AddHostDialogState extends State<AddHostDialog> {
               decoration: const InputDecoration(
                 labelText: 'SSH target',
                 hintText: 'Tailscale SSH: user@machine-name',
+                // The monospace face is wide: at the field's size the hint
+                // would be cut off on a phone.
+                hintStyle: TextStyle(fontSize: 13),
                 helperText: 'user@host or user@host:port',
               ),
               validator: (v) => validateHostTarget(v ?? ''),

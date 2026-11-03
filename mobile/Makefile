@@ -1,5 +1,6 @@
 .PHONY: get fmt fmt-check analyze test check goldens frb-gen frb-check rust-check \
-	session-bin test-integration-linux run-linux run-linux-fake build-linux build-apk
+	session-bin test-integration-linux test-integration-android run-linux run-linux-fake \
+	build-linux build-apk
 
 FLUTTER ?= flutter
 
@@ -59,6 +60,26 @@ test-integration-linux: session-bin
 	  echo "=== $$f"; \
 	  $(CLEAN_ENV) xvfb-run -a -s "-screen 0 1280x800x24" $(FLUTTER) test "$$f" -d linux; \
 	done
+
+# The same test on an Android device or emulator, over SSH: dev-host.sh runs a
+# private roost-session behind dev_sshd on this machine (stopped by its PID
+# afterwards), and the app adds it as dev@10.0.2.2 (the emulator's name for
+# this host), trusts its key and drives it. Boot an x86_64 emulator first.
+ANDROID_DEVICE ?= emulator-5554
+E2E_PORT ?= 2299
+E2E_HOST ?= dev@10.0.2.2:$(E2E_PORT)
+test-integration-android:
+	@set -u; mkdir -p build; log=build/dev-host.log; \
+	$(CLEAN_ENV) ../tools/mobile/dev-host.sh --port $(E2E_PORT) >$$log 2>&1 & pid=$$!; \
+	trap 'kill $$pid 2>/dev/null; wait $$pid 2>/dev/null' EXIT INT TERM; \
+	for _ in $$(seq 1 1500); do \
+	  grep -q '^In the app add host' $$log && break; \
+	  kill -0 $$pid 2>/dev/null || { cat $$log >&2; exit 1; }; \
+	  sleep 0.2; \
+	done; \
+	grep -q '^In the app add host' $$log || { echo "dev-host did not start" >&2; cat $$log >&2; exit 1; }; \
+	$(CLEAN_ENV) $(FLUTTER) test integration_test/real_core_test.dart -d $(ANDROID_DEVICE) \
+	  --dart-define=ROOST_E2E_TARGET=$(E2E_HOST)
 
 # The app on the Linux desktop with the Rust core. Add a host as
 # unix:/path/to/roost.sock (a dev session) or user@machine (Tailscale SSH).
