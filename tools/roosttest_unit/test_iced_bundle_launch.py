@@ -867,8 +867,10 @@ class BundleQualifiedCleanupTests(unittest.TestCase):
         # A symlink, so the process takes the link's name without a
         # written-then-executed file; a plain binary, which keeps that name
         # (a framework Python re-execs itself under another one on macOS).
+        # argv[0] stays "sleep": a multicall coreutils (uutils, on current
+        # ubuntu runners) picks its tool by argv[0] and would exit at once.
         link.symlink_to("/bin/sleep")
-        proc = subprocess.Popen([str(link), "60"])
+        proc = subprocess.Popen(["sleep", "60"], executable=str(link))
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
         deadline = time.monotonic() + 10

@@ -42,7 +42,6 @@ sys.path.insert(0, str(REPO / "tools" / "roosttest"))
 sys.path.insert(0, str(REPO / "tools" / "screenshot"))
 
 import pngtool  # noqa: E402
-import parity  # noqa: E402
 import ui  # noqa: E402
 from client import RoostError  # noqa: E402
 
@@ -594,6 +593,58 @@ def _add_tab_point(pill_right: int, band_center_y: int) -> tuple[int, int]:
     return pill_right + _ADD_TAB_OFFSET, band_center_y
 
 
+# The agent_waiting color in crates/roost-iced/src/chrome.rs.
+WAITING_STRIPE = (0xF0, 0xA0, 0x40)
+
+
+def _components(points: set[tuple[int, int]]) -> list[tuple[int, int, int, int]]:
+    """4-connected components of `points`, as (left, top, right, bottom)."""
+    seen: set[tuple[int, int]] = set()
+    components = []
+    for origin in points:
+        if origin in seen:
+            continue
+        seen.add(origin)
+        stack, group = [origin], []
+        while stack:
+            x, y = stack.pop()
+            group.append((x, y))
+            for neighbor in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if neighbor in points and neighbor not in seen:
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+        xs, ys = zip(*group)
+        components.append((min(xs), min(ys), max(xs), max(ys)))
+    return components
+
+
+def _rollup_stripe_bounds(
+    image, color: tuple[int, int, int], sidebar_width: int, body_top: int, body_bottom: int
+) -> tuple[int, int, int, int] | None:
+    """The one project-rollup stripe in the sidebar body: a narrow,
+    row-height component at the leading edge. Same-color glyphs and dots
+    fall outside the search region or fail its geometry; two plausible
+    stripes are ambiguous, so a harness error."""
+    width, height, bpp, data = image
+    right = max(0, min(sidebar_width, width, 8))
+    top = max(0, min(body_top, height))
+    bottom = max(top, min(body_bottom, height))
+    points = set()
+    for y in range(top, bottom):
+        for x in range(right):
+            offset = (y * width + x) * bpp
+            if (data[offset], data[offset + 1], data[offset + 2]) == color:
+                points.add((x, y))
+    plausible = [
+        (left, t, r, b)
+        for left, t, r, b in _components(points)
+        if 2 <= r - left + 1 <= 5 and 18 <= b - t + 1 <= 40 and left <= 1
+    ]
+    if len(plausible) > 1:
+        raise ValueError(f"multiple plausible rollup stripes: {plausible!r}")
+    return plausible[0] if plausible else None
+
+
 def _stable_rollup_stripe_point(launch: Launch) -> tuple[int, int]:
     """Locate one stable waiting-agent project stripe after focus settles."""
     path = launch.root / "chrome-project-rollup-stripe.png"
@@ -606,9 +657,9 @@ def _stable_rollup_stripe_point(launch: Launch) -> tuple[int, int]:
         metrics = launch.client.window_metrics()
         sidebar = round(float(metrics["sidebar_width"]))
         band = round(launch.client.terminal_top(metrics))
-        bounds = parity.unique_rollup_stripe_bounds(
+        bounds = _rollup_stripe_bounds(
             image,
-            parity.LIFECYCLE_COLORS["waiting"],
+            WAITING_STRIPE,
             sidebar,
             band,
             height - band,
