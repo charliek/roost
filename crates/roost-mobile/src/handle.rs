@@ -229,6 +229,11 @@ impl TerminalHandle {
 
     /// The terminal's events, including any sent before this was set.
     /// A later sink replaces this one.
+    ///
+    /// The sink runs on the terminal thread: it must hand the event off
+    /// (as a Dart `StreamSink` does), not act on it in place. A frame
+    /// pulled from inside it — `take_frame`, `viewport_text` — comes back
+    /// empty, since answering would mean the thread waiting on itself.
     pub fn events(&self, sink: Sink<TerminalEvent>) {
         let sink: SharedSink<TerminalEvent> = Arc::from(sink);
         let mut events = lock(&self.attachment.events);

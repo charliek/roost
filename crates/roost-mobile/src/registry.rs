@@ -5,6 +5,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use roost_ssh::{HostTarget, TargetError};
 use serde::{Deserialize, Serialize};
@@ -109,15 +110,27 @@ pub fn new_id() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Write through a temporary file of this write's own, then rename it
+/// over `path`. Two writes sharing one temporary would truncate and
+/// interleave each other's bytes before either rename.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    ));
     let tmp = PathBuf::from(tmp);
-    let mut file = std::fs::File::create(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path)
+    let written = std::fs::File::create(&tmp).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
+    let renamed = written.and_then(|()| std::fs::rename(&tmp, path));
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    renamed
 }
 
 #[cfg(test)]
@@ -147,7 +160,46 @@ mod tests {
         ];
         save_hosts(dir.path(), &hosts).expect("save");
         assert_eq!(load_hosts(dir.path()).expect("load"), hosts);
-        assert!(!dir.path().join("hosts.json.tmp").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// Long and short lists saved at once: every load parses, as one of
+    /// the lists written whole.
+    #[test]
+    fn concurrent_saves_never_interleave() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let list = |n: usize| -> Vec<HostRecord> {
+            (0..n)
+                .map(|at| HostRecord {
+                    id: format!("{at:016x}"),
+                    label: "x".repeat(40),
+                    target: format!("user@host-{at}"),
+                    pinned_host_key: None,
+                })
+                .collect()
+        };
+        std::thread::scope(|scope| {
+            for writer in 0..8 {
+                let dir = dir.path();
+                let hosts = list(if writer % 2 == 0 { 50 } else { 1 });
+                scope.spawn(move || {
+                    for _ in 0..40 {
+                        save_hosts(dir, &hosts).expect("save");
+                    }
+                });
+            }
+        });
+        let loaded = load_hosts(dir.path()).expect("a whole file");
+        assert!(
+            loaded == list(50) || loaded == list(1),
+            "{} hosts",
+            loaded.len()
+        );
     }
 
     #[test]

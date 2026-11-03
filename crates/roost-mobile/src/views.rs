@@ -56,6 +56,15 @@ pub struct TabView {
     pub status_text: Option<String>,
 }
 
+/// A notification a tab raised (`notification.fired`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationView {
+    pub host_id: String,
+    pub tab_id: i64,
+    pub title: String,
+    pub body: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentBadge {
     None,

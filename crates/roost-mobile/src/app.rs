@@ -33,16 +33,16 @@ use crate::live::Live;
 use crate::owner::{OwnerConfig, TerminalId, TerminalOwner};
 use crate::registry::{self, HostRecord, Target};
 use crate::terminal::Geometry;
-use crate::views::{self, HostStateView, HostView, WorkspaceView};
+use crate::views::{self, HostStateView, HostView, NotificationView, WorkspaceView};
 
 /// A Dart stream, as the FFI layer hands it in.
 pub type Sink<T> = Box<dyn Fn(T) + Send + Sync>;
 pub(crate) type SharedSink<T> = Arc<dyn Fn(T) + Send + Sync>;
 
-/// How long a pause waits for its `tab.release_size` answers, and
-/// teardown for its tasks: a phone going to the background gets a few
-/// moments, not an open-ended wait.
-const PAUSE_BUDGET: Duration = Duration::from_secs(2);
+/// How long a pause (or a disconnect) waits for its `tab.release_size`
+/// answers, and teardown for its tasks: a phone going to the background
+/// gets a few moments, not an open-ended wait.
+const RELEASE_BUDGET: Duration = Duration::from_secs(2);
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
@@ -153,7 +153,11 @@ pub(crate) struct Inner {
     pub(crate) rt: tokio::runtime::Handle,
     pub(crate) owner: Arc<TerminalOwner>,
     hosts: Mutex<Vec<HostSlot>>,
+    /// Held from a saved-host change through its write, so concurrent
+    /// changes reach `hosts.json` in the order they were made.
+    registry: Mutex<()>,
     hosts_sink: Mutex<Option<SharedSink<Vec<HostView>>>>,
+    notifications_sink: Mutex<Option<SharedSink<NotificationView>>>,
     attachments: Mutex<HashMap<TerminalId, Arc<Attachment>>>,
     pub(crate) counters: Arc<Counters>,
     pub(crate) closed: AtomicBool,
@@ -196,18 +200,62 @@ impl Inner {
         sink(view);
     }
 
-    fn persist(&self) -> Result<(), AppError> {
-        let records: Vec<HostRecord> = lock(&self.hosts)
-            .iter()
-            .map(|slot| slot.record.clone())
-            .collect();
+    /// Change the saved hosts and write them, as one step.
+    fn change_hosts<T>(
+        &self,
+        change: impl FnOnce(&mut Vec<HostSlot>) -> Result<T, AppError>,
+    ) -> Result<T, AppError> {
+        let _registry = lock(&self.registry);
+        let (changed, records) = {
+            let mut hosts = lock(&self.hosts);
+            let changed = change(&mut hosts)?;
+            let records: Vec<HostRecord> = hosts.iter().map(|slot| slot.record.clone()).collect();
+            (changed, records)
+        };
         registry::save_hosts(&self.data_dir, &records).map_err(|source| AppError::Io {
             what: "saving hosts.json",
             source,
-        })
+        })?;
+        Ok(changed)
+    }
+
+    fn attachments_of(&self, host_id: Option<&str>) -> Vec<Arc<Attachment>> {
+        lock(&self.attachments)
+            .values()
+            .filter(|attachment| host_id.is_none_or(|host_id| attachment.host_id == host_id))
+            .cloned()
+            .collect()
+    }
+
+    /// Give back the size of every one of `attachments` still streaming
+    /// (`tab.release_size`, waited for briefly), then detach them all,
+    /// each handle reporting `Ended` with `reason`.
+    fn release_and_end(&self, attachments: Vec<Arc<Attachment>>, reason: &str) {
+        let releases: Vec<_> = attachments
+            .iter()
+            .filter(|attachment| attachment.streaming())
+            .filter_map(|attachment| {
+                let params = serde_json::json!({"tab_id": attachment.tab_id.to_string()});
+                self.call(&attachment.host_id, "tab.release_size", params)
+                    .ok()
+            })
+            .collect();
+        if !releases.is_empty() {
+            // Inside the runtime: the timer needs its context to be built.
+            let released = self.rt.block_on(async {
+                tokio::time::timeout(RELEASE_BUDGET, futures::future::join_all(releases)).await
+            });
+            if released.is_err() {
+                tracing::warn!(%reason, "tab.release_size did not answer in time");
+            }
+        }
+        for attachment in attachments {
+            attachment.end(reason);
+        }
     }
 
     fn host_event(&self, host_id: &str, serial: u64, event: HostEvent) {
+        let mut notification = None;
         let workspace_moved = self
             .with_slot(host_id, |slot| {
                 if slot.serial != serial || slot.conn.is_none() {
@@ -225,10 +273,29 @@ impl Inner {
                         connected
                     }
                     HostEvent::Workspace => true,
-                    HostEvent::Notification { .. } => false,
+                    HostEvent::Notification {
+                        tab_id,
+                        title,
+                        body,
+                    } => {
+                        notification = Some(NotificationView {
+                            host_id: host_id.to_string(),
+                            tab_id,
+                            title,
+                            body,
+                        });
+                        false
+                    }
                 }
             })
             .unwrap_or(false);
+        if let Some(notification) = notification {
+            let sink = lock(&self.notifications_sink).clone();
+            if let Some(sink) = sink {
+                sink(notification);
+            }
+            return;
+        }
         if workspace_moved {
             self.emit_workspace(host_id);
         }
@@ -386,7 +453,9 @@ impl RoostApp {
                     })
                     .collect(),
             ),
+            registry: Mutex::new(()),
             hosts_sink: Mutex::new(None),
+            notifications_sink: Mutex::new(None),
             attachments: Mutex::new(HashMap::new()),
             counters,
             closed: AtomicBool::new(false),
@@ -417,35 +486,40 @@ impl RoostApp {
             label => label.to_string(),
         };
         let id = registry::new_id();
-        lock(&self.inner.hosts).push(HostSlot {
-            record: HostRecord {
-                id: id.clone(),
-                label,
-                target,
-                pinned_host_key: None,
-            },
-            state: HostStateView::Disconnected,
-            ssh: None,
-            conn: None,
-            serial: 0,
-            workspace_sink: None,
-        });
-        self.inner.persist()?;
+        self.inner.change_hosts(|hosts| {
+            hosts.push(HostSlot {
+                record: HostRecord {
+                    id: id.clone(),
+                    label,
+                    target,
+                    pinned_host_key: None,
+                },
+                state: HostStateView::Disconnected,
+                ssh: None,
+                conn: None,
+                serial: 0,
+                workspace_sink: None,
+            });
+            Ok(())
+        })?;
         self.inner.emit_hosts();
         Ok(id)
     }
 
+    /// Forget a saved host. Its attached terminals give back their size
+    /// and end ("removed"), then its connection closes.
     pub fn remove_host(&self, host_id: String) -> Result<(), AppError> {
-        let removed = {
-            let mut hosts = lock(&self.inner.hosts);
+        self.inner.with_slot(&host_id, |_| ())?;
+        self.inner
+            .release_and_end(self.inner.attachments_of(Some(&host_id)), "removed");
+        let removed = self.inner.change_hosts(|hosts| {
             let at = hosts
                 .iter()
                 .position(|slot| slot.record.id == host_id)
                 .ok_or_else(|| AppError::UnknownHost(host_id.clone()))?;
-            hosts.remove(at)
-        };
+            Ok(hosts.remove(at))
+        })?;
         drop(removed);
-        self.inner.persist()?;
         self.inner.emit_hosts();
         Ok(())
     }
@@ -488,8 +562,12 @@ impl RoostApp {
         Ok(())
     }
 
-    /// Drop the host's connection. Its attached terminals end.
+    /// Drop the host's connection. Its attached terminals give back
+    /// their size and end ("disconnected") first.
     pub fn disconnect(&self, host_id: String) -> Result<(), AppError> {
+        self.inner.with_slot(&host_id, |_| ())?;
+        self.inner
+            .release_and_end(self.inner.attachments_of(Some(&host_id)), "disconnected");
         let conn = self.inner.with_slot(&host_id, |slot| {
             slot.serial += 1;
             slot.state = HostStateView::Disconnected;
@@ -503,7 +581,11 @@ impl RoostApp {
     /// Pin the host key the user just accepted — the fingerprint a
     /// `NeedsTrust` state showed — and retry with it.
     pub fn trust_host_key(&self, host_id: String, fingerprint: String) -> Result<(), AppError> {
-        self.inner.with_slot(&host_id, |slot| {
+        self.inner.change_hosts(|hosts| {
+            let slot = hosts
+                .iter_mut()
+                .find(|slot| slot.record.id == host_id)
+                .ok_or_else(|| AppError::UnknownHost(host_id.clone()))?;
             slot.record.pinned_host_key = Some(fingerprint.clone());
             if let Some(ssh) = &slot.ssh {
                 ssh.set_host_key_policy(HostKeyPolicy {
@@ -513,10 +595,16 @@ impl RoostApp {
             if let Some(conn) = &slot.conn {
                 conn.client.reconnect_now();
             }
+            Ok(())
         })?;
-        self.inner.persist()?;
         self.inner.emit_hosts();
         Ok(())
+    }
+
+    /// `notification.fired` from every connected host — live only, never
+    /// replayed after a reconnect. A later sink replaces this one.
+    pub fn notifications(&self, sink: Sink<NotificationView>) {
+        *lock(&self.inner.notifications_sink) = Some(Arc::from(sink));
     }
 
     /// The host's projects and tabs, now and after every change. One
@@ -605,28 +693,8 @@ impl RoostApp {
     /// report `Ended` ("paused"); Dart re-attaches the visible tab on
     /// resume. Host connections and their mirrors stay.
     pub fn app_paused(&self) {
-        let attachments: Vec<Arc<Attachment>> =
-            lock(&self.inner.attachments).values().cloned().collect();
-        let releases: Vec<_> = attachments
-            .iter()
-            .filter(|attachment| attachment.streaming())
-            .filter_map(|attachment| {
-                let params = serde_json::json!({"tab_id": attachment.tab_id.to_string()});
-                self.inner
-                    .call(&attachment.host_id, "tab.release_size", params)
-                    .ok()
-            })
-            .collect();
-        // Inside the runtime: the timer needs its context to be built.
-        let released = self.inner.rt.block_on(async {
-            tokio::time::timeout(PAUSE_BUDGET, futures::future::join_all(releases)).await
-        });
-        if released.is_err() {
-            tracing::warn!("tab.release_size did not answer before the pause budget");
-        }
-        for attachment in attachments {
-            attachment.end("paused");
-        }
+        self.inner
+            .release_and_end(self.inner.attachments_of(None), "paused");
     }
 
     /// Back in the foreground: every connected host retries now rather
@@ -683,5 +751,61 @@ impl Drop for RoostApp {
                 rt.shutdown_timeout(TEARDOWN_BUDGET);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Concurrent changes, each saved as made: once a change returns,
+    /// the file holds it, and no older list written afterwards takes it
+    /// back out.
+    #[test]
+    fn concurrent_host_changes_all_reach_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = RoostApp::new(dir.path(), "phone".into()).expect("app");
+        let saved = |id: &str| {
+            registry::load_hosts(dir.path())
+                .expect("a whole file")
+                .into_iter()
+                .find(|record| record.id == id)
+        };
+        let ids: Vec<String> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|worker| {
+                    let (app, saved) = (&app, &saved);
+                    scope.spawn(move || {
+                        (0..10)
+                            .map(|n| {
+                                let id = app
+                                    .add_host(
+                                        format!("h{worker}-{n}"),
+                                        format!("u@host{worker}x{n}"),
+                                    )
+                                    .expect("add");
+                                assert!(saved(&id).is_some(), "an add that returned is saved");
+                                app.trust_host_key(id.clone(), format!("SHA256:{worker}-{n}"))
+                                    .expect("trust");
+                                assert!(
+                                    saved(&id)
+                                        .is_some_and(|record| record.pinned_host_key.is_some()),
+                                    "a trust that returned is saved"
+                                );
+                                id
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("worker"))
+                .collect()
+        });
+        drop(app);
+        let all = registry::load_hosts(dir.path()).expect("a whole file");
+        assert_eq!(all.len(), ids.len());
+        assert!(all.iter().all(|record| record.pinned_host_key.is_some()));
     }
 }

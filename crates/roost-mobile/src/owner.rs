@@ -125,6 +125,7 @@ enum Command {
 pub struct TerminalOwner {
     commands: mpsc::Sender<Command>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    thread_id: std::thread::ThreadId,
     next_id: AtomicU64,
     live: Arc<AtomicUsize>,
 }
@@ -141,6 +142,7 @@ impl TerminalOwner {
             })?;
         Ok(Self {
             commands,
+            thread_id: thread.thread().id(),
             thread: Mutex::new(Some(thread)),
             next_id: AtomicU64::new(1),
             live,
@@ -191,6 +193,9 @@ impl TerminalOwner {
     /// nothing drawable yet, or when the tab is gone. Blocks until the
     /// owner thread has built it.
     pub fn take_frame(&self, id: TerminalId, full: bool) -> Vec<u8> {
+        if self.on_owner_thread("take_frame") {
+            return Vec::new();
+        }
         let (reply, answer) = mpsc::sync_channel(1);
         self.send(Command::TakeFrame { id, full, reply });
         answer.recv().unwrap_or_default()
@@ -198,6 +203,9 @@ impl TerminalOwner {
 
     /// The drawn viewport as text, one trimmed line per row.
     pub fn viewport_text(&self, id: TerminalId) -> Vec<String> {
+        if self.on_owner_thread("viewport_text") {
+            return Vec::new();
+        }
         let (reply, answer) = mpsc::sync_channel(1);
         self.send(Command::ViewportText { id, reply });
         answer.recv().unwrap_or_default()
@@ -207,6 +215,9 @@ impl TerminalOwner {
     /// (bracketed under DECSET 2004), without sending it; `None` for a
     /// tab this owner does not have.
     pub fn encode_paste(&self, id: TerminalId, text: String) -> Option<Vec<u8>> {
+        if self.on_owner_thread("encode_paste") {
+            return None;
+        }
         let (reply, answer) = mpsc::sync_channel(1);
         self.send(Command::EncodePaste { id, text, reply });
         answer.recv().ok().flatten()
@@ -250,6 +261,16 @@ impl TerminalOwner {
                 tracing::warn!("terminal owner thread panicked");
             }
         }
+    }
+
+    /// A sink runs on the owner thread, so a call that waits for the
+    /// owner's answer, made from one, would wait for itself forever.
+    fn on_owner_thread(&self, call: &str) -> bool {
+        let on = std::thread::current().id() == self.thread_id;
+        if on {
+            tracing::warn!("{call} called from a tab sink on the owner thread; answered empty");
+        }
+        on
     }
 
     fn send(&self, command: Command) {
@@ -720,6 +741,39 @@ mod tests {
         let (other, _) = recording(&owner);
         owner.close(other);
         assert_eq!(owner.encode_paste(other, "x".into()), None);
+    }
+
+    /// A sink that pulls the frame it was just told about gets nothing
+    /// back rather than waiting on its own thread.
+    #[test]
+    fn a_sink_that_pulls_a_frame_is_answered_not_deadlocked() {
+        let owner = Arc::new(owner());
+        let id = Arc::new(std::sync::OnceLock::new());
+        let (pulled, answers) = mpsc::channel();
+        let sink_owner = Arc::clone(&owner);
+        let sink_id = Arc::clone(&id);
+        let opened = owner.open(Box::new(move |output| {
+            if output == TabOutput::Event(TerminalEvent::FrameReady) {
+                if let Some(id) = sink_id.get() {
+                    let _ = pulled.send(sink_owner.take_frame(*id, false));
+                }
+            }
+        }));
+        let _ = id.set(opened);
+        attach_hello(&owner, opened, "phone");
+        // A deadlocked owner would never answer; leak it rather than
+        // join a thread that is stuck on itself.
+        let answered = answers.recv_timeout(std::time::Duration::from_secs(10));
+        let Ok(frame) = answered else {
+            std::mem::forget(owner);
+            panic!("the owner thread deadlocked on a pull from its own sink");
+        };
+        assert!(frame.is_empty());
+        assert!(
+            !owner.take_frame(opened, false).is_empty(),
+            "another thread still pulls"
+        );
+        owner.shutdown();
     }
 
     #[test]

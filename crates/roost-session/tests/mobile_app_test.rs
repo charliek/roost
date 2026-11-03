@@ -216,6 +216,14 @@ impl Screen {
     }
 }
 
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + budget();
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
     futures::executor::block_on(future)
 }
@@ -329,6 +337,28 @@ fn a_unix_host_mirrors_attaches_and_takes_typing_writes_and_ops() {
             .flat_map(|project| &project.tabs)
             .any(|tab| tab.id == new_tab)
     });
+    let notifications = Recorder::new();
+    app.notifications(notifications.sink());
+    block_on(
+        app.op(
+            host.clone(),
+            "notification.create".into(),
+            serde_json::json!({"tab_id": tab.to_string(), "title": "Build", "body": "passed"})
+                .to_string(),
+        ),
+    )
+    .expect("notification.create");
+    let fired = notifications.wait("the notification", |_| true);
+    assert_eq!(
+        (
+            fired.host_id.as_str(),
+            fired.tab_id,
+            fired.title.as_str(),
+            fired.body.as_str()
+        ),
+        (host.as_str(), tab, "Build", "passed")
+    );
+
     let refused = block_on(app.op(
         host.clone(),
         "tab.close".into(),
@@ -531,4 +561,46 @@ fn saved_hosts_and_the_client_id_survive_a_restart() {
     assert_eq!(counters.counts(), LeakCounts::default());
     let saved = std::fs::read_to_string(dir.join("hosts.json")).expect("hosts.json");
     assert!(!saved.contains("nonexistent"), "{saved}");
+}
+
+#[test]
+fn disconnecting_or_removing_a_host_ends_its_terminals_and_hands_the_size_on() {
+    let (_tmp, root) = root();
+    let _daemon = start(&root);
+    let (phone, host, _) = connected_app(&root, "phone", "Phone A");
+    let (watcher, watcher_host, _) = connected_app(&root, "watcher", "Watcher");
+    let (_workspace, _, tab) = seed_tab(&phone, &host);
+    let (_watching, watched) = attach(&watcher, &watcher_host, tab, false);
+
+    for (verb, reason) in [("disconnect", "disconnected"), ("remove", "removed")] {
+        let before = watched.len();
+        let (handle, events) = attach(&phone, &host, tab, true);
+        events.wait("our size", |event| {
+            matches!(event, TerminalEvent::Owner { is_me: true, .. })
+        });
+        watched.wait_from(before, "the phone's size", |event| {
+            matches!(event, TerminalEvent::Owner { is_me: false, label: Some(label), .. }
+                if label == "Phone A")
+        });
+
+        let from = watched.len();
+        match verb {
+            "disconnect" => phone.disconnect(host.clone()).expect("disconnect"),
+            _ => phone.remove_host(host.clone()).expect("remove"),
+        }
+        events.wait(reason, |event| {
+            matches!(event, TerminalEvent::Status { state: AttachState::Ended, message: Some(why) }
+                if why == reason)
+        });
+        watched.wait_from(from, "the size handed on", |event| {
+            matches!(event, TerminalEvent::Owner { is_me: true, .. })
+        });
+        wait_until(&format!("{verb}: the stream detached"), || {
+            phone.leak_counts().attach_pumps == 0
+        });
+        drop(handle);
+        if verb == "disconnect" {
+            phone.connect(host.clone()).expect("reconnect");
+        }
+    }
 }
