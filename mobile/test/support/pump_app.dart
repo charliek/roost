@@ -12,10 +12,11 @@ Future<FakeCore> pumpApp(
   WidgetTester tester, {
   required double width,
   double height = 1400,
+  FakeCore? core,
 }) async {
   await tester.binding.setSurfaceSize(Size(width, height));
   addTearDown(() => tester.binding.setSurfaceSize(null));
-  final core = FakeCore();
+  core ??= FakeCore();
   addTearDown(core.dispose);
   await tester.pumpWidget(
     ProviderScope(

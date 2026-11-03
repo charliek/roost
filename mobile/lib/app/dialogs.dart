@@ -18,6 +18,8 @@ String? validateHostTarget(String target) {
   }
   final m = _targetPattern.firstMatch(t);
   if (m == null) return 'Use user@host or user@host:port';
+  // A phone cannot know the host's login user, so the core requires one.
+  if (!t.contains('@')) return 'Include the user: user@host';
   final port = m.group(1);
   if (port != null) {
     final n = int.parse(port);

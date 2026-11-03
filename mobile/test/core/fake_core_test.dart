@@ -169,7 +169,7 @@ void main() {
     }
     await tab.pullFrame();
     expect(tab.model.scrolledBack, isFalse);
-    await tab.session.scroll(-5);
+    await tab.session.scroll(5, col: 0, row: 0);
     await pumpEventQueue();
     await tab.pullFrame();
     expect(tab.model.scrolledBack, isTrue);

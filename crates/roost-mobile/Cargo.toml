@@ -11,6 +11,11 @@ description = "Roost mobile core: per-tab libghostty terminals driven by attach 
 [lints]
 workspace = true
 
+[lib]
+# lib: the integration tests in roost-session link it; cdylib: the Android and
+# Linux app load it through flutter_rust_bridge; staticlib: Apple targets.
+crate-type = ["lib", "cdylib", "staticlib"]
+
 [features]
 # The frame decoder and row-text helpers, for tests outside this crate.
 test-support = []
@@ -21,7 +26,11 @@ roost-ipc = { path = "../roost-ipc" }
 roost-ssh = { path = "../roost-ssh" }
 roost-ui-model = { path = "../roost-ui-model" }
 roost-vt = { path = "../roost-vt", features = ["ffi"] }
+anyhow = { workspace = true }
 base64 = "0.22"
+# The bridge runtime, codec and Dart stream sinks. Pinned to the version of
+# the installed flutter_rust_bridge_codegen and the Dart package in mobile/.
+flutter_rust_bridge = "=2.13.0-beta.5"
 futures = { workspace = true }
 getrandom = { workspace = true }
 serde = { version = "1", features = ["derive"] }

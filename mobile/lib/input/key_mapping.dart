@@ -57,6 +57,10 @@ final _modifierKeys = <LogicalKeyboardKey>{
 
 bool isModifierKey(LogicalKeyboardKey key) => _modifierKeys.contains(key);
 
+/// Every named key this side can send; the Rust encoder is tested against
+/// the same list (`test/fixtures/key_names.json`).
+Set<String> get namedKeyNames => _namedKeys.values.toSet();
+
 bool _printable(String? s) =>
     s != null &&
     s.isNotEmpty &&

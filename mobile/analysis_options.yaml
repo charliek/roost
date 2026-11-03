@@ -2,6 +2,9 @@ include: package:flutter_lints/flutter.yaml
 
 analyzer:
   exclude:
+    # Vendored cargokit is a Dart package of its own whose dependencies this
+    # app never resolves; the platform builds exercise it.
+    - rust_builder/**
     - build/**
     - android/**
     - ios/**

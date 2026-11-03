@@ -7,8 +7,10 @@
 //! events and pulled for frames ([`frame`], C6). Dart never touches
 //! libghostty.
 
+pub mod api;
 pub mod app;
 pub mod frame;
+mod frb_generated;
 mod handle;
 pub mod keys;
 mod live;

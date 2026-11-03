@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../core/roost_core.dart';
 import 'compact_layout.dart';
 import 'expanded_layout.dart';
 import 'medium_layout.dart';
@@ -28,11 +29,29 @@ class RoostMobileApp extends ConsumerStatefulWidget {
 class _RoostMobileAppState extends ConsumerState<RoostMobileApp> {
   late final AppLifecycleListener _lifecycle;
   bool _backgrounded = false;
+  bool _connectedSavedHosts = false;
 
   @override
   void initState() {
     super.initState();
     _lifecycle = AppLifecycleListener(onStateChange: _onLifecycle);
+    ref.listenManual(hostsProvider, (_, next) {
+      final hosts = next.value;
+      if (hosts != null) _connectSavedHosts(hosts);
+    }, fireImmediately: true);
+  }
+
+  /// The core dials nothing on its own: at launch, connect every saved
+  /// host that is not already connecting.
+  void _connectSavedHosts(List<HostView> hosts) {
+    if (_connectedSavedHosts) return;
+    _connectedSavedHosts = true;
+    final core = ref.read(coreProvider);
+    for (final host in hosts) {
+      if (host.state is HostDisconnected) {
+        unawaited(core.connect(host.id).then((_) {}, onError: (Object _) {}));
+      }
+    }
   }
 
   @override

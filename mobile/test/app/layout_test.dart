@@ -225,6 +225,22 @@ void main() {
     );
   });
 
+  testWidgets('launch connects the saved hosts that are disconnected', (
+    tester,
+  ) async {
+    final core = FakeCore()
+      ..setHostState('devbox', const HostDisconnected())
+      ..setHostState('nas', const HostDisconnected());
+    await pumpApp(tester, width: 1200, core: core);
+    final hosts = await core.hosts().first;
+    expect(
+      hosts.firstWhere((h) => h.id == 'devbox').state,
+      const HostConnected(),
+    );
+    expect(hosts.firstWhere((h) => h.id == 'nas').state, isA<HostFailed>());
+    expect(byKey('tab-devbox-11'), findsOneWidget);
+  });
+
   testWidgets('host state labels follow the core', (tester) async {
     final core = await pumpApp(tester, width: 1200);
     core.setHostState(

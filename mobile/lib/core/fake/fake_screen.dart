@@ -133,10 +133,10 @@ class FakeScreen {
     _full = true;
   }
 
-  /// Negative scrolls up into history.
+  /// Positive scrolls up into history.
   void scroll(int delta) {
     final total = _wrap().rows.length;
-    final next = (_scrollBack - delta)
+    final next = (_scrollBack + delta)
         .clamp(0, math.max(0, total - rows))
         .toInt();
     if (next == _scrollBack) return;

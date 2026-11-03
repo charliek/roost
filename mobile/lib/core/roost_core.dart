@@ -88,9 +88,10 @@ abstract class TerminalSession {
   /// Bracketed when the program enabled mode 2004. Takes the size first.
   Future<void> paste(String text);
 
-  /// Scrolls local scrollback, or sends wheel reports when the program tracks
-  /// the mouse. Negative is up, into history.
-  Future<void> scroll(int rows);
+  /// Scrolls local scrollback, or sends wheel reports aimed at cell
+  /// ([col], [row]) when the program tracks the mouse. Positive is up, into
+  /// history.
+  Future<void> scroll(int rows, {required int col, required int row});
 
   Future<void> resize(Geometry geometry, {required bool focused});
 

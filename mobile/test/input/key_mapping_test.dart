@@ -1,7 +1,12 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:roost_mobile/core/models.dart';
+import 'package:roost_mobile/input/extra_keys.dart';
 import 'package:roost_mobile/input/key_mapping.dart';
+import 'package:roost_mobile/input/soft_keyboard.dart';
 
 KeyDownEvent _down(LogicalKeyboardKey key, {String? character}) => KeyDownEvent(
   physicalKey: PhysicalKeyboardKey.keyA,
@@ -89,6 +94,36 @@ void main() {
       expect(_map(_down(LogicalKeyboardKey.controlRight)), isNull);
       expect(_map(_down(LogicalKeyboardKey.metaLeft)), isNull);
     });
+  });
+
+  test('the named keys sent are the ones the Rust encoder is tested on', () {
+    final contract = (jsonDecode(
+      File('test/fixtures/key_names.json').readAsStringSync(),
+    ) as List<Object?>).cast<String>().toSet();
+    expect(namedKeyNames, contract);
+    final others = [
+      escKey.input,
+      tabKey.input,
+      for (final k in extraKeys) k.input,
+      for (final edit in [
+        diffSoftKeyboard(TextEditingValue.empty),
+        diffSoftKeyboard(
+          const TextEditingValue(
+            text: '  \n',
+            selection: TextSelection.collapsed(offset: 3),
+          ),
+        ),
+      ])
+        for (final input in edit.inputs)
+          if (input case SoftKey(:final key)) key,
+    ];
+    for (final k in others) {
+      expect(
+        k.key.runes.length == 1 || contract.contains(k.key),
+        isTrue,
+        reason: k.key,
+      );
+    }
   });
 
   group('looksLikeHardwareKeyboard', () {

@@ -193,9 +193,9 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
     _fire(tab.session.paste(text));
   }
 
-  void _scroll(int rows) {
+  void _scroll(int rows, int col, int row) {
     final tab = _tab;
-    if (tab != null) _fire(tab.session.scroll(rows));
+    if (tab != null) _fire(tab.session.scroll(rows, col: col, row: row));
   }
 
   void _onHardwareKeyboard() {

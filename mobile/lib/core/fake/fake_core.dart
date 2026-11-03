@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import '../../terminal/frame.dart';
 import '../../terminal/frame_encoder.dart';
+import '../replay_feed.dart';
 import '../roost_core.dart';
 import 'fake_screen.dart';
 import 'fake_shell.dart';
@@ -40,8 +41,8 @@ class FakeCore implements RoostCore {
   int resumedCount = 0;
 
   final List<_FakeHost> _hosts = [];
-  final _hostsFeed = _Feed<List<HostView>>(const []);
-  final Map<String, _Feed<WorkspaceView>> _workspaceFeeds = {};
+  final _hostsFeed = ReplayFeed<List<HostView>>(const []);
+  final Map<String, ReplayFeed<WorkspaceView>> _workspaceFeeds = {};
   int _nextId = 100;
   Timer? _ticker;
   bool _desktopTookBack = false;
@@ -546,10 +547,10 @@ class FakeCore implements RoostCore {
     _hostsFeed.add([for (final h in _hosts) h.view]);
   }
 
-  _Feed<WorkspaceView> _workspaceFeed(String hostId) =>
+  ReplayFeed<WorkspaceView> _workspaceFeed(String hostId) =>
       _workspaceFeeds.putIfAbsent(hostId, () {
         final host = _hosts.where((h) => h.id == hostId).firstOrNull;
-        return _Feed(host?.workspaceView ?? WorkspaceView.empty);
+        return ReplayFeed(host?.workspaceView ?? WorkspaceView.empty);
       });
 
   void _publishWorkspace(_FakeHost host) {
@@ -724,7 +725,7 @@ class FakeTerminalSession implements TerminalSession {
   }
 
   @override
-  Future<void> scroll(int rows) async {
+  Future<void> scroll(int rows, {required int col, required int row}) async {
     if (closed) return;
     scrolls.add(rows);
     _tab.shell.screen.scroll(rows);
@@ -864,25 +865,4 @@ class _FakeTab {
   final FakeShell shell;
   bool ownerIsMe = false;
   String? ownerLabel = FakeCore.desktopLabel;
-}
-
-/// The latest value plus every change, replayed to each new listener.
-class _Feed<T> {
-  _Feed(this._value);
-
-  T _value;
-  final Set<MultiStreamController<T>> _listeners = {};
-
-  Stream<T> get stream => Stream<T>.multi((c) {
-    c.add(_value);
-    _listeners.add(c);
-    c.onCancel = () => _listeners.remove(c);
-  });
-
-  void add(T value) {
-    _value = value;
-    for (final c in List.of(_listeners)) {
-      c.add(value);
-    }
-  }
 }

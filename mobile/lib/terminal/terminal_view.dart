@@ -41,8 +41,9 @@ class TerminalView extends StatefulWidget {
   final ValueChanged<Geometry>? onGeometry;
   final ValueChanged<double>? onFontSize;
 
-  /// Rows to scroll; negative is up, into history.
-  final ValueChanged<int>? onScroll;
+  /// Rows to scroll, positive up into history, and the cell (col, row)
+  /// under the pointer, for a program that reads the wheel.
+  final void Function(int rows, int col, int row)? onScroll;
   final VoidCallback? onTap;
 
   @override
@@ -61,6 +62,7 @@ class _TerminalViewState extends State<TerminalView>
   bool _pulling = false;
   double _pinchStartFont = 0;
   double _scrollCarry = 0;
+  Size _size = Size.zero;
 
   @override
   void initState() {
@@ -163,22 +165,40 @@ class _TerminalViewState extends State<TerminalView>
       if (rounded != widget.fontSize) widget.onFontSize?.call(rounded);
       return;
     }
-    _scrollBy(d.focalPointDelta.dy);
+    _scrollBy(d.focalPointDelta.dy, d.localFocalPoint);
   }
 
-  void _scrollBy(double dy) {
-    final ch = _metrics?.cellHeight;
-    if (ch == null || ch <= 0) return;
+  /// Dragging down pulls older lines into view: a positive scroll.
+  void _scrollBy(double dy, Offset at) {
+    final m = _metrics;
+    if (m == null || m.cellHeight <= 0) return;
     _scrollCarry += dy;
-    final rows = (_scrollCarry / ch).truncate();
+    final rows = (_scrollCarry / m.cellHeight).truncate();
     if (rows == 0) return;
-    _scrollCarry -= rows * ch;
-    // Dragging down pulls older lines into view: scroll up.
-    widget.onScroll?.call(-rows);
+    _scrollCarry -= rows * m.cellHeight;
+    final (col, row) = _cellAt(m, at);
+    widget.onScroll?.call(rows, col, row);
+  }
+
+  /// The cell of the drawn grid under [at], through the inset and any
+  /// shrink to fit.
+  (int, int) _cellAt(CellMetrics m, Offset at) {
+    final model = widget.tab?.model;
+    if (model == null || model.cols == 0 || model.rows == 0) return (0, 0);
+    final inner = Size(
+      _size.width - 2 * terminalInset,
+      _size.height - 2 * terminalInset,
+    );
+    final scale = m.scaleToFit(model.cols, model.rows, inner);
+    final col = ((at.dx - terminalInset) / (m.cellWidth * scale)).floor();
+    final row = ((at.dy - terminalInset) / (m.cellHeight * scale)).floor();
+    return (col.clamp(0, model.cols - 1), row.clamp(0, model.rows - 1));
   }
 
   void _onPointerSignal(PointerSignalEvent event) {
-    if (event is PointerScrollEvent) _scrollBy(-event.scrollDelta.dy);
+    if (event is PointerScrollEvent) {
+      _scrollBy(-event.scrollDelta.dy, event.localPosition);
+    }
   }
 
   @override
@@ -188,6 +208,7 @@ class _TerminalViewState extends State<TerminalView>
     return LayoutBuilder(
       builder: (context, constraints) {
         final size = constraints.biggest;
+        _size = size;
         final local = metrics.geometryFor(
           Size(size.width - 2 * terminalInset, size.height - 2 * terminalInset),
         );

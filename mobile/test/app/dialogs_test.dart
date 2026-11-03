@@ -9,7 +9,6 @@ void main() {
         'charlie@devbox',
         'charlie@devbox.tail0a1b.ts.net',
         'charlie@devbox:2222',
-        'devbox',
         'charlie@10.0.0.7',
         'charlie@[fd7a:115c::1]:22',
         'unix:/tmp/rm/roost.sock',
@@ -29,6 +28,7 @@ void main() {
         'charlie@devbox:0',
         'charlie@devbox:70000',
         'charlie@devbox:ssh',
+        'devbox',
         'unix:relative.sock',
       ]) {
         expect(validateHostTarget(t), isNotNull, reason: t);
