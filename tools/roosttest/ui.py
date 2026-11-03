@@ -11,6 +11,7 @@ import atexit
 import fcntl
 import os
 import platform
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,7 @@ import warnings
 from collections.abc import MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
+from xml.parsers.expat import ExpatError
 
 from client import Roost, RoostError, scaled_timeout
 
@@ -66,24 +68,34 @@ _ICED_LOG: Path | None = None
 _MAC_LOG_OFFSET: int | None = None
 
 # The bundle-launched (`ROOST_ICED_APP`) sibling of `_MAC_LOG_OFFSET` +
-# `_ICED_PROC`, scoped to the `iced` target only. Bundle mode launches
-# Roost-Iced.app via LaunchServices (`open`), same as `_launch_mac` — no
-# direct child, so there is no stdout to capture and no `Popen` handle to
+# `_ICED_PROC`, scoped to the `iced` target only. Bundle mode launches the
+# bundle via LaunchServices (`open`), same as `_launch_mac` — no direct
+# child, so there is no stdout to capture and no `Popen` handle to
 # poll/wait on. `_ICED_BUNDLE_LOG_OFFSET` mirrors `_MAC_LOG_OFFSET`'s
 # "everything after this point in the persistent log is this launch's"
 # convention, and doubles as the "are we currently in bundle-launch mode"
-# flag consulted by `_launch_output`/`_boot_refusal`. `_ICED_BUNDLE_PID` is
-# the identify-verified pid of the launched Roost-Iced process, recorded
-# only once its identity is confirmed (see `_launch_iced_bundle`) — this is
-# the sole handle teardown (`_quit_iced_bundle`) signals against, deliberately
-# pid-based rather than process-name-based so it can never reach the Swift
-# Roost.app.
+# flag consulted by `_launch_output`/`_boot_refusal`. `_ICED_BUNDLE` is the
+# bundle that launch drove. `_ICED_BUNDLE_PID` is the identify-verified pid
+# of its process, recorded only once its identity is confirmed (see
+# `_launch_iced_bundle`) — this is the sole handle teardown
+# (`_quit_iced_bundle`) signals against, and every signal is re-qualified by
+# the executable's path inside that bundle, never by a process name: the
+# production bundle's process is named `Roost`, as an installed Roost.app's
+# is.
 _ICED_BUNDLE_LOG_OFFSET: int | None = None
+_ICED_BUNDLE: IcedBundle | None = None
 _ICED_BUNDLE_PID: int | None = None
 
-# Must stay in sync with `mac/scripts/bundle-iced.sh`'s `APP_NAME`/`BUNDLE_ID`.
+# The two identities `mac/scripts/bundle-iced.sh` assembles
+# (ROOST_BUNDLE_IDENTITY). Only the production id resolves the `Mac`
+# profile — MIRRORS `mac_bundle_default_kind` in crates/roost-iced/src/main.rs.
+PRODUCTION_BUNDLE_ID = "ai.stridelabs.Roost"
+DEV_BUNDLE_ID = "ai.stridelabs.Roost.iced"
+# The dev bundle's executable, for the lanes that need that bundle itself.
 ICED_BUNDLE_EXECUTABLE_NAME = "Roost-Iced"
-ICED_BUNDLE_APP_ID = "ai.stridelabs.Roost.iced"
+# Outside CI the harness drives the production identity only when this is
+# `1` — see `refuse_production_identity`.
+ALLOW_PRODUCTION_IDENTITY_ENV = "ROOST_TEST_ALLOW_PRODUCTION_IDENTITY"
 
 # The UI's own words when it refuses to start because another process holds
 # the state lock (`crates/roost-iced/src/main.rs`,
@@ -287,7 +299,7 @@ def socket_path(target: str) -> Path:
         ) from error
     home = Path.home()
     if platform.system() == "Darwin":
-        return home / f"Library/Caches/{spec.mac_label}/roost.sock"
+        return home / f"Library/Caches/{_mac_label(target)}/roost.sock"
     xdg = Path(os.environ.get("XDG_RUNTIME_DIR", ""))
     if xdg.is_absolute():
         return xdg / spec.linux_namespace / "roost.sock"
@@ -344,7 +356,75 @@ def rust_binary_path(target: str) -> tuple[Path, bool]:
     return REPO_ROOT / "target/debug" / spec.binary_name, False
 
 
-def iced_bundle_app() -> Path | None:
+@dataclass(frozen=True)
+class IcedBundle:
+    """An app bundle `ROOST_ICED_APP` names, as its own Info.plist declares
+    it, with the profile that declared id resolves in the UI."""
+
+    app: Path
+    bundle_id: str
+    executable: str
+    profile: str
+    mac_label: str
+    # `title_fallback` in crates/roost-iced/src/app.rs for that profile: the
+    # app menu's title and the window title's fallback.
+    title: str
+
+    @property
+    def executable_path(self) -> Path:
+        return self.app / "Contents" / "MacOS" / self.executable
+
+    @property
+    def is_production(self) -> bool:
+        return self.bundle_id == PRODUCTION_BUNDLE_ID
+
+    def runs_inside(self, command: str) -> bool:
+        """Whether a process's executable path lies inside this bundle."""
+        return command.startswith(f"{self.app}/")
+
+
+def read_bundle(app: Path) -> IcedBundle:
+    """`app`'s identity, from its `Contents/Info.plist`."""
+    info = app / "Contents" / "Info.plist"
+    try:
+        with open(info, "rb") as handle:
+            plist = plistlib.load(handle)
+    except OSError as error:
+        raise FileNotFoundError(f"ROOST_ICED_APP={app} has no readable {info}: {error}") from error
+    except (ValueError, ExpatError) as error:
+        raise ValueError(f"ROOST_ICED_APP={app}: {info} is not a property list: {error}") from error
+    fields = plist if isinstance(plist, dict) else {}
+    bundle_id = fields.get("CFBundleIdentifier")
+    executable = fields.get("CFBundleExecutable")
+    if not (isinstance(bundle_id, str) and bundle_id and isinstance(executable, str) and executable):
+        raise ValueError(f"{info} must name a CFBundleIdentifier and a CFBundleExecutable")
+    if bundle_id == PRODUCTION_BUNDLE_ID:
+        return IcedBundle(app, bundle_id, executable, profile="mac", mac_label="Roost", title="Roost")
+    spec = TARGET_SPECS["iced"]
+    return IcedBundle(
+        app, bundle_id, executable, profile=spec.profile, mac_label=spec.mac_label, title="Roost-Iced"
+    )
+
+
+def refuse_production_identity(bundle: IcedBundle) -> None:
+    """Refuse the production identity outside CI unless opted in.
+
+    On a developer's Mac that identity's socket, logs and defaults domain are
+    the installed Roost.app's: driving it would talk to that app, and fresh
+    mode would quit it."""
+    if not bundle.is_production:
+        return
+    if os.environ.get("CI") or os.environ.get(ALLOW_PRODUCTION_IDENTITY_ENV) == "1":
+        return
+    raise RuntimeError(
+        f"ROOST_ICED_APP={bundle.app} is the production identity ({PRODUCTION_BUNDLE_ID}): "
+        "it shares the installed Roost.app's socket (~/Library/Caches/Roost/roost.sock), "
+        "logs and defaults domain, and --roost-fresh would quit whatever answers there. "
+        f"Quit Roost.app, then set {ALLOW_PRODUCTION_IDENTITY_ENV}=1 (CI needs no opt-in)."
+    )
+
+
+def iced_bundle() -> IcedBundle | None:
     """Resolve + validate `ROOST_ICED_APP`, or `None` when unset.
 
     Validated eagerly, right here where the override is read — never lazily
@@ -352,6 +432,11 @@ def iced_bundle_app() -> Path | None:
     exception at launch time instead of the harness silently falling back
     to `target/debug/roost-iced` (see `rust_binary_path`, which stays
     untouched and unconsulted when this returns non-None).
+
+    The bundle's Info.plist decides which profile it runs, and with it every
+    profile-derived path the harness uses (`socket_path`, the log, the
+    expected `identify.app_id`), so the production identity is refused here,
+    before any of them is consulted (`refuse_production_identity`).
     """
     raw = os.environ.get("ROOST_ICED_APP")
     if not raw:
@@ -367,12 +452,37 @@ def iced_bundle_app() -> Path | None:
         app = REPO_ROOT / app
     if not app.is_dir():
         raise FileNotFoundError(f"ROOST_ICED_APP does not exist: {app}")
-    executable = app / "Contents/MacOS" / ICED_BUNDLE_EXECUTABLE_NAME
-    if not executable.is_file():
+    bundle = read_bundle(app)
+    if not bundle.executable_path.is_file():
         raise FileNotFoundError(
-            f"ROOST_ICED_APP={app} is missing its executable: {executable}"
+            f"ROOST_ICED_APP={app} is missing its executable: {bundle.executable_path}"
         )
-    return app
+    refuse_production_identity(bundle)
+    return bundle
+
+
+def iced_bundle_app() -> Path | None:
+    bundle = iced_bundle()
+    return bundle.app if bundle is not None else None
+
+
+def iced_app_id() -> str:
+    """The `identify.app_id` the iced UI under test serves: the id its
+    bundle declares, or the dev id for a bare binary."""
+    bundle = iced_bundle()
+    return bundle.bundle_id if bundle is not None else DEV_BUNDLE_ID
+
+
+def iced_app_title() -> str:
+    """The iced UI's app-menu title: its bundle profile's, or the dev one."""
+    bundle = iced_bundle()
+    return bundle.title if bundle is not None else "Roost-Iced"
+
+
+def _mac_label(target: str) -> str:
+    if target == "iced" and (bundle := iced_bundle()) is not None:
+        return bundle.mac_label
+    return TARGET_SPECS[target].mac_label
 
 
 def is_alive(target: str) -> bool:
@@ -403,11 +513,13 @@ def _mac_ui_log_path() -> Path:
 
 
 def _iced_bundle_ui_log_path() -> Path:
-    """The bundle-launched Roost-Iced.app's own persistent file log —
-    `TARGET_SPECS["iced"].mac_label` ("Roost-iced"), the same directory a
-    bare `ROOST_BUNDLE_PROFILE=iced` binary logs to. `open` gives no child
-    to capture, same reasoning as `_mac_ui_log_path`."""
-    return Path.home() / f"Library/Logs/{TARGET_SPECS['iced'].mac_label}/roost.log"
+    """The bundle-launched app's own persistent file log, under its
+    profile's label: `Roost` for the production identity, `Roost-iced` for
+    a dev bundle (the directory a bare `ROOST_BUNDLE_PROFILE=iced` binary
+    logs to too). `open` gives no child to capture, same reasoning as
+    `_mac_ui_log_path`."""
+    label = _ICED_BUNDLE.mac_label if _ICED_BUNDLE is not None else TARGET_SPECS["iced"].mac_label
+    return Path.home() / f"Library/Logs/{label}/roost.log"
 
 
 def _launch_output(target: str) -> str:
@@ -483,8 +595,8 @@ def _boot_refusal(target: str) -> str | None:
             return None
     elif target == "iced" and _ICED_BUNDLE_LOG_OFFSET is not None:
         # Bundle mode has no direct child to poll (LaunchServices detaches
-        # it), so liveness is a name probe, same shape as the mac branch —
-        # read-only, unlike teardown's pid-based signals.
+        # it), so liveness is a read-only probe for a process running the
+        # bundle's own executable.
         if _roost_iced_bundle_running():
             return None
     else:
@@ -1146,7 +1258,7 @@ def launch(
     for an unverifiable override, and the allowlist is deliberately
     curated (`ROOST_BUNDLE_PROFILE` is withheld from it on purpose).
     """
-    if extra_env and (target == "mac" or iced_bundle_app() is not None):
+    if extra_env and (target == "mac" or iced_bundle() is not None):
         raise ValueError(
             f"extra_env has no route into the `open`-launched {target} app: "
             "only the bare-binary Rust launch carries an environment"
@@ -1164,8 +1276,8 @@ def launch(
         app = REPO_ROOT / "mac/build/Roost.app"
         _ensure_mac_bundle(app, REPO_ROOT / "mac")
         _launch_mac(app, state_dir=state_dir)
-    elif target == "iced" and (bundle_app := iced_bundle_app()) is not None:
-        _launch_iced_bundle(bundle_app, state_dir=state_dir)
+    elif target == "iced" and (bundle := iced_bundle()) is not None:
+        _launch_iced_bundle(bundle, state_dir=state_dir)
     elif target == "iced":
         # A prior launch in this same process may have gone through
         # bundle mode (ROOST_ICED_APP was set then, unset now); clear
@@ -1174,9 +1286,10 @@ def launch(
         # any pid it recorded — otherwise a stale bundle pid from an
         # earlier (now-dead) bundle would make `quit("iced")` dispatch
         # to bundle teardown instead of terminating this live process.
-        global _ICED_BUNDLE_LOG_OFFSET, _ICED_BUNDLE_PID
+        global _ICED_BUNDLE_LOG_OFFSET, _ICED_BUNDLE_PID, _ICED_BUNDLE
         _ICED_BUNDLE_LOG_OFFSET = None
         _ICED_BUNDLE_PID = None
+        _ICED_BUNDLE = None
         spec = TARGET_SPECS[target]
         assert spec.binary_name is not None and spec.rust_package is not None
         binary, explicit_binary = rust_binary_path(target)
@@ -1271,19 +1384,26 @@ def _forward_env(argv: list[str], name: str) -> None:
         argv += ["--env", f"{name}={os.environ[name]}"]
 
 
-def _launch_iced_bundle(app: Path, *, state_dir: Path | None = None) -> None:
-    """Launch a bundle-assembled Roost-Iced.app via LaunchServices (`open`).
+def _launch_iced_bundle(bundle: IcedBundle, *, state_dir: Path | None = None) -> None:
+    """Launch an assembled iced bundle via LaunchServices (`open`).
 
     A target-parameterized sibling of `_launch_mac`, not a copy: every value
-    here keys off the `iced` target (`TARGET_SPECS["iced"]`, the bundle's own
-    `Roost-Iced` executable name, the iced socket) rather than `_launch_mac`'s
-    hardcoded "Roost" identity, so nothing here can silently drift onto the
-    Swift app. Unlike `_launch_mac` this does not retry-with-cleanup: that
-    dance exists for macos-latest CI flakiness around a specific app; a local
-    `make e2e-iced-bundle` run is the only consumer today, and a genuine boot
-    failure should surface immediately rather than being retried once.
+    here keys off the bundle's own declared identity (its executable, the
+    profile its id resolves, that profile's socket and log) rather than
+    `_launch_mac`'s hardcoded "Roost" identity. Unlike `_launch_mac` this
+    does not retry-with-cleanup: that dance exists for macos-latest CI
+    flakiness around a specific app, and a genuine boot failure should
+    surface immediately rather than being retried once.
     """
-    global _ICED_BUNDLE_LOG_OFFSET, _ICED_BUNDLE_PID
+    global _ICED_BUNDLE_LOG_OFFSET, _ICED_BUNDLE_PID, _ICED_BUNDLE
+    app = bundle.app
+    if bundle.is_production and state_dir is None:
+        raise RuntimeError(
+            f"{app} is the production identity: refusing to launch it without a throwaway "
+            "state dir, which would leave it on ~/Library/Application Support/Roost"
+        )
+    _ICED_BUNDLE = bundle
+    _ICED_BUNDLE_PID = None
     log = _iced_bundle_ui_log_path()
     log.parent.mkdir(parents=True, exist_ok=True)
     # Everything after this point in the bundle's persistent log belongs to
@@ -1336,9 +1456,8 @@ def _launch_iced_bundle(app: Path, *, state_dir: Path | None = None) -> None:
     # Everything from here on can fail after a real process is already up.
     # Leaving a launched bundle running on any of these failures would leak
     # it into whatever runs next, so any exception tears it down before
-    # propagating — pid-based if identity was confirmed, else a best-effort
-    # name kill (safe: `ICED_BUNDLE_EXECUTABLE_NAME` can never match the
-    # Swift app's process name).
+    # propagating — pid-based if identity was confirmed, else every process
+    # running this bundle's own executable (`_stop_bundle_processes`).
     try:
         wait_alive("iced")
 
@@ -1349,17 +1468,18 @@ def _launch_iced_bundle(app: Path, *, state_dir: Path | None = None) -> None:
             )
         command = _process_command(pid)
         name = Path(command).name if command else None
-        if name != ICED_BUNDLE_EXECUTABLE_NAME:
+        if name != bundle.executable:
             raise RuntimeError(
                 f"iced bundle's identify pid {pid} belongs to process {command!r}, "
-                f"expected {ICED_BUNDLE_EXECUTABLE_NAME!r} — refusing to adopt it "
+                f"expected {bundle.executable!r} — refusing to adopt it "
                 "for teardown (would risk signalling the wrong process)"
             )
         # Name alone isn't enough — a same-named process from somewhere else
-        # on $PATH would pass it. `_process_command` returns the full
-        # executable path on macOS (`ps -o comm=`), so confirm it actually
-        # lives inside the bundle we launched.
-        if not command.startswith(str(app)):
+        # (an installed Roost.app, for the production identity) would pass
+        # it. `_process_command` returns the full executable path on macOS
+        # (`ps -o comm=`), so confirm it actually lives inside the bundle we
+        # launched.
+        if not bundle.runs_inside(command):
             raise RuntimeError(
                 f"iced bundle's identify pid {pid} executable {command!r} is "
                 f"not under the launched bundle {app} — refusing to adopt it "
@@ -1369,31 +1489,30 @@ def _launch_iced_bundle(app: Path, *, state_dir: Path | None = None) -> None:
         # `_quit_iced_bundle` acts on.
         _ICED_BUNDLE_PID = pid
 
-        _assert_bundle_identity_logged()
+        _assert_bundle_identity_logged(bundle)
         if os.environ.get("ROOST_TEST_MODE") == "1":
             _assert_test_mode_canary("iced")
     except Exception:
         if _ICED_BUNDLE_PID is not None:
             _quit_iced_bundle(graceful=scaled_timeout(10.0))
         else:
-            subprocess.run(["pkill", "-x", ICED_BUNDLE_EXECUTABLE_NAME], check=False)
+            _stop_bundle_processes(bundle, graceful=scaled_timeout(10.0))
         raise
 
 
-def _assert_bundle_identity_logged() -> None:
-    """W3's startup log line (`resolved bundle identity`) is the only
-    observable proof the bundle-id probe ran and resolved this launch's
-    profile — every mapping arm returns `Iced` today, so the log line is
-    the whole test surface. Assert it on every bundle-mode launch (plan 027
-    W3/W5) rather than in one test module, so it can never silently regress
-    while the two curated e2e modules still pass."""
+def _assert_bundle_identity_logged(bundle: IcedBundle) -> None:
+    """W3's startup log line (`resolved bundle identity`) is the observable
+    proof the bundle-id probe ran and resolved the profile this bundle's id
+    maps to. Assert it on every bundle-mode launch (plan 027 W3/W5) rather
+    than in one test module, so it can never silently regress while the
+    curated e2e modules still pass."""
     output = _launch_output("iced")
-    want_field = f'bundle_id="{ICED_BUNDLE_APP_ID}"'
-    if "resolved bundle identity" not in output or want_field not in output:
+    want = (f'bundle_id="{bundle.bundle_id}"', f'profile="{bundle.profile}"')
+    if "resolved bundle identity" not in output or not all(f in output for f in want):
         raise RuntimeError(
             "iced bundle launch did not log the W3 bundle-identity line "
-            f"(want a line containing `resolved bundle identity` and "
-            f"`{want_field}`); captured log since launch:\n" + output
+            f"(want a line containing `resolved bundle identity`, `{want[0]}` "
+            f"and `{want[1]}`); captured log since launch:\n" + output
         )
 
 
@@ -1510,11 +1629,42 @@ def _roost_running() -> bool:
 def _roost_iced_bundle_running() -> bool:
     """Read-only liveness probe for the bundle-launched process, used only
     while `_launch_iced_bundle` hasn't yet confirmed a pid via `identify`
-    (see `_boot_refusal`). Never used for termination — teardown
-    (`_quit_iced_bundle`) is pid-based so it can't hit the Swift Roost.app."""
-    return subprocess.run(["pgrep", "-x", ICED_BUNDLE_EXECUTABLE_NAME],
-                          stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL).returncode == 0
+    (see `_boot_refusal`)."""
+    return _ICED_BUNDLE is not None and bool(_bundle_pids(_ICED_BUNDLE))
+
+
+def _bundle_pids(bundle: IcedBundle) -> list[int]:
+    """Pids running `bundle`'s own executable: named like it (`pgrep -x`, a
+    read-only probe) AND executing from inside it. The name alone never
+    qualifies a process: the production executable is `Roost`, which is the
+    installed Roost.app's process name too."""
+    try:
+        found = subprocess.run(
+            ["pgrep", "-x", bundle.executable],
+            capture_output=True, text=True, check=False, timeout=_PS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return []
+    pids = [int(token) for token in found.stdout.split() if token.isdigit()]
+    return [pid for pid in pids if _runs_inside(pid, bundle) is True]
+
+
+def _runs_inside(pid: int, bundle: IcedBundle) -> bool | None:
+    """Whether `pid` executes from inside `bundle`; `None` when it is alive
+    but `ps` cannot say what it runs."""
+    command = _process_command(pid)
+    if command is None:
+        return None if _pid_alive(pid) else False
+    return bundle.runs_inside(command)
+
+
+def _stop_bundle_processes(bundle: IcedBundle, *, graceful: float) -> None:
+    """Stop every process running `bundle`'s executable, for a launch that
+    failed before its pid was confirmed. Each is re-qualified before each
+    signal (`_terminate_owned_pid`), so a same-named process elsewhere — an
+    installed Roost.app — is never touched."""
+    for pid in _bundle_pids(bundle):
+        _terminate_owned_pid(pid, owned=lambda p: _runs_inside(p, bundle), graceful=graceful)
 
 
 def _process_command(pid: int) -> str | None:
@@ -1636,30 +1786,25 @@ def _mac_cleanup() -> None:
 
 
 def _quit_iced_bundle(graceful: float = 10.0) -> None:
-    """Stop a bundle-launched Roost-Iced.app and *prove* it is gone — pid-based
-    (SIGTERM, wait, escalate to SIGKILL, wait again), never a process-name
-    kill: `_quit_mac_process` can reach for `pkill -x Roost` because "Roost"
-    unambiguously means the Swift app, but "Roost-Iced" the process name is
-    exactly what we're launching here, so a name-based kill would be safe in
-    isolation yet is banned on principle (plan 027 W5) — the one thing this
-    helper must never do is become copy-pasteable into a context where it
-    WOULD hit the Swift app. `end_session` deletes the session state dir
-    (state.lock included) immediately after `quit()` returns, so this must
-    not return while the bundle might still hold that lock — mirrors
-    `_quit_mac_process`'s confirmed-dead discipline.
+    """Stop a bundle-launched app and *prove* it is gone — pid-based
+    (SIGTERM, wait, escalate to SIGKILL, wait again), and before each signal
+    the pid must still run the launched bundle's own executable, by path:
+    never a process-name kill (plan 027 W5), because the production
+    bundle's process name is the installed Roost.app's. `end_session`
+    deletes the session state dir (state.lock included) immediately after
+    `quit()` returns, so this must not return while the bundle might still
+    hold that lock — mirrors `_quit_mac_process`'s confirmed-dead discipline.
     """
     global _ICED_BUNDLE_PID
     pid = _ICED_BUNDLE_PID
     if pid is None:
         return
-
-    def is_bundle(pid: int) -> bool | None:
-        command = _process_command(pid)
-        if command is None:
-            return None if _pid_alive(pid) else False
-        return Path(command).name == ICED_BUNDLE_EXECUTABLE_NAME
-
-    _terminate_owned_pid(pid, owned=is_bundle, graceful=graceful)
+    bundle = _ICED_BUNDLE
+    if bundle is None:
+        raise OwnershipUnknown(
+            f"pid {pid} was recorded with no bundle to qualify it by — not signalled"
+        )
+    _terminate_owned_pid(pid, owned=lambda p: _runs_inside(p, bundle), graceful=graceful)
     _ICED_BUNDLE_PID = None
 
 

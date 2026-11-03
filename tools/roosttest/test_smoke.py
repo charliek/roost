@@ -7,7 +7,9 @@ docs/development/claude-testing.md.
 from __future__ import annotations
 
 import os
+import sys
 import uuid
+from pathlib import Path
 
 import pytest
 from client import RoostError
@@ -57,9 +59,28 @@ def test_notification_set_and_clear(roost, project):
 
 
 def test_identify_reports_the_target_app_id(roost, target):
-    # Exact equality, never a prefix check: the macOS iced id
-    # `ai.stridelabs.Roost.iced` has the production id as a prefix.
-    assert roost.identify()["app_id"] == EXPECTED_APP_IDS[target]
+    # Exact equality, never a prefix check: the dev id
+    # `ai.stridelabs.Roost.iced` has the production id as a prefix. A
+    # bundle serves the id it declares.
+    want = ui.iced_app_id() if target == "iced" else EXPECTED_APP_IDS[target]
+    assert roost.identify()["app_id"] == want
+
+
+def test_the_ui_runs_the_profile_its_bundle_id_maps_to(roost, target):
+    """Plan 089 D2: the production Roost.app (ai.stridelabs.Roost) runs the
+    `Mac` profile — the label and socket the Swift Roost.app used, so an
+    upgrading user keeps them — while a dev Roost-Iced.app and a bare dev
+    binary run `Roost-iced`."""
+    if target != "iced":
+        pytest.skip("the Swift Mac app has no bundle-id probe")
+    bundle = ui.iced_bundle()
+    production = bundle is not None and bundle.bundle_id == "ai.stridelabs.Roost"
+    label = "Roost" if production else "Roost-iced"
+    identity = roost.identify()
+    assert identity["app_id"] == ("ai.stridelabs.Roost" if production else "ai.stridelabs.Roost.iced")
+    assert identity["app_label"] == label
+    if sys.platform == "darwin":
+        assert identity["socket_path"] == str(Path.home() / "Library/Caches" / label / "roost.sock")
 
 
 def test_the_suite_runs_against_the_in_process_backend(roost, target):

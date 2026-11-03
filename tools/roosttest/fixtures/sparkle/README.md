@@ -9,7 +9,7 @@ build.
 
 The EdDSA public key stamped into the **test-keyed** bundle as
 `SUPublicEDKey` by `make e2e-iced-sparkle` (which reads this file and
-passes it through `bundle-iced.sh`'s `ROOST_ICED_SPARKLE_ED_PUBLIC_KEY`
+passes it through `bundle-iced.sh`'s `ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY`
 env pair). Sparkle 2 will not report a valid update for an ad-hoc-signed
 bundle with no public key, so the key is what makes AC6's `found`
 outcome reachable at all.

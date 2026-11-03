@@ -100,7 +100,7 @@ roost_assemble_skeleton "${APP_DIR}"
 cp "${SWIFT_BUILD_BIN}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 chmod +x "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 
-roost_stamp_plist "${TEMPLATE_PLIST}" "${APP_DIR}" "${VERSION}"
+roost_stamp_plist "${TEMPLATE_PLIST}" "${APP_DIR}" "${VERSION}" "${BUNDLE_ID}" "${APP_NAME}"
 roost_write_pkginfo "${APP_DIR}"
 
 # Resource bundles SwiftPM emits — the .app ships them so the running

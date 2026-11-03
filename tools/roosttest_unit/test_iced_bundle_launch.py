@@ -10,10 +10,12 @@ uses in place of `_ICED_PROC`.
 from __future__ import annotations
 
 import os
+import plistlib
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -33,12 +35,44 @@ def _absent_log_path() -> Path:
     return Path(tempfile.gettempdir()) / f"roost-absent-{uuid.uuid4().hex}.log"
 
 
-def _make_bundle(root: Path, executable_name: str = "Roost-Iced") -> Path:
-    app = root / "Roost-Iced.app"
+def _make_bundle(
+    root: Path,
+    executable_name: str = "Roost-Iced",
+    *,
+    bundle_id: str = "ai.stridelabs.Roost.iced",
+    name: str = "Roost-Iced.app",
+    with_executable: bool = True,
+) -> Path:
+    """A bundle skeleton whose Info.plist declares `bundle_id` and
+    `executable_name`. Nothing in it is ever executed."""
+    app = root / name
     macos_dir = app / "Contents" / "MacOS"
     macos_dir.mkdir(parents=True)
-    (macos_dir / executable_name).write_text("#!/bin/sh\n")
+    with open(app / "Contents" / "Info.plist", "wb") as handle:
+        plistlib.dump(
+            {"CFBundleIdentifier": bundle_id, "CFBundleExecutable": executable_name}, handle
+        )
+    if with_executable:
+        (macos_dir / executable_name).write_text("#!/bin/sh\n")
     return app
+
+
+DEV_BUNDLE = ui.IcedBundle(
+    app=Path("/Applications/Roost-Iced.app"),
+    bundle_id="ai.stridelabs.Roost.iced",
+    executable="Roost-Iced",
+    profile="iced",
+    mac_label="Roost-iced",
+    title="Roost-Iced",
+)
+PRODUCTION_BUNDLE = ui.IcedBundle(
+    app=Path("/repo/mac/build/Roost.app"),
+    bundle_id="ai.stridelabs.Roost",
+    executable="Roost",
+    profile="mac",
+    mac_label="Roost",
+    title="Roost",
+)
 
 
 class IcedBundleAppValidationTests(unittest.TestCase):
@@ -67,11 +101,29 @@ class IcedBundleAppValidationTests(unittest.TestCase):
     @patch("ui.platform.system", return_value="Darwin")
     def test_missing_executable_raises_loudly_not_a_silent_fallback(self, _system) -> None:
         with tempfile.TemporaryDirectory() as root:
-            app = Path(root) / "Roost-Iced.app"
-            (app / "Contents" / "MacOS").mkdir(parents=True)
-            # Deliberately no Roost-Iced executable inside.
+            # The plist names an executable the bundle does not carry.
+            app = _make_bundle(Path(root), with_executable=False)
             with patch.dict(os.environ, {"ROOST_ICED_APP": str(app)}):
                 with self.assertRaisesRegex(FileNotFoundError, "missing its executable"):
+                    ui.iced_bundle_app()
+
+    @patch("ui.platform.system", return_value="Darwin")
+    def test_the_executable_checked_is_the_one_the_plist_names(self, _system) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            app = _make_bundle(Path(root), "Roost", with_executable=False)
+            (app / "Contents" / "MacOS" / "Roost-Iced").write_text("#!/bin/sh\n")
+            with patch.dict(os.environ, {"ROOST_ICED_APP": str(app)}):
+                with self.assertRaisesRegex(FileNotFoundError, r"MacOS/Roost$"):
+                    ui.iced_bundle_app()
+
+    @patch("ui.platform.system", return_value="Darwin")
+    def test_a_bundle_without_a_plist_raises_loudly(self, _system) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            app = Path(root) / "Roost-Iced.app"
+            (app / "Contents" / "MacOS").mkdir(parents=True)
+            (app / "Contents" / "MacOS" / "Roost-Iced").write_text("#!/bin/sh\n")
+            with patch.dict(os.environ, {"ROOST_ICED_APP": str(app)}):
+                with self.assertRaisesRegex(FileNotFoundError, "no readable"):
                     ui.iced_bundle_app()
 
     @patch("ui.platform.system", return_value="Darwin")
@@ -102,11 +154,11 @@ class LaunchModeSelectionTests(unittest.TestCase):
     resolves to something; otherwise the Popen path is untouched."""
 
     def test_launch_dispatches_to_bundle_helper_when_app_resolves(self) -> None:
-        bundle = Path("/Applications/Roost-Iced.app")
+        bundle = DEV_BUNDLE
         with (
             patch("ui.is_alive", return_value=False),
             patch("ui._SESSION_STATE_DIR", None),
-            patch("ui.iced_bundle_app", return_value=bundle),
+            patch("ui.iced_bundle", return_value=bundle),
             patch("ui._launch_iced_bundle") as launch_bundle,
             patch("ui.subprocess.run") as run,
         ):
@@ -119,7 +171,7 @@ class LaunchModeSelectionTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, state_dir, True)
         with (
             patch("ui.is_alive", return_value=False),
-            patch("ui.iced_bundle_app", return_value=None),
+            patch("ui.iced_bundle", return_value=None),
             patch("ui._launch_iced_bundle") as launch_bundle,
             patch("ui.rust_binary_path", return_value=(Path("/usr/bin/true"), True)),
             patch("ui._SESSION_STATE_DIR", state_dir),
@@ -139,7 +191,7 @@ class LaunchModeSelectionTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, state_dir, True)
         with (
             patch("ui.is_alive", return_value=False),
-            patch("ui.iced_bundle_app", return_value=None),
+            patch("ui.iced_bundle", return_value=None),
             patch("ui._ICED_BUNDLE_LOG_OFFSET", 123),
             patch("ui.rust_binary_path", return_value=(Path("/usr/bin/true"), True)),
             patch("ui._SESSION_STATE_DIR", state_dir),
@@ -160,8 +212,9 @@ class LaunchModeSelectionTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, state_dir, True)
         with (
             patch("ui.is_alive", return_value=False),
-            patch("ui.iced_bundle_app", return_value=None),
+            patch("ui.iced_bundle", return_value=None),
             patch("ui._ICED_BUNDLE_PID", 4242),
+            patch("ui._ICED_BUNDLE", DEV_BUNDLE),
             patch("ui.rust_binary_path", return_value=(Path("/usr/bin/true"), True)),
             patch("ui._SESSION_STATE_DIR", state_dir),
             patch("ui._session_config_path", return_value=state_dir / "launcher.conf"),
@@ -219,7 +272,7 @@ class BundleIdentityLogAssertionTests(unittest.TestCase):
     def test_missing_log_line_raises(self) -> None:
         with patch("ui._launch_output", return_value="boot line only\n"):
             with self.assertRaisesRegex(RuntimeError, "did not log the W3"):
-                ui._assert_bundle_identity_logged()
+                ui._assert_bundle_identity_logged(DEV_BUNDLE)
 
     def test_present_log_line_passes(self) -> None:
         line = (
@@ -227,7 +280,16 @@ class BundleIdentityLogAssertionTests(unittest.TestCase):
             'profile="iced"\n'
         )
         with patch("ui._launch_output", return_value=line):
-            ui._assert_bundle_identity_logged()  # must not raise
+            ui._assert_bundle_identity_logged(DEV_BUNDLE)  # must not raise
+
+    def test_the_production_bundle_must_resolve_the_mac_profile(self) -> None:
+        mac = 'INFO resolved bundle identity bundle_id="ai.stridelabs.Roost" profile="mac"\n'
+        with patch("ui._launch_output", return_value=mac):
+            ui._assert_bundle_identity_logged(PRODUCTION_BUNDLE)  # must not raise
+        iced = 'INFO resolved bundle identity bundle_id="ai.stridelabs.Roost" profile="iced"\n'
+        with patch("ui._launch_output", return_value=iced):
+            with self.assertRaisesRegex(RuntimeError, 'profile="mac"'):
+                ui._assert_bundle_identity_logged(PRODUCTION_BUNDLE)
 
 
 class TestModeCanaryTests(unittest.TestCase):
@@ -290,6 +352,11 @@ class BundlePidVerificationTests(unittest.TestCase):
     """`_launch_iced_bundle` refuses to adopt a pid that doesn't belong to
     the bundle's own process before recording it for teardown."""
 
+    def setUp(self) -> None:
+        bundle = patch("ui._ICED_BUNDLE", None)
+        bundle.start()
+        self.addCleanup(bundle.stop)
+
     def test_mismatched_process_name_refuses_to_adopt_the_pid(self) -> None:
         with (
             patch("ui._iced_bundle_ui_log_path", return_value=_absent_log_path()),
@@ -299,7 +366,7 @@ class BundlePidVerificationTests(unittest.TestCase):
             patch("ui._process_command", return_value="/usr/bin/something-else"),
         ):
             with self.assertRaisesRegex(RuntimeError, "refusing to adopt"):
-                ui._launch_iced_bundle(Path("/Applications/Roost-Iced.app"))
+                ui._launch_iced_bundle(DEV_BUNDLE)
         self.assertIsNone(ui._ICED_BUNDLE_PID)
 
     def test_matching_process_name_adopts_the_pid(self) -> None:
@@ -326,7 +393,7 @@ class BundlePidVerificationTests(unittest.TestCase):
             patch("ui._assert_test_mode_canary") as assert_canary,
         ):
             try:
-                ui._launch_iced_bundle(Path("/Applications/Roost-Iced.app"))
+                ui._launch_iced_bundle(DEV_BUNDLE)
                 self.assertEqual(ui._ICED_BUNDLE_PID, 4242)
             finally:
                 ui._ICED_BUNDLE_PID = None
@@ -365,7 +432,7 @@ class BundlePidVerificationTests(unittest.TestCase):
             patch("ui._assert_test_mode_canary"),
         ):
             try:
-                ui._launch_iced_bundle(Path("/Applications/Roost-Iced.app"))
+                ui._launch_iced_bundle(DEV_BUNDLE)
             finally:
                 ui._ICED_BUNDLE_PID = None
         return run.call_args_list[0].args[0]
@@ -398,7 +465,7 @@ class BundlePidVerificationTests(unittest.TestCase):
             patch("ui._process_command", return_value="/usr/local/bin/Roost-Iced"),
         ):
             with self.assertRaisesRegex(RuntimeError, "not under the launched bundle"):
-                ui._launch_iced_bundle(Path("/Applications/Roost-Iced.app"))
+                ui._launch_iced_bundle(DEV_BUNDLE)
         self.assertIsNone(ui._ICED_BUNDLE_PID)
 
 
@@ -408,21 +475,30 @@ class LaunchFailureTeardownTests(unittest.TestCase):
     failure (or a canary failure) leaks a live Roost-Iced process into
     whatever the harness runs next."""
 
-    def test_identity_mismatch_pkills_by_name_when_no_pid_was_ever_adopted(
+    def setUp(self) -> None:
+        bundle = patch("ui._ICED_BUNDLE", None)
+        bundle.start()
+        self.addCleanup(bundle.stop)
+
+    def test_identity_mismatch_stops_the_bundles_own_processes_never_by_name(
         self,
     ) -> None:
         with (
+            patch("ui._ICED_BUNDLE", None),
             patch("ui._iced_bundle_ui_log_path", return_value=_absent_log_path()),
             patch("ui.subprocess.run") as run,
             patch("ui.wait_alive"),
             patch("ui._answering_pid", return_value=4242),
             patch("ui._process_command", return_value="/usr/bin/something-else"),
+            patch("ui._stop_bundle_processes") as stop,
         ):
             with self.assertRaisesRegex(RuntimeError, "refusing to adopt"):
-                ui._launch_iced_bundle(Path("/Applications/Roost-Iced.app"))
+                ui._launch_iced_bundle(DEV_BUNDLE)
         self.assertIsNone(ui._ICED_BUNDLE_PID)
+        stop.assert_called_once()
+        self.assertIs(stop.call_args.args[0], DEV_BUNDLE)
         pkill_calls = [c.args[0] for c in run.call_args_list if c.args[0][0] == "pkill"]
-        self.assertEqual(pkill_calls, [["pkill", "-x", ui.ICED_BUNDLE_EXECUTABLE_NAME]])
+        self.assertEqual(pkill_calls, [])
 
     def test_canary_failure_after_pid_adoption_pid_kills_the_bundle(self) -> None:
         """Once identity is confirmed and the pid is recorded, a later
@@ -446,7 +522,7 @@ class LaunchFailureTeardownTests(unittest.TestCase):
             patch("ui._pid_alive", return_value=False),  # short-circuits to "already dead"
         ):
             with self.assertRaisesRegex(RuntimeError, "env forwarding dropped"):
-                ui._launch_iced_bundle(Path("/Applications/Roost-Iced.app"))
+                ui._launch_iced_bundle(DEV_BUNDLE)
         # The pid-based path (`_quit_iced_bundle`), not a name kill.
         pkill_calls = [c.args[0] for c in run.call_args_list if c.args[0][0] == "pkill"]
         self.assertEqual(pkill_calls, [])
@@ -496,6 +572,7 @@ class QuitDispatchTests(unittest.TestCase):
     def test_quit_dispatches_to_bundle_teardown_when_a_pid_is_recorded(self) -> None:
         with (
             patch("ui._ICED_BUNDLE_PID", 4242),
+            patch("ui._ICED_BUNDLE", DEV_BUNDLE),
             patch("ui._quit_iced_bundle") as quit_bundle,
         ):
             ui.quit("iced")
@@ -512,6 +589,7 @@ class QuitDispatchTests(unittest.TestCase):
     def test_quit_escalates_to_sigkill_and_proves_death_before_returning(self) -> None:
         with (
             patch("ui._ICED_BUNDLE_PID", 4242),
+            patch("ui._ICED_BUNDLE", DEV_BUNDLE),
             patch("ui._pid_alive", return_value=True),  # the one up-front liveness check
             patch(
                 "ui._process_command",
@@ -530,6 +608,7 @@ class QuitDispatchTests(unittest.TestCase):
     def test_quit_raises_rather_than_returning_when_sigkill_is_survived(self) -> None:
         with (
             patch("ui._ICED_BUNDLE_PID", 4242),
+            patch("ui._ICED_BUNDLE", DEV_BUNDLE),
             patch("ui._pid_alive", return_value=True),
             patch(
                 "ui._process_command",
@@ -549,6 +628,7 @@ class QuitDispatchTests(unittest.TestCase):
         the escalation never reaches it."""
         with (
             patch("ui._ICED_BUNDLE_PID", 4242),
+            patch("ui._ICED_BUNDLE", DEV_BUNDLE),
             patch("ui._pid_alive", return_value=True),
             patch(
                 "ui._process_command",
@@ -569,6 +649,7 @@ class QuitDispatchTests(unittest.TestCase):
     def test_an_identity_ps_cannot_tell_is_neither_signalled_nor_forgotten(self) -> None:
         with (
             patch("ui._ICED_BUNDLE_PID", 4242),
+            patch("ui._ICED_BUNDLE", DEV_BUNDLE),
             patch("ui._pid_alive", return_value=True),
             patch("ui._process_command", return_value=None),
             patch("ui.subprocess.run") as run,
@@ -593,6 +674,7 @@ class QuitDispatchTests(unittest.TestCase):
         recorded pid directly."""
         with (
             patch("ui._ICED_BUNDLE_PID", 4242),
+            patch("ui._ICED_BUNDLE", DEV_BUNDLE),
             patch("ui._pid_alive", side_effect=[True, False]),
             patch(
                 "ui._process_command",
@@ -616,6 +698,7 @@ class QuitDispatchTests(unittest.TestCase):
         process that happened to land on the same number."""
         with (
             patch("ui._ICED_BUNDLE_PID", 4242),
+            patch("ui._ICED_BUNDLE", DEV_BUNDLE),
             patch("ui._pid_alive", return_value=True),
             patch("ui._process_command", return_value="/usr/bin/something-else"),
             patch("ui.subprocess.run") as run,
@@ -623,6 +706,223 @@ class QuitDispatchTests(unittest.TestCase):
             ui._quit_iced_bundle()
         run.assert_not_called()
         self.assertIsNone(ui._ICED_BUNDLE_PID)
+
+
+class BundleIdentityTests(unittest.TestCase):
+    """`read_bundle` maps the id a bundle declares onto the profile the UI
+    resolves for it — MIRRORS `mac_bundle_default_kind`."""
+
+    def _read(self, **kwargs) -> "ui.IcedBundle":
+        root = Path(tempfile.mkdtemp(prefix="roost-unit-bundle-id-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        return ui.read_bundle(_make_bundle(root, **kwargs))
+
+    def test_the_production_id_runs_the_mac_profile(self) -> None:
+        bundle = self._read(executable_name="Roost", bundle_id="ai.stridelabs.Roost", name="Roost.app")
+        self.assertEqual(
+            (bundle.executable, bundle.profile, bundle.mac_label, bundle.title),
+            ("Roost", "mac", "Roost", "Roost"),
+        )
+        self.assertTrue(bundle.is_production)
+
+    def test_the_dev_id_and_any_other_id_run_the_iced_profile(self) -> None:
+        for bundle_id in ("ai.stridelabs.Roost.iced", "ai.stridelabs.Roost.other", "com.example.x"):
+            with self.subTest(bundle_id=bundle_id):
+                bundle = self._read(bundle_id=bundle_id)
+                self.assertEqual(
+                    (bundle.profile, bundle.mac_label, bundle.title),
+                    ("iced", "Roost-iced", "Roost-Iced"),
+                )
+                self.assertFalse(bundle.is_production)
+
+    def test_a_plist_without_an_identity_is_refused(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="roost-unit-bundle-id-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        app = _make_bundle(root)
+        with open(app / "Contents" / "Info.plist", "wb") as handle:
+            plistlib.dump({"CFBundleIdentifier": "ai.stridelabs.Roost"}, handle)
+        with self.assertRaisesRegex(ValueError, "CFBundleExecutable"):
+            ui.read_bundle(app)
+        (app / "Contents" / "Info.plist").write_text("not a plist")
+        with self.assertRaisesRegex(ValueError, "not a property list"):
+            ui.read_bundle(app)
+
+
+@patch("ui.platform.system", return_value="Darwin")
+@patch("ui.Path.home", return_value=Path("/Users/tester"))
+class ProfileDerivedPathTests(unittest.TestCase):
+    """Every path the harness derives from a profile follows the bundle's
+    identity: the production bundle's are the `Mac` profile's."""
+
+    def _env(self, bundle_id: str, executable: str, name: str) -> dict[str, str]:
+        root = Path(tempfile.mkdtemp(prefix="roost-unit-bundle-paths-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        app = _make_bundle(root, executable, bundle_id=bundle_id, name=name)
+        return {"ROOST_ICED_APP": str(app), "CI": "true"}
+
+    def test_the_production_bundle_uses_the_mac_profiles_socket_lock_and_ids(self, _home, _system) -> None:
+        with patch.dict(os.environ, self._env("ai.stridelabs.Roost", "Roost", "Roost.app")):
+            self.assertEqual(
+                ui.socket_path("iced"), Path("/Users/tester/Library/Caches/Roost/roost.sock")
+            )
+            self.assertEqual(
+                ui.socket_lock_path("iced"), Path("/Users/tester/Library/Caches/Roost/roost.lock")
+            )
+            self.assertEqual(ui.iced_app_id(), "ai.stridelabs.Roost")
+            self.assertEqual(ui.iced_app_title(), "Roost")
+
+    def test_a_dev_bundle_keeps_the_iced_profiles_paths(self, _home, _system) -> None:
+        with patch.dict(os.environ, self._env("ai.stridelabs.Roost.iced", "Roost-Iced", "Roost-Iced.app")):
+            self.assertEqual(
+                ui.socket_path("iced"), Path("/Users/tester/Library/Caches/Roost-iced/roost.sock")
+            )
+            self.assertEqual(ui.iced_app_id(), "ai.stridelabs.Roost.iced")
+            self.assertEqual(ui.iced_app_title(), "Roost-Iced")
+
+    def test_the_log_follows_the_launched_bundles_label(self, _home, _system) -> None:
+        for bundle, label in ((PRODUCTION_BUNDLE, "Roost"), (DEV_BUNDLE, "Roost-iced"), (None, "Roost-iced")):
+            with self.subTest(label=label), patch("ui._ICED_BUNDLE", bundle):
+                self.assertEqual(
+                    ui._iced_bundle_ui_log_path(),
+                    Path(f"/Users/tester/Library/Logs/{label}/roost.log"),
+                )
+
+
+@patch("ui.platform.system", return_value="Darwin")
+class ProductionIdentityGuardTests(unittest.TestCase):
+    """Plan 089 D2: outside CI the harness refuses the production identity
+    unless opted in — before any path derived from it is consulted, because
+    on a developer's Mac those are the installed Roost.app's."""
+
+    def setUp(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="roost-unit-bundle-guard-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        self.production = _make_bundle(root, "Roost", bundle_id="ai.stridelabs.Roost", name="Roost.app")
+        self.dev = _make_bundle(root)
+
+    def _env(self, app: Path, **extra: str):
+        env = patch.dict(os.environ, {"ROOST_ICED_APP": str(app), **extra})
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("CI", ui.ALLOW_PRODUCTION_IDENTITY_ENV):
+            if name not in extra:
+                os.environ.pop(name, None)
+
+    def test_the_production_identity_is_refused_outside_ci(self, _system) -> None:
+        for extra in ({}, {ui.ALLOW_PRODUCTION_IDENTITY_ENV: "0"}, {"CI": ""}):
+            with self.subTest(extra=extra):
+                self._env(self.production, **extra)
+                with self.assertRaisesRegex(RuntimeError, ui.ALLOW_PRODUCTION_IDENTITY_ENV):
+                    ui.iced_bundle()
+                with self.assertRaisesRegex(RuntimeError, "production identity"):
+                    ui.socket_path("iced")
+
+    def test_ci_or_the_opt_in_allows_it(self, _system) -> None:
+        for extra in ({"CI": "true"}, {ui.ALLOW_PRODUCTION_IDENTITY_ENV: "1"}):
+            with self.subTest(extra=extra):
+                self._env(self.production, **extra)
+                self.assertEqual(ui.iced_bundle().bundle_id, "ai.stridelabs.Roost")
+
+    def test_a_dev_bundle_needs_no_opt_in(self, _system) -> None:
+        self._env(self.dev)
+        self.assertEqual(ui.iced_bundle().bundle_id, "ai.stridelabs.Roost.iced")
+
+    def test_the_production_identity_never_launches_on_the_real_state_dir(self, _system) -> None:
+        with (
+            patch("ui._ICED_BUNDLE", None),
+            patch("ui.subprocess.run") as run,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "throwaway state dir"):
+                ui._launch_iced_bundle(PRODUCTION_BUNDLE, state_dir=None)
+        run.assert_not_called()
+
+
+class BundleQualifiedCleanupTests(unittest.TestCase):
+    """Plan 089 D2: a launch that failed before its pid was confirmed stops
+    only processes running the bundle's own executable, by path — never by
+    name. The production executable is named `Roost`, as an installed
+    Roost.app's process is."""
+
+    def test_an_unrelated_process_with_the_bundles_executable_name_survives(self) -> None:
+        name = f"Roost{uuid.uuid4().hex[:8]}"
+        root = Path(tempfile.mkdtemp(prefix="roost-unit-same-name-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "elsewhere").mkdir()
+        link = root / "elsewhere" / name
+        # A symlink, so the process takes the link's name without a
+        # written-then-executed file; a plain binary, which keeps that name
+        # (a framework Python re-execs itself under another one on macOS).
+        link.symlink_to("/bin/sleep")
+        proc = subprocess.Popen([str(link), "60"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        deadline = time.monotonic() + 10
+        while str(proc.pid) not in subprocess.run(
+            ["pgrep", "-x", name], capture_output=True, text=True
+        ).stdout.split():
+            self.assertLess(time.monotonic(), deadline, f"pgrep never saw {name}")
+            time.sleep(0.05)
+
+        bundle = ui.IcedBundle(
+            app=root / "Roost.app",
+            bundle_id="ai.stridelabs.Roost",
+            executable=name,
+            profile="mac",
+            mac_label="Roost",
+            title="Roost",
+        )
+        asked: list[int] = []
+        real = ui._runs_inside
+
+        def spy(pid: int, b: "ui.IcedBundle"):
+            asked.append(pid)
+            return real(pid, b)
+
+        with patch("ui._runs_inside", side_effect=spy):
+            ui._stop_bundle_processes(bundle, graceful=1.0)
+        # A signal is delivered asynchronously: give a stopped process the
+        # time to die rather than sampling it once.
+        with self.assertRaises(
+            subprocess.TimeoutExpired, msg="an unrelated process with the bundle's name was stopped"
+        ):
+            proc.wait(timeout=1.0)
+        self.assertIn(proc.pid, asked, "the name matched, so only the path can have spared it")
+
+    def test_only_the_pid_running_inside_the_bundle_is_stopped(self) -> None:
+        commands = {
+            11: "/repo/mac/build/Roost.app/Contents/MacOS/Roost",
+            22: "/Applications/Roost.app/Contents/MacOS/Roost",
+        }
+        with (
+            patch(
+                "ui.subprocess.run",
+                return_value=subprocess.CompletedProcess(["pgrep"], 0, stdout="11\n22\n"),
+            ),
+            patch("ui._process_command", side_effect=commands.get),
+            patch("ui._terminate_owned_pid") as terminate,
+        ):
+            ui._stop_bundle_processes(PRODUCTION_BUNDLE, graceful=1.0)
+        self.assertEqual([c.args[0] for c in terminate.call_args_list], [11])
+
+    def test_a_production_pid_reused_by_an_installed_roost_app_is_never_signalled(self) -> None:
+        """Same process name, different bundle: the name check this replaced
+        would have killed the installed app."""
+        with (
+            patch("ui._ICED_BUNDLE_PID", 4242),
+            patch("ui._ICED_BUNDLE", PRODUCTION_BUNDLE),
+            patch("ui._pid_alive", return_value=True),
+            patch(
+                "ui._process_command",
+                side_effect=[
+                    "/repo/mac/build/Roost.app/Contents/MacOS/Roost",
+                    "/Applications/Roost.app/Contents/MacOS/Roost",
+                ],
+            ),
+            patch("ui._wait_pid_gone", side_effect=[False, True]),
+            patch("ui.subprocess.run") as run,
+        ):
+            ui._quit_iced_bundle()
+        self.assertEqual([call.args[0] for call in run.call_args_list], [["kill", "4242"]])
 
 
 if __name__ == "__main__":

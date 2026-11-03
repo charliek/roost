@@ -140,7 +140,7 @@ pass "missing dist/roost-session fails loudly with a clear error"
 
 # ---------------------------------------------------------------------
 # Case 4: the macOS asset — the name bootstrap.rs requests for a Mac host
-# (RemotePlatform::DARWIN_ARM64), from release.yml's mac-iced job.
+# (RemotePlatform::DARWIN_ARM64), from release.yml's mac job.
 # ---------------------------------------------------------------------
 dist4="${work_dir}/darwin/dist"
 mkdir -p "${dist4}"

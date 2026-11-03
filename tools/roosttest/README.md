@@ -54,6 +54,41 @@ refuses to rebuild over a Developer-ID-signed bundle — that is a release
 artifact, and `bundle.sh debug` would replace it with an ad-hoc debug build
 at the same path; set the opt-out to test it as it is.
 
+### Bundles and their identities (`ROOST_ICED_APP`)
+
+One naming, stated once. `--roost-target iced` drives the iced UI: the bare
+`target/debug/roost-iced` (the dev `Iced` profile), or on macOS whichever
+bundle `ROOST_ICED_APP` names. `mac/scripts/bundle-iced.sh` assembles two
+identities, and the bundle's own `Info.plist` decides which one the harness
+is driving:
+
+| `ROOST_BUNDLE_IDENTITY` | Bundle | `CFBundleIdentifier` | Profile | Socket, logs |
+|---|---|---|---|---|
+| `production` | `mac/build/Roost.app` | `ai.stridelabs.Roost` | `Mac` | `~/Library/Caches/Roost/`, `~/Library/Logs/Roost/` |
+| `dev` (default) | `mac/build/Roost-Iced.app` | `ai.stridelabs.Roost.iced` | `Iced` | `~/Library/Caches/Roost-iced/`, `~/Library/Logs/Roost-iced/` |
+
+Every profile-derived value follows that mapping: the socket and its lock,
+the log the launch reads back, the expected `identify.app_id` and the
+`resolved bundle identity` line it asserts. roostctl names the same two
+profiles `--target mac` (the production Roost.app) and `--target iced` (a
+dev build).
+
+The production identity is the installed Roost.app's on a developer's Mac:
+same socket, logs and defaults domain, and `--roost-fresh` quits whatever
+answers on that socket. So outside CI the harness refuses it unless
+`ROOST_TEST_ALLOW_PRODUCTION_IDENTITY=1` is set — quit Roost.app first. CI
+(`CI` set) needs no opt-in. Either way it only ever launches on a throwaway
+`ROOST_STATE_DIR`, and teardown signals a bundle's processes by pid, each
+re-checked to be running the executable inside the launched bundle — never
+by process name, which for the production bundle is `Roost`, the installed
+app's too.
+
+```bash
+make e2e-iced-bundle                                   # assembles + drives the dev Roost-Iced.app
+make e2e-iced-bundle ICED_APP=mac/build/Roost.app \
+  ROOST_TEST_ALLOW_PRODUCTION_IDENTITY=1               # drives an already-built production bundle
+```
+
 ## Layout
 
 | File | What |

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate a publish-free copy of .github/workflows/release.yml.
 
-The output builds every release artifact (linux amd64/arm64, mac, mac-iced)
-on a `dryrun/**` branch push and uploads them as workflow artifacts. It
+The output builds every release artifact (linux amd64/arm64, mac) on a
+`dryrun/**` branch push and uploads them as workflow artifacts. It
 publishes nothing: no draft release, no Sparkle signing, no appcast, no apt
 dispatch, no notarization. See tools/release/README.md.
 
@@ -29,22 +29,17 @@ REMOVED_JOBS = (
     "create-release",
     "publish-release",
     "appcast",
-    "appcast-iced",
     "dispatch-apt-charliek",
 )
-KEPT_JOBS = ("version-check", "linux", "mac", "mac-iced")
-BUILD_JOBS = ("linux", "mac", "mac-iced")
-NOTARIZING_JOBS = ("mac", "mac-iced")
+KEPT_JOBS = ("version-check", "linux", "mac")
+BUILD_JOBS = ("linux", "mac")
+NOTARIZING_JOBS = ("mac",)
 
 DELETED_STEPS = {
     "mac": (
         "Sign the DMG for Sparkle",
         "Hand sign.txt to the appcast job",
         "Append macOS first-launch note to release body",
-    ),
-    "mac-iced": (
-        "Sign the DMG for Sparkle",
-        "Hand sign-iced.txt to the appcast-iced job",
     ),
 }
 

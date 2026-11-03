@@ -360,10 +360,11 @@ cmd_launch() {
   app="${app:-${REPO_ROOT}/mac/build/Roost-Iced.app}"
   [ -d "$app" ] || die "no app bundle at $app — build one first: mac/scripts/bundle-iced.sh debug"
 
-  # bundle-iced.sh always names both the .app dir and its executable
-  # "Roost-Iced" (APP_NAME) — this is not derived from --app's basename.
+  # Dev-only: a dev bundle's executable is always Roost-Iced, whatever --app
+  # is named. A production Roost.app (executable Roost) is refused by this
+  # check on purpose — it runs on the installed Roost.app's socket and state.
   local exe="${app}/Contents/MacOS/Roost-Iced"
-  [ -x "$exe" ] || die "$exe missing or not executable — rebuild with mac/scripts/bundle-iced.sh debug"
+  [ -x "$exe" ] || die "$exe missing or not executable — launch takes a dev bundle (mac/scripts/bundle-iced.sh debug), never a production Roost.app"
 
   log "running: ROOST_SESSION_INSTALL_BIN=$artifact $exe"
   ROOST_SESSION_INSTALL_BIN="$artifact" exec "$exe"

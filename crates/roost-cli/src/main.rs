@@ -223,8 +223,11 @@ struct Args {
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
 enum TargetArg {
+    /// The macOS `Roost.app` (`~/Library/Caches/Roost/roost.sock`).
     Mac,
+    /// The packaged Linux `roost`.
     Linux,
+    /// A dev build: `roost-iced` from a dev tree, or a dev `Roost-Iced.app`.
     Iced,
     /// The headless `roost-session` daemon (#475). Explicit only —
     /// unlike the other three, this value has no `ROOST_BUNDLE_PROFILE`
@@ -1229,9 +1232,6 @@ struct UiSocket<'a> {
     follows_window: bool,
     client: Option<IpcClient>,
     path: PathBuf,
-    /// The kind of UI `client` dialled, when the target ladder named one;
-    /// `None` before it has dialled.
-    kind: Option<BundleProfileKind>,
 }
 
 impl<'a> UiSocket<'a> {
@@ -1246,7 +1246,6 @@ impl<'a> UiSocket<'a> {
             follows_window,
             client: None,
             path: PathBuf::new(),
-            kind: None,
         }
     }
 
@@ -1258,7 +1257,6 @@ impl<'a> UiSocket<'a> {
                     window::route(self.selector, self.environment, self.follows_window).await?;
                 let client = dial(&target.socket_path).await?;
                 self.path = target.socket_path;
-                self.kind = target.kind;
                 client
             }
         };
@@ -1294,26 +1292,18 @@ impl<'a> UiSocket<'a> {
 }
 
 /// `tab.open` with this roostctl stated as the tab's opener (plan 085
-/// D7), the one way `tab open` and `open` send it.
-///
-/// Nothing is stated to a target the ladder named Roost.app: the Swift
-/// app is frozen and refuses both fields. Only on macOS — elsewhere that
-/// profile resolves to a Rust UI, which honours them. A server that
-/// refuses them by name — Roost.app reached by `--socket`, a session from
-/// before them — is asked once more without; any other refusal is the
-/// answer.
+/// D7), the one way `tab open` and `open` send it, to whatever kind of
+/// UI the ladder resolved. A server that refuses the fields by name — a
+/// session from before them — is asked once more without; any other
+/// refusal is the answer.
 async fn open_tab(
     ui: &mut UiSocket<'_>,
     mut params: TabOpenParams,
 ) -> Result<TabOpenResult, CliError> {
-    ui.client().await?;
-    let stated = !(cfg!(target_os = "macos") && ui.kind == Some(BundleProfileKind::Mac));
-    if stated {
-        ui.environment.opener.state(&mut params);
-    }
+    ui.environment.opener.state(&mut params);
     match ui.client().await?.call(ops::TAB_OPEN, &params).await {
         Err(roost_ipc::ClientError::Server { code, message })
-            if stated && opener::refuses_opener_fields(&code, &message) =>
+            if opener::refuses_opener_fields(&code, &message) =>
         {
             tracing::debug!(%message, "the server refuses the opener fields; asking again");
             params.env = None;
@@ -3944,11 +3934,17 @@ mod tests {
 
     impl FakeUi {
         fn start(tag: &str, answer: impl Fn(&str) -> Answer + Send + Sync + 'static) -> Self {
+            Self::start_at(&short_socket_dir(tag).join("ui.sock"), answer)
+        }
+
+        fn start_at(
+            socket: &Path,
+            answer: impl Fn(&str) -> Answer + Send + Sync + 'static,
+        ) -> Self {
             use roost_ipc::messages::{RawRequest, Response};
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-            let socket = short_socket_dir(tag).join("ui.sock");
-            let listener = tokio::net::UnixListener::bind(&socket).expect("bind the fake UI");
+            let listener = tokio::net::UnixListener::bind(socket).expect("bind the fake UI");
             let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let seen = requests.clone();
             let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5547,13 +5543,8 @@ mod tests {
         }
     }
 
-    /// `open_tab` on a connection already dialled to `ui`, as the ladder
-    /// would have left it had it resolved a UI of `kind`.
-    async fn open_tab_on(
-        ui: &FakeUi,
-        kind: Option<BundleProfileKind>,
-        opener: opener::Opener,
-    ) -> Result<TabOpenResult, CliError> {
+    /// `open_tab` on a connection already dialled to `ui`.
+    async fn open_tab_on(ui: &FakeUi, opener: opener::Opener) -> Result<TabOpenResult, CliError> {
         let selector = TargetSelector::default();
         let environment = Environment {
             opener,
@@ -5561,7 +5552,6 @@ mod tests {
         };
         let mut socket = UiSocket::new(&selector, &environment, false);
         socket.client = Some(dial(Path::new(&ui.socket)).await.unwrap());
-        socket.kind = kind;
         open_tab(
             &mut socket,
             TabOpenParams {
@@ -5572,39 +5562,73 @@ mod tests {
         .await
     }
 
-    /// Plan 085 D7 (rule 7): a target the ladder named Roost.app is sent
-    /// neither field — the frozen Swift app refuses both — while every
-    /// other kind, and a socket of unknown kind, is.
-    #[tokio::test]
-    async fn nothing_is_stated_to_a_target_named_roost_app() {
-        let ui = FakeUi::start("opener-mac-kind", answer_ensure_and_open);
-        for (kind, opener) in [
-            (Some(BundleProfileKind::Mac), desk_opener()),
-            (Some(BundleProfileKind::Mac), laptop_opener()),
-        ] {
-            open_tab_on(&ui, kind, opener).await.expect("opened");
-            let sent = ui.take();
-            let opener_fields = stated(tab_opens(&sent)[0]);
-            if cfg!(target_os = "macos") {
-                assert_eq!(opener_fields, (None, None), "{kind:?}");
-            } else {
-                assert_ne!(
-                    opener_fields,
-                    (None, None),
-                    "{kind:?} is a Rust UI off macOS"
-                );
+    /// Sets one process-global variable for the life of the guard. Hold
+    /// [`TEST_ENV`] across it.
+    struct EnvVar {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            EnvVar { key, prev }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
             }
         }
-        for kind in [
-            None,
-            Some(BundleProfileKind::Iced),
-            Some(BundleProfileKind::Linux),
-            Some(BundleProfileKind::Session),
+    }
+
+    /// Plan 089 D2: `--target mac` names the iced `Roost.app`, so the
+    /// ladder's `Mac` answer is told its opener like any other target, on
+    /// every OS — `env` at the machine and `origin` over SSH.
+    #[tokio::test]
+    async fn tab_open_states_its_opener_to_a_mac_profile_target() {
+        let _env = TEST_ENV.lock().await;
+        let root = short_socket_dir("opener-mac");
+        let _paths = if cfg!(target_os = "macos") {
+            EnvVar::set("HOME", &root)
+        } else {
+            EnvVar::set("XDG_RUNTIME_DIR", &root)
+        };
+        let socket = roost_ipc::paths::BundleProfile::mac()
+            .expect("mac profile")
+            .socket_path;
+        assert!(
+            socket.starts_with(&root),
+            "{socket:?} is not under {root:?}"
+        );
+        std::fs::create_dir_all(socket.parent().expect("a socket dir")).unwrap();
+        let ui = FakeUi::start_at(&socket, answer_ensure_and_open);
+        let desk = serde_json::json!({ "DISPLAY": ":4", "SSH_AUTH_SOCK": "/desk/agent" });
+        let laptop = serde_json::json!({
+            "ssh_connection": "10.0.0.2 5 10.0.0.1 22",
+            "ssh_client": "10.0.0.2 5 22",
+        });
+        for (opener, expected) in [
+            (desk_opener(), (Some(desk), None)),
+            (laptop_opener(), (None, Some(laptop))),
         ] {
-            open_tab_on(&ui, kind, desk_opener()).await.expect("opened");
+            let environment = Environment {
+                opener,
+                ..Environment::default()
+            };
+            let argv = ["--target", "mac", "tab", "open", "--project-id", "42"];
+            let args = parse(&argv).unwrap();
+            assert_eq!(run(args, None, None, &environment).await, Ok(0));
             let sent = ui.take();
-            assert!(stated(tab_opens(&sent)[0]).0.is_some(), "{kind:?}");
+            let opens = tab_opens(&sent);
+            assert_eq!(opens.len(), 1, "{sent:?}");
+            assert_eq!(stated(opens[0]), expected);
         }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A stand-in UI that refuses the first `tab.open` it is sent with
@@ -5642,7 +5666,7 @@ mod tests {
             ),
         ] {
             let ui = refusing_first_open(tag, ("unknown-field", refusal));
-            let opened = open_tab_on(&ui, None, opener).await;
+            let opened = open_tab_on(&ui, opener).await;
             assert!(opened.is_ok(), "{refusal}: {opened:?}");
             let sent = ui.take();
             let opens = tab_opens(&sent);
@@ -5676,7 +5700,7 @@ mod tests {
             ),
         ] {
             let ui = refusing_first_open(tag, ("unknown-field", refusal));
-            let error = open_tab_on(&ui, None, laptop_opener())
+            let error = open_tab_on(&ui, laptop_opener())
                 .await
                 .expect_err("the refusal surfaces");
             assert_eq!(

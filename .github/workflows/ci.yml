@@ -129,6 +129,9 @@ jobs:
               - 'mac/scripts/bundle-lib.sh'
               - 'mac/scripts/bundle-iced.sh'
               - 'mac/Resources/Info-iced.plist.template'
+              # The production identity's Sparkle key and its release check.
+              - 'mac/keys/**'
+              - 'mac/scripts/verify-sparkle-key.sh'
               # test_osc7_emitters.py sources all four in real bash and zsh.
               - 'crates/roost-engine/resources/shell-integration/**'
               - 'mac/Sources/Roost/Resources/shell-integration/**'
@@ -140,6 +143,9 @@ jobs:
               - 'tools/release/**'
               - '.github/workflows/release.yml'
               - 'tools/agent-status/**'
+              # test_sparkle_plist.py stamps the plist template; the
+              # entitlements are read beside it.
+              - 'mac/Resources/**'
             # roost-cli's `doc_anchors_resolve` test reads the site nav and
             # every page it links, so those files are inputs to a RUST test
             # even though no Rust file changes when they move. Without this,
@@ -215,12 +221,18 @@ jobs:
               # to either one would re-run nothing that packages a DMG.
               - 'mac/scripts/make-dmg.sh'
               - 'mac/scripts/update-appcast.py'
+              # The production assemble stamps the committed Sparkle key.
+              - 'mac/keys/**'
+              - 'mac/scripts/verify-sparkle-key.sh'
             # Gates the `scripts` job below (make test-linux-scripts +
             # test-mac-scripts) — the only lane that runs either shell
             # test suite; without this filter a script-only fix runs no
             # CI job at all.
             scripts:
               - 'mac/scripts/notarize*.sh'
+              - 'mac/scripts/verify-sparkle-key*.sh'
+              # verify-sparkle-key_test.sh checks the committed key.
+              - 'mac/keys/**'
               - 'linux/scripts/**'
               - 'Makefile'
 
@@ -302,6 +314,9 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      # verify-sparkle-key.sh and its test reach `cryptography` through uv.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
       - name: Shell tests for linux/scripts + mac/scripts release helpers
         run: make test-linux-scripts test-mac-scripts
 
@@ -1485,11 +1500,10 @@ jobs:
             || { echo "FAIL: CFBundleShortVersionString still has the unsubstituted @VERSION@ placeholder"; exit 1; }
           echo "OK: CFBundleShortVersionString is '$version'"
 
-          # 6c posture (plan 028): Sparkle MECHANICS ship, feed
-          # deliberately absent. The default assemble must never carry a
-          # feed URL or public key — the two apps must not be able to
-          # offer each other's updates, and feed enablement is the
-          # explicit ROOST_ICED_SPARKLE_* env pair at bundle time.
+          # A dev bundle ships the Sparkle MECHANICS with no feed: the
+          # default assemble must never carry a feed URL or public key, so
+          # it can never offer or accept an update. Feed enablement is the
+          # explicit ROOST_SPARKLE_* env pair at bundle time.
           for key in SUFeedURL SUPublicEDKey; do
             if has_key "$INFO" "$key"; then
               echo "FAIL: Info.plist unexpectedly carries $key (default assemble must stay feedless)"; exit 1
@@ -1804,12 +1818,12 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         env:
-          ROOST_ICED_SPARKLE_FEED_URL: http://127.0.0.1:1/placeholder
+          ROOST_BUNDLE_SPARKLE_FEED_URL: http://127.0.0.1:1/placeholder
         run: |
           set -euo pipefail
           key_file=tools/roosttest/fixtures/sparkle/TEST-ONLY-public-ed-key.txt
           test -f "$key_file" || { echo "missing $key_file"; exit 1; }
-          ROOST_ICED_SPARKLE_ED_PUBLIC_KEY="$(cat "$key_file")" \
+          ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY="$(cat "$key_file")" \
             ./mac/scripts/bundle-iced.sh debug
           plist="mac/build/Roost-Iced.app/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$plist" >/dev/null \
@@ -1838,21 +1852,98 @@ jobs:
           -m 'not host_client'
           --roost-target iced --roost-fresh -v
 
-      # Branch-side proof of the release path's packaging half (plan 030
-      # § 3.5): release.yml's `mac-iced` job runs this same script with the
-      # same overrides, and the regression that matters is the staging leaf —
-      # a DMG that contains "Roost.app" would drag-install OVER the Swift app.
-      # Version string is arbitrary here; only the layout is under test.
-      - name: Smoke the iced DMG (macOS)
-        if: runner.os == 'macOS'
+      # The production identity (plan 089 D4): the Roost.app release.yml's
+      # `mac` job ships, assembled from the same debug cargo artifacts with
+      # the real feed and the committed production key. The dev bundle's
+      # asserts above keep running; these add the production half. One cell
+      # is enough — nothing here depends on the renderer.
+      - name: Assemble production Roost.app (macOS)
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
         shell: bash
         env:
-          ROOST_DMG_APP_DIR: mac/build/Roost-Iced.app
-          ROOST_DMG_BASENAME: Roost-Iced-ci-smoke
+          ROOST_BUNDLE_IDENTITY: production
+          ROOST_BUNDLE_SPARKLE_FEED_URL: https://charliek.github.io/roost/appcast.xml
+        run: |
+          set -euo pipefail
+          ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY="$(cat mac/keys/roost-sparkle-ed-public-key.txt)" \
+            ./mac/scripts/bundle-iced.sh debug
+
+      - name: Assert production bundle contents (macOS)
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="mac/build/Roost.app"
+          INFO="$APP/Contents/Info.plist"
+          check() {
+            got="$(/usr/libexec/PlistBuddy -c "Print :$1" "$INFO" 2>/dev/null)" \
+              || { echo "FAIL: $INFO has no $1"; exit 1; }
+            [ "$got" = "$2" ] || { echo "FAIL: $1 is '$got', want '$2'"; exit 1; }
+            echo "OK: $1 = $2"
+          }
+          check CFBundleIdentifier ai.stridelabs.Roost
+          check CFBundleExecutable Roost
+          check CFBundleName Roost
+          check CFBundleDisplayName Roost
+          check SUFeedURL https://charliek.github.io/roost/appcast.xml
+          check SUPublicEDKey "$(tr -d '[:space:]' < mac/keys/roost-sparkle-ed-public-key.txt)"
+          check SUEnableAutomaticChecks false
+          check NSMicrophoneUsageDescription "A program running in Roost would like to use the microphone."
+          [ -x "$APP/Contents/MacOS/Roost" ] \
+            || { echo "FAIL: $APP/Contents/MacOS/Roost missing or not executable"; exit 1; }
+          [ ! -e "$APP/Contents/MacOS/Roost-Iced" ] \
+            || { echo "FAIL: $APP carries the dev executable name"; exit 1; }
+          codesign --verify --deep --strict "$APP"
+          echo "OK: codesign --verify --deep --strict passed"
+
+          # libghostty-vt is linked statically on purpose: a dynamic link
+          # reintroduces the dyld @rpath failure the Swift build once hit
+          # (swift-mac's guard, ported). Every Mach-O either bundle ships is
+          # checked, and otool's output is captured first so a binary it
+          # cannot read fails here rather than reading as "no ghostty".
+          for bundle in "$APP" mac/build/Roost-Iced.app; do
+            for bin in "$bundle"/Contents/MacOS/* "$bundle/Contents/Resources/bin/roostctl"; do
+              deps="$(otool -L "$bin")" || { echo "FAIL: otool -L could not read $bin"; exit 1; }
+              if grep -qi 'ghostty' <<<"$deps"; then
+                echo "FAIL: $bin links libghostty-vt dynamically:"
+                printf '%s\n' "$deps"
+                exit 1
+              fi
+              echo "OK: $bin has no dynamic ghostty-vt link"
+            done
+          done
+
+      # `CI` is set by Actions, which is the harness's licence to drive the
+      # production identity — its socket and logs are the installed
+      # Roost.app's on a developer's Mac (tools/roosttest/README.md).
+      - name: Run production bundle smoke (macOS)
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_ICED_APP: mac/build/Roost.app
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-production-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-production-logs
+        run: >
+          uv run --group test pytest
+          tools/roosttest/test_smoke.py
+          -m 'not host_client'
+          --roost-target iced --roost-fresh -v
+
+      # Branch-side proof of the release path's packaging half: release.yml's
+      # `mac` job runs make-dmg.sh with its defaults on mac/build/Roost.app.
+      # Version string is arbitrary here; only the layout is under test.
+      - name: Smoke the DMG (macOS)
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
+        shell: bash
+        env:
+          ROOST_DMG_BASENAME: Roost-ci-smoke
         run: |
           set -euo pipefail
           ./mac/scripts/make-dmg.sh 0.0.0-ci
-          dmg="mac/build/Roost-Iced-ci-smoke.dmg"
+          dmg="mac/build/Roost-ci-smoke.dmg"
           mnt="$(mktemp -d)"
           # Hosted macOS runners fail an attach now and then with "Resource
           # temporarily unavailable" (2026-10-06), the same contention
@@ -1865,10 +1956,12 @@ jobs:
           done
           trap 'hdiutil detach "$mnt" >/dev/null 2>&1 || true' EXIT
           ls -la "$mnt"
-          [ -d "$mnt/Roost-Iced.app" ] \
-            || { echo "FAIL: $dmg does not contain Roost-Iced.app at its root"; exit 1; }
-          [ ! -e "$mnt/Roost.app" ] \
-            || { echo "FAIL: $dmg contains Roost.app — the iced DMG would drag-install over the Swift app"; exit 1; }
+          [ -d "$mnt/Roost.app" ] \
+            || { echo "FAIL: $dmg does not contain Roost.app at its root"; exit 1; }
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$mnt/Roost.app/Contents/Info.plist")" = "ai.stridelabs.Roost" ] \
+            || { echo "FAIL: the Roost.app in $dmg is not the production identity"; exit 1; }
+          [ ! -e "$mnt/Roost-Iced.app" ] \
+            || { echo "FAIL: $dmg also carries Roost-Iced.app"; exit 1; }
           # Spotlight/quarantine briefly holds a fresh mount on CI runners,
           # so a bare detach intermittently fails "Resource busy" (exit 16)
           # AFTER every assertion has passed. Retry, then force — cleanup
@@ -1881,14 +1974,14 @@ jobs:
           done
           trap - EXIT
           rmdir "$mnt" 2>/dev/null || true
-          echo "OK: iced DMG mounts with Roost-Iced.app (and no Roost.app) at its root"
+          echo "OK: the DMG mounts with the production Roost.app at its root"
 
       # The other half: sign_update -> update-appcast.py, the exact chain
-      # release.yml's mac-iced + appcast-iced jobs run, against a scratch copy
-      # of the committed seed feed. Proves the seed parses, the iced overrides
-      # reach the enclosure, and the writer's output is well-formed XML.
-      - name: Smoke the iced sign -> appcast chain (macOS)
-        if: runner.os == 'macOS'
+      # release.yml's `mac` + `appcast` jobs run, against a scratch copy of
+      # the live docs/appcast.xml. Proves the feed parses, the enclosure
+      # carries the DMG's name, and the writer's output is well-formed XML.
+      - name: Smoke the sign -> appcast chain (macOS)
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
         shell: bash
         run: |
           set -euo pipefail
@@ -1905,19 +1998,19 @@ jobs:
           openssl rand 32 | base64 > "$W/ephemeral-private.key"
           third_party/sparkle/out/bin/sign_update \
             --ed-key-file "$W/ephemeral-private.key" \
-            mac/build/Roost-Iced-ci-smoke.dmg > "$W/sign-iced.txt"
-          cat "$W/sign-iced.txt"
-          cp docs/appcast-iced.xml "$W/appcast-iced.xml"
+            mac/build/Roost-ci-smoke.dmg > "$W/sign.txt"
+          cat "$W/sign.txt"
+          cp docs/appcast.xml "$W/appcast.xml"
           ROOST_VERSION=0.0.0-ci-smoke \
             ROOST_TAG=v0.0.0-ci-smoke \
-            ROOST_APPCAST="$W/appcast-iced.xml" \
-            ROOST_DMG_NAME=Roost-Iced-ci-smoke.dmg \
-            ROOST_SIGN_FILE="$W/sign-iced.txt" \
+            ROOST_APPCAST="$W/appcast.xml" \
+            ROOST_DMG_NAME=Roost-ci-smoke.dmg \
+            ROOST_SIGN_FILE="$W/sign.txt" \
             python3 mac/scripts/update-appcast.py
-          xmllint --noout "$W/appcast-iced.xml"
-          grep -q 'Roost-Iced-ci-smoke\.dmg' "$W/appcast-iced.xml" \
-            || { echo "FAIL: the appcast entry does not carry the iced enclosure name"; exit 1; }
-          echo "OK: sign_update -> update-appcast.py chain produced a valid iced feed entry"
+          xmllint --noout "$W/appcast.xml"
+          grep -q 'Roost-ci-smoke\.dmg' "$W/appcast.xml" \
+            || { echo "FAIL: the appcast entry does not carry the DMG's enclosure name"; exit 1; }
+          echo "OK: sign_update -> update-appcast.py chain produced a valid feed entry"
 
       - name: Collect Iced diagnostics
         if: always()
@@ -1948,6 +2041,10 @@ jobs:
             # `Roost-Iced` (CFBundleExecutable), not `roost-iced`, so its
             # crash reports need their own glob.
             cp "$HOME"/Library/Logs/DiagnosticReports/Roost-Iced*.ips diagnostics/ 2>/dev/null || true
+            # The production bundle logs under its own `Roost` label.
+            cp "$HOME"/Library/Logs/Roost/roost.log diagnostics/roost-production-bundle-persistent.log 2>/dev/null || true
+            cp "$HOME"/Library/Logs/Roost/crash-*.txt diagnostics/ 2>/dev/null || true
+            cp "$HOME"/Library/Logs/DiagnosticReports/Roost-[0-9]*.ips diagnostics/ 2>/dev/null || true
             # The real-input suite's artifacts dir holds every helper
             # invocation's JSON (helper/<n>-<command>/), the JUnit XML, any
             # captures and the Roost-linux logs the module copied before its

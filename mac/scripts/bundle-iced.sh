@@ -1,32 +1,33 @@
 #!/usr/bin/env bash
-# Roost-Iced.app bundling — M6 6a (plan 027).
+# Assembles the iced macOS app bundle, in one of two identities
+# (ROOST_BUNDLE_IDENTITY, default `dev`):
 #
-# Wraps the `roost-iced` cargo binary into a proper macOS .app bundle
-# so it can be Finder-launched / Dock-pinned / referenced by its own
-# bundle identifier, side by side with the Swift Roost.app, so M6 can
-# evaluate the iced UI with real macOS bundle identity: Sparkle (6c),
-# UNUserNotificationCenter (6e), and TCC testing all require a
-# bundled, signed .app.
+#   production  mac/build/Roost.app — ai.stridelabs.Roost, executable
+#               Contents/MacOS/Roost. The shipped app. Requires both
+#               ROOST_BUNDLE_SPARKLE_FEED_URL and ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY.
+#   dev         mac/build/Roost-Iced.app — ai.stridelabs.Roost.iced,
+#               executable Contents/MacOS/Roost-Iced. Runs beside an
+#               installed Roost.app. Feedless unless both Sparkle values
+#               are set.
+#
+# Any other value is a hard error, raised before the cargo build.
 #
 # What this script does:
 #   1. Builds `roost-iced` in the requested configuration
 #      (default: release) via `cargo build -p roost-iced`.
-#   2. Assembles `mac/build/Roost-Iced.app` with the standard macOS
-#      bundle layout — Contents/MacOS/Roost-Iced, Contents/Info.plist,
-#      Contents/Resources/.
-#   3. Substitutes @VERSION@ in
-#      `mac/Resources/Info-iced.plist.template` with the workspace
-#      version (or $ROOST_VERSION).
-#   4. Installs the app icon, reusing the same art as Roost.app
-#      (shared art is a recorded decision — plan 027 § W2; a distinct
-#      Roost-Iced icon is future work), and the SIL OFL texts of the two
-#      fonts compiled into the binary (Inter, JetBrains Mono) under
+#   2. Assembles the .app with the standard macOS bundle layout —
+#      Contents/MacOS/<name>, Contents/Info.plist, Contents/Resources/.
+#   3. Stamps `mac/Resources/Info-iced.plist.template` with the workspace
+#      version (or $ROOST_VERSION) and the identity's id and name, then
+#      inserts the Sparkle feed keys when they are given.
+#   4. Installs the app icon and the SIL OFL texts of the two fonts
+#      compiled into the binary (Inter, JetBrains Mono) under
 #      Contents/Resources/ — the OFL requires the license to travel with
 #      the fonts.
-#   5. Embeds `roostctl` under Contents/Resources/bin/ (same as
-#      bundle.sh) and the `roost-session` daemon under Contents/MacOS/,
-#      with a relative compatibility symlink beside roostctl — HS-4b
-#      mechanics (plan 041 § 3.2).
+#   5. Embeds `roostctl` under Contents/Resources/bin/ and the
+#      `roost-session` daemon under Contents/MacOS/, with a relative
+#      compatibility symlink beside roostctl — HS-4b mechanics (plan 041
+#      § 3.2).
 #   6. Fetches (pinned version+SHA, cached — third_party/sparkle/
 #      fetch.sh) and embeds Sparkle.framework under Contents/
 #      Frameworks/ — M6 6c mechanics (plan 028). The embed runs even
@@ -44,45 +45,23 @@
 #      verify plus proof that the nested signatures are OURS). Nonzero
 #      exit on any miss.
 #
-# Sparkle posture (6c: mechanics shipped, feed deliberately absent):
-# the bundle carries the signed framework and the updater machinery,
-# but NO SUFeedURL and NO SUPublicEDKey — a build with no feed never
-# checks, and the two Roost bundles must never be able to offer each
-# other's updates (see Info-iced.plist.template's header). Feed
-# enablement is the ROOST_ICED_SPARKLE_FEED_URL +
-# ROOST_ICED_SPARKLE_ED_PUBLIC_KEY env pair below (both set → keys
-# PlistBuddy-inserted; exactly one → hard error; neither → today's
-# posture).
-#
-# What this script deliberately does NOT do (unlike bundle.sh):
-#   * No SwiftPM build, no SwiftPM resource-bundle copy — the iced
-#     chrome and terminal fonts are `include_bytes!`'d and the themes
-#     ship compiled into `roost-ui-model`; nothing is loaded from a
-#     resource bundle at runtime.
-#
-# Deferred the same way bundle.sh defers them (shared posture, not a
-# difference):
-#   * Notarize via `notarytool`.
-#   * Build a DMG (out of scope — plan 027 scope brief: local build
-#     only, no release.yml wiring).
+# Not done here: notarization (mac/scripts/notarize.sh) and the DMG
+# (mac/scripts/make-dmg.sh), which release.yml runs after this.
 #
 # The toolkit-agnostic stages (version derivation, icon pipeline,
 # roostctl embed, signing machinery, the libghostty-vt precondition)
-# live in bundle-lib.sh, shared with bundle.sh.
-#
-# Note (plan 027 § 4, roadmap 6a decision, not fixed here): with both
-# Roost.app and Roost-Iced.app installed, `claude install`'s
-# self_exe-derived hook path points at whichever bundle's roostctl
-# ran it last — running it from Roost-Iced.app points Claude hooks at
-# this bundle's embedded roostctl, and vice versa for Roost.app. Not
-# a 6a blocker; noted for later slices.
+# live in bundle-lib.sh.
 #
 # Usage:
-#   ./mac/scripts/bundle-iced.sh                 # release build
-#   ./mac/scripts/bundle-iced.sh debug           # debug build
+#   ./mac/scripts/bundle-iced.sh                 # release build, dev identity
+#   ./mac/scripts/bundle-iced.sh debug           # debug build, dev identity
 #   ROOST_VERSION=0.2.0 ./mac/scripts/bundle-iced.sh
+#   ROOST_BUNDLE_IDENTITY=production \
+#     ROOST_BUNDLE_SPARKLE_FEED_URL=https://charliek.github.io/roost/appcast.xml \
+#     ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY="$(cat mac/keys/roost-sparkle-ed-public-key.txt)" \
+#     ./mac/scripts/bundle-iced.sh release       # the shipped Roost.app
 #
-#   open mac/build/Roost-Iced.app                # launch the bundle
+#   open mac/build/Roost-Iced.app                # launch the dev bundle
 
 set -euo pipefail
 
@@ -102,16 +81,19 @@ REPO_ROOT="$(cd "${MAC_DIR}/.." && pwd)"
 # shellcheck source=mac/scripts/bundle-lib.sh
 source "${SCRIPT_DIR}/bundle-lib.sh"
 
+SPARKLE_FEED_URL="${ROOST_BUNDLE_SPARKLE_FEED_URL:-}"
+SPARKLE_ED_PUBLIC_KEY="${ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY:-}"
+roost_resolve_bundle_identity "${ROOST_BUNDLE_IDENTITY:-dev}" \
+  "${SPARKLE_FEED_URL}" "${SPARKLE_ED_PUBLIC_KEY}"
+APP_NAME="${ROOST_APP_NAME}"
+BUNDLE_ID="${ROOST_BUNDLE_ID}"
+
 # Default the marketing version to the workspace's single source of
 # truth — see roost_workspace_version in bundle-lib.sh — so a local
-# `bundle-iced.sh debug` reports the same version the Swift app, the
-# .deb, and `roostctl identify` do.
+# `bundle-iced.sh debug` reports the same version the .deb and
+# `roostctl identify` do.
 VERSION="${ROOST_VERSION:-$(roost_workspace_version "${REPO_ROOT}")}"
-APP_NAME="Roost-Iced"
-BUNDLE_ID="ai.stridelabs.Roost.iced"
 TEMPLATE_PLIST="${MAC_DIR}/Resources/Info-iced.plist.template"
-# Shared icon art with Roost.app (plan 027 § W2 — recorded decision;
-# a distinct Roost-Iced icon is future work).
 ICON_SRC="${MAC_DIR}/Resources/AppIcon.icns"
 ICON_COMPOSER_SRC="${MAC_DIR}/AppIcon.icon"
 
@@ -142,13 +124,8 @@ roost_assemble_skeleton "${APP_DIR}"
 cp "${ICED_BUILD_BIN}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 chmod +x "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 
-roost_stamp_plist "${TEMPLATE_PLIST}" "${APP_DIR}" "${VERSION}"
-# Optional feed enablement (plan 028 § 3.9): both env vars set inserts
-# SUFeedURL + SUPublicEDKey into the stamped plist; exactly one is a
-# hard error; neither (the default) keeps today's no-feed posture.
-roost_insert_sparkle_feed "${APP_DIR}" \
-  "${ROOST_ICED_SPARKLE_FEED_URL:-}" \
-  "${ROOST_ICED_SPARKLE_ED_PUBLIC_KEY:-}"
+roost_stamp_plist "${TEMPLATE_PLIST}" "${APP_DIR}" "${VERSION}" "${BUNDLE_ID}" "${APP_NAME}"
+roost_insert_sparkle_feed "${APP_DIR}" "${SPARKLE_FEED_URL}" "${SPARKLE_ED_PUBLIC_KEY}"
 roost_write_pkginfo "${APP_DIR}"
 
 roost_install_app_icon "${ICON_COMPOSER_SRC}" "${ICON_SRC}" "${APP_DIR}"
@@ -157,9 +134,9 @@ echo "==> Installing font licenses"
 cp "${REPO_ROOT}/third_party/inter/LICENSE.txt" "${APP_DIR}/Contents/Resources/Inter-OFL.txt"
 cp "${REPO_ROOT}/third_party/jetbrains-mono/OFL.txt" "${APP_DIR}/Contents/Resources/JetBrainsMono-OFL.txt"
 
-# M8-parity: embed roostctl under Contents/Resources/bin/ so `claude
-# install` invoked from inside Roost-Iced.app writes hook paths that
-# point at the bundled binary, not a dev-machine target/ path.
+# Embed roostctl under Contents/Resources/bin/ so `roostctl agent
+# install` run from inside the app writes hook paths that point at the
+# bundled binary, not a dev-machine target/ path.
 roost_build_and_embed_roostctl "${REPO_ROOT}" "${APP_DIR}" "${CONFIG}"
 
 # HS-4b (plan 041 § 3.2): ship the host-session daemon inside the app so
@@ -264,8 +241,8 @@ fi
 # actually embedded, so a bundle missing it would have merged and
 # shipped. This proves the bundle contains what the stages above were
 # supposed to put in it, on EVERY assemble (local, CI, release). Kept
-# cheap and network-free: CI's macOS iced cells run this script twice
-# (keyless, then test-keyed).
+# cheap and network-free: CI's macOS iced cells run this script more than
+# once (dev keyless, dev test-keyed, production).
 # ---------------------------------------------------------------------
 roost_iced_bundle_self_check() {
   local app_dir="$1"
@@ -398,14 +375,11 @@ roost_iced_bundle_self_check() {
 roost_iced_bundle_self_check "${APP_DIR}" "${APP_NAME}"
 
 echo "==> Bundled: ${APP_DIR}"
+echo "    Identity:        ${ROOST_BUNDLE_IDENTITY:-dev}"
 echo "    Bundle ID:       ${BUNDLE_ID}"
 echo "    Version:         ${VERSION}"
 echo "    Executable:      ${APP_DIR}/Contents/MacOS/${APP_NAME}"
 echo "    Embedded CLI:    ${APP_DIR}/Contents/Resources/bin/roostctl"
 echo "    Embedded daemon: ${APP_DIR}/Contents/MacOS/roost-session"
-echo
-echo "Note: with both Roost.app and Roost-Iced.app installed, 'claude"
-echo "install' points Claude's hook file at whichever bundle's roostctl"
-echo "ran it last (roadmap 6a decision — noted, not fixed here)."
 echo
 echo "Launch with: open '${APP_DIR}'"

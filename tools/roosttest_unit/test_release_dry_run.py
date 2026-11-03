@@ -24,10 +24,9 @@ PUBLISHING_JOBS = {
     "create-release",
     "publish-release",
     "appcast",
-    "appcast-iced",
     "dispatch-apt-charliek",
 }
-BUILD_JOBS = {"linux", "mac", "mac-iced"}
+BUILD_JOBS = {"linux", "mac"}
 
 
 def load_tool():
@@ -105,15 +104,14 @@ class DryRunTest(unittest.TestCase):
         self.assertNotIn("Append macOS first-launch note", self.text)
 
     def test_notarization_is_forced_off(self):
-        for name in ("mac", "mac-iced"):
-            self.assertIn("\n      CAN_NOTARIZE: 'false'\n", self.jobs[name])
+        self.assertIn("\n      CAN_NOTARIZE: 'false'\n", self.jobs["mac"])
         self.assertNotRegex(self.text, r"CAN_NOTARIZE: \$\{\{")
 
     def test_artifact_names_are_unique_per_cell(self):
         names = re.findall(r"(?m)^          name: (dryrun-.+)$", self.text)
         self.assertEqual(
             sorted(names),
-            ["dryrun-linux-${{ matrix.arch }}", "dryrun-mac-arm64", "dryrun-mac-iced-arm64"],
+            ["dryrun-linux-${{ matrix.arch }}", "dryrun-mac-arm64"],
         )
         self.assertEqual(len(set(names)), len(names))
         for name in BUILD_JOBS:
@@ -142,11 +140,27 @@ class DryRunTest(unittest.TestCase):
         self.assertNotRegex(code, r"\bsecrets\b(?!\.GITHUB_TOKEN\b)")
         for gone in (
             "Verify the Sparkle key material",
-            "Verify the iced Sparkle key material",
             "Import Developer ID certificate",
             "Notarize + staple",
         ):
             self.assertNotIn(gone, self.text)
+
+    def test_the_mac_job_builds_and_stages_the_production_roost_dmg(self):
+        """Plan 089 V5: the dry run's macOS artifact is `Roost-<v>.dmg`
+        holding the production `Roost.app`, and nothing Roost-Iced."""
+        mac = self.jobs["mac"]
+        self.assertIn("          ROOST_BUNDLE_IDENTITY: production\n", mac)
+        self.assertIn(
+            "          ROOST_BUNDLE_SPARKLE_FEED_URL: https://charliek.github.io/roost/appcast.xml\n", mac
+        )
+        self.assertIn("      - name: Assert the production bundle identity\n", mac)
+        self.assertIn('./mac/scripts/make-dmg.sh "${DRYRUN_TAG#v}"', mac)
+        self.assertIn('"mac/build/Roost-${DRYRUN_TAG#v}.dmg#macOS (.dmg)"', mac)
+        self.assertNotIn("ROOST_DMG_APP_DIR", mac)
+        code = "\n".join(
+            ln for ln in self.text.splitlines() if not ln.lstrip().startswith("#")
+        )
+        self.assertNotIn("Roost-Iced", code)
 
     def test_an_injected_secret_step_is_deleted_and_a_stray_secret_raises(self):
         src = RELEASE_YML.read_text()

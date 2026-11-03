@@ -282,8 +282,9 @@ test-linux-scripts:  ## Shell tests for linux/scripts/*.sh release-artifact + CI
 	./linux/scripts/stage-session-artifact_test.sh
 	./linux/scripts/ci-apt-install_test.sh
 
-test-mac-scripts:  ## Shell tests for mac/scripts/notarize.sh against fake ditto/xcrun shims (no macOS needed)
+test-mac-scripts:  ## Shell tests for mac/scripts release helpers: notarize.sh and verify-sparkle-key.sh against fakes (no macOS needed; the key test needs uv)
 	./mac/scripts/notarize_test.sh
+	./mac/scripts/verify-sparkle-key_test.sh
 
 # `e2e` dispatches rather than running a bare full-dir suite: the full
 # `tools/roosttest` dir includes `test_exit_on_empty.py` / `test_menu_quit.py`,
@@ -449,16 +450,22 @@ e2e-iced-release-ci:  ## Release-profile Iced E2E gate: curated subset against a
 e2e-mac-ci:  ## Mac E2E at CI parity. DESTRUCTIVE: force-quits any running Roost.app
 	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest $(DAEMON_E2E_DESELECT) --roost-target mac --roost-fresh
 
-e2e-iced-bundle:  ## macOS-only: assemble Roost-Iced.app + run the curated bundle smoke against it (ROOST_ICED_APP)
-	@[ "$$(uname -s)" = "Darwin" ] || { echo "e2e-iced-bundle is macOS-only: it launches Roost-Iced.app via LaunchServices (open)"; exit 1; }
-	$(MAKE) bundle-iced
-	ROOST_ICED_APP=mac/build/Roost-Iced.app ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_menu_bar.py --roost-target iced --roost-fresh
+# ICED_APP names the bundle under test. The default dev Roost-Iced.app is
+# assembled first; any other bundle is driven as already built, e.g. a
+# production one: `make e2e-iced-bundle ICED_APP=mac/build/Roost.app
+# ROOST_TEST_ALLOW_PRODUCTION_IDENTITY=1` (outside CI the harness refuses
+# that identity without the opt-in — tools/roosttest/README.md).
+ICED_APP ?= mac/build/Roost-Iced.app
+e2e-iced-bundle:  ## macOS-only: run the curated bundle smoke against $(ICED_APP) (default: assemble the dev Roost-Iced.app first)
+	@[ "$$(uname -s)" = "Darwin" ] || { echo "e2e-iced-bundle is macOS-only: it launches the bundle via LaunchServices (open)"; exit 1; }
+	@if [ "$(ICED_APP)" = "mac/build/Roost-Iced.app" ]; then $(MAKE) bundle-iced; fi
+	ROOST_ICED_APP="$(ICED_APP)" ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_menu_bar.py --roost-target iced --roost-fresh
 
 e2e-iced-sparkle:  ## macOS-only: assemble a TEST-KEYED Roost-Iced.app + run the Sparkle E2E against a loopback appcast
 	@[ "$$(uname -s)" = "Darwin" ] || { echo "e2e-iced-sparkle is macOS-only: it launches Roost-Iced.app via LaunchServices (open)"; exit 1; }
 	@test -f $(SPARKLE_TEST_PUBLIC_KEY) || { echo "missing $(SPARKLE_TEST_PUBLIC_KEY)"; exit 1; }
-	ROOST_ICED_SPARKLE_FEED_URL=$(SPARKLE_TEST_PLACEHOLDER_FEED) \
-	ROOST_ICED_SPARKLE_ED_PUBLIC_KEY="$$(cat $(SPARKLE_TEST_PUBLIC_KEY))" \
+	ROOST_BUNDLE_SPARKLE_FEED_URL=$(SPARKLE_TEST_PLACEHOLDER_FEED) \
+	ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY="$$(cat $(SPARKLE_TEST_PUBLIC_KEY))" \
 		$(MAKE) bundle-iced
 	ROOST_ICED_APP=mac/build/Roost-Iced.app ROOST_TEST_MODE=1 \
 		uv run --group test pytest tools/roosttest/test_sparkle.py --roost-target iced --roost-fresh

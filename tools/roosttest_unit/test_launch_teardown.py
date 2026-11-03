@@ -134,6 +134,7 @@ class _IsolatedIcedLaunchTestCase(unittest.TestCase):
                 "_ICED_PROC",
                 "_ICED_LOG",
                 "_ICED_BUNDLE_LOG_OFFSET",
+                "_ICED_BUNDLE",
                 "_ICED_BUNDLE_PID",
             )
         }

@@ -2,70 +2,53 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Info.plist for Roost-Iced.app — M6 6a evaluation bundle.
+  Info.plist for the iced macOS app, in both of the identities
+  `mac/scripts/bundle-iced.sh` assembles (ROOST_BUNDLE_IDENTITY):
 
-  `mac/scripts/bundle-iced.sh` copies this file into the .app bundle
-  and substitutes @VERSION@ with the workspace version (see
-  `roost_workspace_version` in bundle-lib.sh). This bundle exists so
-  the iced UI (`crates/roost-iced`) can be evaluated against the
-  Swift app side by side: Sparkle (6c), UNUserNotificationCenter
-  (6e), and TCC testing all require a bundled, signed .app — see
-  `docs/development/iced-migration.md` (M6).
+    production  Roost.app — ai.stridelabs.Roost / Roost. The shipped
+                app. Its id is the one the Swift Roost.app used, so it
+                updates that app in place and resolves the same `Mac`
+                profile paths (roost-ipc's BundleProfile).
+    dev         Roost-Iced.app — ai.stridelabs.Roost.iced / Roost-Iced.
+                Runs beside an installed Roost.app: the id, the Dock name
+                and the process name all differ, so `pgrep -x Roost` never
+                matches it.
 
-  Distinct identity from Roost.app (Info.plist.template) so the two
-  can be installed and run in parallel: CFBundleIdentifier carries a
-  `.iced` suffix, and CFBundleName/CFBundleDisplayName/
-  CFBundleExecutable are "Roost-Iced" so Dock/Cmd-Tab/Finder show
-  them as separate apps and `pgrep/pkill -x Roost` can never hit this
-  process. `app_label` on the wire stays `Roost-iced` (roost-ipc's
-  BundleProfile, untouched by this plist).
+  `bundle-lib.sh`'s roost_stamp_plist fills the three `@`-wrapped
+  placeholders below — VERSION (the workspace version, see
+  `roost_workspace_version`), BUNDLE_ID and APP_NAME — and fails on any
+  placeholder it leaves behind.
 
-  Sparkle (M6 6c, plan 028): the update MECHANICS ship — bundle-iced.sh
-  embeds + strictly signs Sparkle.framework — but NO SUFeedURL and NO
-  SUPublicEDKey, by design. A build with no feed never checks, so a
-  public key in today's builds buys nothing, and the two apps must
-  never be able to offer each other's updates — an iced bundle
-  carrying the Swift app's feed URL/key could install a
-  Swift-app-shaped update over an iced binary (or vice versa). At
-  enablement time the design mandates a SEPARATE feed URL and a
-  SEPARATE EdDSA keypair from the Swift app's
-  (charliek.github.io/roost/appcast.xml + its SUPublicEDKey stay
-  Swift-only). SUEnableAutomaticChecks is present and false: with the
-  updater instantiated, an ABSENT key would trigger Sparkle's
-  first-run "check automatically?" permission prompt — the explicit
-  false suppresses scheduled checks and that prompt; checks stay
-  strictly user-invoked. Enablement recipe: set both
-  ROOST_ICED_SPARKLE_FEED_URL and ROOST_ICED_SPARKLE_ED_PUBLIC_KEY at
-  bundle time and bundle-iced.sh PlistBuddy-inserts the two keys into
-  the stamped plist (exactly one set is a hard error; see
-  roost_insert_sparkle_feed in bundle-lib.sh).
+  Sparkle: the template carries NO SUFeedURL and NO SUPublicEDKey.
+  bundle-iced.sh inserts both from ROOST_BUNDLE_SPARKLE_FEED_URL +
+  ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY (both or neither; see
+  roost_insert_sparkle_feed in bundle-lib.sh). A production build
+  requires them; a dev build without them is feedless and never checks.
+  SUEnableAutomaticChecks is present and false: with the updater
+  instantiated, an ABSENT key would trigger Sparkle's first-run "check
+  automatically?" permission prompt — the explicit false suppresses
+  scheduled checks and that prompt; checks stay strictly user-invoked.
 
   Device-permission purpose strings (NSMicrophone/Camera/AppleEvents
   UsageDescription): paired with the capture entitlements in
-  Roost-Iced.entitlements. macOS shows these when a program hosted in
-  a Roost-Iced tab requests the microphone/camera (the request is
-  attributed to Roost-Iced, the TCC responsible app). Both must be
-  present — the entitlement to permit the request under the hardened
-  runtime, the string for the prompt — matching Roost.app, ghostty,
-  and cmux.
-
-  Icon: reuses the same AppIcon art as Roost.app (shared art is a
-  recorded decision, plan 027 § W2) — the display name is what
-  disambiguates the Dock tile until a distinct Roost-Iced icon exists
-  (future work).
+  Roost-Iced.entitlements. macOS shows these when a program hosted in a
+  tab requests the microphone/camera (the request is attributed to this
+  app, the TCC responsible app). Both must be present — the entitlement
+  to permit the request under the hardened runtime, the string for the
+  prompt.
 -->
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleIdentifier</key>
-  <string>ai.stridelabs.Roost.iced</string>
+  <string>@BUNDLE_ID@</string>
   <key>CFBundleName</key>
-  <string>Roost-Iced</string>
+  <string>@APP_NAME@</string>
   <key>CFBundleDisplayName</key>
-  <string>Roost-Iced</string>
+  <string>@APP_NAME@</string>
   <key>CFBundleExecutable</key>
-  <string>Roost-Iced</string>
+  <string>@APP_NAME@</string>
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleIconName</key>
@@ -93,10 +76,10 @@
   <key>NSHumanReadableCopyright</key>
   <string>Copyright © 2026 Charlie Knudsen. MIT-licensed.</string>
   <key>NSMicrophoneUsageDescription</key>
-  <string>A program running in Roost-Iced would like to use the microphone.</string>
+  <string>A program running in @APP_NAME@ would like to use the microphone.</string>
   <key>NSCameraUsageDescription</key>
-  <string>A program running in Roost-Iced would like to use the camera.</string>
+  <string>A program running in @APP_NAME@ would like to use the camera.</string>
   <key>NSAppleEventsUsageDescription</key>
-  <string>A program running in Roost-Iced would like to use AppleScript.</string>
+  <string>A program running in @APP_NAME@ would like to use AppleScript.</string>
 </dict>
 </plist>

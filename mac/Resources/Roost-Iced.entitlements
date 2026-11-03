@@ -47,8 +47,8 @@
     LV-disable). Keeping it past that point needlessly weakens the
     hardened runtime.
 
-    Release Developer-ID builds (release.yml's `mac-iced` job, plan
-    030) are already team-signed today and STILL carry this
+    Release Developer-ID builds (release.yml's `mac` job, plans
+    030 and 089) are already team-signed today and STILL carry this
     entitlement: team-signing alone hasn't triggered its removal —
     that's a separate entitlements hygiene pass, not yet done.
 

@@ -334,8 +334,8 @@ enum Message {
 /// everywhere else: on macOS the `Linux` kind still resolves — to
 /// `Roost-linux` — but nothing ships or launches it there, so an unguarded
 /// feature would silently point a Mac build at a profile no Mac process
-/// owns, away from the `Roost-iced` paths the harnesses and the
-/// experimental `Roost-Iced.app` use.
+/// owns, away from the `Roost-iced` paths the harnesses and a dev
+/// `Roost-Iced.app` use.
 ///
 /// Parameterized rather than a bare `#[cfg]` at the call site so all four
 /// cells are unit-testable in a single build.
@@ -347,25 +347,27 @@ fn default_profile_kind(packaged: bool, linux: bool) -> BundleProfileKind {
     }
 }
 
-/// `CFBundleIdentifier` of the macOS Iced bundle (`mac/Resources/
-/// Info-iced.plist.template`), the only id this mapping recognizes.
+/// `CFBundleIdentifier` of a dev `Roost-Iced.app` (`bundle-iced.sh`'s
+/// default `ROOST_BUNDLE_IDENTITY=dev`).
+#[cfg(test)]
 const ICED_BUNDLE_ID: &str = "ai.stridelabs.Roost.iced";
+
+/// `CFBundleIdentifier` of the shipped `Roost.app`
+/// (`ROOST_BUNDLE_IDENTITY=production`).
+const PRODUCTION_BUNDLE_ID: &str = "ai.stridelabs.Roost";
 
 /// The macOS default profile, decided from the app bundle the binary is
 /// running out of rather than from compile-time flags.
 ///
-/// Behaviorally a no-op today — every input maps to `Iced`, which is already
-/// what `default_profile_kind` yields on macOS. What it buys is the seam plus
-/// the logged identity: 6c's cutover has to map an id onto a kind, and the id
-/// it will map (`ai.stridelabs.Roost`, the Swift app's) is deliberately NOT
-/// recognized here, because deciding what the production id resolves to is
-/// 6c's call, not this slice's.
-///
-/// `None` is the ordinary case for a bare `target/debug/roost-iced`: an
-/// unbundled process still has a main `CFBundle`, but its identifier is nil.
+/// Only the shipped `Roost.app` resolves `Mac`, whose paths are the ones the
+/// Swift `Roost.app` used, so a user it replaces keeps their socket, state,
+/// locks and logs. Everything else — a dev `Roost-Iced.app`, an unknown id,
+/// and a bare `target/debug/roost-iced` (an unbundled process still has a
+/// main `CFBundle`, but its identifier is nil) — resolves `Iced`, so a dev
+/// build runs beside an installed Roost.app.
 fn mac_bundle_default_kind(bundle_id: Option<&str>) -> BundleProfileKind {
     match bundle_id {
-        Some(ICED_BUNDLE_ID) => BundleProfileKind::Iced,
+        Some(PRODUCTION_BUNDLE_ID) => BundleProfileKind::Mac,
         _ => BundleProfileKind::Iced,
     }
 }
@@ -1596,20 +1598,21 @@ mod tests {
         assert_eq!(default_profile_kind(false, false), BundleProfileKind::Iced);
     }
 
-    /// Every cell is `Iced` on purpose — see `mac_bundle_default_kind`. The
-    /// table exists so a later change to any one of these rows (6c mapping
-    /// the production id) is a visible, deliberate edit rather than a silent
-    /// behavior shift.
     #[test]
-    fn the_mac_bundle_probe_resolves_iced_for_every_identity() {
+    fn only_the_production_bundle_resolves_the_mac_profile() {
+        assert_eq!(
+            mac_bundle_default_kind(Some("ai.stridelabs.Roost")),
+            BundleProfileKind::Mac,
+            "the shipped Roost.app adopts the paths the Swift app used"
+        );
         assert_eq!(
             mac_bundle_default_kind(Some(ICED_BUNDLE_ID)),
             BundleProfileKind::Iced
         );
         assert_eq!(
-            mac_bundle_default_kind(Some("ai.stridelabs.Roost")),
+            mac_bundle_default_kind(Some("ai.stridelabs.Roost.other")),
             BundleProfileKind::Iced,
-            "the Swift app's id is not mapped here — that cutover is 6c's"
+            "a prefix of the production id is not the production id"
         );
         assert_eq!(
             mac_bundle_default_kind(Some("com.example.Other")),
@@ -1634,6 +1637,14 @@ mod tests {
         assert_eq!(
             host_default_kind(true, true, false, Some(ICED_BUNDLE_ID)),
             BundleProfileKind::Linux
+        );
+        assert_eq!(
+            host_default_kind(true, true, false, Some(PRODUCTION_BUNDLE_ID)),
+            BundleProfileKind::Linux
+        );
+        assert_eq!(
+            host_default_kind(false, false, true, Some(PRODUCTION_BUNDLE_ID)),
+            BundleProfileKind::Mac
         );
         assert_eq!(
             host_default_kind(true, true, true, None),

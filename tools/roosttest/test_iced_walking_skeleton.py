@@ -48,7 +48,7 @@ _skip_wayland = skip_on_live_wayland_desktop(
 
 def test_iced_identity_and_real_pty(roost, project, target):
     identity = roost.identify()
-    assert identity["app_id"] == "ai.stridelabs.Roost.iced"
+    assert identity["app_id"] == ui.iced_app_id()
 
     tab = roost.open_tab(project, cwd="/tmp", title="Iced PTY")
     marker = f"ICED_WALK_{uuid.uuid4().hex[:8]}"

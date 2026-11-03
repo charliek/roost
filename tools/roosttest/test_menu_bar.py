@@ -41,15 +41,17 @@ from unittest.mock import ANY
 
 import pytest
 
+import ui
 from client import RoostError
 from util import BARE_SHELL_ARGV
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
-# `title_fallback(BundleProfileKind::Iced)` (crates/roost-iced/src/app.rs) —
-# the App menu's title is set to this at install time, so no separate
+# `title_fallback` for the profile under test (crates/roost-iced/src/app.rs):
+# "Roost" for the production Roost.app, "Roost-Iced" otherwise. The App
+# menu's title is set to it at install time, so no separate
 # CFBundleName-substitution case exists to test.
-APP = "Roost-Iced"
+APP = ui.iced_app_title()
 
 # The Sparkle item, shared with `test_sparkle.py` — the two modules pin
 # different halves of it (binding here, enabled state there).
