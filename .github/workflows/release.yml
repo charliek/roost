@@ -874,7 +874,7 @@ jobs:
           persist-credentials: false
 
       - name: Download the Sparkle signature
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: sparkle-sign
           path: ${{ runner.temp }}/appcast
