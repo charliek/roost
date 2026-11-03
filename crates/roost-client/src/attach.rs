@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, watch};
 use crate::dial::{BoxRead, BoxWrite, Dialer};
 use crate::host::{leg, HostClient, SessionFacts};
 use crate::state::{Backoff, CLIENT_PAYLOAD_KINDS};
-use crate::task::jitter;
+use crate::task::{jitter, Shutdown};
 
 /// What to attach to, at what size, and whether the attach takes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +92,9 @@ pub const OUTBOX_CAP_BYTES: usize = 1024 * 1024;
 /// A handle on one tab's attach task. Dropping it detaches.
 pub struct AttachStream {
     commands: mpsc::UnboundedSender<Command>,
+    /// Raised beside the `Detach` command, so a write the peer stopped
+    /// reading cannot hold the detach up behind it.
+    detaching: Arc<Shutdown>,
 }
 
 #[derive(Debug)]
@@ -100,7 +103,8 @@ enum Command {
     Resize(Grid, bool),
     Take,
     ForgetResume,
-    Hydrated,
+    /// `Some`: the ordinal of the `Accepted` the consumer means.
+    Hydrated(Option<u64>),
     Detach,
 }
 
@@ -108,6 +112,11 @@ impl AttachStream {
     /// Start attaching `req.tab_id` on the session `host` is connected
     /// to. The handshake names `host`'s client id and current session;
     /// while `host` has no session the attach waits for one.
+    ///
+    /// The attachment belongs to that session: a tab id means something
+    /// only to the process that minted it, so once `host` reaches a
+    /// different session the stream ends (`Ended { reason: "session
+    /// restarted" }`) rather than attach whatever now has that id.
     pub fn spawn(
         rt: &tokio::runtime::Handle,
         dialer: Arc<dyn Dialer>,
@@ -161,7 +170,16 @@ impl AttachStream {
     /// resumed: a resume replays output only, onto a terminal that would
     /// still be missing the rest of the snapshot.
     pub fn hydrated(&self) {
-        let _ = self.commands.send(Command::Hydrated);
+        let _ = self.commands.send(Command::Hydrated(None));
+    }
+
+    /// [`Self::hydrated`], naming the stream: `accepted` counts the
+    /// [`AttachEvent::Accepted`] events this handle has delivered, from 1,
+    /// and is the one whose payload the terminal now holds. A call for a
+    /// stream older than the newest accepted one is ignored, so a consumer
+    /// that falls behind cannot vouch for a snapshot it has not applied.
+    pub fn hydrated_at(&self, accepted: u64) {
+        let _ = self.commands.send(Command::Hydrated(Some(accepted)));
     }
 
     /// `DETACH`, then close. The tab's size is handed on at once.
@@ -172,6 +190,7 @@ impl AttachStream {
 
 impl Drop for AttachStream {
     fn drop(&mut self) {
+        self.detaching.request();
         let _ = self.commands.send(Command::Detach);
     }
 }
@@ -192,22 +211,36 @@ fn spawn_with(
 ) -> (AttachStream, mpsc::UnboundedReceiver<AttachEvent>) {
     let (commands, commands_rx) = mpsc::unbounded_channel();
     let (events, events_rx) = mpsc::unbounded_channel();
+    let detaching = Arc::new(Shutdown::default());
     let attach = Attach {
         tab_id: req.tab_id,
         who,
+        session: session
+            .borrow()
+            .as_ref()
+            .map(|facts| facts.session_id.clone()),
         grid: Grid {
             cols: req.cols,
             rows: req.rows,
             cell_w_px: req.cell_w_px,
             cell_h_px: req.cell_h_px,
         },
+        focus_pending: false,
         take: req.take,
+        accepted: 0,
         resume: None,
         unconfirmed: None,
         outbox: Outbox::new(OUTBOX_CAP_BYTES),
+        detaching: Arc::clone(&detaching),
     };
     rt.spawn(run(attach, dialer, session, commands_rx, events));
-    (AttachStream { commands }, events_rx)
+    (
+        AttachStream {
+            commands,
+            detaching,
+        },
+        events_rx,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,7 +256,6 @@ struct Grid {
 /// its terminal is at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResumePoint {
-    session_id: String,
     server_epoch: u64,
     tab_generation: u64,
     next_seq: u64,
@@ -234,16 +266,25 @@ struct ResumePoint {
 struct Attach {
     tab_id: i64,
     who: Who,
-    /// The advisory grid the next handshake states.
+    /// The session the tab id was minted by: the host's when the attach
+    /// was made, else the first one it dialed.
+    session: Option<String>,
+    /// This client's latest grid: what the next handshake states, and
+    /// what a stream that accepted an older one is caught up to.
     grid: Grid,
-    /// The caller's explicit take, until an attach is accepted with it;
-    /// every re-dial after that is automatic.
+    /// A focused resize arrived with no stream to send it on.
+    focus_pending: bool,
+    /// The caller's explicit take, until the session commits an attach
+    /// with it; every re-dial after that is automatic.
     take: bool,
+    /// How many `Accepted` events have been emitted.
+    accepted: u64,
     resume: Option<ResumePoint>,
     /// A dropped snapshot stream's point, waiting on a late
     /// [`AttachStream::hydrated`] for the snapshot it finished.
     unconfirmed: Option<ResumePoint>,
     outbox: Outbox,
+    detaching: Arc<Shutdown>,
 }
 
 impl Attach {
@@ -274,20 +315,16 @@ impl Attach {
         }
     }
 
-    /// Drop resume points another session's stream left: its epoch can
-    /// never match this one's.
-    fn forget_other_sessions(&mut self, session_id: &str) {
-        let other = |point: &Option<ResumePoint>| {
-            point
-                .as_ref()
-                .is_some_and(|point| point.session_id != session_id)
-        };
-        if other(&self.resume) {
-            self.resume = None;
-        }
-        if other(&self.unconfirmed) {
-            self.unconfirmed = None;
-        }
+    /// Whether a `hydrated` naming `token` is about the newest stream.
+    fn current(&self, token: Option<u64>) -> bool {
+        token.is_none_or(|accepted| accepted == self.accepted)
+    }
+
+    /// The `RESIZE` a stream accepted at `advertised` owes the session:
+    /// the latest grid when the handshake stated an older one, focused
+    /// when a focused resize waited for it.
+    fn catch_up(&self, advertised: Grid) -> Option<(Grid, bool)> {
+        (self.grid != advertised || self.focus_pending).then_some((self.grid, self.focus_pending))
     }
 
     /// A command that arrived with no stream to write it to. `false`
@@ -297,20 +334,18 @@ impl Attach {
             Command::Input(bytes, take) => self.queue(Outgoing::Input(bytes, take)),
             Command::Resize(grid, focused) => {
                 self.grid = grid;
-                // An unfocused resize only moves the advisory grid, which
-                // the next handshake states anyway.
-                if focused {
-                    self.queue(Outgoing::Resize(grid));
-                }
+                self.focus_pending |= focused;
             }
             Command::Take => self.queue(Outgoing::Take),
             Command::ForgetResume => {
                 self.resume = None;
                 self.unconfirmed = None;
             }
-            Command::Hydrated => {
-                if let Some(point) = self.unconfirmed.take() {
-                    self.resume = Some(point);
+            Command::Hydrated(token) => {
+                if self.current(token) {
+                    if let Some(point) = self.unconfirmed.take() {
+                        self.resume = Some(point);
+                    }
                 }
             }
             Command::Detach => return false,
@@ -330,12 +365,11 @@ impl Attach {
     }
 }
 
-/// Something written to the session once a stream is up.
+/// Something held for the next stream. Resizes are not: only the latest
+/// grid matters, and [`Attach::catch_up`] sends it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Outgoing {
     Input(Vec<u8>, InputTake),
-    /// Always focused: an unfocused one is folded into the handshake.
-    Resize(Grid),
     Take,
 }
 
@@ -343,7 +377,6 @@ impl Outgoing {
     fn weight(&self) -> usize {
         match self {
             Outgoing::Input(bytes, _) => bytes.len(),
-            Outgoing::Resize(_) => roost_ipc::dataframe::RESIZE_PAYLOAD_LEN,
             Outgoing::Take => 1,
         }
     }
@@ -383,9 +416,10 @@ impl Outbox {
         dropped
     }
 
-    fn drain(&mut self) -> impl Iterator<Item = Outgoing> + '_ {
-        self.weight = 0;
-        self.items.drain(..)
+    fn pop(&mut self) -> Option<Outgoing> {
+        let item = self.items.pop_front()?;
+        self.weight -= item.weight();
+        Some(item)
     }
 }
 
@@ -405,7 +439,6 @@ enum Resumable {
 #[derive(Debug)]
 struct Stream {
     kind: PayloadKind,
-    session_id: String,
     server_epoch: u64,
     tab_generation: u64,
     resumed: bool,
@@ -433,11 +466,10 @@ enum Step {
 }
 
 impl Stream {
-    fn new(accepted: &AttachAccepted, kind: PayloadKind, session_id: &str) -> Self {
+    fn new(accepted: &AttachAccepted, kind: PayloadKind) -> Self {
         let resumed = accepted.mode == AttachMode::Resume;
         Self {
             kind,
-            session_id: session_id.to_string(),
             server_epoch: accepted.server_epoch,
             tab_generation: accepted.tab_generation,
             resumed,
@@ -454,7 +486,6 @@ impl Stream {
 
     fn point(&self) -> ResumePoint {
         ResumePoint {
-            session_id: self.session_id.clone(),
             server_epoch: self.server_epoch,
             tab_generation: self.tab_generation,
             next_seq: self.next_seq,
@@ -622,7 +653,11 @@ async fn run(
             Ok(facts) => facts,
             Err(reason) => break reason.to_string(),
         };
-        attach.forget_other_sessions(&facts.session_id);
+        match &attach.session {
+            Some(bound) if *bound != facts.session_id => break "session restarted".to_string(),
+            Some(_) => {}
+            None => attach.session = Some(facts.session_id.clone()),
+        }
         let (reason, live, new_session) =
             match attempt(&mut attach, &*dialer, &facts, &mut commands, &emit).await {
                 Outcome::Detached => break "detached".to_string(),
@@ -694,6 +729,7 @@ async fn attempt(
     emit: &impl Fn(AttachEvent),
 ) -> Outcome {
     let handshake = attach.handshake(facts);
+    let advertised = attach.grid;
     let offered = attach.resume.clone();
     let retry = |reason: String| Outcome::Retry {
         reason,
@@ -711,6 +747,10 @@ async fn attempt(
         }
         Some(Ok(Ok(duplex))) => duplex,
     };
+    // The session commits the attach — and an explicit take with it —
+    // when it writes the accepted line, so the take is spent then even if
+    // the preamble behind it never arrives.
+    let committed = std::sync::atomic::AtomicBool::new(false);
     let shaken = tokio::time::timeout(
         leg(),
         DataConnection::<BoxRead, BoxWrite>::handshake_unless(
@@ -718,10 +758,13 @@ async fn attempt(
             duplex.write,
             &handshake,
             until_detached(attach, commands),
-            |_| {},
+            |_| committed.store(true, std::sync::atomic::Ordering::Relaxed),
         ),
     )
     .await;
+    if committed.into_inner() {
+        attach.take = false;
+    }
     let (accepted, conn) = match shaken {
         Err(_) => return retry("the attach handshake timed out".into()),
         Ok(Ok(None)) => return Outcome::Detached,
@@ -733,7 +776,7 @@ async fn attempt(
         AttachPayloadKind::GHOSTTY_SNAPSHOT => PayloadKind::GhosttySnapshot,
         AttachPayloadKind::VT => PayloadKind::Vt,
         other => {
-            let _ = writer.send_detach().await;
+            send(&mut writer, Frame::Detach, &attach.detaching).await;
             return Outcome::Ended(format!(
                 "the session served a {other} payload, which this client never offered"
             ));
@@ -750,13 +793,13 @@ async fn attempt(
         };
         if let Some(reason) = fault {
             attach.resume = None;
-            let _ = writer.send_detach().await;
+            send(&mut writer, Frame::Detach, &attach.detaching).await;
             return retry(reason.into());
         }
     }
-    attach.take = false;
     attach.resume = None;
     attach.unconfirmed = None;
+    attach.accepted += 1;
     emit(AttachEvent::Accepted {
         kind,
         mode: accepted.mode,
@@ -766,8 +809,17 @@ async fn attempt(
         cell_h_px: accepted.snapshot_cell_h_px,
         owner: accepted.owner.clone(),
     });
-    let mut stream = Stream::new(&accepted, kind, &facts.session_id);
-    let outcome = live(attach, &mut stream, reader, writer, commands, emit).await;
+    let mut stream = Stream::new(&accepted, kind);
+    let outcome = live(
+        attach,
+        &mut stream,
+        advertised,
+        reader,
+        writer,
+        commands,
+        emit,
+    )
+    .await;
     stream.retire(attach);
     match outcome {
         Outcome::Retry { reason, .. } => Outcome::Retry { reason, live: true },
@@ -804,24 +856,44 @@ fn refused(error: &ClientError) -> Outcome {
     }
 }
 
-/// An accepted stream: flush what waited for it, then frames one way and
-/// commands the other until it ends.
+/// An accepted stream: catch the session up to this client's grid, flush
+/// what waited for the stream, then frames one way and commands the other
+/// until it ends.
 ///
-/// Only the reader decides that the stream is over. A failed write parks
-/// the writer and later commands queue for the next stream: the session
-/// labels its closes, and ending on the write would lose the label.
+/// A failed write parks the writer and later commands queue for the next
+/// stream; the reader decides when the stream is over, because the
+/// session labels its closes and ending on the write would lose the
+/// label. A write that stalls past its budget is the exception: a peer
+/// that stopped reading may never close either.
 async fn live(
     attach: &mut Attach,
     stream: &mut Stream,
+    advertised: Grid,
     mut reader: DataFrameReader<BoxRead>,
     mut writer: DataWriter<BoxWrite>,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     emit: &impl Fn(AttachEvent),
 ) -> Outcome {
+    let detaching = Arc::clone(&attach.detaching);
     let mut writer_ok = true;
-    for item in attach.outbox.drain() {
-        if writer_ok {
-            writer_ok = write(&mut writer, item, stream).await;
+    if let Some((grid, focused)) = attach.catch_up(advertised) {
+        stream.lose_resume();
+        match send(&mut writer, Frame::Resize(grid, focused), &detaching).await {
+            Written::Ok => attach.focus_pending = false,
+            Written::Failed => writer_ok = false,
+            Written::Stalled => return stalled(),
+            Written::Detached => return Outcome::Detached,
+        }
+    }
+    while writer_ok {
+        let Some(item) = attach.outbox.pop() else {
+            break;
+        };
+        match send(&mut writer, item.into(), &detaching).await {
+            Written::Ok => {}
+            Written::Failed => writer_ok = false,
+            Written::Stalled => return stalled(),
+            Written::Detached => return Outcome::Detached,
         }
     }
     loop {
@@ -862,10 +934,10 @@ async fn live(
                 }
             }
             command = commands.recv() => {
-                let command = match command {
+                let frame = match command {
                     None | Some(Command::Detach) => {
                         if writer_ok {
-                            let _ = writer.send_detach().await;
+                            send(&mut writer, Frame::Detach, &detaching).await;
                         }
                         return Outcome::Detached;
                     }
@@ -873,52 +945,104 @@ async fn live(
                         stream.lose_resume();
                         continue;
                     }
-                    Some(Command::Hydrated) => {
-                        stream.hydrated();
+                    Some(Command::Hydrated(token)) => {
+                        if attach.current(token) {
+                            stream.hydrated();
+                        }
                         continue;
                     }
-                    Some(command) => command,
-                };
-                if !writer_ok {
-                    attach.absorb(command);
-                    continue;
-                }
-                let item = match command {
-                    Command::Input(bytes, take) => Outgoing::Input(bytes, take),
-                    Command::Resize(grid, focused) => {
+                    Some(command) if !writer_ok => {
+                        attach.absorb(command);
+                        continue;
+                    }
+                    Some(Command::Resize(grid, focused)) => {
                         attach.grid = grid;
                         stream.lose_resume();
-                        writer_ok = writer
-                            .send_resize(grid.cols, grid.rows, grid.cell_w_px, grid.cell_h_px, focused)
-                            .await
-                            .is_ok();
-                        continue;
+                        Frame::Resize(grid, focused)
                     }
-                    Command::Take => Outgoing::Take,
-                    Command::ForgetResume | Command::Hydrated | Command::Detach => continue,
+                    Some(Command::Input(bytes, take)) => Frame::Input(bytes, take),
+                    Some(Command::Take) => Frame::Take,
                 };
-                writer_ok = write(&mut writer, item, stream).await;
+                match send(&mut writer, frame, &detaching).await {
+                    Written::Ok => {}
+                    Written::Failed => writer_ok = false,
+                    Written::Stalled => return stalled(),
+                    Written::Detached => return Outcome::Detached,
+                }
             }
         }
     }
 }
 
-/// Write one outgoing item. `false` when the write failed.
-async fn write(writer: &mut DataWriter<BoxWrite>, item: Outgoing, stream: &mut Stream) -> bool {
-    let written = match item {
-        Outgoing::Input(bytes, take) => writer.send_input(&bytes, take).await,
-        Outgoing::Resize(grid) => {
-            stream.lose_resume();
-            writer
-                .send_resize(grid.cols, grid.rows, grid.cell_w_px, grid.cell_h_px, true)
-                .await
-        }
-        Outgoing::Take => writer.send_take().await,
-    };
-    if let Err(error) = &written {
-        tracing::debug!(%error, "data connection write failed; the reader decides what is next");
+fn stalled() -> Outcome {
+    Outcome::Retry {
+        reason: "a write to the session stalled".into(),
+        live: true,
     }
-    written.is_ok()
+}
+
+/// One client→server frame.
+enum Frame {
+    Input(Vec<u8>, InputTake),
+    Resize(Grid, bool),
+    Take,
+    Detach,
+}
+
+impl From<Outgoing> for Frame {
+    fn from(item: Outgoing) -> Self {
+        match item {
+            Outgoing::Input(bytes, take) => Frame::Input(bytes, take),
+            Outgoing::Take => Frame::Take,
+        }
+    }
+}
+
+/// How a write went.
+#[derive(Debug, PartialEq, Eq)]
+enum Written {
+    Ok,
+    Failed,
+    /// Not finished within a control leg's budget.
+    Stalled,
+    /// The caller detached while the write was blocked.
+    Detached,
+}
+
+/// Write one frame, bounded by [`leg`] and abandoned when the caller
+/// detaches. A write that completes on its first poll always lands, so
+/// input sent just before a detach is not lost to it.
+async fn send(writer: &mut DataWriter<BoxWrite>, frame: Frame, detaching: &Shutdown) -> Written {
+    let write = async {
+        match frame {
+            Frame::Input(bytes, take) => writer.send_input(&bytes, take).await,
+            Frame::Resize(grid, focused) => {
+                writer
+                    .send_resize(
+                        grid.cols,
+                        grid.rows,
+                        grid.cell_w_px,
+                        grid.cell_h_px,
+                        focused,
+                    )
+                    .await
+            }
+            Frame::Take => writer.send_take().await,
+            Frame::Detach => writer.send_detach().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        written = tokio::time::timeout(leg(), write) => match written {
+            Ok(Ok(())) => Written::Ok,
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "data connection write failed; the reader decides what is next");
+                Written::Failed
+            }
+            Err(_) => Written::Stalled,
+        },
+        () = detaching.requested() => Written::Detached,
+    }
 }
 
 #[cfg(test)]
@@ -956,7 +1080,7 @@ mod tests {
     }
 
     fn stream(mode: AttachMode, seq: u64) -> Stream {
-        Stream::new(&accepted(mode, seq), PayloadKind::Vt, "s1")
+        Stream::new(&accepted(mode, seq), PayloadKind::Vt)
     }
 
     fn pty(seq: u64) -> ServerFrame {
@@ -1028,7 +1152,6 @@ mod tests {
         let mut ghostty = Stream::new(
             &accepted(AttachMode::Snapshot, 0),
             PayloadKind::GhosttySnapshot,
-            "s1",
         );
         assert_eq!(ghostty.on_frame(ServerFrame::Snap(Vec::new())), Step::Quiet);
     }
@@ -1073,11 +1196,15 @@ mod tests {
                 client_id: "c".into(),
                 libghostty_build: "b".into(),
             },
+            session: Some("s1".into()),
             grid: GRID,
+            focus_pending: false,
             take: true,
+            accepted: 1,
             resume: None,
             unconfirmed: None,
             outbox: Outbox::new(OUTBOX_CAP_BYTES),
+            detaching: Arc::new(Shutdown::default()),
         }
     }
 
@@ -1125,24 +1252,21 @@ mod tests {
     }
 
     #[test]
-    fn another_sessions_points_are_never_offered() {
-        let mut attach = fresh_attach();
-        stream(AttachMode::Resume, 9).retire(&mut attach);
-        attach.forget_other_sessions("s1");
-        assert!(attach.resume.is_some(), "the same session keeps its point");
-        attach.forget_other_sessions("s2");
-        assert_eq!(attach.resume, None);
-        stream(AttachMode::Snapshot, 9).retire(&mut attach);
-        attach.forget_other_sessions("s2");
-        assert!(attach.absorb(Command::Hydrated));
-        assert_eq!(attach.resume, None, "nor a dropped snapshot's");
-    }
-
-    #[test]
     fn a_late_hydrated_confirms_the_dropped_streams_point() {
         let mut attach = fresh_attach();
         stream(AttachMode::Snapshot, 9).retire(&mut attach);
-        assert!(attach.absorb(Command::Hydrated));
+        assert!(attach.absorb(Command::Hydrated(None)));
+        assert_eq!(attach.resume.map(|p| p.next_seq), Some(10));
+    }
+
+    #[test]
+    fn a_hydrated_naming_an_older_stream_than_the_newest_is_ignored() {
+        let mut attach = fresh_attach();
+        attach.accepted = 2;
+        stream(AttachMode::Snapshot, 9).retire(&mut attach);
+        assert!(attach.absorb(Command::Hydrated(Some(1))));
+        assert_eq!(attach.resume, None, "stream 1 cannot vouch for stream 2");
+        assert!(attach.absorb(Command::Hydrated(Some(2))));
         assert_eq!(attach.resume.map(|p| p.next_seq), Some(10));
     }
 
@@ -1197,35 +1321,117 @@ mod tests {
         );
         assert_eq!((outbox.items.len(), outbox.weight), (0, 0));
         outbox.push(Outgoing::Take);
-        assert_eq!(outbox.drain().collect::<Vec<_>>(), vec![Outgoing::Take]);
+        assert_eq!((outbox.pop(), outbox.pop()), (Some(Outgoing::Take), None));
         assert_eq!(outbox.weight, 0);
     }
 
     #[test]
-    fn an_unfocused_resize_while_reconnecting_only_moves_the_handshake() {
+    fn a_stream_is_caught_up_to_the_latest_grid_once() {
         let mut attach = fresh_attach();
+        assert_eq!(attach.catch_up(GRID), None, "the handshake said it all");
         let wider = Grid { cols: 120, ..GRID };
         attach.absorb(Command::Resize(wider, false));
-        assert!(attach.outbox.items.is_empty());
-        assert_eq!(attach.grid, wider);
+        assert_eq!(attach.catch_up(GRID), Some((wider, false)), "unfocused");
+        assert_eq!(attach.catch_up(wider), None);
+        let narrower = Grid { cols: 60, ..GRID };
         attach.absorb(Command::Resize(GRID, true));
-        assert_eq!(attach.outbox.items.back(), Some(&Outgoing::Resize(GRID)));
+        attach.absorb(Command::Resize(narrower, false));
+        assert!(attach.outbox.items.is_empty(), "no resize is queued");
+        assert_eq!(
+            attach.catch_up(wider),
+            Some((narrower, true)),
+            "the latest grid, taking because a focused resize waited"
+        );
     }
 
     /// A dialer whose every dial is one end of an in-memory pipe, the
-    /// other end handed to the test.
-    struct PipeDialer(mpsc::UnboundedSender<tokio::io::DuplexStream>);
+    /// other end handed to the test. Every dial's writes draw on one
+    /// shared byte allowance the test can cut off.
+    struct PipeDialer(mpsc::UnboundedSender<tokio::io::DuplexStream>, Allowance);
+
+    #[derive(Clone)]
+    struct Allowance(Arc<std::sync::Mutex<(usize, Cutoff)>>);
+
+    #[derive(Clone, Copy)]
+    enum Cutoff {
+        /// A write past the allowance fails.
+        Fail,
+        /// A write past the allowance never completes.
+        Stall,
+    }
+
+    impl Allowance {
+        fn unlimited() -> Self {
+            Allowance(Arc::new(std::sync::Mutex::new((usize::MAX, Cutoff::Fail))))
+        }
+
+        fn cut(&self, bytes: usize, cutoff: Cutoff) {
+            *self.0.lock().unwrap() = (bytes, cutoff);
+        }
+
+        fn restore(&self) {
+            self.cut(usize::MAX, Cutoff::Fail);
+        }
+    }
+
+    struct Metered {
+        inner: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        allowance: Allowance,
+    }
+
+    impl tokio::io::AsyncWrite for Metered {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let (left, cutoff) = *self.allowance.0.lock().unwrap();
+            if left == 0 {
+                return match cutoff {
+                    Cutoff::Fail => {
+                        std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+                    }
+                    Cutoff::Stall => std::task::Poll::Pending,
+                };
+            }
+            let take = buf.len().min(left);
+            let written = std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[..take]);
+            if let std::task::Poll::Ready(Ok(n)) = written {
+                let mut allowance = self.allowance.0.lock().unwrap();
+                allowance.0 = allowance.0.saturating_sub(n);
+            }
+            written
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
 
     impl Dialer for PipeDialer {
         fn dial(&self) -> futures::future::BoxFuture<'_, Result<Duplex, DialError>> {
             let (ours, theirs) = tokio::io::duplex(4 * 1024 * 1024);
             let sent = self.0.send(theirs);
+            let allowance = self.1.clone();
             Box::pin(async move {
                 sent.map_err(|_| DialError::Io(std::io::ErrorKind::NotConnected.into()))?;
                 let (read, write) = tokio::io::split(ours);
                 Ok(Duplex {
                     read: Box::new(read),
-                    write: Box::new(write),
+                    write: Box::new(Metered {
+                        inner: write,
+                        allowance,
+                    }),
                 })
             })
         }
@@ -1262,8 +1468,10 @@ mod tests {
         )
     }
 
+    /// Past the write budget, so a test on paused time hears that expire
+    /// first.
     async fn next_event(events: &mut mpsc::UnboundedReceiver<AttachEvent>) -> AttachEvent {
-        tokio::time::timeout(Duration::from_secs(10), events.recv())
+        tokio::time::timeout(leg() * 4, events.recv())
             .await
             .expect("an event in time")
             .expect("the channel open")
@@ -1286,14 +1494,18 @@ mod tests {
         }))
     }
 
-    /// Input typed while the stream is down waits for the next one and
-    /// goes out in order behind its handshake, the re-dial resumes from
-    /// where the hydrated stream stopped, and a paste past the frame cap
-    /// is split with its take on the first frame only.
-    #[tokio::test]
-    async fn input_held_across_a_drop_flushes_in_order_after_the_resume() {
-        let (dials_tx, mut dials) = mpsc::unbounded_channel();
+    struct Rig {
+        stream: AttachStream,
+        events: mpsc::UnboundedReceiver<AttachEvent>,
+        dials: mpsc::UnboundedReceiver<tokio::io::DuplexStream>,
+        session: watch::Sender<Option<SessionFacts>>,
+        allowance: Allowance,
+    }
+
+    fn rig() -> Rig {
+        let (dials_tx, dials) = mpsc::unbounded_channel();
         let session = facts();
+        let allowance = Allowance::unlimited();
         let req = AttachRequest {
             tab_id: 5,
             cols: GRID.cols,
@@ -1306,13 +1518,35 @@ mod tests {
             client_id: "c".into(),
             libghostty_build: "b".into(),
         };
-        let (stream, mut events) = spawn_with(
+        let (stream, events) = spawn_with(
             &tokio::runtime::Handle::current(),
-            Arc::new(PipeDialer(dials_tx)),
+            Arc::new(PipeDialer(dials_tx, allowance.clone())),
             who,
             session.subscribe(),
             req,
         );
+        Rig {
+            stream,
+            events,
+            dials,
+            session,
+            allowance,
+        }
+    }
+
+    /// Input typed while the stream is down waits for the next one and
+    /// goes out in order behind its handshake (after one RESIZE that
+    /// catches the session up), the re-dial resumes from where the
+    /// hydrated stream stopped, and a paste past the frame cap is split
+    /// with its take on the first frame only.
+    #[tokio::test]
+    async fn input_held_across_a_drop_flushes_in_order_after_the_resume() {
+        let Rig {
+            stream,
+            mut events,
+            mut dials,
+            ..
+        } = rig();
 
         let (line, first_reader, mut write) =
             accept(&mut dials, accepted(AttachMode::Snapshot, 3)).await;
@@ -1379,9 +1613,9 @@ mod tests {
         assert_eq!(
             read_back,
             vec![
+                (FRAME_RESIZE, vec![80, 0, 24, 0, 9, 0, 18, 0, 1]),
                 (FRAME_INPUT, vec![0, b'k']),
                 (FRAME_INPUT, vec![INPUT_TAKE_BEFORE, b'l', b's', b'\r']),
-                (FRAME_RESIZE, vec![80, 0, 24, 0, 9, 0, 18, 0, 1]),
             ]
         );
 
@@ -1400,6 +1634,151 @@ mod tests {
             next_frame(&mut reader).await.frame_type,
             roost_ipc::dataframe::FRAME_DETACH
         );
+        assert_eq!(
+            next_event(&mut events).await,
+            AttachEvent::Ended {
+                reason: "detached".into()
+            }
+        );
+    }
+
+    fn facts_for(session_id: &str) -> Option<SessionFacts> {
+        Some(SessionFacts {
+            session_id: session_id.into(),
+            libghostty_build: "b".into(),
+            payload_kinds: vec!["vt".into()],
+            app_version: "0".into(),
+        })
+    }
+
+    async fn reconnecting(events: &mut mpsc::UnboundedReceiver<AttachEvent>) -> String {
+        match next_event(events).await {
+            AttachEvent::Reconnecting { reason } => reason,
+            other => panic!("expected Reconnecting, got {other:?}"),
+        }
+    }
+
+    async fn accepted_event(events: &mut mpsc::UnboundedReceiver<AttachEvent>) {
+        let event = next_event(events).await;
+        assert!(matches!(event, AttachEvent::Accepted { .. }), "{event:?}");
+    }
+
+    /// A tab id belongs to the session that minted it: once the host is
+    /// on another session the stream ends instead of attaching — and
+    /// typing into — whatever that session gave the same id.
+    #[tokio::test]
+    async fn a_replaced_session_ends_the_stream_without_dialing_it() {
+        let mut rig = rig();
+        let (_, first_reader, write) =
+            accept(&mut rig.dials, accepted(AttachMode::Snapshot, 3)).await;
+        accepted_event(&mut rig.events).await;
+        rig.session.send_replace(facts_for("s2"));
+        drop((first_reader, write));
+        reconnecting(&mut rig.events).await;
+        rig.stream
+            .input(b"meant for s1".to_vec(), InputTake::Before);
+        assert_eq!(
+            next_event(&mut rig.events).await,
+            AttachEvent::Ended {
+                reason: "session restarted".into()
+            }
+        );
+        assert!(
+            rig.dials.try_recv().is_err(),
+            "the new session is never dialed"
+        );
+    }
+
+    /// The session commits an explicit take when it writes the accepted
+    /// line; a preamble that never follows must not make the re-dial take
+    /// the size a second time.
+    #[tokio::test]
+    async fn a_take_the_session_committed_is_spent_even_without_the_preamble() {
+        let mut rig = rig();
+        let conn = rig.dials.recv().await.expect("a dial");
+        let (read, mut write) = tokio::io::split(conn);
+        let mut lines = FrameReader::new(read);
+        let line = lines.read_line().await.unwrap().expect("a handshake");
+        let line: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(line["take"].as_bool(), Some(true));
+        let reply = AttachHandshakeReply::Accepted(accepted(AttachMode::Snapshot, 3));
+        write_frame(&mut write, &serde_json::to_vec(&reply).unwrap())
+            .await
+            .unwrap();
+        drop((lines, write));
+        reconnecting(&mut rig.events).await;
+        let (line, _reader, _write) =
+            accept(&mut rig.dials, accepted(AttachMode::Snapshot, 3)).await;
+        assert_eq!(line["take"].as_bool(), Some(false));
+    }
+
+    /// A flush that fails part-way loses the frame it was writing and no
+    /// other: what it never tried waits for the next stream.
+    #[tokio::test]
+    async fn a_failed_flush_keeps_the_input_it_never_tried() {
+        let mut rig = rig();
+        let (_, first_reader, write) =
+            accept(&mut rig.dials, accepted(AttachMode::Snapshot, 3)).await;
+        accepted_event(&mut rig.events).await;
+        drop((first_reader, write));
+        reconnecting(&mut rig.events).await;
+        for key in [b"a", b"b", b"c"] {
+            rig.stream.input(key.to_vec(), InputTake::None);
+        }
+
+        let conn = rig.dials.recv().await.expect("a second dial");
+        let (read, mut write) = tokio::io::split(conn);
+        let mut lines = FrameReader::new(read);
+        lines.read_line().await.unwrap().expect("a handshake");
+        rig.allowance.cut(0, Cutoff::Fail);
+        let reply = AttachHandshakeReply::Accepted(accepted(AttachMode::Snapshot, 3));
+        write_frame(&mut write, &serde_json::to_vec(&reply).unwrap())
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut write, &PREAMBLE)
+            .await
+            .unwrap();
+        accepted_event(&mut rig.events).await;
+        drop((lines, write));
+        reconnecting(&mut rig.events).await;
+        rig.allowance.restore();
+
+        let (_, mut reader, _write) =
+            accept(&mut rig.dials, accepted(AttachMode::Snapshot, 3)).await;
+        let mut read_back = Vec::new();
+        for _ in 0..2 {
+            read_back.push(next_frame(&mut reader).await.payload);
+        }
+        assert_eq!(read_back, vec![vec![0, b'b'], vec![0, b'c']]);
+    }
+
+    /// A peer that stops reading cannot park the attach: the write gives
+    /// up at its budget and the stream is re-dialed.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_write_is_a_dropped_stream() {
+        let mut rig = rig();
+        let (_, _reader, _write) = accept(&mut rig.dials, accepted(AttachMode::Snapshot, 3)).await;
+        accepted_event(&mut rig.events).await;
+        rig.allowance.cut(0, Cutoff::Stall);
+        rig.stream.input(b"x".to_vec(), InputTake::None);
+        let reason = reconnecting(&mut rig.events).await;
+        assert!(reason.contains("stalled"), "{reason}");
+        rig.allowance.restore();
+        accept(&mut rig.dials, accepted(AttachMode::Snapshot, 3)).await;
+    }
+
+    /// A detach does not wait out a write the peer is not reading.
+    #[tokio::test(start_paused = true)]
+    async fn a_detach_is_not_held_up_by_a_stalled_write() {
+        let mut rig = rig();
+        let (_, _reader, _write) = accept(&mut rig.dials, accepted(AttachMode::Snapshot, 3)).await;
+        accepted_event(&mut rig.events).await;
+        rig.allowance.cut(0, Cutoff::Stall);
+        rig.stream.input(b"x".to_vec(), InputTake::None);
+        let Rig {
+            stream, mut events, ..
+        } = rig;
+        stream.detach();
         assert_eq!(
             next_event(&mut events).await,
             AttachEvent::Ended {

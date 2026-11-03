@@ -25,4 +25,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 roost-engine = { path = "../roost-engine", features = ["vt"] }
+# Paused time, for the attach's write budget.
+tokio = { workspace = true, features = ["test-util"] }
 roost-vt = { path = "../roost-vt", features = ["ffi"] }

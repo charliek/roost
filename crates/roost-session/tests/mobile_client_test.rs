@@ -458,7 +458,7 @@ async fn a_dropped_data_connection_resumes_where_it_stopped() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_killed_session_is_redialed_and_the_attach_snapshots_its_successor() {
+async fn a_killed_session_ends_the_attach_and_its_input_never_reaches_the_successor() {
     let (_tmp, root) = root();
     let mut first = start(&root, &session_binary(), "state-a").await;
     let mut host = Host::spawn(&root, SKEWED_BUILD);
@@ -479,8 +479,10 @@ async fn a_killed_session_is_redialed_and_the_attach_snapshots_its_successor() {
         matches!(event, AttachEvent::Reconnecting { .. })
     })
     .await;
+    stream.input(b"echo leaked-$((5+5))\r".to_vec(), InputTake::Before);
 
-    // A fresh layout, so its seed tab has the id the attach names.
+    // A fresh layout, so its seed tab has the id the attach names: the
+    // case where a re-attach would land on the wrong program.
     let _second = start(&root, &session_binary(), "state-b").await;
     host.connected().await;
     let new_session = host.client.session().expect("facts").session_id;
@@ -491,28 +493,27 @@ async fn a_killed_session_is_redialed_and_the_attach_snapshots_its_successor() {
         "the precondition: the seed tab's id again"
     );
 
-    let (accepted, before) = until_attach(&mut events, "the re-attach", |event| {
-        matches!(event, AttachEvent::Accepted { .. })
+    let (ended, before) = until_attach(&mut events, "Ended", |event| {
+        matches!(event, AttachEvent::Ended { .. })
     })
     .await;
-    assert!(
-        before
-            .iter()
-            .all(|event| matches!(event, AttachEvent::Reconnecting { .. })),
-        "{before:?}"
+    assert_eq!(
+        ended,
+        AttachEvent::Ended {
+            reason: "session restarted".into()
+        }
     );
+    assert!(before.is_empty(), "no stream on the successor: {before:?}");
+    let dump = host
+        .call(
+            "tab.dump",
+            serde_json::json!({"tab_id": tab_id.to_string()}),
+        )
+        .await;
     assert!(
-        matches!(
-            accepted,
-            AttachEvent::Accepted {
-                mode: AttachMode::Snapshot,
-                ..
-            }
-        ),
-        "another session's stream cannot be resumed: {accepted:?}"
+        !dump.to_string().contains("leaked"),
+        "input held for the old session reached the new one: {dump}"
     );
-    stream.input(b"echo three-$((1+2))\r".to_vec(), InputTake::Before);
-    until_output(&mut events, "three-3").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
