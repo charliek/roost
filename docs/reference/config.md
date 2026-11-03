@@ -2,10 +2,10 @@
 
 Roost reads a single user-level config file at `~/.config/roost/config.conf`
 (XDG-style on macOS by deliberate divergence from Apple HIG — matching
-Ghostty / nvim / fish). Both UIs — the Swift Mac app and the iced binary
-Linux installs as `roost` — parse the same file with the same semantics,
-so a config tuned on one platform is portable to the other. A few
-settings are honored by only one of them — where that is the case, the
+Ghostty / nvim / fish). The iced UI — `Roost.app` on macOS, `roost` on
+Linux — parses the same file with the same semantics on both, so a config
+tuned on one platform is portable to the other. A few
+settings are honored by only one platform — where that is the case, the
 setting's own section says so explicitly (see
 [`link-modifier`](#link-modifier)); unknown and unsupported keys are
 dropped rather than erroring, so a portable file stays valid everywhere.
@@ -26,26 +26,24 @@ the launcher with deterministic commands.
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `theme` | string | bundled `roost-dark` | Theme name (see [`themes.md`](themes.md)). |
-| `font-family` | string | system monospace (Swift Mac app) / `JetBrains Mono, Monospace` (iced UI, which bundles JetBrains Mono) | Monospaced font family. Quoted values supported (`"JetBrains Mono"`). See [Fonts](fonts.md). |
+| `font-family` | string | `JetBrains Mono, Monospace` (the UI bundles JetBrains Mono) | Monospaced font family. Quoted values supported (`"JetBrains Mono"`). See [Fonts](fonts.md). |
 | `word-break-chars` | string | `` `_-.+~/:@%` `` | Extra characters treated as word characters for double-click word selection (keeps paths + URLs whole). Despite the `-break-` name (kept for Ghostty compatibility), the value is the extra word-char set. |
-| `show-sidebar-agents` | bool | `true` | Whether the sidebar shows the Agents panel — every agent on every host in one list below the projects — and the agent count on each project row. The Swift app shows one row per agent-owned tab under its project instead. Also toggled at runtime (keybind / palette / Mac View menu). |
-| `agent-panel-sort` | `grouped \| priority \| recent` | `grouped` | How the sidebar's Agents panel orders its rows: in sidebar order under a head per host and project, most urgent first, or most recent first. Also cycled at runtime by the `cycle_agent_panel_sort` action and the palette's **Cycle Agent Panel Sort**, which write the choice back here. An unrecognized value logs a warning and reads as `grouped`. iced-only. |
+| `show-sidebar-agents` | bool | `true` | Whether the sidebar shows the Agents panel — every agent on every host in one list below the projects — and the agent count on each project row. Also toggled at runtime (keybind / palette / Mac View menu). |
+| `agent-panel-sort` | `grouped \| priority \| recent` | `grouped` | How the sidebar's Agents panel orders its rows: in sidebar order under a head per host and project, most urgent first, or most recent first. Also cycled at runtime by the `cycle_agent_panel_sort` action and the palette's **Cycle Agent Panel Sort**, which write the choice back here. An unrecognized value logs a warning and reads as `grouped`. |
 | `font-size` | number | `13` (Linux), `14` (Mac) | Point size for the terminal font. Must be `> 0`. One point is one pixel on macOS; Linux renders at 96 dpi (`13` ≈ 17.3 px). See [Fonts](fonts.md#font-size). |
-| `tab-min-width` | number | `80` (Mac) | Minimum tab pill width in points. `0` disables the floor. Mac-only. |
-| `tab-max-width` | number | `220` (Mac) | Maximum tab pill width in points. `0` disables the cap (pills grow to fit). Mac-only. |
 | `keybind` | `<trigger> = <action>` | (see [Keybindings](../getting-started/keybindings.md)) | Append a custom keybinding. Repeatable; later entries override earlier ones. |
 | `command` | `label="…" run="…" [hold=…]` | none | Launcher entry (⌘⇧T / Alt+Shift+T) that runs a fixed command in a new tab. Repeatable. See [Extending Roost](../guides/extending.md#2-the-command-launcher). |
 | `provider` | `label="…" run="…" [timeout=…] [limit=…]` | none | Dynamic, script-backed menu in the custom palette (⌘⇧E / Alt+Shift+E). The script generates rows on demand and acts on the choice. Repeatable; executables in `providers/` (beside this file) are also discovered. See [Extending Roost](../guides/extending.md#3-dynamic-providers). |
 | `copy-on-select` | `off \| true \| clipboard` | `true` | What a mouse-drag selection writes to the clipboard on release. See [the dedicated section below](#copy-on-select). |
 | `clipboard-write` | `allow \| deny` | `allow` | Whether a program running in the terminal can write the host clipboard via OSC 52. See [the dedicated section below](#clipboard-write). |
-| `link-modifier` | `ctrl \| alt \| super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. iced-only; the Swift Mac app is fixed to Cmd. See [the dedicated section below](#link-modifier). |
-| `macos-option-as-alt` | `false \| true \| left \| right` | `false` | Which Option keys send Alt (Meta) on macOS, so ⌥B sends `ESC b` instead of typing `∫`. Read by the iced UI on macOS only. See [the dedicated section below](#macos-option-as-alt). |
-| `macos-auto-secure-input` | bool | `true` | Turn Secure Keyboard Entry on while the active tab is at a password prompt. Read by the iced UI on macOS only. See [Secure Keyboard Entry](#secure-keyboard-entry). |
-| `macos-secure-input-indication` | bool | `true` | Show a lock at the right end of the tab band while Secure Keyboard Entry is on. Read by the iced UI on macOS only. See [Secure Keyboard Entry](#secure-keyboard-entry). |
-| `macos-secure-keyboard-entry` | bool | `false` | Keep Secure Keyboard Entry on whenever Roost is the active app. Written by the menu's **Secure Keyboard Entry** row, the palette's **Toggle Secure Keyboard Entry** and the `toggle_secure_input` action. Read by the iced UI on macOS only. See [Secure Keyboard Entry](#secure-keyboard-entry). |
+| `link-modifier` | `ctrl \| alt \| super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. See [the dedicated section below](#link-modifier). |
+| `macos-option-as-alt` | `false \| true \| left \| right` | `false` | Which Option keys send Alt (Meta) on macOS, so ⌥B sends `ESC b` instead of typing `∫`. Read on macOS only. See [the dedicated section below](#macos-option-as-alt). |
+| `macos-auto-secure-input` | bool | `true` | Turn Secure Keyboard Entry on while the active tab is at a password prompt. Read on macOS only. See [Secure Keyboard Entry](#secure-keyboard-entry). |
+| `macos-secure-input-indication` | bool | `true` | Show a lock at the right end of the tab band while Secure Keyboard Entry is on. Read on macOS only. See [Secure Keyboard Entry](#secure-keyboard-entry). |
+| `macos-secure-keyboard-entry` | bool | `false` | Keep Secure Keyboard Entry on whenever Roost is the active app. Written by the menu's **Secure Keyboard Entry** row, the palette's **Toggle Secure Keyboard Entry** and the `toggle_secure_input` action. Read on macOS only. See [Secure Keyboard Entry](#secure-keyboard-entry). |
 | `agent-hooks` | agent list \| `off` \| absent | absent (unanswered) | Which supported coding agents (Claude Code, Codex, grok/gx, cursor-agent, OpenCode) Roost wires its hook entries into, at startup. Absent means nobody has answered the consent dialog yet — Roost writes nothing until they do. See [the dedicated section below](#agent-hooks) and the [Agent Hooks](../guides/agents.md) guide. |
 | `local-backend` | `in-process \| session` | `in-process` for an existing setup; `session` on a genuinely fresh install | Where the tabs you start in the Roost window run. See [the dedicated section below](#local-backend). |
-| `chrome-accent` | `system \| #rrggbb` | `system` | The accent color of the window chrome: the active tab and project, notification dots, focus rings. iced-only. See [the dedicated section below](#chrome-accent). |
+| `chrome-accent` | `system \| #rrggbb` | `system` | The accent color of the window chrome: the active tab and project, notification dots, focus rings. See [the dedicated section below](#chrome-accent). |
 
 ## `copy-on-select`
 
@@ -196,7 +194,7 @@ and plain `https://…` text matched on screen.
 
 **Defaults are platform-native**, mirroring the keybinding scheme:
 
-- **macOS: Cmd** — matches the Swift app and native Mac apps (⌘-click).
+- **macOS: Cmd** — matches native Mac apps (⌘-click).
 - **Linux: Alt** — Roost's single "primary" modifier on Linux, leaving
   Ctrl free for the shell/readline.
 
@@ -207,11 +205,8 @@ common-terminal convention) just set:
 link-modifier = ctrl
 ```
 
-> **Scope:** this setting is honored by the **iced UI** — the shipped
-> Linux `roost` and the experimental `Roost-Iced.app` alike
+> **Scope:** this setting is honored on both platforms
 > (`link_modifier_held` in `crates/roost-iced/src/app/interactions.rs`).
-> The Swift Mac app's modifier is currently fixed to Cmd, so the key is
-> silently ignored there (harmless — unknown keys are always dropped).
 >
 > **Heads up (Linux):** some window managers/compositors grab `Alt`+drag
 > to move windows, which can swallow `Alt`+click. If link-clicking feels
@@ -277,9 +272,8 @@ the character macOS gives them:
   press and release. If Roost has seen neither while Option is held, it
   counts that Option as the configured side, and logs this once.
 
-> **Scope:** read by the iced UI on macOS (`Roost-Iced.app`). On Linux,
-> Alt already sends the ESC prefix, so the key is parsed and ignored.
-> The Swift Mac app ignores it too (unknown keys are always dropped).
+> **Scope:** read on macOS. On Linux, Alt already sends the ESC prefix,
+> so the key is parsed and ignored.
 
 ## Secure Keyboard Entry
 
@@ -334,10 +328,9 @@ plain `ssh` run in a local tab is different: `ssh` puts the local
 terminal in raw mode, so a password prompt on the far side is never
 seen. Turn on `macos-secure-keyboard-entry` for those.
 
-> **Scope:** the iced UI on macOS (`Roost-Iced.app`). On Linux the
-> three keys are parsed and ignored, `toggle_secure_input` does
-> nothing, and there is no menu row, palette row or lock. The Swift Mac
-> app ignores the keys too (unknown keys are always dropped).
+> **Scope:** macOS. On Linux the three keys are parsed and ignored,
+> `toggle_secure_input` does nothing, and there is no menu row, palette
+> row or lock.
 
 ## `agent-hooks`
 
@@ -399,12 +392,6 @@ ensure`/`uninstall` run there, or its own dialog — and holds until a
 more permissive client connects again. See [Agent Hooks → Remote
 hosts](../guides/agents.md#remote-hosts) for the full behavior.
 
-The Mac app carries its own mirror of this parser (`AgentHooks` in
-`Config.swift`) rather than reading it only through `roostctl` — it
-needs the key at launch to decide whether to raise the consent sheet
-before it has spawned anything — kept in parity with the Rust parser,
-including the normalisation rules, by `ConfigAgentHooksTests`.
-
 ## `local-backend`
 
 Where the tabs you start in the Roost window run: in the UI process
@@ -434,9 +421,6 @@ logs a warning and reads as `in-process` — configured badly, not
 unconfigured, so it never triggers the fresh-install write on a
 later launch.
 
-Read by the iced UI. The Swift Mac app (`Roost.app`) is always
-in-process and never reads this key.
-
 ## `chrome-accent`
 
 The accent color of the window chrome around the terminal: the active
@@ -456,9 +440,6 @@ accent mixed half and half with a dark grey.
 
 Anything else (a color name, a short hex) logs a warning and reads as
 `system`.
-
-Read by the iced UI. The Swift Mac app (`Roost.app`) ignores this key
-and always follows the system accent.
 
 ## Example
 
@@ -485,8 +466,7 @@ copy-on-select = true
 clipboard-write = allow
 
 # Open links with Ctrl+click instead of the platform default
-# (Cmd on Mac, Alt on Linux). iced UI only — the Swift Mac app is
-# always Cmd-click.
+# (Cmd on Mac, Alt on Linux).
 link-modifier = ctrl
 
 # Add a custom trigger (here, restoring the pre-Alt Ctrl+T for new_tab

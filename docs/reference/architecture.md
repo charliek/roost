@@ -1,31 +1,31 @@
 # Architecture
 
-Roost ships two platform products — Swift + AppKit on macOS (`Roost.app`) and Rust + iced on Linux (`roost`, packaged as the `.deb`) — that each embed their runtime in-process. The same iced binary also builds an experimental `Roost-Iced.app` for macOS, which is the Linux UI on a different host rather than a third implementation. External tooling (the `roostctl` CLI, Claude Code hooks) talks to a running UI via newline-delimited JSON over a Unix-domain socket; the wire format is documented in [`docs/reference/ipc.md`](ipc.md). `libghostty-vt` is vendored once and linked directly into both UIs for in-process VT parsing and rendering.
+Roost ships one desktop UI, written in Rust with iced, on macOS (`Roost.app`) and Linux (`roost`, packaged as the `.deb`). It embeds its runtime in-process; the same binary builds for both host OSes, with the AppKit-only seams in `crates/roost-iced/src/macos/`. External tooling (the `roostctl` CLI, Claude Code hooks) talks to a running UI via newline-delimited JSON over a Unix-domain socket; the wire format is documented in [`docs/reference/ipc.md`](ipc.md). `libghostty-vt` is vendored once and linked directly into the UI for in-process VT parsing and rendering.
 
-One contract, two implementations: the op set in `roost-ipc` is the contract, the Rust side implements it over the toolkit-neutral `roost-engine`, and the Swift side implements it over its own `@MainActor` workspace.
+One contract, one desktop implementation: the op set in `roost-ipc` is the contract, and the Rust side implements it over the toolkit-neutral `roost-engine`. A mobile client of `roost-session` is planned.
 
-For the durable design rationale (why two languages, why in-process, why local UDS) see [Vision](../development/vision.md).
+For the durable design rationale (why in-process, why local UDS) see [Vision](../development/vision.md).
 
 ## Stack
 
-| Layer | macOS (`mac/`, Swift + AppKit) | Linux (`crates/roost-iced`, Rust + iced) |
-|---|---|---|
-| Window + chrome | Swift + AppKit | Rust + iced (`crates/roost-iced/src/app.rs`) |
-| Renderer | Core Graphics over libghostty-vt cell grid | iced + wgpu over libghostty-vt cell grid (`crates/roost-iced/src/terminal_widget.rs`) |
-| Terminal engine | `libghostty-vt` (vendored, shared archive) | `libghostty-vt` (vendored, shared archive) |
-| Workspace | `mac/Sources/Roost/Workspace.swift` (`@MainActor`) | `crates/roost-engine/src/workspace.rs` |
-| PTY supervisor | `mac/Sources/Roost/PtySupervisor.swift` (forkpty + `DispatchSourceRead`) | `crates/roost-engine/src/pty.rs` (`portable-pty` + tokio tasks) |
-| Persistence | `state.json` via tmp + fsync + `replaceItemAt` | `state.json` via tmp + fsync + rename + parent-dir fsync (`crates/roost-engine/src/persistence.rs`) |
-| IPC server | `mac/Sources/Roost/IPCServer.swift` (Darwin sockets) | `crates/roost-ipc/src/server.rs` (tokio `UnixListener`) |
-| IPC wire types | `mac/Sources/Roost/IPCMessages.swift` (Codable) | `crates/roost-ipc/src/messages.rs` (serde) |
-| OSC scanning | `mac/Sources/Roost/OscScanner.swift` per `TerminalView` | `roost-osc` crate + `crates/roost-engine/src/osc.rs` (`OscRouter`), per per-tab drain task |
-| URL detection (clickable links) | `mac/Sources/Roost/UrlDetection.swift` — hand-mirrored, parity-pinned against `tests/url-fixtures/` | `crates/roost-url` |
-| Agent state model (shell/lifecycle/attention/ownership axes, `tab.state` derivation) | `mac/Sources/Roost/AgentState.swift` | `crates/roost-ipc/src/agent.rs` |
-| Agent adapters (Claude Code today) | `roostctl claude-hook` (binary from `crates/roost-cli`, links `crates/roost-agent`) — same binary on both UIs | (same) |
-| Single-instance (two flocks: socket/bind + state — see [Paths](paths.md#two-single-instance-locks)) | `mac/Sources/Roost/SingleInstance.swift` (flock via `@_silgen_name`) | `crates/roost-engine/src/single_instance.rs` (`File::try_lock`) |
-| Shell-integration CLI | `roostctl` (binary from `crates/roost-cli`) — same binary on both UIs | (same) |
+| Layer | Implementation (`crates/roost-iced`, Rust + iced) |
+|---|---|
+| Window + chrome | Rust + iced (`crates/roost-iced/src/app.rs`) |
+| Renderer | iced + wgpu over the libghostty-vt cell grid (`crates/roost-iced/src/terminal_widget.rs`) |
+| Terminal engine | `libghostty-vt` (vendored, shared archive) |
+| Workspace | `crates/roost-engine/src/workspace.rs` |
+| PTY supervisor | `crates/roost-engine/src/pty.rs` (`portable-pty` + tokio tasks) |
+| Persistence | `state.json` via tmp + fsync + rename + parent-dir fsync (`crates/roost-engine/src/persistence.rs`) |
+| IPC server | `crates/roost-ipc/src/server.rs` (tokio `UnixListener`) |
+| IPC wire types | `crates/roost-ipc/src/messages.rs` (serde) |
+| OSC scanning | `roost-osc` crate + `crates/roost-engine/src/osc.rs` (`OscRouter`), per per-tab drain task |
+| URL detection (clickable links) | `crates/roost-url` |
+| Agent state model (shell/lifecycle/attention/ownership axes, `tab.state` derivation) | `crates/roost-ipc/src/agent.rs` |
+| Agent adapters (Claude Code today) | `roostctl claude-hook` (binary from `crates/roost-cli`, links `crates/roost-agent`) |
+| Single-instance (two flocks: socket/bind + state — see [Paths](paths.md#two-single-instance-locks)) | `crates/roost-engine/src/single_instance.rs` (`File::try_lock`) |
+| Shell-integration CLI | `roostctl` (binary from `crates/roost-cli`) |
 
-The two UIs are written separately and idiomatic to their platform. What they share is the JSON IPC wire format (the `roost-ipc` crate on the Rust side, its hand-mirrored Swift counterpart in `IPCMessages.swift`) and the agent state model. Below the toolkit line the Rust UI additionally sits on `roost-engine` (workspace, PTY, persistence, events, single-instance) and `roost-ui-model` (config, theme, keybinds, palette, providers, agent/notification projections) — crates that are deliberately toolkit-neutral, both because the same code has to serve iced on two host OSes and because a future Swift adapter over the same core is an open direction. See [Shared Rust engine](../development/shared-rust-engine.md).
+Below the toolkit line the UI sits on `roost-engine` (workspace, PTY, persistence, events, single-instance) and `roost-ui-model` (config, theme, keybinds, palette, providers, agent/notification projections) — crates that are deliberately toolkit-neutral, both because the same code serves iced on two host OSes and because a mobile client of `roost-session` is planned. See [Shared Rust engine](../development/shared-rust-engine.md).
 
 ## Repository layout
 
@@ -41,17 +41,14 @@ crates/
   roost-url/              # Shared URL detection for clickable links
   roost-cli/              # roostctl binary
   roost-client/           # Host-session client core: state machine, mirror, reconnect, op queue, uploads
-  roost-iced/             # iced UI — packaged .deb ships it as /usr/bin/roost;
-                          #   src/macos/ holds the AppKit seams for Roost-Iced.app
+  roost-iced/             # iced UI — the .deb ships it as /usr/bin/roost, the DMG as Roost.app;
+                          #   src/macos/ holds the AppKit seams for the Mac build
   roost-session/          # opt-in headless host-session daemon (roost-session binary);
-                          #   Linux + macOS (bundled in Roost-Iced.app),
+                          #   Linux + macOS (bundled in Roost.app),
                           #   started with `roostctl session start`
 mac/
-  Sources/Roost/          # Swift Mac UI — embeds Workspace + PtySupervisor + IPC server
-  Resources/              # themes, Info.plist.template, Info-iced.plist.template, entitlements
-  Tests/RoostTests/       # swift-testing test suite
-  scripts/bundle.sh       # SwiftPM → Roost.app + embedded roostctl + codesign
-  scripts/bundle-iced.sh  # cargo → Roost-Iced.app (same signing/notarization path)
+  Resources/              # Info.plist.template, entitlements, AppIcon
+  scripts/bundle-iced.sh  # cargo → Roost.app (production) or Roost-Iced.app (dev) + embedded roostctl + codesign
 docs/
   reference/ipc.md        # JSON IPC wire spec — canonical
   archive/roost.proto     # Historical reference (the pre-M7 gRPC schema)
@@ -69,7 +66,7 @@ flowchart LR
     OSC["printf '\\033]9;…'"]
     PTY["PTY supervisor<br/>(in-process)"]
     Workspace["Workspace<br/>(in-process)"]
-    Scanner["OSC scanner<br/>(per TerminalView)"]
+    Scanner["OSC scanner<br/>(per tab)"]
     UI["UI event handler<br/>(main thread)"]
     Indicator["per-tab indicator"]
     Stripe["sidebar rollup stripe"]
@@ -100,33 +97,31 @@ echo '{"id":"1","op":"identify","params":{}}' | nc -U ~/Library/Caches/Roost/roo
 
 ## Threading
 
-AppKit is strictly single-threaded for UI work, and iced's winit event loop is likewise single-threaded for its `update`/`view` cycle. Widget operations and `libghostty-vt` calls must run on that thread.
+iced's winit event loop is single-threaded for its `update`/`view` cycle (and AppKit, under the macOS build, is single-threaded for UI work). Widget operations and `libghostty-vt` calls must run on that thread.
 
-| Layer | macOS | Linux (iced) |
-|---|---|---|
-| UI widgets, draw, input | Main thread only | Main thread only (the winit event-loop thread, driven from `update` / `view`) |
-| `libghostty-vt` handle + `vt_write` | Main thread only (`@MainActor`) | Main thread only, driven from `update` |
-| PTY read (master fd) | `DispatchSourceRead` on a background queue | Per-tab `tokio::spawn_blocking` read loop in `roost-engine` |
-| PTY write | Main thread (`LocalClient.writeTab`) | A per-tab ordered tokio task draining an input + resize command channel, so submission order is preserved |
-| Engine → UI feed | n/a (in-process `@MainActor` calls) | Workspace events, PTY output and IPC requests land on **one** channel from background tokio tasks; a `Notify`-backed iced `Subscription` wakes `update` to drain it on the main thread (`crates/roost-iced/src/engine_feed.rs`) |
-| OSC dispatch | Main thread (hopped from the read queue via `DispatchQueue.main.async`) | Main thread (delivered through the engine feed) |
-| IPC accept loop | Detached `Task` — never blocks main | tokio task — never blocks main |
-| IPC handler dispatch | Per-connection `Task`; mutations hop to main | The handler hands each request to the engine feed and awaits a oneshot reply, so mutations happen on the main thread in FIFO order |
-| `state.json` writes | Main thread (small; atomic via tmp + rename) | Main thread (same) |
+| Layer | Thread / actor |
+|---|---|
+| UI widgets, draw, input | Main thread only (the winit event-loop thread, driven from `update` / `view`) |
+| `libghostty-vt` handle + `vt_write` | Main thread only, driven from `update` |
+| PTY read (master fd) | Per-tab `tokio::spawn_blocking` read loop in `roost-engine` |
+| PTY write | A per-tab ordered tokio task draining an input + resize command channel, so submission order is preserved |
+| Engine → UI feed | Workspace events, PTY output and IPC requests land on **one** channel from background tokio tasks; a `Notify`-backed iced `Subscription` wakes `update` to drain it on the main thread (`crates/roost-iced/src/engine_feed.rs`) |
+| OSC dispatch | Main thread (delivered through the engine feed) |
+| IPC accept loop | tokio task — never blocks main |
+| IPC handler dispatch | The handler hands each request to the engine feed and awaits a oneshot reply, so mutations happen on the main thread in FIFO order |
+| `state.json` writes | Main thread (small; atomic via tmp + rename) |
 
-Both UIs are therefore single-actor for state: every request is applied on the UI thread, and responses come back in completion order rather than request order.
+The UI is therefore single-actor for state: every request is applied on the UI thread, and responses come back in completion order rather than request order.
 
-The Mac PTY read path uses a dedicated pattern: the `DispatchSourceRead` closure is installed via a `nonisolated static` helper so Swift 6 doesn't infer `@MainActor` isolation on the closure body (which would trip `dispatch_assert_queue(main)` from the dispatch worker thread). Bytes bridge to the main actor through a `Sendable AsyncStream<InternalEvent>` that a drain `Task { @MainActor in ... }` consumes — see `mac/Sources/Roost/PtySupervisor.swift` for the comment block that walks through this.
-
-The iced side's equivalent subtlety is the drain: the feed is batched (capped per wake), and a request that arrives in a batch which already carries pending workspace mutations forces a mid-drain reconcile first, so an IPC caller never observes state from before the mutations that preceded it on the same channel. The macOS-only AppKit ops in `crates/roost-iced/src/macos/` additionally require an `objc2::MainThreadMarker` and fail loudly rather than touch AppKit off-thread.
+The drain has one subtlety: the feed is batched (capped per wake), and a request that arrives in a batch which already carries pending workspace mutations forces a mid-drain reconcile first, so an IPC caller never observes state from before the mutations that preceded it on the same channel. The macOS-only AppKit ops in `crates/roost-iced/src/macos/` additionally require an `objc2::MainThreadMarker` and fail loudly rather than touch AppKit off-thread.
 
 ## Boundaries
 
-- Each UI process owns its workspace, PTY supervisor, and IPC server. There is no separate daemon by default — except a fresh Roost-Iced install, which starts its local tabs on a `roost-session` it manages. The other opt-in exception is `roost-session` (`crates/roost-session/`), a headless daemon for host-sessions, started with `roostctl session start` (see [`ipc.md`](ipc.md#session-sockets)). State is in memory + the bundle-profile `state.json` file. A saved host's *connection* state is the running UI's alone — `state.json` persists only the `{id, label, target, last_connected}` registry, plus the tab the window last showed in each of a host's projects (`tab_memory`) — which is why `host.connect` / `host.disconnect` / `host.status` have no headless form and answer `internal: no UI attached` without one.
-- `libghostty-vt` lives inside each UI for VT parsing + rendering.
-- OSC scanning lives in the UI (`OscScanner.swift` on macOS, the `roost-osc` crate + `roost-engine`'s `OscRouter` in the Rust UI) because OSC parsing walks the same byte stream the VT parser does. OSC events apply directly to the local workspace via `LocalClient.applyOSC`.
-- Terminal *query* replies (the program asking the terminal for its colors, device attributes, etc.) all come from libghostty, through the `write_pty` effects callback each UI installs and drains onto the tab's PTY input. Roost's OSC scanner sees those queries but answers none of them — it did synthesize the OSC color replies until the pinned SHA started answering them, at which point synthesizing too meant double-answering. See [Terminal query replies](terminal-queries.md).
-- The IPC server is per-UI: external tooling (`roostctl`, Claude hooks) talks to the bundle profile's socket. Dev builds of iced (and the experimental `Roost-Iced.app`) use isolated `Roost-iced`/`roost-iced` paths; the packaged `.deb` build resolves the production `Linux` profile instead (see [Paths & Environment](paths.md)). `roostctl --target {mac,linux,iced}` routes explicitly; with no selector it probes every distinct candidate concurrently and requires a choice if multiple UIs answer.
-- Single-instance enforcement uses `flock(LOCK_EX | LOCK_NB)` on **two** lock files, one per thing guarded: `roost.lock` beside the socket (the bind lock, following the socket: `XDG_RUNTIME_DIR` for a UI, the passwd-home socket directory or `ROOST_SESSION_SOCKET_DIR` for a session) and `state.lock` beside `state.json` (following `ROOST_STATE_DIR`). They are taken socket-first and released in reverse. Losing the **socket** lock reads the holder PID, activates the running window and exits 0; losing the **state** lock **fails closed** — it guards `state.json`, and the owner's socket is undiscoverable in that case by construction. `ROOST_ALLOW_MULTI=1` bypasses enforcement on **macOS only** (the Swift app); the iced UI has no bypass. See [Paths & Environment](paths.md).
+- The UI process owns its workspace, PTY supervisor, and IPC server. There is no separate daemon by default — except a fresh install, which starts its local tabs on a `roost-session` it manages. The other opt-in exception is `roost-session` (`crates/roost-session/`), a headless daemon for host-sessions, started with `roostctl session start` (see [`ipc.md`](ipc.md#session-sockets)). State is in memory + the bundle-profile `state.json` file. A saved host's *connection* state is the running UI's alone — `state.json` persists only the `{id, label, target, last_connected}` registry, plus the tab the window last showed in each of a host's projects (`tab_memory`) — which is why `host.connect` / `host.disconnect` / `host.status` have no headless form and answer `internal: no UI attached` without one.
+- `libghostty-vt` lives inside the UI for VT parsing + rendering.
+- OSC scanning lives in the UI (the `roost-osc` crate + `roost-engine`'s `OscRouter`) because OSC parsing walks the same byte stream the VT parser does. OSC events apply directly to the local workspace.
+- Terminal *query* replies (the program asking the terminal for its colors, device attributes, etc.) all come from libghostty, through the `write_pty` effects callback the UI installs and drains onto the tab's PTY input. Roost's OSC scanner sees those queries but answers none of them — it did synthesize the OSC color replies until the pinned SHA started answering them, at which point synthesizing too meant double-answering. See [Terminal query replies](terminal-queries.md).
+- The IPC server is per-UI: external tooling (`roostctl`, Claude hooks) talks to the bundle profile's socket. Dev builds of iced (and the dev `Roost-Iced.app`) use isolated `Roost-iced`/`roost-iced` paths; the packaged `.deb` build resolves the production `Linux` profile and the shipped `Roost.app` the `Mac` profile instead (see [Paths & Environment](paths.md)). `roostctl --target {mac,linux,iced}` routes explicitly; with no selector it probes every distinct candidate concurrently and requires a choice if multiple UIs answer.
+- Single-instance enforcement uses `flock(LOCK_EX | LOCK_NB)` on **two** lock files, one per thing guarded: `roost.lock` beside the socket (the bind lock, following the socket: `XDG_RUNTIME_DIR` for a UI, the passwd-home socket directory or `ROOST_SESSION_SOCKET_DIR` for a session) and `state.lock` beside `state.json` (following `ROOST_STATE_DIR`). They are taken socket-first and released in reverse. Losing the **socket** lock reads the holder PID, activates the running window and exits 0; losing the **state** lock **fails closed** — it guards `state.json`, and the owner's socket is undiscoverable in that case by construction. There is no bypass. See [Paths & Environment](paths.md).
 
 See [Vision → Decision log](../development/vision.md#decision-log) for the rationale behind each major choice.

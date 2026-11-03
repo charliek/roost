@@ -21,10 +21,10 @@ no binary editing.
 - `packaging/icons/hicolor/256x256/apps/roost.png` — Linux `.deb` hicolor icon
 - `packaging/icons/hicolor/512x512/apps/roost.png` — Linux `.deb` hicolor icon
 - `mac/AppIcon.icon/` — macOS **Tahoe glass icon** (Icon Composer source:
-  `icon.json` + `Assets/owl.png`). `mac/scripts/bundle.sh` compiles it with
+  `icon.json` + `Assets/owl.png`). `mac/scripts/bundle-iced.sh` compiles it with
   `actool` into the `Assets.car` the `.app` ships.
 - `mac/Resources/AppIcon.icns` — macOS **flat fallback** (built via `iconutil`)
-  for pre-Tahoe and for `bundle.sh` runs without `actool` (Command-Line-Tools-
+  for pre-Tahoe and for `bundle-iced.sh` runs without `actool` (Command-Line-Tools-
   only dev boxes).
 
 The release CI ships these committed assets, so it needs no SVG-render toolchain
@@ -79,7 +79,7 @@ A compiled **Icon Composer `.icon`** catalog (the format ghostty/cmux ship).
 Tahoe then fills the tile edge-to-edge and applies the glass treatment (sheen,
 depth, automatic dark-mode + user-tinted variants). `generate_icons.py` authors
 the `.icon` *source* from the SVG (`mac/AppIcon.icon/` — a solid Roost-Violet
-fill + the white owl as a foreground layer); `mac/scripts/bundle.sh` compiles
+fill + the white owl as a foreground layer); `mac/scripts/bundle-iced.sh` compiles
 it. `CFBundleIconName=AppIcon` (Info.plist) routes the OS to the catalog.
 
 ### actool gotchas
@@ -91,7 +91,7 @@ it. `CFBundleIconName=AppIcon` (Info.plist) routes the OS to the catalog.
   partial plist and **no `Assets.car`**.
 - **Needs Xcode 26+.** The `.icon` format is new in the Tahoe-era Xcode; bare
   Command Line Tools have no `actool`, and older Xcode won't understand it.
-  `bundle.sh` falls back to the flat `.icns` when `actool` is missing (bundle
+  `bundle-iced.sh` falls back to the flat `.icns` when `actool` is missing (bundle
   still launches, just framed on Tahoe). The release workflow runs on
   `macos-26` so Xcode 26 is present.
 - **Min-deployment can stay low.** Compiling at `LSMinimumSystemVersion` (15.0)

@@ -19,41 +19,30 @@ misspelled key is silently ignored.
 
 | Key           | Default                 | Effect                                                                                 |
 |---------------|-------------------------|----------------------------------------------------------------------------------------|
-| `font-family` | Swift `Roost.app`: the system monospaced font. iced UI (Linux, and `Roost-Iced.app` on macOS): `JetBrains Mono, Monospace`, which is always [JetBrains Mono](#the-bundled-terminal-font) | Terminal cell font. Quote values containing spaces (`"JetBrains Mono"`). |
+| `font-family` | `JetBrains Mono, Monospace`, which is always [JetBrains Mono](#the-bundled-terminal-font) | Terminal cell font. Quote values containing spaces (`"JetBrains Mono"`). |
 | `font-size`   | `13` (Linux) / `14` (macOS) | Point size for the terminal font (see [Font size](#font-size)). Must be `> 0`. Adjustable per tab at runtime via `Cmd-+` / `Cmd--` (`Alt-+` / `Alt--` on Linux). |
 
 ### How `font-family` resolves
 
-The two UIs resolve the value differently, so a config file that has to
-work on both should name a single installed family:
-
-- **Linux (iced).** The value is a comma-separated fallback chain, matched
-  case-insensitively against the installed families left-to-right; the
-  first installed one wins. `monospace` anywhere in the chain (and an
-  unmatched chain) resolves to the `Monospace` generic
-  (`resolve_family_name` in `crates/roost-ui-model/src/typography.rs`),
-  which the iced UI maps to its bundled JetBrains Mono. The same rules
-  apply to `Roost-Iced.app` on macOS.
-- **macOS (Swift).** The value is a single family name handed to
-  `NSFont(name:size:)`. An unknown or empty name falls back to
-  `NSFont.monospacedSystemFont` — a comma-separated *list* is not parsed,
-  so it will not match a family and you get the system monospace instead.
-
-Either way an unresolvable family never stops Roost from launching: the
-iced UI falls back to its bundled JetBrains Mono, and the Swift app to the
-system monospace.
+The value is a comma-separated fallback chain, matched
+case-insensitively against the installed families left-to-right; the
+first installed one wins. `monospace` anywhere in the chain (and an
+unmatched chain) resolves to the `Monospace` generic
+(`resolve_family_name` in `crates/roost-ui-model/src/typography.rs`),
+which the UI maps to its bundled JetBrains Mono. An unresolvable family
+never stops Roost from launching: it falls back to the bundled
+JetBrains Mono.
 
 ## Font size
 
 `font-size` is in points, and each OS turns points into pixels its own
 way, so a size matches that OS's other terminals:
 
-- **macOS (both apps):** one point is one pixel, as in AppKit. The iced
-  UI sizes its cells as the Swift app does: the width is the "M"
-  advance and the height is the font's ascent + descent + line gap,
-  each rounded up. JetBrains Mono at 13 gives 8×18 cells in both apps.
+- **macOS:** one point is one pixel, as in AppKit. The width of a cell
+  is the "M" advance and the height is the font's ascent + descent +
+  line gap, each rounded up. JetBrains Mono at 13 gives 8×18 cells.
   The default is `14`.
-- **Linux (iced):** 96 dpi, so `13` draws at about 17.3 px. A cell is
+- **Linux:** 96 dpi, so `13` draws at about 17.3 px. A cell is
   the "M" advance wide and 1.2 lines tall, each rounded down. The
   default is `13`.
 
@@ -74,9 +63,9 @@ font you had.
 
 ## Picking a font from the UI
 
-Both UIs expose **Select a font…** in the command palette
+**Select a font…** is in the command palette
 (`Cmd-Shift-P` / `Alt-Shift-P`). It lists the monospaced families the
-system reports (plus the bundled JetBrains Mono in the iced UI),
+system reports (plus the bundled JetBrains Mono),
 previews the highlighted one live, and writes the choice back to
 `config.conf` as a `font-family =` line when you confirm — so the picker
 and the config file are the same setting, not two.
@@ -84,13 +73,11 @@ and the config file are the same setting, not two.
 ## Chrome vs. terminal cells
 
 Only the **terminal cell font** is configurable. The window chrome —
-sidebar rows, tab pill labels, palette rows — uses its own font:
-
-- **macOS:** the system UI font.
-- **Linux (iced):** [Inter](https://rsms.me/inter/) v4.1, bundled into the
+sidebar rows, tab pill labels, palette rows — uses its own font,
+[Inter](https://rsms.me/inter/) v4.1, bundled into the
   binary (`third_party/inter`, embedded by `crates/roost-iced/src/main.rs`
   and served through the single `chrome::chrome_font()` seam). Bundling it
-  makes the chrome render identically on every distro instead of
+  makes the chrome render identically on every distro and OS instead of
   inheriting whatever the desktop's default sans happens to be.
 
 ## Limitations

@@ -78,26 +78,21 @@ selection-foreground = #545454
 
 - **No user override directory.** Only the bundled themes are loadable. To use a theme that isn't bundled, add the file to the bundled set and rebuild (see below) — themes are embedded into the binary at compile time.
 - **No hot-reload.** Theme is loaded once when each tab is created. To switch, edit `config.conf` and restart roost.
-- **The Swift Mac app draws selections its own way.** Its selection is a 60%-alpha `selection-background` overlay over the text, and it does not read `selection-foreground`.
 - **Indices 16–255 of the palette are not customizable** — they're filled by the standard xterm formula. Bundled themes only set indices 0–15, matching every Ghostty theme.
 
 ## Trying a Ghostty theme that isn't bundled
 
 The format is identical, so you can add one to the bundled set. Themes
-live in two byte-identical trees — the Rust crate (Linux UI) and the Mac
-SwiftPM bundle — kept in sync by `make themes-check`:
+live in one tree, the `roost-ui-model` crate, and are embedded into the
+binary:
 
 ```bash
-# Run from your roost checkout. Copy into BOTH trees.
+# Run from your roost checkout.
 SRC="/Applications/Ghostty.app/Contents/Resources/ghostty/themes/Solarized Osaka Night"
 cp "$SRC" crates/roost-ui-model/src/resources/themes/
-cp "$SRC" mac/Sources/Roost/Resources/themes/
 ```
 
-The Mac UI discovers themes by listing its bundle directory, so it picks
-the new file up automatically. The Linux UI embeds them explicitly: add a
-matching entry to the `BUNDLED_THEMES` array in
-`crates/roost-ui-model/src/theme.rs`. Then rebuild (`cargo build` /
-`swift build`) and set `theme = Solarized Osaka Night` in `config.conf`.
+Then add a matching entry to the `BUNDLED_THEMES` array in
+`crates/roost-ui-model/src/theme.rs`, rebuild (`cargo build`) and set `theme = Solarized Osaka Night` in `config.conf`.
 If the theme uses keys roost doesn't honor (e.g. `palette-generate`),
 they're silently dropped — the rest still works.

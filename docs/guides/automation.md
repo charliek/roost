@@ -64,12 +64,9 @@ roostctl identify --json
 ```
 
 `identify.ops` lists the operations this socket serves *right now*.
-`open` and `project ensure` refuse `unsupported` when `ops` is missing
-`project.ensure` — today, the Swift Mac app; `wait` falls back to
-polling and `events` and `tab prompt` fail outright when `ops` lacks
-`events.subscribe` and there's no session backing the local tabs. See
-[the Mac paragraph](#the-mac-app) below for the concrete shape of
-that gap. `identify.instance_id` names the process: it changes on
+`wait`, `events` and `tab prompt` refuse `unsupported` when `ops` lacks
+`events.subscribe` and there's no session backing the local tabs, which
+only a Roost older than your `roostctl` does. `identify.instance_id` names the process: it changes on
 every restart, and a resumed `wait`/`events` connection checks it to
 tell "the same Roost, still running" from "a different one answered".
 
@@ -309,7 +306,7 @@ The authoritative version of this table, including the partial-failure
 exception for the `agent` verbs, is
 [`cli.md#exit-codes`](../reference/cli.md#exit-codes).
 
-## The Mac app
+## `roostctl` on the Mac
 
 **`roostctl` is not on `PATH`.** The `.dmg` ships it inside the bundle,
 at `Roost.app/Contents/Resources/bin/roostctl` (#261) — a
@@ -318,35 +315,8 @@ script written against a bare `roostctl` needs a one-time symlink onto
 `PATH`, or the full path. See [`cli.md`'s "Where `roostctl`
 lives"](../reference/cli.md#where-roostctl-lives).
 
-The Swift `Roost.app` also omits `identify.ops` entirely, which every
-verb above treats the same as an `ops` list missing the op it needs
-(#510):
-
-- `open` and `project ensure` refuse `unsupported` — use `project
-  list --json` to find a project by name, then `tab open
-  --project-id`.
-- `wait` falls back to polling `tab.list` (and `tab.dump` for
-  `--text`) at `--interval-ms` instead of following the event stream.
-- `events` fails outright with the server's own refusal (today,
-  `not-implemented`) — there's no poll fallback for a continuous
-  stream.
-- `tab prompt` needs the event stream `events` does, and there is no
-  polling fallback for it either (a poll can't see a turn that starts
-  and ends between two `tab.list` calls) — it refuses `unsupported` the
-  same way.
-
-**`Roost.app` through v0.0.20 predates `--no-activate`.** `tab open
---no-activate` answers `unknown-field` there — reported verbatim, same
-as any refusal from a server that doesn't recognize a field — rather
-than silently opening the tab active anyway; later builds serve it.
-`open --no-activate` never gets that far on any Swift build: `open`
-needs `project.ensure`, which the Swift `Roost.app` does not serve, so
-it refuses `unsupported` after `identify`. Either way **no tab is
-created**, so there is nothing to wait on.
-
-Everything else in this guide — `identify`, the target policy, `tab
-send`/`tab dump`/`notify`, the exit-code table — works the same on
-both platforms.
+The same guide applies on both platforms; only the `roostctl` path
+differs.
 
 ## The agent skill
 

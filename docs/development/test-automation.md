@@ -22,8 +22,8 @@ is the source of truth for this map; the summary:
 Reach for the highest layer that can answer the question. Layer 1 is
 where most new coverage lands: it needs no compositor, no macOS
 Accessibility (TCC) grant, and no Wayland pointer mapping, which is
-exactly what makes "Mac E2E in CI" tractable at all. `cargo test` /
-`swift test` remain the fast first line below all three;
+exactly what makes "Mac E2E in CI" tractable at all. `cargo test`
+remains the fast first line below all three;
 [`tools/perf/`](https://github.com/charliek/roost/blob/main/tools/perf/README.md)
 measures *cost* on a sibling axis rather than correctness.
 
@@ -119,21 +119,20 @@ that motivated the rule.
 
 | Target | What it runs |
 |---|---|
-| `make test` | `cargo test --workspace` (+ the `roost-vt` ffi tests) + `swift test` + the harness's own unit tests |
-| `make e2e` | Dispatch on `ROOST_TARGET` (`mac` \| `iced`, default `iced`) to one of the two below |
-| `make e2e-iced` / `make e2e-mac` | Quick local functional runs — reuse a running UI if one is present |
-| `make e2e-iced-ci` / `make e2e-mac-ci` | CI parity: `ROOST_TEST_MODE=1` + `--roost-fresh`, so a local run exercises the **same set CI does**. Both are **destructive** (they force-quit a running UI) and labeled accordingly. |
+| `make test` | `cargo test --workspace` (+ the `roost-vt` ffi tests) + the harness's own unit tests + the release-script shell tests |
+| `make e2e` | Alias for `make e2e-iced` |
+| `make e2e-iced` | Quick local functional run — reuses a running UI if one is present |
+| `make e2e-iced-ci` | CI parity: `ROOST_TEST_MODE=1` + `--roost-fresh`, so a local run exercises the **same set CI does**. **Destructive** (it force-quits a running UI) and labeled accordingly. |
 | `make e2e-iced-exit` / `make e2e-iced-menu-quit` | Lifecycle lanes in their own runs — the UI they drive exits, so they cannot share a session-scoped fixture |
-| `make e2e-iced-bundle` / `make e2e-iced-sparkle` | macOS only: assemble `Roost-Iced.app` (test-keyed, for Sparkle) and run the curated smoke against the real bundle |
+| `make e2e-iced-bundle` / `make e2e-iced-sparkle` | macOS only: assemble the dev `Roost-Iced.app` (test-keyed, for Sparkle) and run the curated smoke against the real bundle. `make e2e-iced-bundle ICED_APP=mac/build/Roost.app` drives an already-built production bundle instead, and refuses unless `ROOST_TEST_ALLOW_PRODUCTION_IDENTITY=1` (CI sets it) |
 | `make test-iced-real-input` / `make test-iced-wayland-input` | Layer 3 — X11 (Xvfb + xdotool) and Wayland (cage + a real uinput seat) |
 | `make e2e-iced-real-input-mac` | Layer 3 on macOS — real CGEvent/Accessibility input against the branch `Roost-Iced.app` (see [below](#the-mac-real-input-harness)) |
-| `make smoke-iced` / `make smoke-mac` | Layer 2 — screenshot-driven UI smoke against a running UI |
+| `make smoke-iced` | Layer 2 — screenshot-driven UI smoke against a running UI |
 
-`make e2e` **dispatches** rather than running the whole `tools/roosttest`
+`make e2e` runs a curated list rather than the whole `tools/roosttest`
 directory: that directory contains modules that deliberately end the UI
-they drive, which under the iced default would strand every module the
-session-scoped fixture runs afterward. `e2e-iced` runs a curated list
-instead. **The enumerated-list trap:** a new roosttest module needs
+they drive, which would strand every module the
+session-scoped fixture runs afterward. **The enumerated-list trap:** a new roosttest module needs
 adding to `ICED_E2E_TESTS` in the `Makefile` *and* to the corresponding
 lists in `ci.yml`, or it never runs on the iced target.
 
@@ -192,23 +191,22 @@ The one-time setup, the helper's commands and its accepted limits live in
 ## CI lanes
 
 The single required check is `ci-success`, which derives its membership
-from its own `needs:` list — ten jobs: the `changes` path-filter job
-plus the nine required ones below. (The table's last row,
+from its own `needs:` list (`tools/roosttest_unit/test_ci_contract.py`
+fails if a job is missing from it) — the `changes` path-filter job
+plus the required ones below. (The table's last row,
 `e2e-iced-wayland-drag`, is a non-blocking signal lane and is
-deliberately *not* one of the ten.) `changes` and `ci-success` always
+deliberately *not* in `needs`.) `changes` and `ci-success` always
 run; every other job is conditionally gated on `changes`' outputs, so a
 PR pays only for what it touches.
 
 | Job | Runs | Required |
 |---|---|---|
 | `rust-lint` | `cargo fmt --check`, clippy at `-D warnings` | ✅ |
-| `harness-unit` | `tools/roosttest_unit` — target/path/capability wiring | ✅ |
-| `themes-parity` | The Rust + Mac bundled-theme copies are byte-identical | ✅ |
-| `rust-build` | `cargo build`/`test` on Linux + macOS, plus the `roost-vt` ffi and `roost-engine/facade` passes | ✅ |
-| `swift-mac` | `swift build` / `swift test`, release bundle, embedded `roostctl`, entitlements + link guards | ✅ |
+| `harness-unit` | `tools/roosttest_unit` — target/path/capability wiring, the E2E list contracts, and the `ci-success` contract (`test_ci_contract.py`) | ✅ |
+| `scripts` | Shell tests for the `linux/scripts` and `mac/scripts` release helpers (notarize, Sparkle key check) | ✅ |
+| `rust-build` | `cargo build`/`test` on Linux + macOS, plus the `roost-vt` ffi pass | ✅ |
 | `iced-build-e2e` | Six cells: ubuntu × (wgpu, tiny-skia) × (X11, Wayland), and macOS × (wgpu, tiny-skia). Each builds; the X11 and macOS cells also run the unit tests, clippy and the toolkit-boundary check. Then functional E2E under the cell's display: X11 (xvfb) or **Wayland** (headless weston), each in its own cell so the two run in parallel. Plus the exit-on-empty, menu-quit and (X11) real-input clipboard lanes, the six host-session client lanes (below), and (macOS) bundle-identity + smoke lanes | ✅ |
 | `iced-release` | Release-profile build, the real `.deb`, a release-binary E2E subset, packaged-profile assertion, artifact smoke, dependency-closure check | ✅ |
-| `e2e-mac` | The full `tools/roosttest` directory against a bundled `Roost.app` on a GUI-session runner | ✅ |
 | `session-e2e` | The headless host-session lanes — `roost-session` driven with no UI and no display (`SESSION_E2E_TESTS`, marker-based rather than an enumerated CI list) | ✅ |
 | `e2e-iced-wayland-drag` | `roost-iced` fullscreen under `cage` with a real `/dev/uinput` seat — the pointer-drag + system-clipboard guard the IPC-driven Wayland lane cannot cover | ❌ soft (`continue-on-error`, absent from `ci-success`) |
 
@@ -232,10 +230,9 @@ passing as a skip, and it tees diagnostics to an uploaded artifact —
 `continue-on-error` hides a failure's *conclusion*, so the log body has
 to be the honest record. Promotion to required is tracked separately.
 
-Both required E2E lanes run `--roost-fresh` with a throwaway
-`ROOST_STATE_DIR` and upload diagnostics on failure (the mac lane
-additionally emits JUnit XML for GitHub's test annotations). Neither reruns failed tests: a genuine
-intermittent bug must not be masked. The macOS lane additionally scales
+The required E2E lanes run `--roost-fresh` with a throwaway
+`ROOST_STATE_DIR` and upload diagnostics on failure. None reruns failed tests: a genuine
+intermittent bug must not be masked. The macOS cell additionally scales
 its timeouts (`ROOST_TEST_TIMEOUT_SCALE`) and clears any stale
 socket/lock before launching, since a crashed instance's held
 single-instance flock is the one cascade mode that wedges the next run.

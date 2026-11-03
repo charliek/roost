@@ -28,7 +28,7 @@ gives no usable directory either, Roost uses the cwd the shell last reported
 over OSC 7 (see the shell integration below).
 
 **Tabs on a session follow the same rule.** For a tab on a `roost-session` —
-Roost-Iced's local session, the fresh-install default, or a saved host — the
+Roost's local session, the fresh-install default, or a saved host — the
 session reads the directory on its own machine. A session started by an older
 Roost, still running after an upgrade, can't; until it restarts, a new tab
 opens in the active tab's tracked cwd — where OSC 7 last put it, else where the
@@ -186,9 +186,9 @@ your rc first, so the override is picked up before Roost's hooks apply. The
 same opt-out works for `ssh-env`: `ROOST_SHELL_FEATURES=...,no-ssh-env` to
 disable.
 
-### Overriding a function instead of a flag (Roost-Iced)
+### Overriding a function instead of a flag
 
-On **Roost-Iced**, if you already define `__roost_osc7`, `__roost_title`,
+If you already define `__roost_osc7`, `__roost_title`,
 `__roost_marks` (bash) or `__roost_osc7`, `__roost_title`, `__roost_mark_c`,
 `__roost_mark_d` (zsh) yourself — say, sourced from your own rc before
 Roost's integration loads — your definition wins and Roost's own is never
@@ -200,8 +200,7 @@ from your own registration, once from Roost's prepend; zsh's `add-zsh-hook`
 is idempotent per function name, so a zsh hook you registered yourself does
 not get a second entry. Use a name
 Roost doesn't own (like `__roost_fancy_title` below) unless you mean to
-replace the feature outright. The Swift `Roost.app` still defines its own
-functions unconditionally and has no such override.
+replace the feature outright.
 
 ## The environment Roost injects
 

@@ -1,9 +1,8 @@
 # Iced migration — history & status
 
-**Status: complete for Linux, under evaluation for macOS.** Linux ships
-the iced UI; macOS ships the Swift app with an experimental iced build
-beside it. This page is the record of how that happened and what is
-still open.
+**Status: completed at v0.1.0.** iced is the only desktop UI: Linux ships
+it as `roost`, and macOS ships it as `Roost.app`, replacing the Swift app.
+This page is the record of how that happened and what is still open.
 
 It replaces four planning documents that governed the migration while it
 was in flight — the POC plan, the POC development notes, the parity
@@ -23,9 +22,10 @@ The short version — the decision-log entries are the canonical form:
   host OSes; and both Rust UIs already sat on the toolkit-neutral
   `roost-engine`, so retiring an adapter cost the core nothing.
 - **[DL-16](vision.md#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25)**
-  — the macOS build exists to test the convergence hypothesis (one
-  codebase, both platforms) against the Swift app in daily use. It
-  records a hypothesis, not a decision.
+  — the macOS build existed to test the convergence hypothesis (one
+  codebase, both platforms) against the Swift app in daily use. The
+  hypothesis held; [DL-33](vision.md#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)
+  retires the Swift app.
 
 ## What shipped, by milestone
 
@@ -40,8 +40,8 @@ branches off `main` in slices sized for one pass.
 | **M3** | Functional parity with the GTK UI | Complete |
 | **E** | Engine track — renderer + robustness | Complete except a deferred Ghostty pin bump |
 | **M4** | Ship iced to Linux users | Shipped in v0.0.18 |
-| **M5** | Rust under Swift (FFI exploration) | **Frozen** |
-| **M6** | macOS iced (evaluation → parity) | Experimental build shipped in v0.0.18 |
+| **M5** | Rust under Swift (FFI exploration) | Dropped; the facade was deleted |
+| **M6** | macOS iced (evaluation → parity) | Experimental build shipped in v0.0.18; became `Roost.app` in v0.1.0 |
 
 ### M1–M2 — the POC was merge-quality
 
@@ -89,22 +89,16 @@ upgrade in place with **no migration step**, and `roostctl` plus the
 Claude hooks keep working unchanged. GTK4 and libadwaita left the
 runtime dependency set.
 
-### M5 — frozen
+### M5 — dropped
 
 `roost-engine`'s `facade` module (`Engine` / `EngineCommand` /
-`EngineSnapshot` / `EngineEventStream`) is the Swift-facing boundary. It
-is feature-gated (`roost-engine/facade`, off by default, compiled and
-tested in CI) and **has no production consumer**, so the seam is
-unproven — tracked as
-[#286](https://github.com/charliek/roost/issues/286), held at "don't
-invest, don't delete" until the Mac-shell question resolves. If a full
-iced replacement happens, a Swift-facing FFI boundary is wasted
-investment; if it doesn't, this is where the (b) branch starts. See
-[Direction](vision.md#direction-under-evaluation).
+`EngineSnapshot` / `EngineEventStream`) was the Swift-facing boundary. It
+had no production consumer, and with the Swift app retired in v0.1.0 it
+was deleted ([#286](https://github.com/charliek/roost/issues/286)).
 
 ### M6 — macOS iced
 
-`Roost-Iced-<version>.dmg`, opt-in and installed beside `Roost.app`:
+`Roost-Iced-<version>.dmg`, opt-in and installed beside the Swift `Roost.app` until v0.1.0, when the iced build took over the `Roost.app` name and bundle id:
 
 - **Bundling + parallel install** (plan 027) — `mac/scripts/bundle-lib.sh`
   carries the toolkit-agnostic stages out of `bundle.sh`;
@@ -123,12 +117,13 @@ investment; if it doesn't, this is where the (b) branch starts. See
   crate whose premise is replacing Swift.
 - **Sparkle, menu bar, notifications** (plans 028, 030) — user-invoked
   update checks against `docs/appcast-iced.xml` with its own signing key
-  (`SUEnableAutomaticChecks` is `false`; the app does not self-update),
+  (`SUEnableAutomaticChecks` is `false`; the app does not self-update;
+  that feed is frozen since v0.1.0, and `Roost.app` updates from
+  `docs/appcast.xml`),
   a real `NSMenu`, a Dock badge, and `UNUserNotificationCenter` banners
   that focus the originating tab on click.
 - **Developer-ID signed and notarized**, published as the fourth release
-  asset. The two macOS apps carry separate feeds and separate keys, so
-  neither can ever offer the other's update.
+  asset.
 
 Two things were **decided, not discovered**: accessibility regresses
 (an iced canvas gives essentially no VoiceOver support where AppKit
@@ -140,29 +135,21 @@ chase since `App.swift` implements none of them either.
 
 | | macOS | Linux |
 |---|---|---|
-| Product | `Roost.app` — Swift + AppKit | `roost` — Rust + iced (`.deb`) |
-| Also shipped | `Roost-Iced.dmg` — experimental, opt-in | — |
-| CI gates | `swift-mac`, `e2e-mac`, and the macOS half of `iced-build-e2e` | `iced-build-e2e` (X11 + Wayland), `iced-release` |
+| Product | `Roost.app` — Rust + iced (`.dmg`) | `roost` — Rust + iced (`.deb`) |
+| CI gates | the macOS half of `iced-build-e2e` | `iced-build-e2e` (X11 + Wayland), `iced-release` |
 
 ## What remains
 
-- **The Mac-shell question.** Everything above is prologue to one open
-  decision, gated on whether iced visuals on macOS reach parity with the
-  Swift app. Both branches and what each implies are in
-  [Direction (under evaluation)](vision.md#direction-under-evaluation).
-- **macOS parity items deferred rather than dropped**: window vibrancy
-  (there is no `NSVisualEffectView` in the Swift source to port — the
-  sidebar's translucency is AppKit's implicit source-list material, so
-  iced has to build it explicitly), and Secure Keyboard Entry (feasible
-  via Carbon `EnableSecureEventInput`, deferred pending a product
-  decision on the toggle surface, since always-on breaks text
-  expanders).
-- **A macOS real-input tier.** The uinput harness is Linux-only; a
-  CGEvent sibling ([#285](https://github.com/charliek/roost/issues/285))
-  is what would make a macOS parity claim mechanically honest rather
-  than hand-verified. See
-  [`tools/README.md`](https://github.com/charliek/roost/blob/main/tools/README.md)
-  for the layer map and [test-automation.md](test-automation.md) for the
-  CI lanes.
-- **The Ghostty pin + Zig bump**, deliberately sequenced after the
-  direction resolves rather than before it.
+- **macOS rough edges** are tracked as issues; none block the single-UI
+  architecture. Window vibrancy is the notable one deferred rather than
+  dropped: the Swift sidebar's translucency was AppKit's implicit
+  source-list material, so iced has to build it explicitly.
+- **Accessibility** regresses against AppKit: an iced canvas gives
+  essentially no VoiceOver support (see DL-16). That was decided, not
+  discovered, and stays open.
+- **A mobile client** of `roost-session` is planned; the toolkit-neutral
+  `roost-engine` and `roost-ui-model` crates are what it would reuse.
+
+See [`tools/README.md`](https://github.com/charliek/roost/blob/main/tools/README.md)
+for the test-harness layer map and [test-automation.md](test-automation.md)
+for the CI lanes.

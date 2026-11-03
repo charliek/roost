@@ -6,15 +6,12 @@ libghostty-vt terminal per tab. The
 `roostctl` companion CLI surfaces notifications when an agent in a tab needs
 attention.
 
-Two native UIs — **Swift + AppKit on macOS** (`Roost.app`) and **Rust + iced
-on Linux** (`roost`) — each embed the workspace + PTY supervisor + a JSON-IPC
-server **in-process** (no daemon by default; the one opt-in exception is
-`roost-session`, a headless daemon for
+One native UI — **Rust + iced**, on macOS (`Roost.app`) and Linux
+(`roost`) — embeds the workspace + PTY supervisor + a JSON-IPC server
+**in-process**. A fresh install starts its local tabs on a `roost-session` it
+manages; the headless `roost-session` daemon is also what powers
 [host sessions](docs/guides/host-sessions.md) — shells that keep running
-after the window closes). macOS also gets an experimental
-**Roost-Iced.dmg**, the same iced UI built for Mac, installed side by side
-with `Roost.app` — see the
-[latest release](https://github.com/charliek/roost/releases/latest). External
+after the window closes. External
 tooling (`roostctl`, Claude Code hooks) talks to the running UI over
 newline-delimited JSON on a Unix-domain socket; the wire contract is in
 [`docs/reference/ipc.md`](docs/reference/ipc.md).
@@ -39,12 +36,8 @@ double-click — no Gatekeeper detour. See
 [Installation](docs/getting-started/installation.md#shipping-builds)
 for details.
 
-An experimental **`Roost-Iced-<version>.dmg`** is also published on the same
-release — the iced UI built for macOS, installed side by side with
-`Roost.app` under its own bundle id. If you drive Roost from an agent
-(the Claude skill, `roostctl open`/`wait`/`events`, `tab prompt`),
-install this one instead — see
-[Installation](docs/getting-started/installation.md) for details.
+Coming from `Roost-Iced.app`? See
+[Roost-Iced.app users](docs/getting-started/installation.md#roost-icedapp-users).
 
 ### Claude Code / agent skills
 
@@ -77,12 +70,12 @@ cd roost
 mise install                          # Rust (rust-toolchain.toml) + Zig 0.17.x
 ./third_party/ghostty/build.sh        # clones Ghostty at the pinned SHA, builds libghostty-vt
 
-# Linux UI — iced, what the packaged .deb ships (needs: sudo apt install libclang-dev pkg-config):
+# The iced UI — the only desktop app (Linux needs: sudo apt install libclang-dev pkg-config):
 cargo build --release -p roost-iced -p roost-cli    # → target/release/{roost-iced,roostctl}
 ./linux/scripts/build-deb.sh 0.0.1-dev              # …or build an installable .deb (packages roost-iced as /usr/bin/roost via the linux-package feature; also needs nfpm on PATH)
 
-# macOS UI:
-cd mac && swift build                 # or: ./mac/scripts/bundle.sh release  → mac/build/Roost.app
+# macOS app bundle (dev build, → mac/build/Roost-Iced.app):
+make bundle-iced
 ```
 
 ## Documentation
@@ -97,7 +90,7 @@ The full site lives under `docs/` and builds with [Zensical](https://zensical.or
 - [Claude Code Hooks](docs/guides/claude-code.md) — copy-paste `settings.json`
 - [Host Sessions](docs/guides/host-sessions.md) — the opt-in `roost-session` daemon: shells that survive closing the window
 - [Architecture](docs/reference/architecture.md) — package layout + threading contract
-- [Vision & Principles](docs/development/vision.md) — direction, decision log, and the two-implementation architecture
+- [Vision & Principles](docs/development/vision.md) — direction, decision log, and the single-implementation architecture
 - [IPC Reference](docs/reference/ipc.md) — the JSON wire format `roostctl` and Claude hooks speak
 
 `CLAUDE.md` at the repo root captures the project conventions enforced by review.

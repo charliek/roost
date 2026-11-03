@@ -22,65 +22,51 @@ open it, and drag `Roost.app` into `/Applications`. Release DMGs
 are Developer-ID signed and notarized by Apple, so
 Roost opens with a normal double-click — no Gatekeeper detour.
 
-**If you drive Roost from an agent** — the [Claude skill](https://github.com/charliek/roost/tree/main/skills/roost),
-`roostctl open`/`wait`/`events`, or `tab prompt` — install
-**`Roost-Iced.app`** below instead of `Roost.app`. `Roost.app` is the
-classic Swift + AppKit build, and it does not serve the agent-facing
-surface: it has no `project.ensure`, so `open` and `project ensure`
-refuse with `unsupported`, and it serves no event stream, so `events`
-and `tab prompt` fail and `wait` falls back to polling. `tab send-file`
-and the `host` verbs are iced-only too. Roost-Iced serves all of it.
-See the direction note below.
+`Roost.app` is the Rust + iced UI, the same codebase Linux ships, with
+the full agent-facing surface (`roostctl open`/`wait`/`events`, `tab prompt`,
+the [Claude skill](https://github.com/charliek/roost/tree/main/skills/roost)).
+Before v0.1.0 `Roost.app` was a Swift + AppKit build; that app is retired. It
+keeps the same bundle id (`ai.stridelabs.Roost`) and the same state paths, so
+an existing install updates in place through Sparkle and keeps its projects,
+socket and logs.
 
-### `Roost-Iced.app` (experimental)
+### `Roost-Iced.app` users
 
-The same release also publishes `Roost-Iced-<version>.dmg`. That is the
-**iced** UI — the Rust codebase Linux ships — built for macOS, packaged as
-`Roost-Iced.app`. It's still experimental as a general daily driver —
-`Roost.app` (Swift + AppKit) remains the more polished, accessible Mac
-build — but for the agent-facing surface above, Roost-Iced is already
-the more complete of the two, which is why agent-driving users are
-pointed at it above.
+`Roost-Iced.app` (bundle id `ai.stridelabs.Roost.iced`) was the experimental
+iced build published beside the Swift app. Its update feed is frozen, so it
+will not offer v0.1.0; switch by hand:
 
-**Direction note.** After this release, Roost will either sunset the
-Swift app and make Roost-Iced the Mac default, or rebuild the Swift UI
-as a thin layer over the same Rust core Roost-Iced already uses. Either
-way, the agent-control surface lives in the Rust core going forward.
-Nothing is decided yet — this is recorded as a pending entry in
-[`development/vision.md`](../development/vision.md)'s decision log, not
-a commitment.
+1. Install `Roost.app` from the DMG above.
+2. Quit both apps, then delete `Roost-Iced.app`.
+3. Re-run `roostctl agent install`. Agent hooks written earlier point at
+   `Roost-Iced.app`'s copy of `roostctl`, which no longer exists once the
+   app is deleted.
+4. Optionally copy your projects and tabs across. Roost-Iced kept them in
+   its own directory, and `Roost.app` does not read it:
 
-It is deliberately built to sit **beside** the Swift app rather than
-replace it:
+   ```bash
+   cd ~/Library/Application\ Support
+   mkdir -p Roost
+   cp -n Roost-iced/state.json Roost/state.json
+   ```
 
-- Its own bundle id (`ai.stridelabs.Roost.iced`) and its own app name, so
-  Dock, Cmd-Tab and Finder treat it as a separate app.
-- Its own state: the `Iced` bundle profile (`~/Library/Application Support/Roost-iced/`,
-  `~/Library/Caches/Roost-iced/roost.sock`, `~/Library/Logs/Roost-iced/`) —
-  see [Paths & Environment](../reference/paths.md). Your Swift-app projects
-  and tabs are untouched, and both can run at once.
-- Its own Sparkle feed (`appcast-iced.xml`), so updating one never offers
-  the other.
+   `-n` keeps any `state.json` that `Roost.app` already has, from the Swift
+   app or from a first launch; move that one aside first if you want
+   Roost-Iced's instead. Run it while both apps are quit. Your config (`~/.config/roost/config.conf`) is shared
+   and needs nothing.
 
-Install it the same way: open the DMG, drag `Roost-Iced.app` to
-`/Applications`. It is signed and notarized on the same terms as
-`Roost.app`. Beyond the agent-facing surface above, try it if you want
-the newer renderer (iced + wgpu) or want to report parity gaps against
-the Swift app.
-
-Note that `roostctl` auto-detects a single running UI, but with both apps
-running it will ask you to choose — pass `--target mac` or `--target iced`
-(see [CLI reference → Where `roostctl` lives](../reference/cli.md#where-roostctl-lives)).
+Dev builds (`make bundle-iced`) are still named `Roost-Iced.app` and still
+use the separate `Roost-iced` paths, so they run beside an installed
+`Roost.app`; see [Paths & Environment](../reference/paths.md).
 
 ### Updating
 
-- **macOS.** Both apps check for updates through
+- **macOS.** `Roost.app` checks for updates through
   [Sparkle](https://sparkle-project.org), and checks are **user-invoked**:
-  choose **Check for Updates…** from the app menu. Neither app polls in the
-  background (`SUEnableAutomaticChecks` is `false` in both bundles), so you
-  will never get an unprompted update panel. The feeds are served from this
-  documentation site — `appcast.xml` for `Roost.app`, `appcast-iced.xml`
-  for `Roost-Iced.app` — and each app only ever sees its own.
+  choose **Check for Updates…** from the app menu. It does not poll in the
+  background (`SUEnableAutomaticChecks` is `false`), so you will never get
+  an unprompted update panel. The feed (`appcast.xml`) is served from this
+  documentation site.
 - **Linux.** Updates come from apt: `sudo apt update && sudo apt upgrade`
   (or just `sudo apt install --only-upgrade roost`). The package upgrades
   in place — same socket, `state.json`, and log paths as the version it
@@ -90,20 +76,17 @@ The rest of this page covers building from source.
 
 ## Building from source
 
-Roost ships a native UI on each platform. Each UI embeds the
+Roost ships one UI, Rust + iced, on both platforms. It embeds the
 workspace + PTY supervisor in-process and serves a JSON IPC
 socket for external tooling (`roostctl`, Claude Code hooks):
 
 | Platform | UI | How it builds |
 |---|---|---|
-| macOS | Swift + AppKit (`Roost.app`) | SwiftPM via `mac/scripts/bundle.sh` |
-| macOS (experimental) | Rust + iced (`Roost-Iced.app`) | `mac/scripts/bundle-iced.sh` |
+| macOS | Rust + iced (`Roost.app`) | `ROOST_BUNDLE_IDENTITY=production mac/scripts/bundle-iced.sh` (release pipeline); `make bundle-iced` for the dev `Roost-Iced.app` |
 | Linux | Rust + iced (`roost`) | `cargo build -p roost-iced -p roost-cli`; the `.deb` adds `--features roost-iced/linux-package` |
 
 The `roost-iced` UI, the `roostctl` CLI, the JSON IPC crate, and the
-`libghostty-vt` FFI all live in one Cargo workspace under `crates/`. The
-Swift UI is its own SwiftPM package under `mac/` and links the same
-vendored `libghostty-vt` static archive.
+`libghostty-vt` FFI all live in one Cargo workspace under `crates/`.
 
 The Linux `.deb` ships the iced UI as `/usr/bin/roost`. The
 `linux-package` Cargo feature is the only difference between a dev build
@@ -112,8 +95,8 @@ so the installed binary resolves the production socket / `state.json` /
 log paths every previous Linux release used. See
 [Paths & Environment](../reference/paths.md).
 
-`mac/scripts/bundle.sh` embeds `target/<config>/roostctl` under
-`Roost.app/Contents/Resources/bin/roostctl` so a packaged .app is
+`mac/scripts/bundle-iced.sh` embeds `target/<config>/roostctl` under
+`<app>/Contents/Resources/bin/roostctl` so a packaged .app is
 self-contained: that is the binary each tab's `$ROOST_AGENT_HOOK` points
 at, and the one the shell integration and agent hooks run.
 
@@ -123,7 +106,7 @@ at, and the one the shell integration and agent hooks run.
 |---|---|---|
 | Rust | CLI + the iced UI | 1.97.1 (via `mise`) |
 | Zig | Builds `libghostty-vt` from the vendored Ghostty source | 0.17.x (via `mise`) |
-| Xcode Command Line Tools | Builds the Mac UI | macOS only |
+| Xcode Command Line Tools | Builds the Mac UI and bundle | macOS only |
 | `libclang-dev` + `pkg-config` | Build-time deps of the Rust UI's FFI bindings | Linux only |
 | `mise` | Manages the pinned Rust + Zig versions | any |
 
@@ -135,7 +118,7 @@ Install system packages:
 brew install mise
 ```
 
-Recommended: JetBrains Mono. Roost defaults to the system monospace; this
+Recommended: JetBrains Mono. Roost defaults to its bundled JetBrains Mono; this
 is the family the docs' examples set via `font-family` (see
 [Fonts](../reference/fonts.md)).
 
@@ -163,23 +146,21 @@ Build the `roostctl` CLI:
 ~/.cargo/bin/cargo build --release -p roost-cli
 ```
 
-Bundle the Mac `.app` (this builds and embeds `roostctl` for you):
+Bundle the dev Mac `.app` (this builds and embeds `roostctl` and
+`roost-session` for you):
 
 ```bash
-./mac/scripts/bundle.sh release
-open mac/build/Roost.app
-```
-
-Optionally, bundle the experimental iced app the same way. It resolves the
-isolated `Iced` bundle profile, so it will not touch `Roost.app`'s state.
-A locally bundled `Roost-Iced.app` deliberately carries **no** Sparkle
-feed URL — only the release pipeline stamps one in — so **Check for
-Updates…** does nothing in a local build:
-
-```bash
-./mac/scripts/bundle-iced.sh release
+make bundle-iced
 open mac/build/Roost-Iced.app
 ```
+
+A dev bundle resolves the isolated `Iced` bundle profile, so it will not
+touch an installed `Roost.app`'s state, and it deliberately carries **no**
+Sparkle feed URL (only the release pipeline stamps one in), so **Check for
+Updates…** does nothing in a local build. The shipped `Roost.app` is the same
+script run with `ROOST_BUNDLE_IDENTITY=production`, which needs the feed URL
+and public key (`ROOST_BUNDLE_SPARKLE_FEED_URL`,
+`ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY`) and is normally left to CI.
 
 ### macOS 26 (Tahoe) `libghostty-vt` shim
 
@@ -295,4 +276,4 @@ When the pinned Ghostty SHA changes, re-build `libghostty-vt`:
 ~/.cargo/bin/cargo build --release
 ```
 
-`--force` discards the cached Ghostty source tree and re-clones at the new SHA. After it finishes, the Mac UI's next `bundle.sh` run picks up the new archive automatically.
+`--force` discards the cached Ghostty source tree and re-clones at the new SHA. After it finishes, the Mac UI's next `bundle-iced.sh` run picks up the new archive automatically.

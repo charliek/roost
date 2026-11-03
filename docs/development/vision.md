@@ -8,16 +8,14 @@ the north star every PR is measured against.
 A single-window, cross-platform terminal multiplexer: a sidebar of
 projects, tabs per project, one terminal per tab. The differentiator is
 the multi-project workspace with **notification routing for AI coding
-agents** (Claude Code, Codex, …). It ships **two platform products, each
-embedding the workspace + PTY supervisor in-process** — Swift + AppKit on
-macOS (`Roost.app`), Rust + iced on Linux (`roost`, the packaged `.deb`).
-The same iced binary additionally ships an **experimental macOS build**,
-`Roost-Iced.dmg`, with its own bundle id and its own update feed; it
-installs beside `Roost.app` and is not a third implementation, just the
-Linux UI on a different host. `libghostty-vt` is vendored once and
-linked into both for in-process VT parsing and rendering. There is no
-daemon by default, except a fresh Roost-Iced install, which starts its
-local tabs on a `roost-session` it manages. The other opt-in exception
+agents** (Claude Code, Codex, …). It ships **one desktop implementation,
+embedding the workspace + PTY supervisor in-process** — Rust + iced, on
+macOS (`Roost.app`) and Linux (`roost`, the packaged `.deb`). Before
+v0.1.0 the Mac app was Swift + AppKit; it is retired
+([DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)).
+`libghostty-vt` is vendored once and linked in for in-process VT parsing
+and rendering. There is no daemon by default, except a fresh install,
+which starts its local tabs on a `roost-session` it manages. The other opt-in exception
 is `roost-session`, a headless daemon for host-sessions
 ([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)).
 
@@ -47,16 +45,13 @@ events — never its own source of truth.**
 - A hotkey (`Cmd+Shift+T`) and a `roostctl` call invoke the **same**
   command — e.g. "run action" or "open tab".
 
-**One contract, two implementations.** There is no shared *codebase*
-core across languages — Swift and Rust can't share one. There is one
-shared **contract** — the IPC op set in
-[`crates/roost-ipc`](../reference/ipc.md) — implemented by **Swift
-`Workspace` + AppKit** and **Rust + iced** (the Rust side over the
-toolkit-neutral `roost-engine`). "Same interface" means same op contract
-+ behavioral parity, which the cross-platform E2E suite
-([test-automation.md](test-automation.md)) exists to enforce. Per
-implementation: identical command surface, platform-specific guts
-(`forkpty` vs `portable-pty`; Core Graphics vs iced + wgpu).
+**One contract, one desktop implementation.** The contract is the IPC
+op set in [`crates/roost-ipc`](../reference/ipc.md); the one desktop
+implementation is **Rust + iced** on macOS and Linux, over the
+toolkit-neutral `roost-engine`. A mobile client of `roost-session` is
+planned, and would be a second client of the same contract. The E2E suite
+([test-automation.md](test-automation.md)) drives that contract on both
+host OSes.
 
 **Two seams** connect the surfaces to the core:
 
@@ -64,13 +59,12 @@ implementation: identical command surface, platform-specific guts
    direct. Every UI/hotkey action should route through the op set, not
    carry divergent local logic. *Convergence is an ongoing invariant —
    each place the UI keeps its own truth instead of reacting to a core
-   event is a bug to retire (e.g. the dropped `active.changed` the Mac
-   UI used to ignore).*
-2. **core → UI** (view reach-back: screenshot / dump / activate): on
-   Linux, `roost-engine`'s one `UiRequest` port, delivered to the iced
-   UI over the single engine feed it drains on the main thread; on Mac,
-   the one `UiBridge` seam — a single registered path from the IPC
-   handler to the main thread either way, not an ad-hoc channel per op.
+   event is a bug to retire.*
+2. **core → UI** (view reach-back: screenshot / dump / activate):
+   `roost-engine`'s one `UiRequest` port, delivered to the iced UI over
+   the single engine feed it drains on the main thread — a single
+   registered path from the IPC handler to the main thread, not an
+   ad-hoc channel per op.
 
 **Why this is the north star.** It buys the three things Roost optimizes
 for at once:
@@ -85,17 +79,19 @@ for at once:
   thin adapters", not bespoke logic per surface.
 
 Every decision below — and every new feature — is measured against it:
-*does it route through the one op set, keep the UI reactive, and stay at
-parity across both implementations?*
+*does it route through the one op set and keep the UI reactive?*
 
 ## Why this shape
 
-**Native Mac UI.** AppKit gives the right trackpad, menu, accessibility,
-and notarization story for macOS, and a Swift `.app` bundle needs no
-third-party toolkit installed to run — signing + DMG distribution are a
-standard Apple workflow.
+**One UI toolkit.** iced runs on Linux and macOS, so one Rust codebase
+covers both host OSes. The macOS-specific surface (menu bar, Dock badge,
+notifications, the Sparkle updater, Secure Keyboard Entry) lives behind
+`objc2` seams in `crates/roost-iced/src/macos/`, not in a second
+application. The trade is accessibility: an iced canvas gives essentially
+no VoiceOver support where AppKit gives it for free, accepted knowingly
+in [DL-16](#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25).
 
-**No daemon.** Each UI is a single process that owns its PTY supervisor,
+**No daemon.** The UI is a single process that owns its PTY supervisor,
 workspace state, and IPC server. There is no separate `roost-core`
 binary to spawn, supervise, or lifecycle. An earlier design had a gRPC
 daemon owning state for thin clients; the realistic deployment is one
@@ -121,7 +117,7 @@ file, hand-debuggable with `nc -U`. Dropping protobuf evolution rules is
 acceptable because the only producers + consumers are versioned together
 in this repo.
 
-**Rust core (Linux UI + IPC + CLI).** Memory-safe, ergonomic FFI in both
+**Rust core (UI + IPC + CLI).** Memory-safe, ergonomic FFI in both
 directions, mature async (`tokio`), small static binaries. The
 systems-level work — PTY lifecycle, OSC parsing, IPC framing — is
 exactly what Rust is good at.
@@ -133,34 +129,24 @@ the iced cutover it stayed in-repo a while longer as the parity
 reference iced was measured against, and was removed once iced *was* the
 product. See [DL-15](#dl-15-linux-ships-iced-gtk4-rs-is-retired-and-removed-2026-08-25).
 
-**Two languages, not one — for now.** Swift on Linux has no AppKit, so a
-"uniform language" would still mean binding a foreign toolkit from
-Swift: it adds the Swift runtime to Linux bundles and unifies no UI
-code. What is worth unifying is the JSON IPC wire format + the
-PTY/workspace state machines, and those are mirrored idiomatically in
-each language today. Whether that stays the right trade is exactly what
-[Direction](#direction-under-evaluation) is gating.
+**History: Swift + AppKit was the first Mac UI.** The Mac app was Swift
++ AppKit until v0.1.0, with the JSON IPC wire format and the PTY/workspace
+state machines mirrored idiomatically in each language and pinned to each
+other by shared fixture corpora. That duplication is what
+[DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)
+retires.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  subgraph MacApp["Roost.app (Swift + AppKit)"]
-    macView["Cell renderer<br/>(AppKit + Core Graphics)"]
-    macVT["libghostty-vt<br/>(in-process VT parse)"]
-    macWS["Workspace + PtySupervisor<br/>(@MainActor)"]
-    macIPC["JSON IPC server<br/>(Darwin sockets)"]
-    macView --- macVT --- macWS
-    macWS --- macIPC
-  end
-
-  subgraph LinuxApp["roost (Rust + iced) — packaged Linux UI"]
-    linuxView["Cell renderer<br/>(iced + wgpu)"]
-    linuxVT["libghostty-vt<br/>(in-process VT parse)"]
-    linuxWS["Workspace + PtySupervisor<br/>(tokio + portable-pty)"]
-    linuxIPC["JSON IPC server<br/>(tokio UnixListener)"]
-    linuxView --- linuxVT --- linuxWS
-    linuxWS --- linuxIPC
+  subgraph App["Roost.app / roost (Rust + iced)"]
+    view["Cell renderer<br/>(iced + wgpu)"]
+    vt["libghostty-vt<br/>(in-process VT parse)"]
+    ws["Workspace + PtySupervisor<br/>(tokio + portable-pty)"]
+    ipc["JSON IPC server<br/>(tokio UnixListener)"]
+    view --- vt --- ws
+    ws --- ipc
   end
 
   subgraph External["External tooling"]
@@ -168,10 +154,8 @@ flowchart LR
     claude["Claude Code hooks"]
   end
 
-  roostctl -- "UDS<br/>JSON IPC" --- macIPC
-  roostctl -- "UDS<br/>JSON IPC" --- linuxIPC
-  claude -- "UDS<br/>JSON IPC" --- macIPC
-  claude -- "UDS<br/>JSON IPC" --- linuxIPC
+  roostctl -- "UDS<br/>JSON IPC" --- ipc
+  claude -- "UDS<br/>JSON IPC" --- ipc
 ```
 
 **Hot path.** PTY bytes flow `kernel → master fd → in-process drain task
@@ -201,12 +185,10 @@ chunk, then everything else is in-process memory.
   over SSH stdio rather than networking the protocol itself.
 - **No rendered output over the wire.** PTY bytes only ever live
   in-process.
-- **No shared UI code between Mac and Linux beyond the JSON wire
-  format.** Each UI is idiomatic to its platform. *(The one non-goal
-  currently under review — see
-  [Direction](#direction-under-evaluation).)*
-- **No core rewrites in third languages.** Rust for the Linux UI + CLI +
-  IPC + supporting crates; Swift for the Mac UI. Lua, if it ever lands,
+- **No per-platform UI forks.** One iced codebase serves macOS and
+  Linux; platform specifics live behind seams.
+- **No core rewrites in third languages.** Rust for the UI + CLI + IPC +
+  supporting crates. Lua, if it ever lands,
   is an *embedded scripting surface* for user automation (see DL-12),
   not a third implementation language.
 
@@ -216,6 +198,8 @@ Short ADR-style entries. Each captures a live decision so it is not
 relitigated by accident.
 
 ### DL-1: Swift + AppKit on Mac, not Rust
+
+**Superseded by [DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03).**
 
 Swift owns the macOS native experience: HIG, AppKit lifecycle,
 accessibility, notarization, App Store-adjacent tooling. A Rust UI on
@@ -256,6 +240,8 @@ project's tab **layout** (title + cwd + position) + active selection (see
 DL-7).
 
 ### DL-5: Two languages, not Rust everywhere
+
+**Superseded by [DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03).**
 
 Considered and rejected: Rust + gtk4-rs on Mac. This still requires
 hand-rolled AppKit/macOS integration for menus, dock, notifications, and
@@ -468,6 +454,8 @@ upgrade needs no migration step. Only the profile's *name* changed
 
 ### DL-16: An experimental mac-iced build ships beside Swift (2026-08-25)
 
+**Superseded by [DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)** — the hypothesis held.
+
 v0.0.18 added `Roost-Iced-<version>.dmg` — the same iced binary bundled
 for macOS with its own bundle id (`ai.stridelabs.Roost.iced`), its own
 socket/state/log paths, its own Sparkle feed and signing key
@@ -481,7 +469,7 @@ hypothesis* is that one iced codebase can serve both platforms well
 enough to retire the second implementation — and the only place to test
 that against the Swift app is daily use, which is what this build exists
 for. What the evaluation turns on, and what each outcome implies, is in
-[Direction (under evaluation)](#direction-under-evaluation).
+[Direction](#direction-under-evaluation).
 
 Accepted going in, decided rather than discovered: **accessibility**.
 AppKit gives the Swift sidebar and menus VoiceOver support for free; an
@@ -1133,6 +1121,8 @@ for the user-facing shape and
 
 ### DL-28: Roost-Iced becomes the recommended Mac install for agent-driving users (2026-09-19, pending)
 
+**Superseded by [DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03).**
+
 **This is a pending decision, not a shipped one.** From the release
 after v0.0.19, [`getting-started/installation.md`](../getting-started/installation.md)
 steers Mac users who drive Roost from an agent — the Claude skill,
@@ -1150,7 +1140,7 @@ the same Rust core Roost-Iced already uses. Either branch puts the
 agent-control surface in the Rust core — this is additive to
 [DL-16](#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25)'s
 convergence hypothesis and the (a)/(b) branches in
-[Direction (under evaluation)](#direction-under-evaluation) below, not a
+[Direction](#direction-under-evaluation) below, not a
 resolution of it.
 
 ### DL-29: program status is a fourth per-tab axis, composed above the hook layer (2026-10-28)
@@ -1355,57 +1345,79 @@ The values are advisory, like the bridge preamble: any process of the
 session's uid can state either. Protocol 7 is amended in place, with no
 generation bump.
 
-## Direction (under evaluation)
+### DL-33: The Swift app is retired; iced is the only desktop UI (2026-11-03)
 
-**Status: under evaluation — not a commitment.** Nothing in this section
-is decided. It is written down so the next stretch of work is read
-against it. Decision-log entries land in the PR that actually builds the
-thing, not here — the same rule `discovery/` sets for itself.
+v0.1.0 ships one desktop UI. The iced build takes over `Roost.app` and the
+bundle id `ai.stridelabs.Roost`; the Swift + AppKit app is gone from this
+repo (its sources live on in the private archive repo
+`charliek/roost-legacy-swift`, a snapshot of v0.0.27). This resolves
+[Direction](#direction-under-evaluation) to branch (a) and supersedes
+[DL-1](#dl-1-swift-appkit-on-mac-not-rust),
+[DL-5](#dl-5-two-languages-not-rust-everywhere),
+[DL-16](#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25)
+and
+[DL-28](#dl-28-roost-iced-becomes-the-recommended-mac-install-for-agent-driving-users-2026-09-19-pending).
 
-**The fixed point is one shared Rust core.** Maintaining two full
-codebases long-term delays features and is not acceptable. There is
-already far too much duplicated code: the workspace state machine, the
-agent-state derivation, config/theme/keybind parsing, URL detection and
-word selection, and the IPC wire types all exist twice — once in Rust,
-once in Swift — pinned to each other by shared fixture corpora precisely
-*because* they are duplicates. Merging the codebases is what makes the
-advanced features feasible at all.
+- **Why.** Two implementations of one contract was the cost the
+  convergence hypothesis existed to remove, and daily use showed the iced
+  build serving the full agent-facing surface (`open`, `events`,
+  `tab prompt`, host sessions) that the Swift app never would. What the
+  Swift app still did better was accessibility, which stays a known,
+  accepted regression ([DL-16](#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25)).
+- **Upgrade path.** The production iced build resolves the same Mac
+  paths the Swift app used (`~/Library/Caches/Roost/roost.sock`,
+  `~/Library/Application Support/Roost`, `~/Library/Logs/Roost`) and the
+  same Sparkle key and feed (`docs/appcast.xml`), so a Swift user updates
+  in place and keeps their projects, tab layout and selection.
+- **`Roost-Iced.app` users switch by hand.** Its bundle id and feed are
+  separate and the feed (`docs/appcast-iced.xml`) is frozen; see
+  [Roost-Iced.app users](../getting-started/installation.md#roost-icedapp-users).
+  Dev builds keep the `Roost-Iced.app` name and the separate
+  `Roost-iced` paths.
+- **The north star keeps its shape.** One contract (`roost-ipc`'s op
+  set), now with one desktop implementation; a mobile client of
+  `roost-session` is planned. The parity language goes, and so do the
+  Swift CI jobs, the `--roost-target mac` lane and the engine facade.
+- **Still true of the code.** `roost-engine` and `roost-ui-model` stay
+  toolkit-neutral, so a second client does not need a rewrite.
 
-**The open question is the Mac shell**, and it is gated on one thing:
-whether iced visuals on macOS can reach parity with the Swift app.
+## Direction {: #direction-under-evaluation }
 
-- **(a) If they can** — converge on iced as the single codebase. Both
-  platforms first-class, feature parity by construction, and the
-  platform-specific items (menu bar, notifications, Dock, updater, TCC,
-  vibrancy) live behind seams/interfaces instead of in a second
-  application.
+**Status: resolved to branch (a) by
+[DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)**
+(v0.1.0). This section used to be *Direction (under evaluation)*; the
+anchor is kept because other pages link to it.
+
+**The fixed point was one shared Rust core.** Maintaining two full
+codebases delays features: the workspace state machine, the agent-state
+derivation, config/theme/keybind parsing, URL detection and word
+selection, and the IPC wire types all existed twice, once in Rust and
+once in Swift, pinned to each other by shared fixture corpora precisely
+*because* they were duplicates.
+
+**The open question was the Mac shell**, gated on whether iced visuals on
+macOS could reach parity with the Swift app:
+
+- **(a) If they can** — converge on iced as the single codebase, with the
+  platform-specific items (menu bar, notifications, Dock, updater, TCC)
+  behind seams instead of in a second application. **This is what
+  happened.**
 - **(b) If they cannot** — keep Swift as the Mac shell and drive it to
-  reuse much more of the Rust core, shrinking the duplication from the
-  other end.
+  reuse much more of the Rust core. Not taken; the Swift-facing facade
+  ([#286](https://github.com/charliek/roost/issues/286)) that was its seam
+  has been deleted.
 
-Either branch pays off the same investment — the iced UI,
-`roost-engine`, and `roost-ui-model` — which is why the question is
-gated rather than answered early. The unproven Swift-facing facade
-([#286](https://github.com/charliek/roost/issues/286)) is the (b) seam,
-held at "don't invest, don't delete" until the direction resolves.
-
-**What either branch unlocks** is the `discovery/` backlog as the
-candidate roadmap. The first spike, **remote host support without
-needing tmux or herdr**
+**What it unlocks** is the `discovery/` backlog as the candidate roadmap.
+The first spike, **remote host support without needing tmux or herdr**
 ([`discovery/host-sessions.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions.md)),
-is landing, not just a candidate: `roost-session`
+landed: `roost-session`
 ([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)),
 an opt-in session daemon built from `roost-engine` with the UI as one of
-its clients, shipped its lifecycle + control plane as HS-1a; the data
-plane (attach, leases, headless `tab.dump`, snapshot payload) is HS-1b,
-tracked in
-[`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md).
-It revises the "no daemon" non-goal for that feature without reversing
-the default. Its companion, **agent watching**
+its clients. Its companion, **agent watching**
 ([`discovery/agent-watching.md`](https://github.com/charliek/roost/blob/main/discovery/agent-watching.md)),
 adding screen/process observation as a fallback writer into the four
 agent axes rather than a replacement for hooks, remains an unscheduled
-discovery note; the two don't wait on each other.
+discovery note. A mobile client of `roost-session` is planned.
 
 ## Migration history
 
@@ -1429,12 +1441,16 @@ sprite/box-drawing parity, IME input, and crash robustness (the engine
 track). **M4** swapped the Linux `.deb`: `/usr/bin/roost` became the
 iced binary, built with the `linux-package` feature so it adopts the
 production profile the GTK package owned — same socket, same
-`state.json`, no migration step. **M5** (Rust under Swift) is frozen.
+`state.json`, no migration step. **M5** (Rust under Swift) was dropped.
 **M6** bundled the same binary for macOS as the experimental
 `Roost-Iced.dmg` — bundle + parallel install, an `objc2` native seam,
 Sparkle, menu bar, macOS notifications (plans 027 / 028 / 030). Both
 shipped in **v0.0.18** (2026-08-25). Plan 031 then removed
 `crates/roost-linux` and the "three implementations" framing with it.
+**v0.1.0 (2026-11)** retired the Swift app: the iced build took over the
+`Roost.app` name and bundle id, and the Swift sources moved to a private
+archive repo
+([DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)).
 The full account is in
 [Iced migration — history & status](iced-migration.md).
 
@@ -1444,7 +1460,7 @@ The full account is in
 |---|---|
 | `docs/development/vision.md` (this file) | The **living architecture + principles**. Every PR is measured against the north star + decision log here. |
 | [`docs/development/test-automation.md`](test-automation.md) | How the north star is verified: the three-layer harness map, the CI lanes, and the determinism principles. |
-| [`docs/development/iced-migration.md`](iced-migration.md) | How Roost got to two implementations — the iced migration's milestones, status, and what remains. |
+| [`docs/development/iced-migration.md`](iced-migration.md) | How Roost got to one implementation — the iced migration's milestones, status, and what remains. |
 | [`docs/reference/ipc.md`](../reference/ipc.md) | JSON IPC wire format spec — the canonical command contract. |
 | [`docs/reference/architecture.md`](../reference/architecture.md) | Package layout + threading contract for the in-process implementation. |
 | [`docs/archive/roost.proto`](../archive/roost.proto) | Historical reference for the pre-rewrite gRPC contract. |

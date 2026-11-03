@@ -3,8 +3,8 @@
 Roost draws images that programs send with the
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/):
 `kitten icat`, `chafa -f kitty`, `timg`, yazi's previews, and plotting
-backends that print to the terminal. Roost-Iced draws them, on Linux and on
-macOS. The older Swift Roost.app doesn't.
+backends that print to the terminal. Roost draws them, on Linux and on
+macOS.
 
 ## Trying it
 
@@ -79,7 +79,7 @@ program isn't resized. The scale a window opens at never takes a tab either.
 
 ## Tabs on a session
 
-A tab on a `roost-session` (Roost-Iced's local session, or a saved host) draws
+A tab on a `roost-session` (Roost's local session, or a saved host) draws
 images in the same way. The session keeps the terminal state, so an image on
 screen is still there after you detach and attach again, or reconnect.
 

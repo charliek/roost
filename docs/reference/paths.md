@@ -2,13 +2,13 @@
 
 Roost resolves all of its filesystem state once at startup. Other components read the paths from this resolution; nothing should derive its own.
 
-There are three UI bundle profiles — `Mac`, `Linux`, and `Iced` (slugs `mac`, `linux`, `iced`) — and each running UI resolves exactly one of them; each owns its own workspace + PTY supervisor in-process, so there is no daemon a UI depends on. A fourth profile, `Session`, is resolved by the headless `roost-session` daemon (HS-1a, plan 035) — a workspace + PTY supervisor with no UI attached, opt-in via `roostctl session start` (see [Session profile](#session-profile) below). It is a legal `roostctl --target` value (`--target session`, explicit only — #475) but not a legal `ROOST_BUNDLE_PROFILE` value, and auto-detect never probes it; `roostctl session start|stop|status` keep their own carve-out, addressing its socket directly ahead of that ladder. The Rust definition lives in `crates/roost-ipc/src/paths.rs`; the Swift companion is `mac/Sources/Roost/BundleProfile.swift`. On macOS the two implementations are tested in lockstep.
+There are three UI bundle profiles — `Mac`, `Linux`, and `Iced` (slugs `mac`, `linux`, `iced`) — and each running UI resolves exactly one of them; each owns its own workspace + PTY supervisor in-process, so there is no daemon a UI depends on. A fourth profile, `Session`, is resolved by the headless `roost-session` daemon (HS-1a, plan 035) — a workspace + PTY supervisor with no UI attached, opt-in via `roostctl session start` (see [Session profile](#session-profile) below). It is a legal `roostctl --target` value (`--target session`, explicit only — #475) but not a legal `ROOST_BUNDLE_PROFILE` value, and auto-detect never probes it; `roostctl session start|stop|status` keep their own carve-out, addressing its socket directly ahead of that ladder. The definition lives in `crates/roost-ipc/src/paths.rs`.
 
 | Profile | Who resolves it | `app_label` | `app_id` |
 |---|---|---|---|
-| `Mac`   | the Swift `Roost.app` | `Roost` | `ai.stridelabs.Roost` |
+| `Mac`   | the shipped macOS `Roost.app` (bundle id `ai.stridelabs.Roost`) | `Roost` | `ai.stridelabs.Roost` |
 | `Linux` | the packaged Linux UI (`/usr/bin/roost`) | `Roost-linux` | `ai.stridelabs.Roost` on Linux; `ai.stridelabs.Roost.linux` on macOS |
-| `Iced`  | a dev build of `roost-iced`, and the experimental macOS `Roost-Iced.app` | `Roost-iced` | `ai.stridelabs.Roost.iced` |
+| `Iced`  | a dev build of `roost-iced`, and the dev macOS `Roost-Iced.app` (`make bundle-iced`) | `Roost-iced` | `ai.stridelabs.Roost.iced` |
 | `Session` | the headless `roost-session` daemon (`/usr/bin/roost-session` on the Linux `.deb`) | `RoostSession` (`RoostSessionDev` in debug builds) | `ai.stridelabs.Roost.session` |
 
 `app_label` is fixed per profile on every platform — it is the string `identify` and `roostctl doctor` report, and on macOS it is also the directory component of the profile's paths. `app_id` is the only field that resolves per platform: on Linux the `Linux` profile shares `ai.stridelabs.Roost` with the `Mac` profile, which can never run there and already shares that platform's path namespace; on macOS every profile stays independently resolvable (so their paths and identities can never collide), even though nothing ships or launches the `Linux` one there.
@@ -19,8 +19,8 @@ The profile defaults to:
 
 | Binary       | Default profile | Override |
 |--------------|------------------|----------|
-| Swift `Roost.app` | `Mac` | n/a (the app picks `Mac` directly) |
-| `roost` (Linux `.deb`, built `--features roost-iced/linux-package`) | `Linux` | `ROOST_BUNDLE_PROFILE=iced` to keep the isolated profile in a packaged build (or `=mac` to target another UI) |
+| `Roost.app` (macOS) | `Mac` | the app's bundle id (`ai.stridelabs.Roost`) picks `Mac` |
+| `roost` (Linux `.deb`, built `--features roost-iced/linux-package`) | `Linux` | `ROOST_BUNDLE_PROFILE=iced` to keep the isolated profile in a packaged build (or `=mac` to dial another profile's namespace) |
 | `roost-iced` (dev build, any platform; macOS `Roost-Iced.app`) | `Iced` | `ROOST_BUNDLE_PROFILE=mac` / `=linux` to dial another profile's namespace |
 | `roostctl` (binary from the `roost-cli` crate) | auto-detect | `ROOST_BUNDLE_PROFILE` / `--socket` / `ROOST_SOCKET` / `--target {mac,linux,iced,session}` |
 
@@ -28,15 +28,17 @@ The two sides treat an **unrecognized** `ROOST_BUNDLE_PROFILE` value differently
 
 ## File locations
 
-The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). Set `ROOST_CONFIG` to an absolute path to read config from there instead (used by the E2E harness to drive the command launcher off a seeded config). A `config.lock` sits beside it, after symlinks are resolved: the UI, the Swift app, `roostctl` and a connecting client can all rewrite `config.conf`, and an atomic rename stops a torn file but not a lost update, so every Roost writer takes that lock first. It moves with `ROOST_CONFIG`. The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost`, `Roost-linux`, `Roost-iced`, or `RoostSession`/`RoostSessionDev` for a headless session.
+The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). Set `ROOST_CONFIG` to an absolute path to read config from there instead (used by the E2E harness to drive the command launcher off a seeded config). A `config.lock` sits beside it, after symlinks are resolved: the UI, `roostctl` and a connecting client can all rewrite `config.conf`, and an atomic rename stops a torn file but not a lost update, so every Roost writer takes that lock first. It moves with `ROOST_CONFIG`. The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost`, `Roost-linux`, `Roost-iced`, or `RoostSession`/`RoostSessionDev` for a headless session.
 
-Set `ROOST_STATE_DIR` to an **absolute** path to redirect **only** the state directory (where `state.json` and its `state.lock` live) — the socket, the socket lock, and the log dir stay on the default profile path, so `roostctl` and the E2E harness still find the running UI by its unchanged socket. A `roost-session` under the override also puts its [upload store](#session-profile) inside that directory rather than on the cache path, which is the point: an isolated session must not sweep a developer's real one at start. Note the consequence: two UIs with different `ROOST_STATE_DIR` values no longer collide on state, so a collision that used to be loud is now silent isolation; the socket lock is what still catches a genuine second instance on one socket. The E2E harness uses this to give each run an isolated, throwaway `state.json` without touching a developer's real saved tabs. Unlike `ROOST_CONFIG` (which accepts any non-empty value), `ROOST_STATE_DIR` requires an absolute path: a relative value is ignored (a relative state dir would resolve against the process's working directory). Note this does **not** isolate the Swift `Roost.app`'s `UserDefaults` (e.g. sidebar visibility), which is a separate store — Roost-Iced has no `UserDefaults` equivalent.
+Set `ROOST_STATE_DIR` to an **absolute** path to redirect **only** the state directory (where `state.json` and its `state.lock` live) — the socket, the socket lock, and the log dir stay on the default profile path, so `roostctl` and the E2E harness still find the running UI by its unchanged socket. A `roost-session` under the override also puts its [upload store](#session-profile) inside that directory rather than on the cache path, which is the point: an isolated session must not sweep a developer's real one at start. Note the consequence: two UIs with different `ROOST_STATE_DIR` values no longer collide on state, so a collision that used to be loud is now silent isolation; the socket lock is what still catches a genuine second instance on one socket. The E2E harness uses this to give each run an isolated, throwaway `state.json` without touching a developer's real saved tabs. Unlike `ROOST_CONFIG` (which accepts any non-empty value), `ROOST_STATE_DIR` requires an absolute path: a relative value is ignored (a relative state dir would resolve against the process's working directory).
 
 One derivation rides on top of the seam, and it is asymmetric on purpose. When something **launches** a headless `roost-session` for you — the UI's Connect on a `localhost` host, or `roostctl session start` — and `ROOST_STATE_DIR` is set to a value the resolver honours, the daemon is handed `<that directory>/session` instead of inheriting the value verbatim. Without it the daemon would resolve its launcher's *own* state dir, find that launcher's `state.lock` already held, and refuse to start ("another session (pid N) is using this state directory") — the isolation seam colliding with itself. `roostctl session start` prints the derived path on stderr when it does this; the UI records it in its log. The daemon stays addressable either way, because the socket does not move with `ROOST_STATE_DIR` — `roostctl session status|stop` find it by socket. The other half of the asymmetry: the daemon's own reading of the variable is unchanged, so running `ROOST_STATE_DIR=/tmp/x roost-session start` **directly** still puts its state in `/tmp/x` verbatim. Only a launcher derives, and only from a value that would redirect its own state dir — an empty or relative value derives nothing and is passed through untouched.
 
 This is a deliberate divergence from Apple's HIG on macOS: Roost matches the convention used by Ghostty, nvim, fish, and most CLI-adjacent tools, which keeps user-edited config alongside the rest of one's dotfiles. State files (which the user does not edit) stay in `~/Library/Application Support/<app_label>/` and the socket lives in `~/Library/Caches/<app_label>/`.
 
-### macOS — `Mac` profile (Swift `Roost.app`)
+### macOS — `Mac` profile (`Roost.app`)
+
+These are the paths the Swift `Roost.app` used before v0.1.0, unchanged, so an upgrade keeps its state, socket and logs.
 
 | Path | Purpose |
 |---|---|
@@ -50,8 +52,8 @@ This is a deliberate divergence from Apple's HIG on macOS: Roost matches the con
 
 ### macOS — `Iced` profile (`Roost-Iced.app`, or `cargo run -p roost-iced`)
 
-Same shape as the `Mac` profile with `Roost-iced` in place of `Roost`, so the
-experimental iced build runs beside the Swift app without touching its state:
+Same shape as the `Mac` profile with `Roost-iced` in place of `Roost`, so a
+dev build runs beside an installed `Roost.app` without touching its state:
 
 | Path | Purpose |
 |---|---|
@@ -110,14 +112,14 @@ switch (see [Switching the local backend](../guides/host-sessions.md#switching-t
 not to the daemon it switches onto. It only exists while a switch is in
 progress or was interrupted mid-flight; a UI that starts up and finds
 one resumes or rolls it back before doing anything else, then deletes
-it. Swift never writes one — `local-backend` isn't a key it reads.
+it.
 
 ### Session profile
 
 `Session` resolves paths the same way the three UI profiles do, and is
 now live: the headless `roost-session` daemon (HS-1a, plan 035) resolves
 it — the Linux `.deb` ships it as `/usr/bin/roost-session` and
-`Roost-Iced.app` ships it at `Contents/MacOS/roost-session` (HS-4b),
+`Roost.app` ships it at `Contents/MacOS/roost-session` (HS-4b),
 opt-in via `roostctl session start` or the palette's
 **Connect Host: localhost**. It is a legal `roostctl --target` value —
 `roostctl --target session` resolves to this profile's socket — but
@@ -418,7 +420,7 @@ Keys use Ghostty-style hyphens (`font-family`, not `font_family`); a misspelled 
 | `command`        | (none)                               | Repeatable. A command-launcher entry (`Cmd/Alt+Shift+T`). See [Command launcher](#command-launcher) below. |
 | `copy-on-select` | `true`                               | `off` / `true` / `clipboard`. Controls what a mouse-drag selection writes on release. See [`config.md`](config.md#copy-on-select) for per-platform behavior. |
 
-Tab-strip pill widths (`tab-min-width` / `tab-max-width`, macOS) are documented in [Tab Strip](tab-strip.md#config-keys).
+Tab-strip pill widths are fixed; see [Tab Strip](tab-strip.md#sizing).
 
 An unresolvable `font-family` degrades to the platform's system monospace rather than failing to launch; [Fonts](fonts.md#how-font-family-resolves) has the per-UI resolution rules.
 
@@ -467,8 +469,7 @@ the serving process's environment minus `DISPLAY`, `WAYLAND_DISPLAY`,
 `SSH_CLIENT` and `SSH_TTY`, which come only from whoever opened the tab
 (a desk opener's display, bus and agent; a remote opener's two `SSH_*`
 values) — see [Tab environment](ipc.md#tab-environment) for who that is.
-`SHELL` is the passwd shell. (Roost-Iced and `roost-session`; the
-frozen Swift app still inherits its own environment whole.) The
+`SHELL` is the passwd shell. (The UI and `roost-session`.) The
 variables below are set on top — the user's own values for
 `TERM_PROGRAM_VERSION` etc. would be overwritten;
 `ROOST_SHELL_FEATURES` is the only one that defers to a pre-existing
@@ -566,10 +567,10 @@ collapse onto the same production socket.
 To wipe Roost's persistent state and start fresh:
 
 ```bash
-# macOS — Mac profile (Swift Roost.app)
+# macOS — Mac profile (Roost.app)
 rm "$HOME/Library/Application Support/Roost/state.json"
 
-# macOS — Iced profile (Roost-Iced.app, or cargo run -p roost-iced)
+# macOS — Iced profile (dev Roost-Iced.app, or cargo run -p roost-iced)
 rm "$HOME/Library/Application Support/Roost-iced/state.json"
 
 # Linux (uses XDG_DATA_HOME with the spec-default fallback)

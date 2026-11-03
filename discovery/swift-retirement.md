@@ -1,7 +1,9 @@
 # Retiring the Swift app (discovery)
 
-Status: **decided direction, not an implementation plan.** Written
-2026-09-27. Companion to [`text-rendering.md`](text-rendering.md), which is
+Status: **Executed by plan 089 (v0.1.0).** The Swift app is retired and
+the supersession is recorded as DL-33 in `docs/development/vision.md`. This
+note is kept as the decision record; the text below is as written before
+the cutover. Written 2026-09-27. Companion to [`text-rendering.md`](text-rendering.md), which is
 about tuning iced's terminal text; that work does not block this one. File
 and line references are as of `main` @ `474e6b5`.
 

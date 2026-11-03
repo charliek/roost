@@ -1,12 +1,11 @@
 # Shared Rust engine
 
 `roost-engine` is Roost's toolkit-neutral authoritative Rust application
-engine. It is the core of the Linux UI — `roost-iced` is an adapter over it,
-not a second implementation of it — and it is the seam a future convergence
-would build on, whichever way
-[that question resolves](vision.md#direction-under-evaluation): either an iced
-shell on both platforms sits on this engine, or a Swift shell adopts it
-incrementally without exposing Rust layouts across an ABI.
+engine. It is the core of the UI on both platforms — `roost-iced` is an adapter over
+it, not a second implementation of it — and the seam a future second client
+(the planned mobile one) would build on.
+The [direction](vision.md#direction-under-evaluation) resolved to one iced
+shell on both platforms.
 
 That the engine has exactly one consumer today is a fact about the present,
 not a licence to fold it back into the UI. Its whole value is that the
@@ -53,27 +52,12 @@ mpsc the adapter drains on its own main-loop task — for iced, the `EngineFeed`
 wake subscription — folding lag or the startup gap into a full-state `Resync`
 the adapter reconciles against.
 
-The `facade` module (`Engine`/`EngineCommand`/`EngineSnapshot`/
-`EngineEventStream`) is the **experimental** Swift-facing boundary. It has no
-production consumer, is feature-gated (`roost-engine/facade`, compiled and
-tested in CI but off by default), and stays unproven until a real adapter
-adopts it — tracked as
-[#286](https://github.com/charliek/roost/issues/286), held at "don't invest,
-don't delete" while the Mac-shell question is open (see
-[Direction](vision.md#direction-under-evaluation) and the
-[iced migration's M5](iced-migration.md#m5-frozen)). Its design:
-`EngineCommand` reuses serializable `roost-ipc` request DTOs.
-`Engine::execute` returns an owned `CommandResult` or a typed `EngineError`
-with a stable status key. `EngineSnapshot` is a versioned, owned, ordered
-replacement projection. Every committed workspace transition has a monotonic
-in-process revision; compound events share that revision and retain their
-established order.
-
-`EngineEventStream` subscribes before its initial snapshot, discards any stale
-buffered deltas already represented by that snapshot, and turns broadcast lag
-or a revision gap into `EngineEvent::Resync`. Event publication is synchronous
-and non-blocking while the state lock establishes order. No UI callback runs
-under that lock, and persistence I/O happens after it is released.
+Every committed workspace transition has a monotonic in-process revision;
+compound events share that revision and retain their established order. The
+event subscription turns broadcast lag or a revision gap into a
+`WorkspaceEvent::Resync`. Event publication is synchronous and non-blocking
+while the state lock establishes order. No UI callback runs under that lock,
+and persistence I/O happens after it is released.
 
 `Workspace` also owns the last selected live tab for each project. Its
 `preferred_tab` query falls back to display order, and a close repairs that
