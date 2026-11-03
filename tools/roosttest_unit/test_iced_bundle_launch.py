@@ -865,12 +865,18 @@ class BundleQualifiedCleanupTests(unittest.TestCase):
         (root / "elsewhere").mkdir()
         link = root / "elsewhere" / name
         # A symlink, so the process takes the link's name without a
-        # written-then-executed file; a plain binary, which keeps that name
-        # (a framework Python re-execs itself under another one on macOS).
-        # argv[0] stays "sleep": a multicall coreutils (uutils, on current
-        # ubuntu runners) picks its tool by argv[0] and would exit at once.
-        link.symlink_to("/bin/sleep")
-        proc = subprocess.Popen(["sleep", "60"], executable=str(link))
+        # written-then-executed file, to a binary that keeps running under
+        # that name: macOS's /bin/sleep (a framework Python re-execs itself
+        # under another name there), and on Linux the interpreter, because
+        # uutils' multicall sleep (current ubuntu runners) refuses to run
+        # under a name that isn't its own.
+        if sys.platform == "darwin":
+            link.symlink_to("/bin/sleep")
+            argv = ["sleep", "60"]
+        else:
+            link.symlink_to(Path(sys.executable).resolve())
+            argv = ["python3", "-c", "import time; time.sleep(60)"]
+        proc = subprocess.Popen(argv, executable=str(link))
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
         deadline = time.monotonic() + 10
