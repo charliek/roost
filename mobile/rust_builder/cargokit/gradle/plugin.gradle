@@ -147,7 +147,12 @@ class CargoKitPlugin implements Plugin<Project> {
             }
 
             // Same thing addFlutterDependencies does in flutter.gradle
-            if (buildType == "debug") {
+            // LOCAL PATCH (roost): only when no --target-platform was given.
+            // An explicit list (make mobile-apk, `flutter run` on a device) is
+            // the whole list; adding android-x86 to it would build an ABI that
+            // libghostty-vt is not built for. Re-apply if cargokit is
+            // re-vendored.
+            if (buildType == "debug" && !project.hasProperty('target-platform')) {
                 platforms.add("android-x86")
                 platforms.add("android-x64")
             }

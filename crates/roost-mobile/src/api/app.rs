@@ -100,9 +100,7 @@ impl BridgeApp {
         geometry: BridgeGeometry,
         take: bool,
     ) -> anyhow::Result<BridgeTerminal> {
-        let handle = self
-            .app()
-            .attach(host_id, tab_id, geometry.into(), take)?;
+        let handle = self.app().attach(host_id, tab_id, geometry.into(), take)?;
         Ok(BridgeTerminal::new(handle))
     }
 

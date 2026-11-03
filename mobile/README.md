@@ -95,6 +95,8 @@ Contract details:
 - `takeFrame` returns the next C6 payload, empty when nothing changed; the
   view calls it at most once per vsync, only after a `FrameReady`.
 - `scroll(rows, col, row)`: positive is up, into history, aimed at a cell.
+  Once a local scroll settles (500 ms after its last step) on a tab another
+  client sizes, the pane calls `takeSize()`, as ipc.md's ownership rules ask.
 - Geometry cell sizes are device pixels (logical × devicePixelRatio).
 - Ids in `op` params are string-wrapped, as on the wire (`"tab_id": "3"`).
 - SSH targets must name the user (`user@host`).

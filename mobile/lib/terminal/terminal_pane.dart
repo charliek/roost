@@ -20,6 +20,9 @@ import 'terminal_view.dart';
 /// A hardware key event within this long hides the extra-keys bar.
 const hardwareKeyboardWindow = Duration(minutes: 2);
 
+/// A local scroll has settled this long after its last step.
+const scrollSettle = Duration(milliseconds: 500);
+
 /// One tab on screen: attaches it (taking its size) once the view knows its
 /// grid, routes every kind of input to it, and detaches when it goes away.
 class TerminalPane extends ConsumerStatefulWidget {
@@ -57,6 +60,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
   bool _ctrl = false;
   bool _alt = false;
   DateTime? _hardwareKeyAt;
+  Timer? _scrollSettle;
 
   RoostCore get _core => ref.read(coreProvider);
 
@@ -69,6 +73,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
   @override
   void dispose() {
     _attachSeq++;
+    _scrollSettle?.cancel();
     _detach();
     _focus
       ..removeListener(_onFocusChange)
@@ -85,6 +90,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
   }
 
   void _detach() {
+    _scrollSettle?.cancel();
     final tab = _tab;
     _tab = null;
     if (tab == null) return;
@@ -195,7 +201,18 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
 
   void _scroll(int rows, int col, int row) {
     final tab = _tab;
-    if (tab != null) _fire(tab.session.scroll(rows, col: col, row: row));
+    if (tab == null) return;
+    _fire(tab.session.scroll(rows, col: col, row: row));
+    _scrollSettle?.cancel();
+    _scrollSettle = Timer(scrollSettle, _scrollSettled);
+  }
+
+  /// Reading this tab's scrollback is using the tab here: once the scroll
+  /// settles, take its size back from whoever holds it (ipc.md, size
+  /// ownership: "TAKE — once a local scroll has settled").
+  void _scrollSettled() {
+    final tab = _tab;
+    if (tab != null && tab.sizedElsewhere) _fire(tab.session.takeSize());
   }
 
   void _onHardwareKeyboard() {

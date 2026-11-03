@@ -18,7 +18,11 @@ Vendored from shed-mobile's `rust_builder/`, with its local patches kept:
   after the library cargo builds (`roost-mobile` → `libroost_mobile`), not
   after the package.
 
-Re-apply all three if cargokit is ever re-vendored. Windows is dropped (Roost is
+- `cargokit/gradle/plugin.gradle` (Roost): a debug build adds x86 and x64
+  only when no `--target-platform` was given, so `make mobile-apk`
+  (arm64 + x64) never asks for an ABI libghostty-vt is not built for.
+
+Re-apply all four if cargokit is ever re-vendored. Windows is dropped (Roost is
 Mac and Linux on the desktop).
 
 Building needs libghostty-vt: `third_party/ghostty/out` for the host, and

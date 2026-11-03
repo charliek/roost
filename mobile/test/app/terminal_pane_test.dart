@@ -186,6 +186,44 @@ void main() {
       expect(byKey('size-owner-banner'), findsNothing);
     });
 
+    testWidgets('a settled scroll takes the size back from another client', (
+      tester,
+    ) async {
+      final core = await _openTab(tester, 12);
+      final session = lastSession(core);
+      core.takeSizeFrom(
+        'devbox',
+        12,
+        label: 'charlie-laptop',
+        cols: 132,
+        rows: 40,
+      );
+      await tester.pumpAndSettle();
+      await tester.drag(byKey('terminal-canvas'), const Offset(0, 120));
+      await tester.pump();
+      expect(session.scrolls, isNotEmpty);
+      expect(session.scrolls.first, greaterThan(0), reason: 'down is history');
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(session.takeSizeCount, 0, reason: 'still scrolling');
+      await tester.drag(byKey('terminal-canvas'), const Offset(0, 60));
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(session.takeSizeCount, 0, reason: 'the settle restarted');
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(session.takeSizeCount, 1);
+      expect(byKey('size-owner-banner'), findsNothing);
+    });
+
+    testWidgets('a settled scroll takes nothing when the size is ours', (
+      tester,
+    ) async {
+      final core = await _openTab(tester, 13);
+      final session = lastSession(core);
+      await tester.drag(byKey('terminal-canvas'), const Offset(0, 120));
+      await tester.pump(const Duration(seconds: 1));
+      expect(session.scrolls, isNotEmpty);
+      expect(session.takeSizeCount, 0);
+    });
+
     testWidgets('a burst of size changes settles into one resize', (
       tester,
     ) async {

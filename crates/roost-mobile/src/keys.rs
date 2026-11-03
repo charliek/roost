@@ -413,14 +413,16 @@ mod tests {
     /// whose test checks it sends exactly this list).
     #[test]
     fn every_named_key_the_app_sends_encodes() {
-        let names: Vec<String> = serde_json::from_str(include_str!(
-            "../../../mobile/test/fixtures/key_names.json"
-        ))
-        .expect("key_names.json");
+        let names: Vec<String> =
+            serde_json::from_str(include_str!("../../../mobile/test/fixtures/key_names.json"))
+                .expect("key_names.json");
         assert!(names.len() > 20, "{names:?}");
         let t = terminal();
         for name in names {
-            assert!(!encode(&t, &key(&name)).is_empty(), "{name} encodes to nothing");
+            assert!(
+                !encode(&t, &key(&name)).is_empty(),
+                "{name} encodes to nothing"
+            );
         }
     }
 
