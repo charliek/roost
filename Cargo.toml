@@ -43,6 +43,7 @@ members = [
     "crates/roost-client",
     "crates/roost-iced",
     "crates/roost-session",
+    "crates/roost-mobile",
 ]
 # The mobile crates (roost-mobile, roost-ssh) are members but not default
 # members: `cargo build`/`make check` at the root skip their russh and

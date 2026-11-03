@@ -3116,6 +3116,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "roost-mobile"
+version = "0.0.27"
+dependencies = [
+ "roost-client",
+ "roost-ipc",
+ "roost-ui-model",
+ "roost-vt",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "roost-osc"
 version = "0.0.27"
 dependencies = [
