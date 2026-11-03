@@ -51,6 +51,8 @@ pub enum AppError {
     UnknownHost(String),
     #[error("host {0} is not connected")]
     NotConnected(String),
+    #[error("the app is in the background")]
+    Paused,
     #[error("{0}")]
     InvalidTarget(String),
     #[error("params are not a JSON object: {0}")]
@@ -161,6 +163,9 @@ pub(crate) struct Inner {
     attachments: Mutex<HashMap<TerminalId, Arc<Attachment>>>,
     pub(crate) counters: Arc<Counters>,
     pub(crate) closed: AtomicBool,
+    /// Between `app_paused` and `app_resumed`: attaches are refused. Set
+    /// and read under the `attachments` lock.
+    paused: AtomicBool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -459,6 +464,7 @@ impl RoostApp {
             attachments: Mutex::new(HashMap::new()),
             counters,
             closed: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
         });
         Ok(Self {
             inner,
@@ -683,8 +689,15 @@ impl RoostApp {
         geometry: Geometry,
         take: bool,
     ) -> Result<TerminalHandle, AppError> {
+        // Opened and registered under the lock a pause collects through: a
+        // pause either ends this attachment or comes first and refuses it.
+        let mut attachments = lock(&self.inner.attachments);
+        if self.inner.paused.load(Ordering::SeqCst) {
+            return Err(AppError::Paused);
+        }
         let attachment = handle::open(&self.inner, host_id, tab_id, geometry, take)?;
-        lock(&self.inner.attachments).insert(attachment.id(), Arc::clone(&attachment));
+        attachments.insert(attachment.id(), Arc::clone(&attachment));
+        drop(attachments);
         Ok(TerminalHandle::new(attachment))
     }
 
@@ -692,14 +705,23 @@ impl RoostApp {
     /// attached tab (`tab.release_size`), then detach them. Their handles
     /// report `Ended` ("paused"); Dart re-attaches the visible tab on
     /// resume. Host connections and their mirrors stay.
+    /// Attaches are refused until [`Self::app_resumed`].
     pub fn app_paused(&self) {
-        self.inner
-            .release_and_end(self.inner.attachments_of(None), "paused");
+        let attachments = {
+            let attachments = lock(&self.inner.attachments);
+            self.inner.paused.store(true, Ordering::SeqCst);
+            attachments.values().cloned().collect()
+        };
+        self.inner.release_and_end(attachments, "paused");
     }
 
     /// Back in the foreground: every connected host retries now rather
     /// than at its next backoff step.
     pub fn app_resumed(&self) {
+        {
+            let _attachments = lock(&self.inner.attachments);
+            self.inner.paused.store(false, Ordering::SeqCst);
+        }
         for slot in lock(&self.inner.hosts).iter() {
             if let Some(conn) = &slot.conn {
                 conn.client.reconnect_now();

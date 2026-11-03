@@ -38,7 +38,12 @@ class TerminalView extends StatefulWidget {
   final AttachedTab? tab;
   final double fontSize;
   final bool focused;
-  final ValueChanged<Geometry>? onGeometry;
+
+  /// The grid that fits. [deliberate] when the user changed it (the font
+  /// size), not when the space around it moved (a banner, a bar, the
+  /// keyboard): only a deliberate regrid may take the tab's size.
+  final void Function(Geometry geometry, {required bool deliberate})?
+  onGeometry;
   final ValueChanged<double>? onFontSize;
 
   /// Rows to scroll, positive up into history, and the cell (col, row)
@@ -57,7 +62,9 @@ class _TerminalViewState extends State<TerminalView>
   final TerminalModel _blank = TerminalModel();
   CellMetrics? _metrics;
   Geometry? _reported;
+  double? _reportedFontSize;
   Geometry? _pending;
+  double? _pendingFontSize;
   Timer? _debounce;
   bool _pulling = false;
   double _pinchStartFont = 0;
@@ -126,27 +133,32 @@ class _TerminalViewState extends State<TerminalView>
     return _metrics = CellMetrics.measure(fontSize, dpr);
   }
 
-  void _offer(Geometry local) {
+  void _offer(Geometry local, double fontSize) {
     if (_reported == null) {
       _reported = local;
+      _reportedFontSize = fontSize;
       SchedulerBinding.instance.addPostFrameCallback((_) {
-        if (mounted) widget.onGeometry?.call(local);
+        if (mounted) widget.onGeometry?.call(local, deliberate: false);
       });
       return;
     }
     if (local == _reported) {
       _debounce?.cancel();
       _pending = null;
+      _reportedFontSize = fontSize;
       return;
     }
-    if (local == _pending) return;
+    if (local == _pending && fontSize == _pendingFontSize) return;
     _pending = local;
+    _pendingFontSize = fontSize;
     _debounce?.cancel();
     _debounce = Timer(regridDebounce, () {
       _pending = null;
       if (!mounted || local == _reported) return;
+      final deliberate = fontSize != _reportedFontSize;
       _reported = local;
-      widget.onGeometry?.call(local);
+      _reportedFontSize = fontSize;
+      widget.onGeometry?.call(local, deliberate: deliberate);
     });
   }
 
@@ -212,7 +224,7 @@ class _TerminalViewState extends State<TerminalView>
         final local = metrics.geometryFor(
           Size(size.width - 2 * terminalInset, size.height - 2 * terminalInset),
         );
-        _offer(local);
+        _offer(local, metrics.fontSize);
         return Listener(
           onPointerSignal: _onPointerSignal,
           child: GestureDetector(

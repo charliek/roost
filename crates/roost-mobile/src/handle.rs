@@ -102,11 +102,16 @@ impl Attachment {
         self.owner.end_stream(self.id(), reason.to_string());
     }
 
-    fn close(&self) {
+    /// No stream replaces this one from here on, but the one there stays
+    /// until the owner thread has worked through what was queued before
+    /// the close: a key typed just before it still reaches the tab.
+    fn close(self: &Arc<Self>) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.detach();
+        self.ended.store(true, Ordering::SeqCst);
+        let closing = Arc::clone(self);
+        self.owner.after(Box::new(move || closing.detach()));
         self.owner.close(self.id());
         if let Some(inner) = self.inner.upgrade() {
             inner.forget_attachment(self.id());

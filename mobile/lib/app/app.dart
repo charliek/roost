@@ -29,6 +29,10 @@ class RoostMobileApp extends ConsumerStatefulWidget {
 class _RoostMobileAppState extends ConsumerState<RoostMobileApp> {
   late final AppLifecycleListener _lifecycle;
   bool _backgrounded = false;
+
+  /// Every pause and resume, one after another: a resume never overtakes
+  /// the pause before it.
+  Future<void> _transitions = Future.value();
   bool _connectedSavedHosts = false;
 
   @override
@@ -68,19 +72,26 @@ class _RoostMobileAppState extends ConsumerState<RoostMobileApp> {
       case AppLifecycleState.hidden || AppLifecycleState.paused:
         if (_backgrounded) return;
         _backgrounded = true;
-        unawaited(core.appPaused());
+        _enqueue(core.appPaused);
       case AppLifecycleState.resumed:
         if (!_backgrounded) return;
         _backgrounded = false;
-        unawaited(_resume());
+        _enqueue(() async {
+          await core.appResumed();
+          // Fenced: the app may have gone back to the background meanwhile.
+          if (mounted && !_backgrounded) {
+            ref.read(resumeEpochProvider.notifier).bump();
+          }
+        });
       case AppLifecycleState.inactive || AppLifecycleState.detached:
         break;
     }
   }
 
-  Future<void> _resume() async {
-    await ref.read(coreProvider).appResumed();
-    if (mounted) ref.read(resumeEpochProvider.notifier).bump();
+  void _enqueue(Future<void> Function() transition) {
+    _transitions = _transitions
+        .then((_) => transition())
+        .catchError((Object e) => debugPrint('roost: lifecycle: $e'));
   }
 
   @override

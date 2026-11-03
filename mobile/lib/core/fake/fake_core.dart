@@ -14,9 +14,10 @@ import 'fake_shell.dart';
 class FakeCore implements RoostCore {
   FakeCore({
     this.latency = Duration.zero,
+    Duration? pauseLatency,
     this.demo = false,
     bool seed = true,
-  }) {
+  }) : pauseLatency = pauseLatency ?? latency {
     if (seed) _seed();
   }
 
@@ -30,6 +31,10 @@ class FakeCore implements RoostCore {
       'SHA256:q3Vb8m0Xr2pL9cJk4TfYwN1zE6hG5sAa7uDiOoP0cMk';
 
   final Duration latency;
+
+  /// How long `appPaused` takes before it detaches: a real pause waits for
+  /// its size releases.
+  final Duration pauseLatency;
   final bool demo;
 
   final List<FakeAttach> attaches = [];
@@ -264,6 +269,7 @@ class FakeCore implements RoostCore {
   @override
   Future<void> appPaused() async {
     pausedCount++;
+    if (pauseLatency != Duration.zero) await Future<void>.delayed(pauseLatency);
     for (final s in List.of(sessions)) {
       final tab = s._tab;
       if (tab.ownerIsMe) {

@@ -119,6 +119,7 @@ enum Command {
     },
     SetTheme(Box<Theme>),
     Close(TerminalId),
+    After(Box<dyn FnOnce() + Send>),
     Shutdown,
 }
 
@@ -230,6 +231,15 @@ impl TerminalOwner {
     /// Drop a tab's terminal. Idempotent.
     pub fn close(&self, id: TerminalId) {
         self.send(Command::Close(id));
+    }
+
+    /// Run `then` on the owner thread once everything sent before it has
+    /// been handled (at once, here, if the thread is gone).
+    pub fn after(&self, then: Box<dyn FnOnce() + Send>) {
+        if let Err(mpsc::SendError(Command::After(then))) = self.commands.send(Command::After(then))
+        {
+            then();
+        }
     }
 
     /// Tab terminals alive on this owner.
@@ -466,6 +476,7 @@ fn run(config: OwnerConfig, inbox: &mpsc::Receiver<Command>, live: &Arc<AtomicUs
             Command::Close(id) => {
                 tabs.remove(&id);
             }
+            Command::After(then) => then(),
             Command::Shutdown => break,
         }
     }

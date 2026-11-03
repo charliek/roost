@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:roost_mobile/app/providers.dart';
 import 'package:roost_mobile/core/fake/fake_core.dart';
 import 'package:roost_mobile/core/roost_core.dart';
+import 'package:roost_mobile/terminal/terminal_pane.dart';
 
 import '../support/pump_app.dart';
 
@@ -10,8 +13,9 @@ Future<FakeCore> _openTab(
   WidgetTester tester,
   int tabId, {
   double width = 1200,
+  FakeCore? core,
 }) async {
-  final core = await pumpApp(tester, width: width);
+  core = await pumpApp(tester, width: width, core: core);
   if (width < 600) {
     await tester.tap(byKey('host-card-devbox'));
     await tester.pumpAndSettle();
@@ -129,8 +133,8 @@ void main() {
       );
       tester.testTextInput.updateEditingValue(
         const TextEditingValue(
-          text: ' ',
-          selection: TextSelection.collapsed(offset: 1),
+          text: '  l',
+          selection: TextSelection.collapsed(offset: 3),
         ),
       );
       await tester.pumpAndSettle();
@@ -156,8 +160,8 @@ void main() {
       await tester.pump();
       tester.testTextInput.updateEditingValue(
         const TextEditingValue(
-          text: '  c',
-          selection: TextSelection.collapsed(offset: 3),
+          text: '  cc',
+          selection: TextSelection.collapsed(offset: 4),
         ),
       );
       await tester.pump();
@@ -232,6 +236,36 @@ void main() {
       expect(session.takeSizeCount, 0);
     });
 
+    testWidgets('a layout regrid never takes the size; a zoom does', (
+      tester,
+    ) async {
+      final core = await _openTab(tester, 12);
+      final session = lastSession(core);
+      core.takeSizeFrom(
+        'devbox',
+        12,
+        label: 'charlie-laptop',
+        cols: 132,
+        rows: 40,
+      );
+      await tester.pumpAndSettle();
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(session.resizes, isNotEmpty, reason: 'the banner moved the grid');
+      expect(
+        session.resizes.map((r) => r.$2),
+        everyElement(isFalse),
+        reason: 'the banner is not the user resizing',
+      );
+      expect(find.text('sized by charlie-laptop · 132×40'), findsOneWidget);
+
+      ProviderScope.containerOf(tester.element(find.byType(TerminalPane)))
+          .read(terminalFontSizeProvider.notifier)
+          .set(16);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(session.resizes.last.$2, isTrue, reason: 'a zoom is deliberate');
+    });
+
     testWidgets('a burst of size changes settles into one resize', (
       tester,
     ) async {
@@ -256,7 +290,71 @@ void main() {
     });
   });
 
+  void background(TestWidgetsFlutterBinding binding) {
+    for (final s in [
+      AppLifecycleState.inactive,
+      AppLifecycleState.hidden,
+      AppLifecycleState.paused,
+    ]) {
+      binding.handleAppLifecycleStateChanged(s);
+    }
+  }
+
+  void foreground(TestWidgetsFlutterBinding binding) {
+    for (final s in [
+      AppLifecycleState.hidden,
+      AppLifecycleState.inactive,
+      AppLifecycleState.resumed,
+    ]) {
+      binding.handleAppLifecycleStateChanged(s);
+    }
+  }
+
   group('lifecycle', () {
+    testWidgets('a resume waits for the pause before it', (tester) async {
+      final core = await _openTab(
+        tester,
+        13,
+        core: FakeCore(
+          latency: const Duration(milliseconds: 10),
+          pauseLatency: const Duration(milliseconds: 300),
+        ),
+      );
+      background(tester.binding);
+      foreground(tester.binding);
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(core.attaches, hasLength(1), reason: 'the pause is still going');
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pumpAndSettle();
+      expect(core.attaches, hasLength(2));
+      expect(
+        core.sessions.single.closed,
+        isFalse,
+        reason: 'the late pause must not end the fresh attach',
+      );
+    });
+
+    testWidgets('a resume overtaken by another pause does not re-attach', (
+      tester,
+    ) async {
+      final core = await _openTab(
+        tester,
+        13,
+        core: FakeCore(
+          latency: const Duration(milliseconds: 10),
+          pauseLatency: const Duration(milliseconds: 100),
+        ),
+      );
+      background(tester.binding);
+      foreground(tester.binding);
+      background(tester.binding);
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pumpAndSettle();
+      expect((core.pausedCount, core.resumedCount), (2, 1));
+      expect(core.attaches, hasLength(1));
+      expect(core.sessions, isEmpty);
+    });
+
     testWidgets(
       'background releases and detaches; resume re-attaches taking the size',
       (tester) async {

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use roost_ipc::paths::{
     SESSION_SOCKET_DIR_ENV, STATE_DIR_ENV, TEST_PASSWD_HOME_ENV, TEST_USER_RUNTIME_DIR_ENV,
 };
-use roost_mobile::app::{LeakCounts, RoostApp, Sink};
+use roost_mobile::app::{AppError, LeakCounts, RoostApp, Sink};
 use roost_mobile::frame::{decode, flags, row_text};
 use roost_mobile::owner::TerminalEvent;
 use roost_mobile::terminal::{AttachState, Geometry};
@@ -603,4 +603,50 @@ fn disconnecting_or_removing_a_host_ends_its_terminals_and_hands_the_size_on() {
             phone.connect(host.clone()).expect("reconnect");
         }
     }
+}
+
+#[test]
+fn input_typed_just_before_a_close_still_reaches_the_tab() {
+    let (_tmp, root) = root();
+    let _daemon = start(&root);
+    let (app, host, _) = connected_app(&root, "app", "Phone");
+    let (_workspace, _, tab) = seed_tab(&app, &host);
+
+    let (handle, _events) = attach(&app, &host, tab, true);
+    let mut screen = Screen::default();
+    screen.wait(&handle, "the shell prompt", |rows| {
+        rows.iter().any(|row| row.starts_with('$'))
+    });
+    // Queued for the owner thread, then closed at once: the close must
+    // not drop the stream out from under the queued input.
+    handle.text("echo closed-$((2+3))\r".into());
+    handle.close();
+    drop(handle);
+
+    let (again, _) = attach(&app, &host, tab, true);
+    let mut screen = Screen::default();
+    screen.wait(&again, "closed-5", |rows| {
+        rows.iter().any(|row| row.trim() == "closed-5")
+    });
+}
+
+#[test]
+fn an_attach_while_paused_is_refused_until_resume() {
+    let (_tmp, root) = root();
+    let _daemon = start(&root);
+    let (app, host, _) = connected_app(&root, "app", "Phone");
+    let (_workspace, _, tab) = seed_tab(&app, &host);
+
+    app.app_paused();
+    let refused = app.attach(host.clone(), tab, GEOMETRY, true);
+    assert!(
+        matches!(refused, Err(AppError::Paused)),
+        "an attach in the background must not take the size"
+    );
+    assert_eq!(app.leak_counts().attachments, 0);
+
+    app.app_resumed();
+    let (handle, events) = attach(&app, &host, tab, true);
+    events.wait("Live", |event| is_status(event, AttachState::Live));
+    drop(handle);
 }

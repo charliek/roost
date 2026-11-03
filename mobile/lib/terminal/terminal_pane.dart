@@ -100,11 +100,11 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
     SchedulerBinding.instance.addPostFrameCallback((_) => tab.dispose());
   }
 
-  void _onGeometry(Geometry geometry) {
+  void _onGeometry(Geometry geometry, {required bool deliberate}) {
     _geometry = geometry;
     final tab = _tab;
     if (tab != null) {
-      _fire(tab.session.resize(geometry, focused: _focus.hasFocus));
+      _fire(tab.session.resize(geometry, focused: deliberate));
     } else if (!_attaching && _attachError == null) {
       unawaited(_attach());
     }

@@ -17,89 +17,184 @@ TextEditingValue _value(
   composing: composing,
 );
 
+TextEditingDeltaInsertion _insert(String old, String text, {int? at}) {
+  final offset = at ?? old.length;
+  return TextEditingDeltaInsertion(
+    oldText: old,
+    textInserted: text,
+    insertionOffset: offset,
+    selection: TextSelection.collapsed(offset: offset + text.length),
+    composing: TextRange.empty,
+  );
+}
+
+TextEditingDeltaDeletion _delete(String old, {int count = 1}) =>
+    TextEditingDeltaDeletion(
+      oldText: old,
+      deletedRange: TextRange(start: old.length - count, end: old.length),
+      selection: TextSelection.collapsed(offset: old.length - count),
+      composing: TextRange.empty,
+    );
+
 void main() {
-  group('diffSoftKeyboard', () {
-    test('a typed character is text', () {
-      final edit = diffSoftKeyboard(_value('  a'));
-      expect(edit.inputs, [const SoftText('a')]);
-      expect(edit.reset, isTrue);
+  group('diffText', () {
+    test('added characters are text, removed ones Backspaces', () {
+      expect(diffText('  ', '  a'), [const SoftText('a')]);
+      expect(diffText('  ', ' '), [_backspace]);
+      expect(diffText('  ', ''), [_backspace, _backspace]);
+      expect(diffText('  ', '   '), [const SoftText(' ')]);
+      expect(diffText('  ', 'x  '), [const SoftText('x')]);
+      expect(diffText('  ', ' é'), [_backspace, const SoftText('é')]);
     });
 
-    test('a committed word is one text', () {
-      expect(diffSoftKeyboard(_value('  hello ')).inputs, [
-        const SoftText('hello '),
-      ]);
-    });
-
-    test('Backspace on an "empty" field still reaches the terminal', () {
-      final edit = diffSoftKeyboard(_value(' '));
-      expect(edit.inputs, [_backspace]);
-      expect(edit.reset, isTrue);
-    });
-
-    test('a delete that clears the whole sentinel is two Backspaces', () {
-      expect(diffSoftKeyboard(_value('')).inputs, [_backspace, _backspace]);
-    });
-
-    test('a newline is an Enter key, around the text it splits', () {
-      expect(diffSoftKeyboard(_value('  \n')).inputs, [_enter]);
-      expect(diffSoftKeyboard(_value('  ls\npwd')).inputs, [
+    test('a newline is an Enter key between the text it splits', () {
+      expect(diffText('  ', '  \n'), [_enter]);
+      expect(diffText('  ', '  ls\npwd'), [
         const SoftText('ls'),
         _enter,
         const SoftText('pwd'),
       ]);
-      expect(diffSoftKeyboard(_value('  a\r\n')).inputs, [
-        const SoftText('a'),
-        _enter,
-      ]);
+      expect(diffText('  ', '  a\r\n'), [const SoftText('a'), _enter]);
     });
 
-    test('a repeated space is text, not lost in the sentinel', () {
-      expect(diffSoftKeyboard(_value('   ')).inputs, [const SoftText(' ')]);
+    test('one deleted emoji is one Backspace', () {
+      expect(diffText('  👍🏽', '  '), [_backspace]);
+    });
+  });
+
+  group('SoftKeyboardDecoder, full values', () {
+    test('each value is diffed against the one before, not the sentinel', () {
+      // Android can send "  a" then "  ab" before a reset lands.
+      final d = SoftKeyboardDecoder();
+      expect(d.value(_value('  a')).inputs, [const SoftText('a')]);
+      expect(d.value(_value('  ab')).inputs, [const SoftText('b')]);
     });
 
-    test(
-      'text typed before the sentinel (cursor moved home) is still text',
-      () {
-        expect(diffSoftKeyboard(_value('x  ', cursor: 1)).inputs, [
-          const SoftText('x'),
-        ]);
-      },
-    );
-
-    test('a replacement deletes then types', () {
-      // An IME that rewrites the last sentinel char (rare with suggestions
-      // off) is a Backspace followed by the new text.
-      expect(diffSoftKeyboard(_value(' é')).inputs, [
-        _backspace,
-        const SoftText('é'),
-      ]);
+    test('two deletions are two Backspaces', () {
+      final d = SoftKeyboardDecoder();
+      expect(d.value(_value(' ')).inputs, [_backspace]);
+      expect(d.value(_value('')).inputs, [_backspace]);
     });
 
-    test('nothing is sent mid-composition, and the field is left alone', () {
-      final edit = diffSoftKeyboard(
+    test('the field is reset only when it must be', () {
+      final d = SoftKeyboardDecoder();
+      expect(d.value(_value('  a')).reset, isFalse, reason: 'room to delete');
+      expect(d.value(_value('  ')).reset, isFalse);
+      expect(d.value(_value(' ')).reset, isTrue, reason: 'one char left');
+      d.didReset();
+      expect(d.value(_value('  \n')).reset, isTrue, reason: 'a newline');
+      d.didReset();
+      expect(d.value(_value('  ', cursor: 0)).reset, isTrue, reason: 'cursor');
+      d.didReset();
+      expect(d.value(_value('  ${'x' * 70}')).reset, isTrue, reason: 'long');
+    });
+
+    test('a composition is held, then sent once as committed', () {
+      final d = SoftKeyboardDecoder();
+      final ni = d.value(
         _value('  ni', composing: const TextRange(start: 2, end: 4)),
       );
+      expect(ni.inputs, isEmpty);
+      expect(ni.reset, isFalse, reason: 'never touch a composing field');
+      expect(d.composing, isTrue);
+      d.value(_value('  nihao', composing: const TextRange(start: 2, end: 7)));
+      expect(d.value(_value('  你好')).inputs, [const SoftText('你好')]);
+      expect(d.composing, isFalse);
+    });
+
+    test('an unchanged value sends nothing', () {
+      final d = SoftKeyboardDecoder();
+      final edit = d.value(softKeyboardSentinel);
       expect(edit.inputs, isEmpty);
       expect(edit.reset, isFalse);
     });
+  });
 
-    test('the committed composition is sent once', () {
-      expect(diffSoftKeyboard(_value('  nihao')).inputs, [
-        const SoftText('nihao'),
+  group('SoftKeyboardDecoder, deltas', () {
+    test('insertions are sent as made, whatever the field held', () {
+      final d = SoftKeyboardDecoder();
+      final a = d.deltas([_insert('  ', 'a')]);
+      expect(a.inputs, [const SoftText('a')]);
+      expect(a.reset, isTrue);
+      d.didReset();
+      // The IME made this edit before the reset reached it.
+      expect(d.deltas([_insert('  a', 'b')]).inputs, [const SoftText('b')]);
+    });
+
+    test('each deletion is its Backspaces', () {
+      final d = SoftKeyboardDecoder();
+      expect(d.deltas([_delete('  ')]).inputs, [_backspace]);
+      expect(d.deltas([_delete(' ')]).inputs, [_backspace]);
+      expect(d.deltas([_delete('  ab', count: 2)]).inputs, [
+        _backspace,
+        _backspace,
       ]);
     });
 
-    test('an unchanged value sends nothing and needs no reset', () {
-      final edit = diffSoftKeyboard(softKeyboardSentinel);
-      expect(edit.inputs, isEmpty);
-      expect(edit.reset, isFalse);
+    test('a replacement deletes, then types', () {
+      final d = SoftKeyboardDecoder();
+      final edit = d.deltas([
+        const TextEditingDeltaReplacement(
+          oldText: '  teh',
+          replacementText: 'the',
+          replacedRange: TextRange(start: 2, end: 5),
+          selection: TextSelection.collapsed(offset: 5),
+          composing: TextRange.empty,
+        ),
+      ]);
+      expect(edit.inputs, [
+        _backspace,
+        _backspace,
+        _backspace,
+        const SoftText('the'),
+      ]);
     });
 
-    test('a cursor moved inside the sentinel is put back', () {
-      final edit = diffSoftKeyboard(_value('  ', cursor: 0));
-      expect(edit.inputs, isEmpty);
-      expect(edit.reset, isTrue);
+    test('a newline is Enter, a selection change nothing', () {
+      final d = SoftKeyboardDecoder();
+      expect(d.deltas([_insert('  ', '\n')]).inputs, [_enter]);
+      d.didReset();
+      final moved = d.deltas([
+        const TextEditingDeltaNonTextUpdate(
+          oldText: '  ',
+          selection: TextSelection.collapsed(offset: 0),
+          composing: TextRange.empty,
+        ),
+      ]);
+      expect(moved.inputs, isEmpty);
+    });
+
+    test('a composition is held until it is committed', () {
+      final d = SoftKeyboardDecoder();
+      final held = d.deltas([
+        const TextEditingDeltaInsertion(
+          oldText: '  ',
+          textInserted: 'n',
+          insertionOffset: 2,
+          selection: TextSelection.collapsed(offset: 3),
+          composing: TextRange(start: 2, end: 3),
+        ),
+        const TextEditingDeltaInsertion(
+          oldText: '  n',
+          textInserted: 'i',
+          insertionOffset: 3,
+          selection: TextSelection.collapsed(offset: 4),
+          composing: TextRange(start: 2, end: 4),
+        ),
+      ]);
+      expect(held.inputs, isEmpty);
+      expect(held.reset, isFalse);
+      final done = d.deltas([
+        const TextEditingDeltaReplacement(
+          oldText: '  ni',
+          replacementText: '你',
+          replacedRange: TextRange(start: 2, end: 4),
+          selection: TextSelection.collapsed(offset: 3),
+          composing: TextRange.empty,
+        ),
+      ]);
+      expect(done.inputs, [const SoftText('你')]);
+      expect(done.reset, isTrue);
     });
   });
 
@@ -149,21 +244,28 @@ void main() {
       expect(tester.testTextInput.editingState!['text'], '  ');
     });
 
+    testWidgets('asks for the delta model', (tester) async {
+      await pump(tester);
+      expect(tester.testTextInput.setClientArgs!['enableDeltaModel'], isTrue);
+    });
+
     testWidgets(
-      'soft keyboard text and Backspace reach the terminal, then the field resets',
+      'soft keyboard text and Backspace reach the terminal; a newline resets',
       (tester) async {
         await pump(tester);
+        int resets() => tester.testTextInput.log
+            .where((call) => call.method == 'TextInput.setEditingState')
+            .length;
+        final opened = resets();
+        tester.testTextInput.updateEditingValue(_value('  l'));
+        tester.testTextInput.updateEditingValue(_value('  ls'));
         tester.testTextInput.updateEditingValue(_value('  l'));
         await tester.pump();
-        expect(
-          tester.testTextInput.editingState!['text'],
-          '  ',
-          reason: 'reset to the sentinel',
-        );
-        tester.testTextInput.updateEditingValue(_value('  s'));
-        tester.testTextInput.updateEditingValue(_value(' '));
-        tester.testTextInput.updateEditingValue(_value('  \n'));
+        expect(resets(), opened, reason: 'no reset while there is room');
+        tester.testTextInput.updateEditingValue(_value('  l\n'));
         await tester.pump();
+        expect(resets(), opened + 1, reason: 'a newline resets the field');
+        expect(tester.testTextInput.editingState!['text'], '  ');
         expect(texts, ['l', 's']);
         expect(keys, [const KeyInput('Backspace'), const KeyInput('Enter')]);
         expect(soft, 4);

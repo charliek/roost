@@ -131,8 +131,8 @@ void main() {
       'e2e: typed command echoed back in ${typed.elapsedMilliseconds} ms',
     );
 
-    // The soft keyboard: a committed word, a Backspace on the
-    // "empty" field, then the IME's newline.
+    // The soft keyboard, as an IME without the delta model reports it:
+    // each full value after a commit, a deletion, then the newline.
     void ime(String text) => tester.testTextInput.updateEditingValue(
       TextEditingValue(
         text: text,
@@ -141,9 +141,9 @@ void main() {
     );
     ime('  echo $name-softt');
     await tester.pump();
-    ime(' ');
+    ime('  echo $name-soft');
     await tester.pump();
-    ime('  \n');
+    ime('  echo $name-soft\n');
     await _until(
       tester,
       'the soft keyboard runs echo $name-soft',

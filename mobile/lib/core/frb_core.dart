@@ -10,6 +10,7 @@ import '../src/rust/api/terminal.dart';
 import '../src/rust/api/types.dart';
 import 'replay_feed.dart';
 import 'roost_core.dart';
+import 'serial_queue.dart';
 
 /// [RoostCore] over the Rust `RoostApp` (crates/roost-mobile, through
 /// flutter_rust_bridge). Converts the bridge's flat values to the app's
@@ -32,6 +33,7 @@ class FrbCore implements RoostCore {
   final BridgeApp _app;
   ReplayFeed<List<HostView>>? _hosts;
   final Map<String, ReplayFeed<WorkspaceView>> _workspaces = {};
+  final _writes = SerialQueue();
 
   BridgeLeakCounts leakCounts() => _app.leakCounts();
 
@@ -94,14 +96,21 @@ class FrbCore implements RoostCore {
     return result.isEmpty ? null : jsonDecode(result);
   }
 
+  /// One host's writes cross the bridge one at a time: two async bridge
+  /// calls can reach the host in either order, and a quick reply's `1` must
+  /// land before its Enter.
   @override
   Future<void> sendText(
     String hostId,
     int tabId,
     String text, {
     required bool paste,
-  }) => _guard(
-    () => _app.sendText(hostId: hostId, tabId: tabId, text: text, paste: paste),
+  }) => _writes.run(
+    hostId,
+    () => _guard(
+      () =>
+          _app.sendText(hostId: hostId, tabId: tabId, text: text, paste: paste),
+    ),
   );
 
   @override

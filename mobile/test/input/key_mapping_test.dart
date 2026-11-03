@@ -105,17 +105,8 @@ void main() {
       escKey.input,
       tabKey.input,
       for (final k in extraKeys) k.input,
-      for (final edit in [
-        diffSoftKeyboard(TextEditingValue.empty),
-        diffSoftKeyboard(
-          const TextEditingValue(
-            text: '  \n',
-            selection: TextSelection.collapsed(offset: 3),
-          ),
-        ),
-      ])
-        for (final input in edit.inputs)
-          if (input case SoftKey(:final key)) key,
+      for (final input in [...diffText('  ', ''), ...diffText('  ', '  \n')])
+        if (input case SoftKey(:final key)) key,
     ];
     for (final k in others) {
       expect(
