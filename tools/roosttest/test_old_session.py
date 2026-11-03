@@ -23,8 +23,8 @@ Which checks run is chosen by the old binary's own generation, from
   path`, the path in `detail`) — as do `roostctl session status` and
   `doctor`, while a plain `roostctl session stop` leaves it alone — and the
   restart stops it on its old socket and starts today's at the new one,
-  which reads the old one's `state.json`. v0.0.19 (generation 2) is pinned
-  for it, and "latest" gets it too.
+  which reads the old one's `state.json`. v0.0.19 (generation 2) and
+  v0.0.26 (the newest release before M2) are pinned for it.
 
 v0.0.20 is pinned as well, for ⌘T's `cwd_from_tab` → `unknown-field` retry
 (`open_host_tab_flow`): it predates the field, and "latest" soon will not.
@@ -60,7 +60,9 @@ The compatibility checks need a release at this tree's generation, and no
 release that predates M2 is one, so they skip. Every release the lane runs
 must predate M2 (`LAST_PRE_M2_RELEASE`): a later one would bind where this
 tree looks, and there would be no old path to find, so `fetch()` fails the
-lane on one rather than skipping — the signal to revisit it (#652).
+lane on a pin that does. "Latest" is v0.0.27 or later, past M2: its
+same-generation checks skip, naming #652, until the lane learns post-M2
+sockets with the old-path probe's retirement.
 
 One module-scoped old session + UI per release, condition waits only, and
 every assertion on the op set — `host.status`, `tab.list`, the window's
@@ -158,6 +160,8 @@ FORCED_UPDATE_PIN = "0.0.19"
 #: The last release before plan 083 M2 moved the session socket under the
 #: passwd home. Every release this lane runs must be at or below it.
 LAST_PRE_M2_RELEASE = (0, 0, 26)
+#: The upgrade a v0.0.26 user makes: the newest session on the old path.
+NEWEST_PRE_M2_PIN = "0.0.26"
 #: Every process here resolves the shipped session directory names.
 DIR_NAMES = "release"
 DIR_NAMES_ENV = {sessionlib.SESSION_DIR_NAMES_ENV: DIR_NAMES}
@@ -196,7 +200,7 @@ def assert_predates_m2(version: str) -> None:
     )
 
 
-for _pin in (RETRY_PIN, FORCED_UPDATE_PIN):
+for _pin in (RETRY_PIN, FORCED_UPDATE_PIN, NEWEST_PRE_M2_PIN):
     assert_predates_m2(_pin)
 
 
@@ -228,6 +232,18 @@ def fetch(request: pytest.FixtureRequest, which: str) -> Release | str:
 
     `fetch.sh` exiting non-zero — a broken release, a binary that does not
     match its `.sha256` — fails the run: those are not outages."""
+    if which == "latest":
+        resolved = subprocess.run(
+            ["bash", str(FETCH), "--resolve", which], capture_output=True, text=True, timeout=60
+        )
+        version = dict(
+            line.partition("=")[::2] for line in resolved.stdout.splitlines() if "=" in line
+        ).get("version")
+        if version and not predates_m2(version):
+            return (
+                f"latest is v{version}, past plan 083 M2: this lane only drives sessions on "
+                "the old path, so the same-generation checks wait for its rework (#652)"
+            )
     result = subprocess.run(
         ["bash", str(FETCH), which], capture_output=True, text=True, timeout=300
     )
@@ -582,7 +598,7 @@ def retry_pin(worlds: Worlds) -> World:
     return worlds.enter(release)
 
 
-@pytest.fixture(params=["latest", FORCED_UPDATE_PIN])
+@pytest.fixture(params=[NEWEST_PRE_M2_PIN, FORCED_UPDATE_PIN])
 def older_generation(request, worlds: Worlds):
     """Closed straight after its test: the forced update replaced its
     session, so nothing else may reuse it."""
