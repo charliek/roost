@@ -525,6 +525,28 @@ check-iced: fmt-check test-iced  ## Iced formatting, lint, tests, and dependency
 
 check: fmt-check clippy test  ## Pre-push gate: fmt-check + clippy + tests
 
+# ---- mobile -----------------------------------------------------------
+# Android cross-builds. Need the Android NDK (tools/mobile/android-env.sh
+# finds it) and `rustup target add aarch64-linux-android x86_64-linux-android`;
+# deliberately not part of `make check`.
+
+ANDROID_TARGETS := aarch64-linux-android x86_64-linux-android
+
+.PHONY: mobile-deps mobile-android-check
+mobile-deps:  ## Build libghostty-vt for both Android ABIs into third_party/ghostty/out/<triple>/
+	. tools/mobile/android-env.sh && for t in $(ANDROID_TARGETS); do \
+		third_party/ghostty/build.sh --target $$t || exit 1; \
+	done
+
+# roost-client is checked without its tests: its dev-dependencies
+# (roost-engine -> portable-pty -> termios) do not build for Android.
+mobile-android-check: mobile-deps  ## Cross-check roost-vt (ffi), roost-ipc, roost-ui-model, roost-client for Android; link their test binaries
+	. tools/mobile/android-env.sh && for t in $(ANDROID_TARGETS); do \
+		RUSTFLAGS=-Dwarnings cargo check -p roost-client --target $$t && \
+		RUSTFLAGS=-Dwarnings cargo test --no-run -p roost-vt -p roost-ipc -p roost-ui-model \
+			--features roost-vt/ffi --target $$t || exit 1; \
+	done
+
 # ---- docs -------------------------------------------------------------
 
 .PHONY: docs docs-serve
