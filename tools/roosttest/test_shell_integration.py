@@ -255,8 +255,12 @@ def test_documented_rooster_override(roost, project):
     escaping (`\\~`) just flips which version breaks. The cd-to-$HOME step
     below runs on both runners (Apple bash 3.2 on Mac, bash 5.x on Linux),
     so it catches a regression to either non-portable form."""
+    # Apple's bash 3.2 readline, in the C locale, takes the emoji's high
+    # bytes for Meta keys and drops the rest of the line, and a tab inherits
+    # whatever locale launched the app (an ssh session on a Mac is LC_ALL=C).
+    locale = ["/usr/bin/env", "LC_ALL=en_US.UTF-8"] if sys.platform == "darwin" else []
     tab = roost.open_tab(project, cwd="/tmp",
-                         argv=["/bin/bash", "--norc", "--noprofile"])
+                         argv=[*locale, "/bin/bash", "--norc", "--noprofile"])
     # The exact function from docs/guides/cwd-tracking.md, as a one-liner.
     fancy = (
         r'''__roost_fancy_title() { [ -n "$ROOST_TAB_ID" ] || return; '''
