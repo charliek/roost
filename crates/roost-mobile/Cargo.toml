@@ -18,10 +18,17 @@ test-support = []
 [dependencies]
 roost-client = { path = "../roost-client" }
 roost-ipc = { path = "../roost-ipc" }
+roost-ssh = { path = "../roost-ssh" }
 roost-ui-model = { path = "../roost-ui-model" }
 roost-vt = { path = "../roost-vt", features = ["ffi"] }
+base64 = "0.22"
+futures = { workspace = true }
+getrandom = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-serde_json = "1"
+tempfile = "3"

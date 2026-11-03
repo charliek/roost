@@ -59,6 +59,9 @@ getrandom = { workspace = true }
 tempfile   = "3"
 # `mobile_client_test`: the mobile host client against this binary.
 roost-client = { path = "../roost-client" }
+# `mobile_app_test`: the mobile app layer against this binary.
+roost-mobile = { path = "../roost-mobile", features = ["test-support"] }
+futures      = { workspace = true }
 
 [lints]
 workspace = true

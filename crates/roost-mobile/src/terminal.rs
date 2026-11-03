@@ -71,6 +71,9 @@ pub struct Applied {
     pub status: Option<Status>,
     pub owner: Option<OwnerView>,
     pub exited: Option<i32>,
+    /// The terminal now holds the whole payload (FINISH, or the `vt`
+    /// terminator): from here on the stream's resume point is its own.
+    pub hydrated: bool,
     /// This terminal is not at the stream's resume point, and never will
     /// be: a payload it could not take, or a resume offered to a terminal
     /// that never finished hydrating. The stream must forget its resume
@@ -290,15 +293,10 @@ impl TabTerminal {
                 applied.exited = Some(code);
             }
             AttachEvent::Reconnecting { reason } => {
-                // A half-built payload cannot outlive its stream: the
-                // stream's resume point counts bytes this terminal has
-                // not taken, so it has to go too.
-                if self.abandon(&mut applied) {
-                    self.request_reattach(
-                        format!("stream dropped mid-hydration: {reason}"),
-                        &mut applied,
-                    );
-                }
+                // A half-built payload cannot outlive its stream. Nothing
+                // more to ask for: a stream never told `hydrated` re-dials
+                // for a snapshot by itself.
+                self.abandon(&mut applied);
                 if !matches!(self.phase, Phase::Over) {
                     self.phase = Phase::Waiting;
                 }
@@ -512,6 +510,7 @@ impl TabTerminal {
         };
         self.screen = Some(Screen { terminal, geometry });
         self.off_resume_point = false;
+        applied.hydrated = true;
         self.scroll = TerminalScroll::new();
         applied.frame_dirty = true;
         self.set_status(AttachState::Live, None, applied);
@@ -1148,6 +1147,7 @@ mod tests {
             })
         );
         assert_eq!(last.reattach, None);
+        assert!(last.hydrated, "FINISH is the whole payload");
 
         src.vt_write(b"ab");
         src.vt_write(b"c\r\n");
@@ -1199,6 +1199,7 @@ mod tests {
 
         let done = tab.apply(AttachEvent::Snap(Vec::new()));
         assert!(done.frame_dirty);
+        assert!(done.hydrated, "the terminator is the whole payload");
         assert_eq!(tab.status(), AttachState::Live);
 
         src.vt_write(b"!");
@@ -1372,7 +1373,10 @@ mod tests {
         let applied = mid.apply(AttachEvent::Reconnecting {
             reason: "eof".into(),
         });
-        assert!(applied.reattach.is_some(), "a drop mid-hydration");
+        assert_eq!(
+            applied.reattach, None,
+            "a stream never told `hydrated` snapshots again by itself"
+        );
         let applied = mid.apply(accepted(
             PayloadKind::GhosttySnapshot,
             AttachMode::Resume,
@@ -1457,7 +1461,8 @@ mod tests {
         let dropped = tab.apply(AttachEvent::Reconnecting {
             reason: "eof".into(),
         });
-        assert!(dropped.reattach.is_some());
+        assert_eq!(dropped.reattach, None);
+        assert!(!dropped.hydrated);
         let resumed = tab.apply(accepted(
             PayloadKind::GhosttySnapshot,
             AttachMode::Resume,

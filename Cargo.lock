@@ -3929,12 +3929,19 @@ dependencies = [
 name = "roost-mobile"
 version = "0.0.27"
 dependencies = [
+ "base64",
+ "futures",
+ "getrandom 0.4.2",
  "roost-client",
  "roost-ipc",
+ "roost-ssh",
  "roost-ui-model",
  "roost-vt",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
 ]
 
@@ -3951,6 +3958,7 @@ version = "0.0.27"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
  "getrandom 0.4.2",
  "libc",
  "roost-agent",
@@ -3958,6 +3966,7 @@ dependencies = [
  "roost-client",
  "roost-engine",
  "roost-ipc",
+ "roost-mobile",
  "roost-vt",
  "serde_json",
  "tempfile",

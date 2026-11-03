@@ -5,11 +5,17 @@
 //! tasks forwarding attach events, the FFI layer answering Dart) only
 //! ever hold a [`TerminalOwner`] handle. Each tab reports back through
 //! its own [`TabSink`], called on the owner thread in command order.
+//!
+//! A tab is fed by one attach stream at a time, numbered from 0. When the
+//! terminal asks for a fresh stream ([`TabOutput::Reattach`]) or the
+//! caller ends one ([`TerminalOwner::end_stream`]), the number moves on at
+//! once, on this thread, so whatever the old stream still had in flight
+//! is dropped however late it arrives.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use roost_client::attach::AttachEvent;
@@ -17,6 +23,7 @@ use roost_ipc::dataframe::InputTake;
 use roost_ui_model::theme::Theme;
 
 use crate::keys::KeyInput;
+use crate::live::Live;
 use crate::terminal::{Applied, AttachState, Input, TabTerminal};
 
 /// Names one tab's terminal on its owner. Minted per [`TerminalOwner::open`],
@@ -54,10 +61,14 @@ pub enum TabOutput {
         bytes: Vec<u8>,
         take: InputTake,
     },
-    /// The terminal is off the stream's resume point for good: forget
-    /// it and re-attach for a fresh snapshot.
+    /// The terminal holds the whole payload: `AttachStream::hydrated()`,
+    /// so a drop from here on resumes instead of snapshotting.
+    Hydrated,
+    /// The terminal is off the stream's resume point for good: replace
+    /// the stream with a fresh one, whose events go in as `stream`.
     Reattach {
         reason: String,
+        stream: u64,
     },
 }
 
@@ -74,7 +85,15 @@ enum Command {
         id: TerminalId,
         sink: TabSink,
     },
-    Apply(TerminalId, AttachEvent),
+    Apply {
+        id: TerminalId,
+        stream: u64,
+        event: AttachEvent,
+    },
+    EndStream {
+        id: TerminalId,
+        reason: String,
+    },
     Key(TerminalId, KeyInput),
     Text(TerminalId, String),
     Paste(TerminalId, String),
@@ -93,6 +112,11 @@ enum Command {
         id: TerminalId,
         reply: mpsc::SyncSender<Vec<String>>,
     },
+    EncodePaste {
+        id: TerminalId,
+        text: String,
+        reply: mpsc::SyncSender<Option<Vec<u8>>>,
+    },
     SetTheme(Box<Theme>),
     Close(TerminalId),
     Shutdown,
@@ -100,7 +124,7 @@ enum Command {
 
 pub struct TerminalOwner {
     commands: mpsc::Sender<Command>,
-    thread: Option<JoinHandle<()>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
     next_id: AtomicU64,
     live: Arc<AtomicUsize>,
 }
@@ -117,7 +141,7 @@ impl TerminalOwner {
             })?;
         Ok(Self {
             commands,
-            thread: Some(thread),
+            thread: Mutex::new(Some(thread)),
             next_id: AtomicU64::new(1),
             live,
         })
@@ -131,9 +155,17 @@ impl TerminalOwner {
         id
     }
 
-    /// Feed one attach event, in the stream's order.
-    pub fn apply(&self, id: TerminalId, event: AttachEvent) {
-        self.send(Command::Apply(id, event));
+    /// Feed one event of attach stream `stream`, in that stream's order.
+    /// Dropped once the tab has moved on to a later stream.
+    pub fn apply(&self, id: TerminalId, stream: u64, event: AttachEvent) {
+        self.send(Command::Apply { id, stream, event });
+    }
+
+    /// The caller ended the tab's stream (detached it) and will not
+    /// replace it: the tab reports `Ended` with `reason`, and anything the
+    /// stream still had in flight is dropped.
+    pub fn end_stream(&self, id: TerminalId, reason: String) {
+        self.send(Command::EndStream { id, reason });
     }
 
     pub fn key(&self, id: TerminalId, key: KeyInput) {
@@ -171,6 +203,15 @@ impl TerminalOwner {
         answer.recv().unwrap_or_default()
     }
 
+    /// `text` framed as a paste for the tab's program as it is now
+    /// (bracketed under DECSET 2004), without sending it; `None` for a
+    /// tab this owner does not have.
+    pub fn encode_paste(&self, id: TerminalId, text: String) -> Option<Vec<u8>> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        self.send(Command::EncodePaste { id, text, reply });
+        answer.recv().ok().flatten()
+    }
+
     pub fn set_theme(&self, theme: Theme) {
         self.send(Command::SetTheme(Box::new(theme)));
     }
@@ -185,43 +226,50 @@ impl TerminalOwner {
         self.live.load(Ordering::SeqCst)
     }
 
+    /// The count behind [`Self::live_tabs`], readable after the owner is
+    /// gone.
+    pub fn live_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.live)
+    }
+
+    /// Stop the thread, dropping every tab (and its sink) on it, and wait
+    /// for it. Idempotent. Called from the owner thread itself — a sink
+    /// dropping the last handle — it only asks.
+    pub fn shutdown(&self) {
+        let _ = self.commands.send(Command::Shutdown);
+        let thread = self
+            .thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(thread) = thread {
+            if thread.thread().id() == std::thread::current().id() {
+                return;
+            }
+            if thread.join().is_err() {
+                tracing::warn!("terminal owner thread panicked");
+            }
+        }
+    }
+
     fn send(&self, command: Command) {
         if self.commands.send(command).is_err() {
-            tracing::warn!("terminal owner thread is gone; command dropped");
+            tracing::debug!("terminal owner thread is gone; command dropped");
         }
     }
 }
 
 impl Drop for TerminalOwner {
     fn drop(&mut self) {
-        self.send(Command::Shutdown);
-        if let Some(thread) = self.thread.take() {
-            if thread.join().is_err() {
-                tracing::warn!("terminal owner thread panicked");
-            }
-        }
-    }
-}
-
-/// Counts a tab for [`TerminalOwner::live_tabs`] while it lives.
-struct Live(Arc<AtomicUsize>);
-
-impl Live {
-    fn new(count: &Arc<AtomicUsize>) -> Self {
-        count.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(count))
-    }
-}
-
-impl Drop for Live {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.shutdown();
     }
 }
 
 struct Tab {
     terminal: TabTerminal,
     sink: TabSink,
+    /// The attach stream whose events this tab takes.
+    stream: u64,
     /// A `FrameReady` is out and no frame has been pulled since.
     frame_announced: bool,
     _live: Live,
@@ -257,8 +305,15 @@ impl Tab {
         if let Some(code) = applied.exited {
             (self.sink)(TabOutput::Event(TerminalEvent::Exited { code }));
         }
+        if applied.hydrated {
+            (self.sink)(TabOutput::Hydrated);
+        }
         if let Some(reason) = applied.reattach {
-            (self.sink)(TabOutput::Reattach { reason });
+            self.stream += 1;
+            (self.sink)(TabOutput::Reattach {
+                reason,
+                stream: self.stream,
+            });
         }
         if applied.frame_dirty {
             self.frame_moved();
@@ -300,6 +355,7 @@ fn run(config: OwnerConfig, inbox: &mpsc::Receiver<Command>, live: &Arc<AtomicUs
                         Tab {
                             terminal,
                             sink,
+                            stream: 0,
                             frame_announced: false,
                             _live: Live::new(live),
                         },
@@ -313,9 +369,16 @@ fn run(config: OwnerConfig, inbox: &mpsc::Receiver<Command>, live: &Arc<AtomicUs
                     }));
                 }
             },
-            Command::Apply(id, event) => {
-                if let Some(tab) = tabs.get_mut(&id) {
+            Command::Apply { id, stream, event } => {
+                if let Some(tab) = tabs.get_mut(&id).filter(|tab| tab.stream == stream) {
                     let applied = tab.terminal.apply(event);
+                    tab.deliver(applied, &client_id);
+                }
+            }
+            Command::EndStream { id, reason } => {
+                if let Some(tab) = tabs.get_mut(&id) {
+                    tab.stream += 1;
+                    let applied = tab.terminal.apply(AttachEvent::Ended { reason });
                     tab.deliver(applied, &client_id);
                 }
             }
@@ -365,6 +428,10 @@ fn run(config: OwnerConfig, inbox: &mpsc::Receiver<Command>, live: &Arc<AtomicUs
                     None => Vec::new(),
                 };
                 let _ = reply.send(text);
+            }
+            Command::EncodePaste { id, text, reply } => {
+                let bytes = tabs.get_mut(&id).map(|tab| tab.terminal.paste(&text).bytes);
+                let _ = reply.send(bytes);
             }
             Command::SetTheme(next) => {
                 theme = *next;
@@ -439,6 +506,7 @@ mod tests {
             .expect("ground");
         owner.apply(
             id,
+            0,
             AttachEvent::Accepted {
                 kind: PayloadKind::Vt,
                 mode: AttachMode::Snapshot,
@@ -452,8 +520,8 @@ mod tests {
                 }),
             },
         );
-        owner.apply(id, AttachEvent::Snap(payload));
-        owner.apply(id, AttachEvent::Snap(Vec::new()));
+        owner.apply(id, 0, AttachEvent::Snap(payload));
+        owner.apply(id, 0, AttachEvent::Snap(Vec::new()));
     }
 
     #[test]
@@ -462,7 +530,7 @@ mod tests {
         let (id, outputs) = recording(&owner);
         attach_hello(&owner, id, "phone");
         for _ in 0..3 {
-            owner.apply(id, AttachEvent::Pty(b"!".to_vec()));
+            owner.apply(id, 0, AttachEvent::Pty(b"!".to_vec()));
         }
         assert_eq!(owner.viewport_text(id)[0], "hello!!!");
 
@@ -483,8 +551,8 @@ mod tests {
         assert_eq!(row_text(&frame.rows[0], 20), "hello!!!");
         assert!(owner.take_frame(id, false).is_empty(), "nothing new");
 
-        owner.apply(id, AttachEvent::Pty(b"?".to_vec()));
-        owner.apply(id, AttachEvent::Pty(b"?".to_vec()));
+        owner.apply(id, 0, AttachEvent::Pty(b"?".to_vec()));
+        owner.apply(id, 0, AttachEvent::Pty(b"?".to_vec()));
         owner.viewport_text(id);
         assert_eq!(
             frame_ready_count(&drain(&outputs)),
@@ -553,11 +621,105 @@ mod tests {
     fn a_reattach_reaches_the_stream_holder() {
         let owner = owner();
         let (id, outputs) = recording(&owner);
-        owner.apply(id, AttachEvent::Pty(b"stray".to_vec()));
+        owner.apply(id, 0, AttachEvent::Pty(b"stray".to_vec()));
         owner.viewport_text(id);
         assert!(drain(&outputs)
             .iter()
             .any(|output| matches!(output, TabOutput::Reattach { .. })));
+    }
+
+    #[test]
+    fn hydrated_is_reported_once_the_payload_is_whole() {
+        let owner = owner();
+        let (id, outputs) = recording(&owner);
+        attach_hello(&owner, id, "phone");
+        owner.apply(id, 0, AttachEvent::Pty(b"!".to_vec()));
+        owner.viewport_text(id);
+        let hydrated = drain(&outputs)
+            .iter()
+            .filter(|output| **output == TabOutput::Hydrated)
+            .count();
+        assert_eq!(hydrated, 1);
+    }
+
+    #[test]
+    fn a_replaced_stream_is_numbered_and_its_stragglers_dropped() {
+        let owner = owner();
+        let (id, outputs) = recording(&owner);
+        attach_hello(&owner, id, "phone");
+        owner.apply(id, 0, AttachEvent::Snap(b"confused".to_vec()));
+        owner.viewport_text(id);
+        assert!(drain(&outputs).contains(&TabOutput::Reattach {
+            reason: "SNAP outside a hydration".into(),
+            stream: 1,
+        }));
+
+        owner.apply(
+            id,
+            1,
+            AttachEvent::Accepted {
+                kind: PayloadKind::Vt,
+                mode: AttachMode::Snapshot,
+                cols: 20,
+                rows: 5,
+                cell_w_px: 8,
+                cell_h_px: 16,
+                owner: None,
+            },
+        );
+        owner.apply(id, 1, AttachEvent::Snap(b"fresh".to_vec()));
+        owner.apply(id, 1, AttachEvent::Snap(Vec::new()));
+        owner.apply(id, 0, AttachEvent::Pty(b"-late".to_vec()));
+        assert_eq!(owner.viewport_text(id)[0], "fresh", "stream 0 is gone");
+    }
+
+    #[test]
+    fn an_ended_stream_reports_once_and_goes_quiet() {
+        let owner = owner();
+        let (id, outputs) = recording(&owner);
+        attach_hello(&owner, id, "phone");
+        owner.viewport_text(id);
+        drain(&outputs);
+
+        owner.end_stream(id, "paused".into());
+        owner.apply(
+            id,
+            0,
+            AttachEvent::Ended {
+                reason: "detached".into(),
+            },
+        );
+        owner.apply(id, 0, AttachEvent::Pty(b"!".to_vec()));
+        assert_eq!(owner.viewport_text(id)[0], "hello");
+        assert_eq!(
+            drain(&outputs),
+            vec![TabOutput::Event(TerminalEvent::Status {
+                state: AttachState::Ended,
+                message: Some("paused".into()),
+            })]
+        );
+    }
+
+    #[test]
+    fn a_paste_is_encoded_for_the_program_without_being_sent() {
+        let owner = owner();
+        let (id, outputs) = recording(&owner);
+        attach_hello(&owner, id, "phone");
+        assert_eq!(
+            owner.encode_paste(id, "a\nb".into()),
+            Some(b"a\rb".to_vec())
+        );
+        owner.apply(id, 0, AttachEvent::Pty(b"\x1b[?2004h".to_vec()));
+        assert_eq!(
+            owner.encode_paste(id, "a\nb".into()),
+            Some(b"\x1b[200~a\nb\x1b[201~".to_vec())
+        );
+        assert!(!drain(&outputs)
+            .iter()
+            .any(|output| matches!(output, TabOutput::Input { .. })));
+        let (other, _) = recording(&owner);
+        owner.close(other);
+        assert_eq!(owner.encode_paste(other, "x".into()), None);
     }
 
     #[test]
