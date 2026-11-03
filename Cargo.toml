@@ -44,6 +44,23 @@ members = [
     "crates/roost-iced",
     "crates/roost-session",
 ]
+# The mobile crates (roost-mobile, roost-ssh) are members but not default
+# members: `cargo build`/`make check` at the root skip their russh and
+# flutter_rust_bridge builds; the mobile CI job names them with -p.
+default-members = [
+    "crates/roost-ipc",
+    "crates/roost-vt",
+    "crates/roost-osc",
+    "crates/roost-url",
+    "crates/roost-agent",
+    "crates/roost-agent-install",
+    "crates/roost-engine",
+    "crates/roost-ui-model",
+    "crates/roost-cli",
+    "crates/roost-client",
+    "crates/roost-iced",
+    "crates/roost-session",
+]
 # Belt-and-braces: members is already explicit above, but exclude spells
 # out that examples/ipc-consumer is a deliberately separate crate (own
 # workspace, own lockfile) proving roost-ipc is consumable standalone —

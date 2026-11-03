@@ -1,3 +1,6 @@
+pub mod attach;
+pub mod dial;
+pub mod host;
 pub mod mirror;
 pub mod queue;
 pub mod reconnect;
