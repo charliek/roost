@@ -91,17 +91,22 @@ pub struct Colors {
     pub cursor: Option<ColorRgb>,
 }
 
-/// SGR style bits the renderer needs to resolve effective fg/bg.
-/// `Bold / Italic / Inverse` are the three bits the cell-color
-/// resolver consumes to swap fg↔bg for `\e[7m` cells and apply the
-/// bold-accent rule. Underline / faint / blink / strikethrough /
-/// overline ride along the C struct but no caller uses them yet, so
-/// we drop them on the way in to keep `Cell` small.
+/// SGR style bits a renderer draws from. `Bold / Italic / Inverse` are
+/// the three the cell-color resolver consumes (fg↔bg swap for `\e[7m`,
+/// the bold-accent rule); the decorations are for renderers that draw
+/// them (the mobile frame encoder). Blink and overline ride along the C
+/// struct but no renderer draws them, so they are dropped on the way in.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Style {
     pub bold: bool,
     pub italic: bool,
     pub inverse: bool,
+    pub faint: bool,
+    /// Any SGR 4 underline style (single, double, curly, dotted, dashed).
+    pub underline: bool,
+    pub strikethrough: bool,
+    /// SGR 8: the glyph is hidden, its background still drawn.
+    pub invisible: bool,
 }
 
 /// How a cell participates in double-width text. Mirrors
@@ -1044,6 +1049,10 @@ impl RenderState {
             bold: s.bold,
             italic: s.italic,
             inverse: s.inverse,
+            faint: s.faint,
+            underline: s.underline != 0,
+            strikethrough: s.strikethrough,
+            invisible: s.invisible,
         }
     }
 

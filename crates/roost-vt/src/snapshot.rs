@@ -741,6 +741,27 @@ impl SnapshotDecoder {
         terminal.resize(cols, rows, cell_width_px, cell_height_px)
     }
 
+    /// Push an embedder theme onto the decoded terminal between history
+    /// pages, for a client that renders from READY rather than FINISH.
+    /// Like a theme push on any [`Terminal`] it moves only the defaults,
+    /// so a program's `OSC 4`/`10`/`11`/`12` override in the snapshot
+    /// survives it.
+    pub fn set_default_colors(
+        &mut self,
+        foreground: crate::ColorRgb,
+        background: crate::ColorRgb,
+        cursor: crate::ColorRgb,
+        palette: &[crate::ColorRgb; 256],
+    ) -> Result<()> {
+        let terminal = self.terminal.as_mut().ok_or(Error::Lifecycle(
+            "set_default_colors before try_ready reported Ready",
+        ))?;
+        terminal.set_color_foreground(foreground)?;
+        terminal.set_color_background(background)?;
+        terminal.set_color_cursor(cursor)?;
+        terminal.set_color_palette(palette)
+    }
+
     /// Take the decoded terminal once FINISH has validated.
     ///
     /// Legal only in the finished state; anything earlier is

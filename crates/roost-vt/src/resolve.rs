@@ -146,6 +146,10 @@ mod tests {
         bold: false,
         italic: false,
         inverse: false,
+        faint: false,
+        underline: false,
+        strikethrough: false,
+        invisible: false,
     };
     const BOLD: Style = Style {
         bold: true,
