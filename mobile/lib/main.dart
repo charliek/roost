@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'app/app.dart';
@@ -30,7 +31,14 @@ Future<void> main() async {
 
 Future<RoostCore> _createCore() async {
   if (_useFakeCore) return FakeCore.demo();
-  await RustLib.init();
+  // On macOS cargokit links the Rust core into the roost_mobile_rust pod
+  // framework, not the roost_mobile.framework FRB's default loader looks for;
+  // that framework is loaded at launch, so its symbols are in the process.
+  await RustLib.init(
+    externalLibrary: Platform.isMacOS
+        ? ExternalLibrary.process(iKnowHowToUseIt: true)
+        : null,
+  );
   final dir = await getApplicationSupportDirectory();
   return FrbCore.start(dataDir: dir.path, deviceLabel: deviceLabel());
 }
