@@ -13,6 +13,13 @@
 # Usage:
 #   ./third_party/ghostty/build.sh           # build (idempotent on cache hit)
 #   ./third_party/ghostty/build.sh --force   # discard cache, rebuild from scratch
+#   ./third_party/ghostty/build.sh --target aarch64-linux-android [--force]
+#
+# `--target` cross-compiles into out/<rust triple>/ (the directory
+# crates/roost-vt/build.rs links from when cargo's TARGET differs from HOST);
+# the host build stays at out/. It takes the rust or the zig spelling of a
+# triple. Android targets need ANDROID_NDK_HOME (tools/mobile/android-env.sh
+# finds and exports it).
 
 set -euo pipefail
 
@@ -27,16 +34,75 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GHOSTTY_SRC="${SCRIPT_DIR}/src"
 OUT_DIR="${SCRIPT_DIR}/out"
 
+usage() {
+  echo "usage: $0 [--force] [--target <triple>]" >&2
+  exit 1
+}
+
 force=0
-case "${1:-}" in
-  --force) force=1 ;;
-  "")      ;;
-  *)       echo "usage: $0 [--force]"; exit 1 ;;
+target=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --force)  force=1 ;;
+    --target)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || usage
+      target="$2"
+      shift
+      ;;
+    *) usage ;;
+  esac
+  shift
+done
+
+# Rust and zig spell some triples differently; the output directory is named
+# by the rust triple because that is what cargo hands roost-vt's build.rs.
+zig_target=""
+rust_target=""
+case "${target}" in
+  "") ;;
+  aarch64-linux-android|x86_64-linux-android)
+    zig_target="${target}"; rust_target="${target}" ;;
+  aarch64-unknown-linux-gnu|aarch64-linux-gnu)
+    zig_target="aarch64-linux-gnu"; rust_target="aarch64-unknown-linux-gnu" ;;
+  x86_64-unknown-linux-gnu|x86_64-linux-gnu)
+    zig_target="x86_64-linux-gnu"; rust_target="x86_64-unknown-linux-gnu" ;;
+  aarch64-apple-darwin|aarch64-macos)
+    zig_target="aarch64-macos"; rust_target="aarch64-apple-darwin" ;;
+  x86_64-apple-darwin|x86_64-macos)
+    zig_target="x86_64-macos"; rust_target="x86_64-apple-darwin" ;;
+  *)
+    echo "error: unsupported --target ${target}." >&2
+    echo "       Known: aarch64-linux-android, x86_64-linux-android," >&2
+    echo "       {aarch64,x86_64}-unknown-linux-gnu, {aarch64,x86_64}-apple-darwin." >&2
+    exit 1
+    ;;
 esac
 
+case "${rust_target}" in
+  *-android)
+    if [ -z "${ANDROID_NDK_HOME:-}" ] || [ ! -d "${ANDROID_NDK_HOME}" ]; then
+      echo "error: --target ${rust_target} needs ANDROID_NDK_HOME set to an installed NDK" >&2
+      echo "       (e.g. ~/Android/Sdk/ndk/28.2.13676358); got '${ANDROID_NDK_HOME:-<unset>}'." >&2
+      echo "       \`source tools/mobile/android-env.sh\` detects and exports it." >&2
+      exit 1
+    fi
+    ;;
+esac
+
+if [ -n "${rust_target}" ]; then
+  OUT_DIR="${SCRIPT_DIR}/out/${rust_target}"
+fi
+
 if [ "${force}" -eq 1 ]; then
-  echo "==> --force: removing ${GHOSTTY_SRC} and ${OUT_DIR}"
-  rm -rf "${GHOSTTY_SRC}" "${OUT_DIR}"
+  if [ -n "${rust_target}" ]; then
+    # The source checkout is shared with the host build; a target's --force
+    # only discards that target's output.
+    echo "==> --force: removing ${OUT_DIR}"
+    rm -rf "${OUT_DIR}"
+  else
+    echo "==> --force: removing ${GHOSTTY_SRC} and ${OUT_DIR}"
+    rm -rf "${GHOSTTY_SRC}" "${OUT_DIR}"
+  fi
 fi
 
 command -v zig >/dev/null 2>&1 || {
@@ -67,7 +133,7 @@ if [ "${current_sha}" != "${GHOSTTY_SHA}" ]; then
   git checkout --quiet "${GHOSTTY_SHA}"
 fi
 
-echo "==> Building libghostty-vt"
+echo "==> Building libghostty-vt${rust_target:+ for ${rust_target}}"
 # `-Dcpu=baseline`: build for the architecture's portable baseline CPU, not
 # the builder's native CPU. Without it, zig (via Ghostty's
 # `standardTargetOptions`) bakes in whatever instructions the building
@@ -77,7 +143,8 @@ echo "==> Building libghostty-vt"
 # poorer one. That surfaced as a flaky "gtk UI did not boot" + roost-vt ffi
 # test crashes. Baseline keeps the static archive portable across any CPU
 # of the same arch.
-zig build -Demit-lib-vt=true -Doptimize=ReleaseFast -Dcpu=baseline --prefix "${OUT_DIR}"
+zig build -Demit-lib-vt=true -Doptimize=ReleaseFast -Dcpu=baseline \
+  ${zig_target:+-Dtarget="${zig_target}"} --prefix "${OUT_DIR}"
 popd >/dev/null
 
 # zig emits BOTH `libghostty-vt.a` and `libghostty-vt.dylib` (plus

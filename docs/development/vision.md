@@ -1381,6 +1381,40 @@ and
 - **Still true of the code.** `roost-engine` and `roost-ui-model` stay
   toolkit-neutral, so a second client does not need a rewrite.
 
+### DL-34: a mobile client of roost-session (2026-11-03)
+
+Plan 090 (`discovery/mobile-client.md`). Roost gains a phone and tablet
+client: a Flutter app in `mobile/`, Android first, for driving a host's
+projects, tabs and agents from a device. It is a **client of
+`roost-session`**, exactly as Roost-Iced is when it shows a host — the same
+control plane, events and data-plane attach, and no new ops — so the one-op-set
+north star holds: the app is one more reaction to the session's events.
+
+**Shape.** Flutter draws; Rust does everything below the pixels. Dart never
+touches libghostty: `crates/roost-mobile` owns each attached tab's terminal on
+one owner thread and hands Flutter a binary frame of dirty rows per vsync,
+over flutter_rust_bridge. The transport-agnostic client core is
+`roost-client` (a `Dialer` seam, `HostClient`, `AttachStream`); `roost-ssh` is
+an in-process russh dialer, so there is no loopback port another app could
+reach. iced keeps its own connection task for now; converging it onto
+`roost-client`'s (B2) is a later milestone.
+
+**Choices.** Tailscale SSH (`none` auth, trust-on-first-use host keys) is the
+only login in the first build; key auth has a seam. Size follows protocol 7
+ownership (DL-31): opening a tab on the phone takes it, typing takes it, going
+to the background releases it; the compose box and quick replies use
+`tab.write` and never take it. The app requires an exact `session_protocol`
+match, built from the same tree as the session it talks to.
+
+**Rejected:** dartssh2 with a loopback forward (any app on the device could
+reach the session through it); a client-local reflow instead of size
+ownership (the session is the authority); a third copy of the connection logic
+inside the app crate.
+
+This amends the [non-goals](#non-goals): Dart is a UI language for the
+mobile client alone, like Swift was for the Mac UI, and no core logic is
+written in it.
+
 ## Direction {: #direction-under-evaluation }
 
 **Status: resolved to branch (a) by

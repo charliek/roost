@@ -54,3 +54,15 @@ pub fn scale() -> f64 {
     static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *SCALE.get_or_init(session_launch::timeout_scale)
 }
+
+/// A jitter source in `0.0..1.0` with no `rand` dependency: the low bits
+/// of the clock are plenty of spread for staggering reconnects, and this
+/// is not a security decision.
+pub fn jitter() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0);
+    f64::from(nanos % 1_000_000) / 1_000_000.0
+}

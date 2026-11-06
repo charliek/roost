@@ -1899,3 +1899,43 @@ fn an_unknown_record_after_a_page_is_skipped_at_every_split() {
     assert_steps_while_streaming(&fragmented, &bytes);
     assert_matches_source(&mut fragmented, &mut source, bytes.len());
 }
+
+/// A client that draws from READY themes the decoded terminal then; the
+/// theme moves only the defaults, so the program's own `OSC 11` in the
+/// snapshot still wins.
+#[test]
+fn a_theme_pushed_at_ready_moves_the_defaults_under_program_overrides() {
+    let mut source = term(TerminalOptions::default());
+    source.vt_write(b"\x1b]11;rgb:00/11/22\x07");
+    let bytes = source.snapshot().expect("snapshot");
+
+    let mut decode = SnapshotDecoder::new(SnapshotDecodeOptions::default());
+    assert!(matches!(
+        decode.set_default_colors(
+            ColorRgb::new(1, 1, 1),
+            ColorRgb::new(2, 2, 2),
+            ColorRgb::new(3, 3, 3),
+            &[ColorRgb::new(4, 4, 4); 256],
+        ),
+        Err(Error::Lifecycle(_))
+    ));
+    decode.feed(&bytes).expect("feed");
+    assert_eq!(decode.try_ready().expect("try_ready"), ReadyState::Ready);
+
+    let fg = ColorRgb::new(0xe5, 0xe5, 0xe5);
+    let bg = ColorRgb::new(0x1c, 0x1c, 0x1c);
+    let mut palette = [ColorRgb::new(0, 0, 0); 256];
+    palette[1] = ColorRgb::new(0xcc, 0x37, 0x2e);
+    decode
+        .set_default_colors(fg, bg, ColorRgb::new(0xbb, 0xbb, 0xbb), &palette)
+        .expect("theme");
+    let terminal = decode.terminal().expect("ready");
+    let live = terminal.live_colors().expect("live colors");
+    assert_eq!(live.foreground, fg, "no override: the theme");
+    assert_eq!(
+        live.background,
+        ColorRgb::new(0x00, 0x11, 0x22),
+        "the program's OSC 11"
+    );
+    assert_eq!(terminal.live_palette().expect("palette")[1], palette[1]);
+}
