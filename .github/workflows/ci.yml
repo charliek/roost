@@ -140,6 +140,10 @@ jobs:
               # test_sparkle_plist.py stamps the plist template;
               # test_mac_entitlements.py reads the entitlements beside it.
               - 'mac/Resources/**'
+              # test_iced_feed_sunset.py reads the retired app's feed and the
+              # install page its notice links to.
+              - 'docs/appcast-iced.xml'
+              - 'docs/getting-started/installation.md'
             # roost-cli's `doc_anchors_resolve` test reads the site nav and
             # every page it links, so those files are inputs to a RUST test
             # even though no Rust file changes when they move. Without this,

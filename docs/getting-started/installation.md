@@ -33,8 +33,9 @@ socket and logs.
 ### `Roost-Iced.app` users
 
 `Roost-Iced.app` (bundle id `ai.stridelabs.Roost.iced`) was the experimental
-iced build published beside the Swift app. Its update feed is frozen, so it
-will not offer v0.1.0; switch by hand:
+iced build published beside the Swift app. It cannot update itself into
+`Roost.app`: its **Check for Updates…** now shows a notice pointing here
+instead of offering an update. Switch by hand:
 
 1. Install `Roost.app` from the DMG above.
 2. Quit both apps, then delete `Roost-Iced.app`.

@@ -85,5 +85,24 @@
       <sparkle:minimumSystemVersion>15.0.0</sparkle:minimumSystemVersion>
       <enclosure url="https://github.com/charliek/roost/releases/download/v0.0.27/Roost-Iced-0.0.27.dmg" type="application/octet-stream" sparkle:edSignature="CpS460lwiu52mQL/hhgEeOatHUEK8ffRnC2LobrdspHKZRe7/28e3p16yqVOZj2t5hwsHtOpx91ejlOkD/aTBQ==" length="19479264" />
     </item>
+    <item>
+      <title>Roost-Iced is now Roost</title>
+      <link>https://charliek.github.io/roost/getting-started/installation/#roost-icedapp-users</link>
+      <sparkle:version>0.1.0</sparkle:version>
+      <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>15.0.0</sparkle:minimumSystemVersion>
+      <sparkle:informationalUpdate />
+      <description><![CDATA[
+        <h2>Roost-Iced is now Roost</h2>
+        <p>From v0.1.0 this app ships as <b>Roost.app</b>, and Roost-Iced.app gets no further updates.
+        It can't update itself into Roost.app, so the switch is by hand:</p>
+        <ol>
+          <li>Install Roost.app from the <a href="https://github.com/charliek/roost/releases/latest">latest release</a>.</li>
+          <li>Quit both apps, then delete Roost-Iced.app.</li>
+          <li>Run <code>roostctl agent install</code> again.</li>
+          <li>Optionally copy your projects and tabs across (Learn More has the command).</li>
+        </ol>
+      ]]></description>
+    </item>
   </channel>
 </rss>

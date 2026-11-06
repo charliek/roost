@@ -232,7 +232,12 @@ guard fires correctly).
 
 `docs/appcast-iced.xml`, the feed of the retired Roost-Iced.app, is
 **frozen**: no job writes it any more, and it is never deleted, so a
-Roost-Iced.app still installed keeps a valid (if final) feed.
+Roost-Iced.app still installed keeps a valid feed. Its last item is a
+Sparkle *informational* update (`<sparkle:informationalUpdate />`, no
+enclosure) at 0.1.0, so **Check for Updates…** shows a notice whose Learn
+More opens the switch steps in the installation docs instead of installing
+anything. It went live with v0.1.0, not before, because Pages redeploys on
+any push to `docs/`.
 
 ## When things break
 
