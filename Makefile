@@ -532,7 +532,7 @@ check: fmt-check clippy test  ## Pre-push gate: fmt-check + clippy + tests
 
 ANDROID_TARGETS := aarch64-linux-android x86_64-linux-android
 
-.PHONY: mobile-deps mobile-android-check mobile-apk mobile-apk-release mobile-dev-host
+.PHONY: mobile-deps mobile-android-check mobile-apk mobile-apk-release mobile-dev-host mobile-icons
 mobile-deps:  ## Build libghostty-vt for both Android ABIs into third_party/ghostty/out/<triple>/
 	. tools/mobile/android-env.sh && for t in $(ANDROID_TARGETS); do \
 		third_party/ghostty/build.sh --target $$t || exit 1; \
@@ -562,6 +562,14 @@ mobile-apk-release:  ## Release APK for devices (arm64-v8a), signed with the .se
 
 mobile-dev-host:  ## A private dev roost-session behind dev_sshd, for the app in an emulator (Ctrl-C stops it)
 	tools/mobile/dev-host.sh
+
+# cairosvg loads libcairo through ctypes, which misses Homebrew's prefix on a Mac.
+mobile-icons:  ## Re-render the app icons from Roost's owl and deploy them to android/ and macos/
+	cd mobile && if [ "$$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then \
+		export DYLD_FALLBACK_LIBRARY_PATH="$$(brew --prefix)/lib:$${DYLD_FALLBACK_LIBRARY_PATH:-/usr/local/lib:/usr/lib}"; \
+	fi; \
+	uv run --with cairosvg --with pillow python scripts/generate_app_icons.py && \
+	env -u ROOST_SOCKET -u ROOST_TAB_ID -u ROOST_AGENT_HOOK -u HERDR_ENV dart run flutter_launcher_icons
 
 # ---- docs -------------------------------------------------------------
 

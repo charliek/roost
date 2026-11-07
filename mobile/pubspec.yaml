@@ -28,6 +28,8 @@ dev_dependencies:
   integration_test:
     sdk: flutter
   flutter_lints: ^6.0.0
+  # Deploys assets/icon/ into the platform icon slots (make mobile-icons).
+  flutter_launcher_icons: ^0.14.3
 
 flutter:
   uses-material-design: true
