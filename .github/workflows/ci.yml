@@ -61,7 +61,7 @@ jobs:
       scripts: ${{ steps.filter.outputs.scripts }}
       mobile: ${{ steps.filter.outputs.mobile }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dorny/paths-filter@v4
@@ -259,7 +259,7 @@ jobs:
     # libghostty-vt archive before it can lint.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -311,7 +311,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Install zsh
@@ -326,7 +326,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       # verify-sparkle-key.sh and its test reach `cryptography` through uv.
@@ -352,7 +352,7 @@ jobs:
       # whose CPU is slower/variable than the budgets were tuned against.
       ROOST_TEST_TIMEOUT_SCALE: "3"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -579,7 +579,7 @@ jobs:
     # more), so 40 leaves a cold one room again.
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -2016,7 +2016,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -2310,7 +2310,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -2431,7 +2431,7 @@ jobs:
     # headroom up front rather than discover it as a flake.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -2550,7 +2550,7 @@ jobs:
     env:
       ROOST_TEST_TIMEOUT_SCALE: "3"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -2645,7 +2645,7 @@ jobs:
       # Gradle and tools/mobile/android-env.sh link with the same NDK.
       ROOST_NDK_VERSION: 28.2.13676358
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
