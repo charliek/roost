@@ -2672,7 +2672,7 @@ jobs:
           { yes || true; } | "${sdkmanager}" --install "ndk;${ROOST_NDK_VERSION}" >/dev/null
           echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${ROOST_NDK_VERSION}" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
