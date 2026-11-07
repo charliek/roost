@@ -283,7 +283,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -371,7 +371,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -605,7 +605,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -1389,7 +1389,7 @@ jobs:
       # flake the assemble step on a warm cache (plan 028 § 3.10).
       - name: Cache Sparkle stage
         if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: third_party/sparkle/out
           key: sparkle-stage-${{ hashFiles('third_party/sparkle/fetch.sh') }}
@@ -2040,7 +2040,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -2338,7 +2338,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -2454,7 +2454,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -2505,7 +2505,7 @@ jobs:
 
       - name: Cache released sessions (Linux)
         if: runner.os == 'Linux'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: target/old-session
           # The pinned releases live in the test module, so its hash
@@ -2575,7 +2575,7 @@ jobs:
       # version).
       - name: Cache flutter_rust_bridge_codegen
         id: cache-frb-codegen
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/flutter_rust_bridge_codegen
           key: frb-codegen-2.13.0-beta.5-${{ runner.os }}
@@ -2591,7 +2591,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -2680,7 +2680,7 @@ jobs:
       # A key of its own: this one also holds out/<android triple>/, which
       # the host jobs' entry never has (and a cache hit is never re-saved).
       - name: Cache vendored libghostty-vt (Android)
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
