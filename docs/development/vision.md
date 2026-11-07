@@ -1370,7 +1370,8 @@ and
   same Sparkle key and feed (`docs/appcast.xml`), so a Swift user updates
   in place and keeps their projects, tab layout and selection.
 - **`Roost-Iced.app` users switch by hand.** Its bundle id and feed are
-  separate and the feed (`docs/appcast-iced.xml`) is frozen; see
+  separate and the feed (`docs/appcast-iced.xml`) is frozen, ending in an
+  informational item that points at the switch steps; see
   [Roost-Iced.app users](../getting-started/installation.md#roost-icedapp-users).
   Dev builds keep the `Roost-Iced.app` name and the separate
   `Roost-iced` paths.

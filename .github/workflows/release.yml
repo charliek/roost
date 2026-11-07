@@ -373,8 +373,9 @@ jobs:
   # The macOS release: the iced UI as Roost.app, in the production identity
   # (`ROOST_BUNDLE_IDENTITY=production`, plan 089) — the bundle id, Sparkle
   # feed and EdDSA key the Swift Roost.app shipped with, so every installed
-  # Roost.app updates to it in place. docs/appcast-iced.xml is frozen; a
-  # Roost-Iced.app user moves to Roost.app by hand.
+  # Roost.app updates to it in place. docs/appcast-iced.xml is frozen (its
+  # last item is an informational notice); a Roost-Iced.app user moves to
+  # Roost.app by hand.
   mac:
     needs: create-release
     runs-on: macos-26   # arm64 — pinned; ships Xcode 26 by default, whose
