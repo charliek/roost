@@ -1,5 +1,7 @@
 // Generates Rust bindings for libghostty-vt's C API and links the static
-// archive at third_party/ghostty/out/lib/libghostty-vt.a.
+// archive at third_party/ghostty/out/lib/libghostty-vt.a — or, when cargo
+// cross-compiles (TARGET != HOST), at out/<TARGET>/lib/libghostty-vt.a, which
+// `third_party/ghostty/build.sh --target <TARGET>` produces.
 //
 // Gated behind the `ffi` cargo feature so `cargo check` works before the
 // vendored archive has been built. The bindgen build-dependency is also
@@ -37,17 +39,29 @@ mod ffi {
         println!("cargo:rustc-env=ROOST_GHOSTTY_SHA={sha}");
         println!("cargo:rerun-if-changed={}", ghostty_build_script.display());
 
-        let ghostty_out = workspace_root.join("third_party/ghostty/out");
+        let target = env::var("TARGET").expect("cargo sets TARGET for build scripts");
+        let host = env::var("HOST").expect("cargo sets HOST for build scripts");
+        let cross = target != host;
+
+        let mut ghostty_out = workspace_root.join("third_party/ghostty/out");
+        if cross {
+            ghostty_out.push(&target);
+        }
 
         let header = ghostty_out.join("include/ghostty/vt.h");
         let lib_dir = ghostty_out.join("lib");
         let lib_archive = lib_dir.join("libghostty-vt.a");
 
         if !header.exists() || !lib_archive.exists() {
+            let build_cmd = if cross {
+                format!("third_party/ghostty/build.sh --target {target}")
+            } else {
+                "third_party/ghostty/build.sh".to_string()
+            };
             panic!(
-                "libghostty-vt artifacts not found.\n\
+                "libghostty-vt artifacts for {target} not found.\n\
                  expected:\n  {}\n  {}\n\
-                 run third_party/ghostty/build.sh first.",
+                 run `{build_cmd}` first.",
                 header.display(),
                 lib_archive.display()
             );
@@ -90,6 +104,7 @@ mod ffi {
         let bindings = bindgen::Builder::default()
             .header(header.to_string_lossy())
             .clang_arg(format!("-I{}", ghostty_out.join("include").display()))
+            .clang_args(android_sysroot_args(&target, &host))
             .allowlist_function("ghostty_.*")
             .allowlist_type("Ghostty.*")
             .allowlist_type("ghostty_.*")
@@ -104,6 +119,77 @@ mod ffi {
         bindings
             .write_to_file(&out_path)
             .expect("could not write bindings");
+    }
+
+    /// Clang arguments that let bindgen find the NDK's libc headers when
+    /// cross-compiling for Android. Empty for every other target, and when
+    /// the caller already supplied `BINDGEN_EXTRA_CLANG_ARGS[_<target>]`
+    /// (bindgen reads those itself).
+    ///
+    /// The sysroot comes from `ANDROID_NDK_HOME`, else from the NDK clang
+    /// that `CC_<target>` names: cargokit sets `CC_<target>` but neither
+    /// `ANDROID_NDK_HOME` nor a bindgen variable.
+    fn android_sysroot_args(target: &str, host: &str) -> Vec<String> {
+        if !target.contains("-android") {
+            return Vec::new();
+        }
+        let target_underscored = target.replace('-', "_");
+        let bindgen_vars = [
+            format!("BINDGEN_EXTRA_CLANG_ARGS_{target}"),
+            format!("BINDGEN_EXTRA_CLANG_ARGS_{target_underscored}"),
+            "BINDGEN_EXTRA_CLANG_ARGS".to_string(),
+        ];
+        let cc_vars = [format!("CC_{target}"), format!("CC_{target_underscored}")];
+        for var in bindgen_vars.iter().chain(&cc_vars) {
+            println!("cargo:rerun-if-env-changed={var}");
+        }
+        println!("cargo:rerun-if-env-changed=ANDROID_NDK_HOME");
+
+        if bindgen_vars.iter().any(|var| env::var_os(var).is_some()) {
+            return Vec::new();
+        }
+
+        let sysroot = if let Some(ndk) = env::var_os("ANDROID_NDK_HOME") {
+            let host_tag = if host.contains("-linux") {
+                "linux-x86_64"
+            } else if host.contains("-apple-darwin") {
+                // The NDK uses this directory name on Apple Silicon too.
+                "darwin-x86_64"
+            } else {
+                panic!("no Android NDK host tag known for build host {host}");
+            };
+            PathBuf::from(ndk)
+                .join("toolchains/llvm/prebuilt")
+                .join(host_tag)
+                .join("sysroot")
+        } else if let Some(cc) = cc_vars.iter().find_map(env::var_os) {
+            // <ndk>/toolchains/llvm/prebuilt/<host-tag>/bin/clang -> ../sysroot
+            let cc = PathBuf::from(cc);
+            match cc.parent().and_then(Path::parent) {
+                Some(prebuilt) => prebuilt.join("sysroot"),
+                None => panic!(
+                    "cannot derive the NDK sysroot from {} for {target}",
+                    cc.display()
+                ),
+            }
+        } else {
+            panic!(
+                "cross-compiling roost-vt for {target} needs the Android NDK: set \
+                 ANDROID_NDK_HOME (`source tools/mobile/android-env.sh`), or \
+                 BINDGEN_EXTRA_CLANG_ARGS_{target_underscored}=--sysroot=<ndk sysroot>"
+            );
+        };
+
+        if !sysroot.is_dir() {
+            panic!(
+                "Android NDK sysroot {} does not exist (building roost-vt for {target})",
+                sysroot.display()
+            );
+        }
+        vec![
+            format!("--target={target}"),
+            format!("--sysroot={}", sysroot.display()),
+        ]
     }
 
     /// Extract the pinned Ghostty commit from

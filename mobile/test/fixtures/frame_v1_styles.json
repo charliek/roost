@@ -1,0 +1,184 @@
+{
+  "cols": 20,
+  "cursor_col": 3,
+  "cursor_color": 8438015,
+  "cursor_row": 4,
+  "cursor_style": 1,
+  "default_bg": 1052688,
+  "default_fg": 13684944,
+  "description": "Bold, italic, underline; 256-color and truecolor fg/bg; inverse; two wide CJK characters; strikethrough and faint; blank cells with an SGR background; bracketed paste and mouse tracking on; a bar cursor at row 4, col 3.",
+  "flag_names": [
+    "FULL",
+    "CURSOR_VISIBLE",
+    "MOUSE_TRACKING",
+    "BRACKETED_PASTE"
+  ],
+  "flags": 23,
+  "input": "\u001b[1mbold\u001b[0m \u001b[3mital\u001b[0m \u001b[4mund\u001b[0m\r\n\u001b[38;5;196mred\u001b[0m \u001b[38;2;10;20;30;48;2;200;210;220mtc\u001b[0m \u001b[7minv\u001b[0m\r\n中文 \u001b[9mstrike\u001b[0m \u001b[2mfaint\u001b[0m\r\n\u001b[41m  \u001b[0m end\u001b[?2004h\u001b[?1000h\u001b[5 q\u001b[5;4H",
+  "row_data": [
+    {
+      "row_index": 0,
+      "runs": [
+        {
+          "attr_names": [
+            "BOLD"
+          ],
+          "attrs": 1,
+          "bg": 1052688,
+          "cells": 4,
+          "col": 0,
+          "fg": 13684944,
+          "text": "bold"
+        },
+        {
+          "attr_names": [
+            "ITALIC"
+          ],
+          "attrs": 2,
+          "bg": 1052688,
+          "cells": 4,
+          "col": 5,
+          "fg": 13684944,
+          "text": "ital"
+        },
+        {
+          "attr_names": [
+            "UNDERLINE"
+          ],
+          "attrs": 4,
+          "bg": 1052688,
+          "cells": 3,
+          "col": 10,
+          "fg": 13684944,
+          "text": "und"
+        }
+      ]
+    },
+    {
+      "row_index": 1,
+      "runs": [
+        {
+          "attr_names": [],
+          "attrs": 0,
+          "bg": 1052688,
+          "cells": 3,
+          "col": 0,
+          "fg": 16711680,
+          "text": "red"
+        },
+        {
+          "attr_names": [
+            "EXPLICIT_BG"
+          ],
+          "attrs": 32,
+          "bg": 13161180,
+          "cells": 2,
+          "col": 4,
+          "fg": 660510,
+          "text": "tc"
+        },
+        {
+          "attr_names": [
+            "EXPLICIT_BG"
+          ],
+          "attrs": 32,
+          "bg": 13684944,
+          "cells": 3,
+          "col": 7,
+          "fg": 1052688,
+          "text": "inv"
+        }
+      ]
+    },
+    {
+      "row_index": 2,
+      "runs": [
+        {
+          "attr_names": [
+            "WIDE"
+          ],
+          "attrs": 64,
+          "bg": 1052688,
+          "cells": 2,
+          "col": 0,
+          "fg": 13684944,
+          "text": "中"
+        },
+        {
+          "attr_names": [
+            "WIDE"
+          ],
+          "attrs": 64,
+          "bg": 1052688,
+          "cells": 2,
+          "col": 2,
+          "fg": 13684944,
+          "text": "文"
+        },
+        {
+          "attr_names": [
+            "STRIKE"
+          ],
+          "attrs": 8,
+          "bg": 1052688,
+          "cells": 6,
+          "col": 5,
+          "fg": 13684944,
+          "text": "strike"
+        },
+        {
+          "attr_names": [
+            "FAINT"
+          ],
+          "attrs": 16,
+          "bg": 1052688,
+          "cells": 5,
+          "col": 12,
+          "fg": 13684944,
+          "text": "faint"
+        }
+      ]
+    },
+    {
+      "row_index": 3,
+      "runs": [
+        {
+          "attr_names": [
+            "EXPLICIT_BG"
+          ],
+          "attrs": 32,
+          "bg": 13383470,
+          "cells": 2,
+          "col": 0,
+          "fg": 13684944,
+          "text": "  "
+        },
+        {
+          "attr_names": [],
+          "attrs": 0,
+          "bg": 1052688,
+          "cells": 3,
+          "col": 3,
+          "fg": 13684944,
+          "text": "end"
+        }
+      ]
+    },
+    {
+      "row_index": 4,
+      "runs": []
+    }
+  ],
+  "row_text": [
+    "bold ital und",
+    "red tc inv",
+    "中文 strike faint",
+    "   end",
+    ""
+  ],
+  "rows": 5,
+  "scroll_len": 5,
+  "scroll_offset": 0,
+  "scroll_total": 5,
+  "version": 1
+}

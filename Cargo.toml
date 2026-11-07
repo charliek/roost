@@ -23,6 +23,8 @@
 #   * roost-session — the headless host-session daemon; binary is
 #                     `roost-session`. Same engine as a UI, no toolkit.
 #   * roost-cli   — shell-integration CLI; binary is `roostctl`.
+#   * roost-ssh   — the mobile app's in-process SSH dialer (russh, ring):
+#                   Tailscale SSH to a host's `client-bridge`.
 #
 # The pre-M7 daemon-era crates (roost-core, roost-proto, roost-common,
 # roost-smoke) are gone; `proto/roost.proto` has moved to
@@ -31,6 +33,25 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/roost-ipc",
+    "crates/roost-vt",
+    "crates/roost-osc",
+    "crates/roost-url",
+    "crates/roost-agent",
+    "crates/roost-agent-install",
+    "crates/roost-engine",
+    "crates/roost-ui-model",
+    "crates/roost-cli",
+    "crates/roost-client",
+    "crates/roost-iced",
+    "crates/roost-session",
+    "crates/roost-mobile",
+    "crates/roost-ssh",
+]
+# The mobile crates (roost-mobile, roost-ssh) are members but not default
+# members: `cargo build`/`make check` at the root skip their russh and
+# flutter_rust_bridge builds; the mobile CI job names them with -p.
+default-members = [
     "crates/roost-ipc",
     "crates/roost-vt",
     "crates/roost-osc",
@@ -56,7 +77,7 @@ exclude = ["examples/ipc-consumer", "tools/input/mac/roost-input-mac"]
 # Single source of truth for the release version. Tag pushes (`v0.0.2`)
 # assert `${tag#v}` matches this in the release workflow; the .deb + .app
 # read it via $ROOST_VERSION at packaging time. Bump here before tagging.
-version       = "0.0.27"
+version       = "0.1.0"
 edition       = "2021"
 rust-version  = "1.97"
 license       = "MIT"

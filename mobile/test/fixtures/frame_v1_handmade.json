@@ -1,0 +1,70 @@
+{
+  "cols": 20,
+  "rows": 4,
+  "flags": 19,
+  "default_fg": 14146272,
+  "default_bg": 987413,
+  "cursor_color": 15132910,
+  "cursor": {
+    "col": 5,
+    "row": 2,
+    "style": 1
+  },
+  "scroll": {
+    "total": 120,
+    "offset": 116,
+    "len": 4
+  },
+  "rows_data": [
+    {
+      "row": 0,
+      "runs": [
+        {
+          "col": 0,
+          "cells": 2,
+          "fg": 7973631,
+          "bg": 987413,
+          "attrs": 1,
+          "text": "~/"
+        },
+        {
+          "col": 3,
+          "cells": 5,
+          "fg": 14146272,
+          "bg": 987413,
+          "attrs": 0,
+          "text": "hello"
+        }
+      ]
+    },
+    {
+      "row": 2,
+      "runs": [
+        {
+          "col": 0,
+          "cells": 2,
+          "fg": 15902298,
+          "bg": 987413,
+          "attrs": 64,
+          "text": "漢"
+        },
+        {
+          "col": 2,
+          "cells": 3,
+          "fg": 987413,
+          "bg": 14146272,
+          "attrs": 32,
+          "text": "inv"
+        },
+        {
+          "col": 6,
+          "cells": 4,
+          "fg": 8376731,
+          "bg": 987413,
+          "attrs": 6,
+          "text": "été!"
+        }
+      ]
+    }
+  ]
+}

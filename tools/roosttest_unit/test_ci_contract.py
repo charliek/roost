@@ -264,11 +264,11 @@ class CiContractTests(unittest.TestCase):
     def test_a_new_job_outside_needs_is_caught(self) -> None:
         mutated = self.text.replace(
             f"\n  {AGGREGATE}:\n",
-            "\n  mobile:\n    needs: changes\n    runs-on: ubuntu-latest\n\n"
+            "\n  new-lane:\n    needs: changes\n    runs-on: ubuntu-latest\n\n"
             f"  {AGGREGATE}:\n",
             1,
         )
-        self.assertIn(f"mobile is neither in {AGGREGATE}.needs nor NON_BLOCKING", problems(mutated, self.files))
+        self.assertIn(f"new-lane is neither in {AGGREGATE}.needs nor NON_BLOCKING", problems(mutated, self.files))
 
     def test_a_filter_path_that_matches_nothing_is_caught(self) -> None:
         mutated = self.text.replace(

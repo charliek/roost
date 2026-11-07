@@ -29,10 +29,10 @@ pub fn current_euid() -> u32 {
 
 /// The effective UID of the process on the other end of `stream`.
 ///
-/// Linux reads `SO_PEERCRED`, macOS `getpeereid(3)`. Both report the
-/// peer's *effective* UID as of the connect, which is what an access
-/// decision needs.
-#[cfg(target_os = "linux")]
+/// Linux and Android read `SO_PEERCRED`, macOS `getpeereid(3)`. Both
+/// report the peer's *effective* UID as of the connect, which is what an
+/// access decision needs.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn peer_uid(stream: &UnixStream) -> anyhow::Result<u32> {
     let mut cred = libc::ucred {
         pid: 0,
@@ -79,7 +79,7 @@ pub fn peer_uid(stream: &UnixStream) -> anyhow::Result<u32> {
 
 /// Fail-closed on platforms Roost does not ship. Keeps the crate
 /// compiling everywhere without ever handing out an unchecked allow.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 pub fn peer_uid(_stream: &UnixStream) -> anyhow::Result<u32> {
     anyhow::bail!("peer-credential lookup is not implemented on this platform")
 }

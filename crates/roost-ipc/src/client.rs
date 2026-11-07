@@ -55,10 +55,16 @@ use crate::Error;
 // Sequential request/response client
 // ============================================================================
 
+/// The read half of whatever carries a connection: a Unix socket, or
+/// an SSH channel to a remote `client-bridge`.
+pub type BoxedRead = Box<dyn AsyncRead + Send + Unpin>;
+/// The write half that goes with a [`BoxedRead`].
+pub type BoxedWrite = Box<dyn AsyncWrite + Send + Unpin>;
+
 /// Single-connection sequential client.
 pub struct IpcClient {
-    reader: FrameReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
+    reader: FrameReader<BoxedRead>,
+    writer: BoxedWrite,
     next_id: AtomicI64,
 }
 
@@ -72,9 +78,17 @@ impl IpcClient {
     /// Wrap an already-dialed stream.
     pub fn over(stream: UnixStream) -> Self {
         let (r, w) = stream.into_split();
+        Self::over_split(r, w)
+    }
+
+    /// Wrap the two halves of any already-dialed stream.
+    pub fn over_split(
+        read: impl AsyncRead + Send + Unpin + 'static,
+        write: impl AsyncWrite + Send + Unpin + 'static,
+    ) -> Self {
         Self {
-            reader: FrameReader::new(r),
-            writer: w,
+            reader: FrameReader::new(Box::new(read)),
+            writer: Box::new(write),
             next_id: AtomicI64::new(1),
         }
     }
@@ -258,13 +272,13 @@ pub enum EventFrame {
 /// is the client's cue to resync (fresh `tab.list`, re-subscribe, fence
 /// against the new ack).
 pub struct EventStream {
-    reader: FrameReader<OwnedReadHalf>,
+    reader: FrameReader<BoxedRead>,
     /// Held open on purpose. The server keeps reading this connection
     /// so it notices a peer that goes away; half-closing the write half
     /// is how a peer says it is gone, and the server would end the
     /// stream.
     #[allow(dead_code)]
-    writer: OwnedWriteHalf,
+    writer: BoxedWrite,
     revision: u64,
     session_id: String,
     next_revision: u64,
@@ -1261,5 +1275,60 @@ mod tests {
                 other => panic!("expected DataProtocol, got {other:?}"),
             }
         }
+    }
+
+    /// Answer one request line on a duplex the way a session would:
+    /// `result` for the id the line carried.
+    async fn answer_one(
+        lines: &mut FrameReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        write: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        result: serde_json::Value,
+    ) -> serde_json::Value {
+        let line = lines.read_line().await.expect("read").expect("a request");
+        let request: serde_json::Value = serde_json::from_slice(&line).expect("json");
+        let reply = serde_json::json!({"id": request["id"], "ok": true, "result": result});
+        write_frame(write, &serde_json::to_vec(&reply).unwrap())
+            .await
+            .expect("reply");
+        request
+    }
+
+    /// Nothing about the request client or the push reader needs a Unix
+    /// socket: a call and then a subscription run over an in-memory pipe,
+    /// the stand-in for an SSH channel.
+    #[tokio::test]
+    async fn a_call_and_a_subscription_run_over_any_split_stream() {
+        let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(client_end);
+        let (server_read, mut server_write) = tokio::io::split(server_end);
+        let server = tokio::spawn(async move {
+            let mut lines = FrameReader::new(server_read);
+            let first =
+                answer_one(&mut lines, &mut server_write, serde_json::json!({"x": 1})).await;
+            let second = answer_one(
+                &mut lines,
+                &mut server_write,
+                serde_json::json!({"revision": 4, "session_id": "s1"}),
+            )
+            .await;
+            let batch = serde_json::json!({"revision": 5, "events": []});
+            write_frame(&mut server_write, &serde_json::to_vec(&batch).unwrap())
+                .await
+                .expect("push");
+            (first, second, server_write)
+        });
+
+        let mut client = IpcClient::over_split(read, write);
+        let result = client.call_raw("tab.list", serde_json::json!({})).await;
+        assert_eq!(result.expect("answered"), serde_json::json!({"x": 1}));
+        let mut stream = client.subscribe_events().await.expect("subscribed");
+        assert_eq!((stream.revision(), stream.session_id()), (4, "s1"));
+        match stream.next().await.expect("a frame") {
+            Some(EventFrame::Batch(batch)) => assert_eq!(batch.revision, 5),
+            other => panic!("expected the first batch, got {other:?}"),
+        }
+        let (first, second, _held) = server.await.expect("join");
+        assert_eq!(first["op"], "tab.list");
+        assert_eq!(second["op"], ops::EVENTS_SUBSCRIBE);
     }
 }

@@ -9,6 +9,54 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.1.0 — 2026-11-07
+
+_One desktop app. `Roost.app` on macOS is now the Rust + iced build, the
+same codebase Linux ships, and the Swift + AppKit app is retired. A Swift
+`Roost.app` updates to it in place through **Check for Updates…** and keeps
+its projects, tabs, config, socket and logs. This release also brings the
+first prototype of Roost mobile, an Android client of `roost-session`._
+
+### Changed
+
+- **`Roost.app` is the iced build.** It takes over the Swift app's bundle id
+  (`ai.stridelabs.Roost`), its state, socket and log paths, and its Sparkle
+  feed and signing key, so an installed Swift `Roost.app` is offered 0.1.0
+  and relaunches as the iced app. Everything the Swift app did on the Mac is
+  in the iced app: the native menu bar, notifications, the Dock badge,
+  Sparkle updates and Secure Keyboard Entry. See the
+  [decision record](docs/development/vision.md) (DL-33).
+- **`Roost-Iced.app` is retired.** It was the experimental iced build
+  published beside the Swift app. Its update feed gets no new versions, and
+  it cannot update itself into `Roost.app`; switch by hand with the
+  [steps in the install guide](docs/getting-started/installation.md#roost-icedapp-users):
+  install `Roost.app`, delete `Roost-Iced.app`, re-run `roostctl agent install`,
+  and optionally copy `state.json` across. Dev builds (`make bundle-iced`)
+  keep the `Roost-Iced.app` name and their separate paths.
+- **`roostctl wait` and `roostctl tab prompt` need an event stream.** Against
+  a Roost that serves none they now exit 1 with `unsupported: … update Roost`
+  instead of polling. Only the Swift app lacked one. Compatibility with a
+  server one protocol back is kept until the next protocol bump.
+
+### Added
+
+- **Roost mobile, a first prototype.** An Android app (Flutter + Rust,
+  `mobile/`) that connects to a machine's `roost-session` over Tailscale SSH
+  and shows its projects, tabs and agent state. Open a tab to attach and
+  type, with hardware keys, the soft keyboard, a compose box and quick
+  replies. Opening a tab takes its size, and going to the background hands it
+  back and reconnects on return. Phone and tablet layouts. Hosts need
+  `roost-session` 0.0.27 or later with Tailscale SSH on; there is no key
+  auth yet, so a host behind plain OpenSSH refuses it. Not yet: a
+  notification inbox, Share to Roost, Kitty images, selection and copy. It
+  is not attached to this release: it is coming to the Play Store, and until
+  then it builds from source ([`mobile/README.md`](mobile/README.md)).
+
+### Removed
+
+- **The Swift + AppKit app** and its CI jobs and make targets. Its source,
+  as of v0.0.27, lives on in a separate repository.
+
 ## v0.0.27 — 2026-11-03
 
 _The protocol-7 release: one `roost-session` per machine that every

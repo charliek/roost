@@ -59,6 +59,7 @@ jobs:
       docnav: ${{ steps.filter.outputs.docnav }}
       examples: ${{ steps.filter.outputs.examples }}
       scripts: ${{ steps.filter.outputs.scripts }}
+      mobile: ${{ steps.filter.outputs.mobile }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -232,6 +233,27 @@ jobs:
               - 'mac/keys/**'
               - 'linux/scripts/**'
               - 'Makefile'
+            # Gates `mobile` and `mobile-android`: the Flutter app and every
+            # crate it links or cross-checks for Android, libghostty-vt
+            # (built for Android there too), the scripts and Makefile
+            # targets those jobs run, and the toolchain pins. Not `rust`:
+            # rust-build's `cargo test --workspace` already tests the two
+            # mobile crates on every Rust change, so this stays the Flutter
+            # and NDK cost line.
+            mobile:
+              - 'mobile/**'
+              - 'crates/roost-mobile/**'
+              - 'crates/roost-ssh/**'
+              - 'crates/roost-client/**'
+              - 'crates/roost-ipc/**'
+              - 'crates/roost-ui-model/**'
+              - 'crates/roost-vt/**'
+              - 'third_party/ghostty/**'
+              - 'tools/mobile/**'
+              - 'Cargo.lock'
+              - 'Makefile'
+              - 'rust-toolchain.toml'
+              - '.mise.toml'
 
   rust-lint:
     needs: changes
@@ -2518,6 +2540,183 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # The mobile client on the host: its two Rust crates (the SSH dialer and the
+  # app core, which links libghostty-vt) and the Flutter app's format,
+  # analyze and widget tests. No Android SDK here; that is mobile-android.
+  mobile:
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    # Covers a cold run: the libghostty-vt archive, roost-session (a
+    # roost-ssh dev-dependency), the Flutter SDK download, a codegen compile
+    # on a cache miss and the cargokit build behind the end-to-end test.
+    timeout-minutes: 55
+    env:
+      ROOST_TEST_TIMEOUT_SCALE: "3"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install libclang, the Flutter Linux build deps and Xvfb
+        # libclang: bindgen, for roost-vt's ffi (roost-mobile links it).
+        # GTK 3 + ninja: the app's Linux desktop build; Xvfb: its end-to-end
+        # test.
+        run: >-
+          sudo linux/scripts/ci-apt-install.sh
+          libclang-dev libgtk-3-dev ninja-build xvfb
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: jdx/mise-action@v4
+
+      # The bridge's codegen, pinned to the flutter_rust_bridge version in
+      # crates/roost-mobile and mobile/pubspec.yaml. No prebuilt binary is
+      # published for it; a cache miss compiles it (a few minutes, once per
+      # version).
+      - name: Cache flutter_rust_bridge_codegen
+        id: cache-frb-codegen
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/flutter_rust_bridge_codegen
+          key: frb-codegen-2.13.0-beta.5-${{ runner.os }}
+
+      - name: Install flutter_rust_bridge_codegen
+        if: steps.cache-frb-codegen.outputs.cache-hit != 'true'
+        run: cargo install flutter_rust_bridge_codegen --version 2.13.0-beta.5 --locked
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      - name: cargo nextest (roost-ssh, roost-mobile)
+        run: cargo nextest run -p roost-ssh -p roost-mobile
+
+      # rust-lint's workspace clippy covers these too; repeated so this
+      # lane stands on its own.
+      - name: cargo clippy (roost-ssh, roost-mobile)
+        run: cargo clippy -p roost-ssh -p roost-mobile --all-targets -- -D warnings
+
+      - uses: subosito/flutter-action@v2
+        with:
+          # Pinned exactly, never a drifting `channel: stable` alone.
+          flutter-version: 3.47.2
+          channel: stable
+          cache: true
+
+      - name: Flutter format, analyze, test
+        run: make -C mobile get check
+
+      - name: Bridge bindings match the Rust API (codegen drift)
+        run: make -C mobile frb-check
+
+      # The app, the Rust core through the bridge, and a real roost-session
+      # (built here; private /tmp/rm-* dirs, stopped by PID), under Xvfb.
+      # cargokit builds roost-mobile again in the app's own target dir: the
+      # bulk of this step's time on a cold cache.
+      - name: End to end on the Linux desktop
+        run: make -C mobile test-integration-linux
+
+  # The Android build: libghostty-vt for both ABIs, the Rust crates
+  # cross-checked for Android, then a debug APK for arm64-v8a + x86_64 and the
+  # 16 KB page-alignment gate on every library in it.
+  mobile-android:
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    # Cold: two libghostty-vt cross-builds, two Rust cross-checks, Gradle and
+    # the Flutter SDK download.
+    timeout-minutes: 50
+    env:
+      # Must match ndkVersion in mobile/android/app/build.gradle.kts, so
+      # Gradle and tools/mobile/android-env.sh link with the same NDK.
+      ROOST_NDK_VERSION: 28.2.13676358
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install libclang
+        # bindgen, for roost-vt's ffi cross-checks.
+        run: sudo linux/scripts/ci-apt-install.sh libclang-dev
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: aarch64-linux-android,x86_64-linux-android
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: jdx/mise-action@v4
+
+      # The runner image ships an Android SDK with licenses accepted; add
+      # the pinned NDK to it. ANDROID_NDK_HOME is what android-env.sh and
+      # build.sh read.
+      - name: Install the Android NDK
+        run: |
+          set -euo pipefail
+          sdkmanager="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          # `yes` dies of SIGPIPE when sdkmanager exits; pipefail would fail on it.
+          { yes || true; } | "${sdkmanager}" --install "ndk;${ROOST_NDK_VERSION}" >/dev/null
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${ROOST_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # A key of its own: this one also holds out/<android triple>/, which
+      # the host jobs' entry never has (and a cache hit is never re-saved).
+      - name: Cache vendored libghostty-vt (Android)
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-android-${{ runner.os }}-${{ env.ROOST_NDK_VERSION }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt for Android, cross-check the crates
+        run: make mobile-android-check
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.2
+          channel: stable
+          cache: true
+
+      - name: Debug APK + 16 KB alignment
+        run: make mobile-apk
+
+      # Until the Rust core is wired in (mobile/rust_builder/), the APK is the
+      # Flutter shell alone and this has nothing to look for.
+      - name: The APK carries the Rust core for both ABIs
+        if: hashFiles('mobile/rust_builder/**') != ''
+        run: |
+          set -euo pipefail
+          listing="$(unzip -l mobile/build/app/outputs/flutter-apk/app-debug.apk)"
+          for abi in arm64-v8a x86_64; do
+            grep -q "lib/${abi}/libroost_mobile.so" <<<"${listing}" || {
+              echo "::error::the debug APK has no lib/${abi}/libroost_mobile.so"
+              exit 1
+            }
+          done
+
   # Single required check. Always runs; passes iff no gated job failed (skipped
   # jobs are fine — that's the path-filter doing its job).
   ci-success:
@@ -2525,7 +2724,7 @@ jobs:
     # it is a non-blocking signal lane (see its job comment).
     # tools/roosttest_unit/test_ci_contract.py fails if any other job is
     # missing, so adding a job is this one line.
-    needs: [changes, rust-lint, harness-unit, scripts, rust-build, iced-build-e2e, iced-release, session-e2e]
+    needs: [changes, rust-lint, harness-unit, scripts, rust-build, iced-build-e2e, iced-release, session-e2e, mobile, mobile-android]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
