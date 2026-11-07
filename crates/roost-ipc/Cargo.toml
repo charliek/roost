@@ -46,4 +46,4 @@ tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3.10"
 # Validates tests/ipc-vectors against the schema bundle. No default
 # features: no HTTP or file `$ref` resolution, the bundle is one document.
-jsonschema = { version = "0.56", default-features = false }
+jsonschema = { version = "0.60", default-features = false }
