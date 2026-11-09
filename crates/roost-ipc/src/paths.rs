@@ -549,17 +549,23 @@ impl BundleProfile {
     /// the tab environment: the Claude plugin `CLAUDE_CODE_PLUGIN_DIRS`
     /// names and the opencode plugin `OPENCODE_CONFIG_CONTENT` names.
     ///
-    /// The cache root, like [`Self::files_dir`], and for the same two
-    /// reasons: the Mac state dir has a space in it, which a
-    /// `file://` URL would have to escape, and the contents are
+    /// The cache root, like [`Self::files_dir`]: the contents are
     /// reproducible, so a cache clean costs only a rewrite at the next
     /// tab spawn. Per profile, so the UI and a session each own theirs.
     /// A honoured `ROOST_STATE_DIR` moves it inside the state dir.
+    ///
+    /// Any path here may hold spaces or non-ASCII (a home of
+    /// `/Users/John Smith`), so a `file://` URL built from it must be
+    /// percent-encoded, and one read back percent-decoded.
     pub fn agent_integration_dir(&self) -> anyhow::Result<PathBuf> {
-        self.cache_subdir_with(
-            AGENT_INTEGRATION_DIR_NAME,
-            std::env::var_os(STATE_DIR_ENV).as_deref(),
-        )
+        self.agent_integration_dir_with(std::env::var_os(STATE_DIR_ENV).as_deref())
+    }
+
+    fn agent_integration_dir_with(
+        &self,
+        state_dir_env: Option<&std::ffi::OsStr>,
+    ) -> anyhow::Result<PathBuf> {
+        self.cache_subdir_with(AGENT_INTEGRATION_DIR_NAME, state_dir_env)
     }
 
     fn cache_subdir_with(
@@ -2661,13 +2667,10 @@ mod tests {
         let base = BundleProfile::session().expect("session profile");
         let isolated = Some(std::ffi::OsStr::new("/tmp/roost-isolated-state"));
         assert_eq!(
-            base.cache_subdir_with(AGENT_INTEGRATION_DIR_NAME, isolated)
-                .expect("dir"),
+            base.agent_integration_dir_with(isolated).expect("dir"),
             base.state_dir.join("agent-integration")
         );
-        let cached = base
-            .cache_subdir_with(AGENT_INTEGRATION_DIR_NAME, None)
-            .expect("dir");
+        let cached = base.agent_integration_dir_with(None).expect("dir");
         assert_eq!(
             cached.parent(),
             base.files_dir_with(None).expect("files dir").parent()

@@ -1371,11 +1371,11 @@ fn the_proxy_honors_the_username_override() {
     assert_eq!(run.probes[1]["status"], json!(200));
 }
 
-/// Two copies of the plugin in one opencode process (the old `plugins/`
-/// file beside the env-named one, or an inherited Roost directory beside
-/// this process's own) would forward every event twice. The first copy
-/// to start keeps the process; the second installs no handlers. The
-/// first copy, called again for a second project instance, still does.
+/// Two guarded copies of the plugin in one opencode process (an
+/// inherited Roost directory beside this process's own) would forward
+/// every event twice. The first copy to start keeps the process; the
+/// second installs no handlers. The first copy, called again for a
+/// second project instance, still does.
 #[test]
 fn a_second_copy_of_the_plugin_in_one_process_installs_nothing() {
     if node_is_missing() {

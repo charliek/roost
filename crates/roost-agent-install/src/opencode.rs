@@ -34,13 +34,21 @@ pub fn plugin_path(home: &Home) -> PathBuf {
         .join(roost_agent::opencode::PLUGIN_FILE_NAME)
 }
 
+/// The plugin as v0.1.0 shipped it, which is what this writer puts in
+/// `plugins/`. Frozen, not the current asset, so the file never takes a
+/// byte form no release wrote: removing an old Roost file matches it
+/// against exact known bytes, and a new variant under the same
+/// integration version would be one that table does not list. The
+/// current asset reaches opencode through the tab environment instead.
+const LEGACY_PLUGIN_SOURCE: &str = include_str!("../assets/opencode/roost-agent-state.v3.js");
+
 fn desired() -> Vec<u8> {
     format!(
         "{MARKER}{INTEGRATION_VERSION}\n\
          // Written by `roostctl agent install opencode`; removed by\n\
          // `roostctl agent uninstall opencode`. Local edits are overwritten.\n\
          {plugin}",
-        plugin = roost_agent::opencode::PLUGIN_SOURCE
+        plugin = LEGACY_PLUGIN_SOURCE
     )
     .into_bytes()
 }
@@ -136,7 +144,18 @@ mod tests {
         assert!(is_ours(&bytes));
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains(&format!("integration version {INTEGRATION_VERSION}")));
-        assert!(text.ends_with(roost_agent::opencode::PLUGIN_SOURCE));
+        assert!(text.ends_with(LEGACY_PLUGIN_SOURCE));
+    }
+
+    /// The file is byte for byte the one v0.1.0 wrote (digest taken from
+    /// that release's writer), so it is never a form a removal table
+    /// does not know.
+    #[test]
+    fn the_written_file_is_the_one_v0_1_0_wrote() {
+        assert_eq!(
+            crate::codex_hash::hex(&write::digest(&desired())),
+            "e1656d12bfd59a2ee91f21e148d359caef933bf988e2b6c2197311a4698bd10b"
+        );
     }
 
     /// A prefix test says yes to files that merely start the same way.

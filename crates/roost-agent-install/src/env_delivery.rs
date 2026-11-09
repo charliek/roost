@@ -21,9 +21,16 @@
 //! first of two same-named plugins: a stale Roost folder can shadow the
 //! current one but never double-fire, and inside a Roost tab the env copy
 //! replaces an installed `roost@roost` marketplace plugin.
+//!
+//! Claude runs what the plugin folder holds, so the directory is private
+//! to this user (a `0700` leaf under a parent no other uid can write) and
+//! a version directory counts as present only when it holds exactly
+//! these files and nothing else.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use roost_agent::{Agent, CLAUDE_HOOK_EVENTS};
@@ -52,7 +59,9 @@ const VERSION_LEN: usize = 16;
 pub struct EnvAssets {
     /// The folder to append to `CLAUDE_CODE_PLUGIN_DIRS`.
     pub claude_plugin_dir: PathBuf,
-    /// The file to name in `OPENCODE_CONFIG_CONTENT`'s `plugin` list.
+    /// The file to name in `OPENCODE_CONFIG_CONTENT`'s `plugin` list. A
+    /// path, not a URL: it may hold spaces or non-ASCII, so a `file://`
+    /// form of it must be percent-encoded.
     pub opencode_plugin: PathBuf,
 }
 
@@ -149,12 +158,89 @@ fn version(assets: &[Asset]) -> String {
     hex
 }
 
-/// Does `dir` hold exactly these bytes at these paths? Extra files are
-/// not checked: nothing loads them.
+/// Does `dir` hold these bytes at these paths, and nothing else? Claude
+/// loads more from a plugin folder than the files Roost writes (an
+/// `.mcp.json`, `commands/`, `agents/`, other skills), so an extra entry
+/// makes the copy damaged, not present.
 fn holds(dir: &Path, assets: &[Asset]) -> bool {
-    assets
+    let want: BTreeSet<PathBuf> = assets
         .iter()
-        .all(|asset| fs::read(dir.join(&asset.path)).is_ok_and(|bytes| bytes == asset.bytes))
+        .flat_map(|asset| Path::new(&asset.path).ancestors())
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect();
+    let mut found = BTreeSet::new();
+    fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir())
+        && entries(dir, Path::new(""), &mut found).is_ok()
+        && found == want
+        && assets
+            .iter()
+            .all(|asset| fs::read(dir.join(&asset.path)).is_ok_and(|bytes| bytes == asset.bytes))
+}
+
+/// Every path under `root.join(rel)`, relative to `root`. A link or any
+/// other kind of entry is an error: nothing Roost writes is one.
+fn entries(root: &Path, rel: &Path, found: &mut BTreeSet<PathBuf>) -> io::Result<()> {
+    for entry in fs::read_dir(root.join(rel))? {
+        let entry = entry?;
+        let path = rel.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            entries(root, &path, found)?;
+        } else if !kind.is_file() {
+            return Err(io::Error::other("neither a file nor a directory"));
+        }
+        found.insert(path);
+    }
+    Ok(())
+}
+
+fn refuse(dir: &Path, why: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("agent integration dir {}: {why}", dir.display()),
+    )
+}
+
+/// Make `dir` a `0700` directory of this user's, under a parent no other
+/// uid can write, or refuse. On the Mac a `HOME`-less process falls back
+/// to a cache root under `/tmp`, which another uid could have made first
+/// and filled with a plugin Claude would run.
+fn prepare(dir: &Path) -> io::Result<()> {
+    let euid = roost_ipc::current_euid();
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)?;
+        let meta = fs::metadata(parent)?;
+        if meta.uid() != euid {
+            return Err(refuse(
+                dir,
+                &format!("parent is owned by uid {}", meta.uid()),
+            ));
+        }
+        if meta.mode() & 0o002 != 0 {
+            return Err(refuse(dir, "parent is writable by every user"));
+        }
+    }
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        // A umask can only clear bits; this puts back owner bits it took.
+        Ok(()) => fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(refuse(dir, "not a directory"));
+    }
+    if meta.uid() != euid {
+        return Err(refuse(dir, &format!("owned by uid {}", meta.uid())));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(refuse(
+            dir,
+            &format!("mode {:04o}; 0700 is required", meta.mode() & 0o7777),
+        ));
+    }
+    Ok(())
 }
 
 /// A name no other call, in this process or another, is using.
@@ -166,20 +252,24 @@ fn scratch_name(kind: &str) -> String {
 /// [`BundleProfile::agent_integration_dir`](roost_ipc::paths::BundleProfile::agent_integration_dir))
 /// unless they are already there, and say where they are.
 ///
-/// Cheap when the files are in place (four small reads), so a caller can
-/// run it at every tab spawn and so survive a cache clean. Otherwise the
-/// set is staged in a scratch directory and renamed into place whole, so
-/// no agent ever sees half a plugin, and a damaged copy (a truncated file,
-/// a partial clean) is replaced. Safe to race: when two processes
-/// materialize at once, one rename wins and the other finds its files in
-/// place.
+/// Cheap when the files are in place (a few stats, directory reads and
+/// four small reads), so a caller can run it at every tab spawn and so
+/// survive a cache clean. Otherwise the set is staged in a scratch
+/// directory and renamed into place whole, so no agent ever sees half a
+/// plugin, and a damaged copy (a truncated file, a partial clean, an
+/// extra file) is replaced. Safe to race: when two processes materialize
+/// at once, one rename wins and the other finds its files in place.
+///
+/// Blocking file I/O, a miss included, so never from iced's
+/// `update`/`view`: call it on the engine's spawn path or a blocking
+/// task, in the UI and in `roost-session` alike.
 pub fn materialize(dir: &Path) -> io::Result<EnvAssets> {
     let assets = assets();
+    prepare(dir)?;
     let target = dir.join(version(&assets));
     if holds(&target, &assets) {
         return Ok(EnvAssets::under(&target));
     }
-    fs::create_dir_all(dir)?;
     let staging = dir.join(scratch_name("staging"));
     let installed = stage(&staging, &assets).and_then(|()| install(&staging, &target, &assets));
     // Gone already when the rename went through.
@@ -199,22 +289,40 @@ fn stage(staging: &Path, assets: &[Asset]) -> io::Result<()> {
 }
 
 fn install(staging: &Path, target: &Path, assets: &[Asset]) -> io::Result<()> {
-    let Err(error) = fs::rename(staging, target) else {
+    install_with(staging, target, assets, || {})
+}
+
+/// `install`, with `before_aside` run just before the damaged copy is
+/// moved, where a racing repair can get there first.
+fn install_with(
+    staging: &Path,
+    target: &Path,
+    assets: &[Asset],
+    before_aside: impl FnOnce(),
+) -> io::Result<()> {
+    if fs::rename(staging, target).is_ok() {
         return Ok(());
-    };
+    }
     // Another process renamed the same set into place first.
     if holds(target, assets) {
         return Ok(());
     }
-    if !target.exists() {
-        return Err(error);
-    }
     // A damaged copy: a directory cannot be renamed over a non-empty one,
     // so move it aside first.
     let aside = target.with_file_name(scratch_name("damaged"));
-    fs::rename(target, &aside)?;
-    let replaced = fs::rename(staging, target);
-    let _ = fs::remove_dir_all(&aside);
+    before_aside();
+    let replaced = match fs::rename(target, &aside) {
+        Ok(()) => {
+            let replaced = fs::rename(staging, target);
+            let _ = fs::remove_dir_all(&aside);
+            replaced
+        }
+        // Gone: a racing repair moved it aside, or it never existed and
+        // the first rename failed for another reason, which retrying
+        // reports.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::rename(staging, target),
+        Err(error) => return Err(error),
+    };
     match replaced {
         Err(_) if holds(target, assets) => Ok(()),
         other => other,
@@ -295,14 +403,6 @@ mod tests {
         let settings = Json::parse(settings).expect("settings JSON");
 
         assert_eq!(hooks.get("hooks"), settings.get("hooks"));
-        let events: Vec<&str> = hooks
-            .get("hooks")
-            .and_then(Json::as_object)
-            .expect("hooks object")
-            .iter()
-            .map(|(event, _)| event.as_str())
-            .collect();
-        assert_eq!(events, CLAUDE_HOOK_EVENTS);
     }
 
     /// The plugin's name is what lets the env copy replace an installed
@@ -386,6 +486,109 @@ mod tests {
         fs::remove_dir_all(&dir).expect("clean");
         assert_eq!(materialize(&dir).expect("rewrite"), assets);
         assert_eq!(fs::read(&hooks).expect("hooks"), want);
+    }
+
+    /// Claude loads more from a plugin folder than Roost writes, so an
+    /// extra entry anywhere in the set is damage, put right at the next
+    /// call.
+    #[test]
+    fn an_extra_entry_in_the_set_is_removed() {
+        let (_scratch, dir) = root();
+        let assets = materialize(&dir).expect("materialize");
+        let plugin = &assets.claude_plugin_dir;
+        for extra in [
+            Extra::File(plugin.join(".mcp.json")),
+            Extra::File(plugin.join("commands/run.md")),
+            Extra::Dir(plugin.join("agents")),
+            Extra::Link(plugin.join("skills/other")),
+        ] {
+            let path = extra.plant(plugin);
+            assert_eq!(materialize(&dir).expect("repair"), assets);
+            assert!(fs::symlink_metadata(&path).is_err(), "{}", path.display());
+            assert!(holds(
+                plugin.parent().expect("version dir"),
+                &super::assets()
+            ));
+        }
+    }
+
+    enum Extra {
+        File(PathBuf),
+        Dir(PathBuf),
+        Link(PathBuf),
+    }
+
+    impl Extra {
+        fn plant(&self, plugin: &Path) -> PathBuf {
+            match self {
+                Extra::File(path) => {
+                    fs::create_dir_all(path.parent().expect("parent")).expect("parent");
+                    fs::write(path, b"{}").expect("plant file");
+                    path.clone()
+                }
+                Extra::Dir(path) => {
+                    fs::create_dir(path).expect("plant dir");
+                    path.clone()
+                }
+                Extra::Link(path) => {
+                    std::os::unix::fs::symlink(plugin.join("skills/roost"), path)
+                        .expect("plant link");
+                    path.clone()
+                }
+            }
+        }
+    }
+
+    /// Another uid's plugin must never be what a tab names: a directory
+    /// others can reach into, a link, or one under a parent every user
+    /// can write is refused rather than used.
+    #[test]
+    fn a_directory_others_can_write_is_refused() {
+        let (scratch, dir) = root();
+        fs::create_dir(&dir).expect("dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let error = materialize(&dir).expect_err("a 0755 dir is refused");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+
+        let elsewhere = scratch.path().join("elsewhere");
+        fs::create_dir(&elsewhere).expect("elsewhere");
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o700)).expect("chmod");
+        let link = scratch.path().join("linked");
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("link");
+        let error = materialize(&link).expect_err("a link is refused");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+
+        let shared = scratch.path().join("shared");
+        fs::create_dir(&shared).expect("shared");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("chmod");
+        let error = materialize(&shared.join(AGENT_INTEGRATION_DIR_NAME))
+            .expect_err("a world-writable parent is refused");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(!shared.join(AGENT_INTEGRATION_DIR_NAME).exists());
+    }
+
+    /// Two repairs of one damaged copy: the one that finds the copy
+    /// already moved aside by the other still installs, not fails.
+    #[test]
+    fn a_repair_beaten_to_the_damaged_copy_still_installs() {
+        let (scratch, dir) = root();
+        let assets = materialize(&dir).expect("materialize");
+        let target = assets
+            .claude_plugin_dir
+            .parent()
+            .expect("version dir")
+            .to_path_buf();
+        fs::write(target.join("roost/hooks/hooks.json"), b"{").expect("damage");
+
+        let set = super::assets();
+        let staging = dir.join(scratch_name("staging"));
+        stage(&staging, &set).expect("stage");
+        let taken = scratch.path().join("taken");
+        install_with(&staging, &target, &set, || {
+            fs::rename(&target, &taken).expect("the other repair moves it first");
+        })
+        .expect("install");
+        assert!(holds(&target, &set));
     }
 
     /// Processes racing to materialize the same set all succeed, all

@@ -33,13 +33,17 @@
 import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 
-// One copy of this plugin per opencode process. Two copies load when the
-// file is reachable twice: the old `plugins/` file beside the env-named
-// one, or a stale Roost directory inherited from a parent Roost tab
-// beside this process's own. Both would forward every event, so the
-// first copy to start claims the process and every other copy installs
-// nothing. The claim is per module, not per call: opencode calls one
-// copy once per project instance, and each of those still runs.
+// One copy of this plugin per opencode process, among the copies that
+// carry this guard. Two load when the environment names a stale Roost
+// directory inherited from a parent Roost tab beside this process's own.
+// Both would forward every event, so the first copy to start claims the
+// process and every other copy installs nothing. The claim is per
+// module, not per call: opencode calls one copy once per project
+// instance, and each of those still runs.
+//
+// A copy without the guard is out of its reach. The `plugins/` file
+// older releases wrote has none, so while one sits beside the env copy
+// both forward, and every event arrives twice until it is removed.
 const OWNER = Symbol.for("roost.opencode.agent-state");
 const THIS_COPY = Symbol("roost-agent-state");
 
