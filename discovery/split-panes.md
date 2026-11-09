@@ -602,7 +602,7 @@ out=$(roostctl split --right --json -- sh -c 'git diff --stat; exec $SHELL')
 new=$(printf '%s' "$out" | jq -r .tab.id)
 
 # Start a second agent below me and give it work.
-roostctl split --down --json -- claude
+id=$(roostctl split --down --json -- claude | jq -r .tab.id)
 roostctl tab prompt --tab "$id" "Review the diff in the right pane"
 
 # Read the layout I am in.

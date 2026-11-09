@@ -841,7 +841,11 @@ the selected row is the accent mixed half and half with `#1f1f1f`
 | Yellow | `#8f7310` | 4.54 | 1.04 | 3.08 |
 
 So no fixed alpha of white works for every accent. The count on a selected
-row should use the label's own color.
+row should use the label's own color. That is only as good as the label: a
+bright custom accent such as `chrome-accent = #ffffff` gives a `#8f8f8f` row,
+where the white label itself is 3.23:1. Meeting 4.5:1 there means picking dark
+text on a light row (by the row's luminance), with a bright accent in the
+contrast tests.
 
 **The smallest lifts that reach 4.5:1 at the same hue:**
 
@@ -1162,7 +1166,9 @@ cost.
   instance. On the mini, compare the pill at 2x.
 - **Approach:**
   - (a) Apply the same strip to the pill's display text, through one shared
-    helper made public. Dumps keep the full title. The tab's status dot
+    helper made public, only on a tab an agent owns (the rows' case). The
+    strip is structural, so on a plain tab it would eat a user's `🚀 Deploy`;
+    those keep their title. Dumps keep the full title. The tab's status dot
     already shows the agent's state.
   - (b) Also let #592's macOS fallback list reach chrome. It is installed on
     the shared `FontSystem`, so it does by construction.
@@ -1273,7 +1279,7 @@ This never touches a running Roost or roost-session:
 The runtime dir must be short (SUN_LEN). Stop only the pid you started.
 
 ```bash
-S=<scratch dir>; RT=$(mktemp -d /tmp/claude-1000/rr.XXXX); chmod 700 "$RT"
+S=<scratch dir>; RT=$(mktemp -d /tmp/rr.XXXX); chmod 700 "$RT"
 mkdir -p "$RT/sess" "$S"/{home,cfg,state,data,cache,rstate}; chmod 700 "$RT/sess"
 printf 'local-backend = in-process\nagent-hooks = off\nshow-sidebar-agents = true\n' > "$S/config.conf"
 env -i PATH=/usr/bin:/bin HOME="$S/home" XDG_RUNTIME_DIR="$RT" \
@@ -1282,6 +1288,8 @@ env -i PATH=/usr/bin:/bin HOME="$S/home" XDG_RUNTIME_DIR="$RT" \
   ROOST_TEST_USER_RUNTIME_DIR="$RT" ROOST_WL_WIDTH=1400 ROOST_WL_HEIGHT=900 SHELL=/bin/bash \
   tools/wayland/weston-run.sh target/debug/roost-iced &
 C="env -i PATH=/usr/bin:/bin target/debug/roostctl --socket $RT/roost-iced/roost.sock"
+for _ in $(seq 120); do $C identify >/dev/null 2>&1 && break; sleep 0.5; done
+$C identify >/dev/null || { echo "UI never answered on $RT/roost-iced/roost.sock" >&2; exit 1; }
 # check the log's "Selected: AdapterInfo" says Vulkan/llvmpipe, not GL
 $C open --project mobile-client-android-tablet-experiments --cwd "$S/home"
 $C tab report --tab <id> --source probe --session-id s --claim --lifecycle failed --title "Build failed"

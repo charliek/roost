@@ -137,7 +137,7 @@ Item numbers are stable. Other notes cite them (for example "item 13").
 | 5 | Configurable scrollback | feature | High: silent history loss | S–M | #707 | B |
 | 6 | `roostctl` on PATH on macOS, for the skill | bug-ish | High for agent users on a Mac | S–M | #261 | C |
 | 7 | Jump to previous / next prompt | feature | Medium-high | S | #169 | B |
-| 8 | Clear a dead agent's state when the shell is back | agent | High; recommended in agent-integration key question 12 | M | #519, #621 | agent-integration Phase 3 |
+| 8 | Clear a dead agent's state when the shell is back | agent | High; decided yes in agent-integration key question 12 (2026-11-08) | M | #519, #621 | agent-integration Phase 3 |
 | 9 | Terminal right-click menu | feature | Medium-high for new users | S–M | #165 | D |
 | 10 | Clickable `path:line` | feature | Medium-high: agents print these all day | M | #708 | E |
 | 11 | Reload config without a restart | feature | Medium: in-process restarts kill shells | M | #709 | E |
@@ -208,7 +208,7 @@ release. Nothing here needs a ruling or a protocol bump.
    - `themes.md:10,80` say themes need a restart; Select Theme applies live.
    - `installation.md:7-12` names the apt repo without the commands, which are only
      in `README.md`.
-5. **#712.** On Linux, check `DISPLAY` / `WAYLAND_DISPLAY` before the locks and
+5. **#712.** On Linux, check `DISPLAY` / `WAYLAND_DISPLAY` / `WAYLAND_SOCKET` before the locks and
    `App::bootstrap` (`crates/roost-iced/src/main.rs:463-500`); print a hint and exit.
 6. **#716 grok `app=grok`.** grok 1.0.77 reports `app=grok`, so today every grok hook
    claim is dropped as `ForeignApp` and its row reads `grok`. Map `grok` in
@@ -268,8 +268,9 @@ release. Nothing here needs a ruling or a protocol bump.
 ### Plan B: Scrollback and find (with the Ghostty pin bump)
 
 **Goal.** Keep enough history for agent transcripts, make it searchable, and let
-users jump prompt to prompt. Search is an op, so `roostctl`, agents and the mobile
-client get it too.
+users jump prompt to prompt. Search is a UI op, so `roostctl` and agents that reach
+the UI get it too. A headless session client, such as the mobile app, has no UI mirror
+to search; session-side search is out of scope below.
 
 **In scope, in order.**
 1. **Ghostty pin bump** from `6ba14415` to current main, as its own PR (the precedent
@@ -297,7 +298,7 @@ client get it too.
 **Out of scope.**
 - Scrollback that survives a restart (L, unfiled; #363 closed with it open).
 - Idle scrollback compression (#366).
-- Searching on the session side for host tabs.
+- Searching on the session side (for a headless client or the mobile app).
 
 **Complexity.** L: the bump, then two or three feature commits.
 
@@ -596,9 +597,9 @@ The repo has no `XXX`, `FIXME` or `HACK` markers to mine.
 4. Plan B: scrollback default, in lines or bytes? Must session and mirror caps always
    match?
 5. Agent-integration Phase 3: end ownership once the agent's process is gone (#621,
-   #519)? Asked there as key question 12, in user terms, with a recommendation of
-   yes ([Ownership after an agent dies](agent-integration.md#ownership-after-an-agent-dies)).
-   Listed for completeness.
+   #519)? **Decided yes** (Charlie, 2026-11-08) as key question 12 there
+   ([Ownership after an agent dies](agent-integration.md#ownership-after-an-agent-dies)).
+   Listed for completeness; not open.
 6. Resume on restore: on by default, offered, or not at all? (Agent-integration
    Phase 7.)
 7. Should a font zoom persist as the next launch's baseline, as it does since

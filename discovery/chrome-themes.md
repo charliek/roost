@@ -338,8 +338,9 @@ below); it needs the portal reader the deferred light/dark plan would build.
   `pill_height`, `agent_row_height`, `footer_height`.
 - **Harnesses:** replace the hard-coded 32 / 42 / 44 in the four files above with reads
   from that block. Land this first, so the default lanes prove nothing moved.
-- **Unit invariants:** for `s` from 10/13 to 24/13 and `d` in {1, 1.25, 1.5, 2}, every
-  height is whole in device px and derived sums hold.
+- **Unit invariants:** for `s` from 10/13 to 24/13 except the default 13/13, and `d` in
+  {1, 1.25, 1.5, 2}, every height is whole in device px and derived sums hold. At 13/13
+  the default rule wins (`new(13.0, d) == BASE`), so 42 at 1.25 stays 52.5 device px.
 - **e2e** (palette-driven, like `test_z_typography.py`): activate `chrome_size_increase`;
   assert `chrome.band_height` and `terminal_top` grew, rows shrank, and `config.conf` holds
   `chrome-font-size`; reset and assert byte-equal geometry.
