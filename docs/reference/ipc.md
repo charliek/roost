@@ -2981,7 +2981,7 @@ collapsed); the empty-state row
 
 | Op | Request params | Notes |
 |---|---|---|
-| `palette.open` | `{"kind": "commands"}` | `kind`: `""`/`commands` → command palette; `launcher` → custom-command launcher; `custom` → the script-backed provider palette; `agents` → the agent-jump palette; `notifications` → the notification inbox; `host_targets` → the host picker. Other values → `invalid-param`. |
+| `palette.open` | `{"kind": "commands"}` | `kind`: `""`/`commands` → command palette; `launcher` → custom-command launcher; `custom` → the script-backed provider palette; `agents` → the agent-jump palette. Other values → `invalid-param` (`notifications` and `host_targets` are frame ids, not openable kinds). |
 | `palette.state` | `{}` | Read the current state. |
 | `palette.query` | `{"query": "theme"}` | Set the current frame's filter (resets selection to the top match). |
 | `palette.activate` | `{"id": "new_tab"}` | Confirm the visible row with this id — runs its command or drills into its sub-frame. `not-found` if no palette is open or no row matches. |

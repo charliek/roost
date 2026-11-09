@@ -615,9 +615,9 @@ pub struct TabDumpResult {
 /// `palette.open` params: which root frame to present. Empty or
 /// `"commands"` opens the command palette, `"launcher"` the
 /// custom-command launcher, `"custom"` the script-backed provider
-/// palette, `"agents"` the agent-jump palette, `"notifications"` the
-/// notification inbox and `"host_targets"` the host picker. An unknown
-/// kind is rejected `invalid-param`.
+/// palette and `"agents"` the agent-jump palette. Any other kind is
+/// rejected `invalid-param`; `notifications` and `host_targets` are
+/// frame ids a palette can show, not kinds `palette.open` accepts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PaletteOpenParams {
