@@ -193,9 +193,7 @@ The one-time setup, the helper's commands and its accepted limits live in
 The single required check is `ci-success`, which derives its membership
 from its own `needs:` list (`tools/roosttest_unit/test_ci_contract.py`
 fails if a job is missing from it) — the `changes` path-filter job
-plus the required ones below. (The table's last row,
-`e2e-iced-wayland-drag`, is a non-blocking signal lane and is
-deliberately *not* in `needs`.) `changes` and `ci-success` always
+plus every job below. `changes` and `ci-success` always
 run; every other job is conditionally gated on `changes`' outputs, so a
 PR pays only for what it touches.
 
@@ -208,7 +206,7 @@ PR pays only for what it touches.
 | `iced-build-e2e` | Six cells: ubuntu × (wgpu, tiny-skia) × (X11, Wayland), and macOS × (wgpu, tiny-skia). Each builds. The **wgpu** cells carry the full coverage: the X11 and macOS wgpu cells also run the unit tests, clippy and the toolkit-boundary check; then functional E2E under the cell's display (X11 via xvfb, **Wayland** via headless weston, or macOS), plus the exit-on-empty, menu-quit and (X11) real-input clipboard lanes, the six host-session client lanes (below), and (macOS) the bundle-identity, smoke, DMG and Sparkle lanes. The **tiny-skia** cells (the GPU-less fallback renderer) run only `ICED_RENDERER_E2E_TESTS` (`make e2e-iced-renderer`): smoke, the pixel modules, Kitty images, IME and the agent panel's divider check | ✅ |
 | `iced-release` | Release-profile build, the real `.deb`, a release-binary E2E subset, packaged-profile assertion, artifact smoke, dependency-closure check | ✅ |
 | `session-e2e` | The headless host-session lanes — `roost-session` driven with no UI and no display (`SESSION_E2E_TESTS`, marker-based rather than an enumerated CI list) | ✅ |
-| `e2e-iced-wayland-drag` | `roost-iced` fullscreen under `cage` with a real `/dev/uinput` seat — the pointer-drag + system-clipboard guard the IPC-driven Wayland lane cannot cover | ❌ soft (`continue-on-error`, absent from `ci-success`) |
+| `e2e-iced-wayland-drag` | `roost-iced` fullscreen under `cage` with a real `/dev/uinput` seat — the pointer-drag + system-clipboard guard the IPC-driven Wayland lane cannot cover | ✅ |
 
 **The six host-session client lanes inside `iced-build-e2e`.** They
 need a UI *and* a `roost-session` daemon, so they are in neither
