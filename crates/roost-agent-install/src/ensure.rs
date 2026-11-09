@@ -256,6 +256,10 @@ pub struct Status {
     pub files: Vec<std::path::PathBuf>,
     pub skipped: Option<SkipReason>,
     pub warnings: Vec<crate::error::Warning>,
+    /// Switched on in `agent-integration` (or the legacy answer while
+    /// that key is absent): what the tab environment and the settings
+    /// card go by. [`Self::allowed`] is the file shadow.
+    pub on: bool,
     /// What the retire did for this agent, with the entries it left.
     pub retired: Option<crate::retire::Retired>,
     /// The retire finished, and an exact Roost entry is back on disk.
@@ -410,10 +414,30 @@ pub fn raise(
     Ok(outcome)
 }
 
-/// Set the `agent-hooks` key to exactly `mode`, then bring this
+/// What [`set_hooks`] writes for `mode`: `agent-integration` names
+/// every agent that is on, whatever its delivery, and `agent-hooks`
+/// becomes the shadow older builds and the file `ensure` read, the agents
+/// this build delivers by file (or `off`), so neither puts back an entry
+/// the retire took out.
+pub fn keys_for(home: &Home, mode: &Mode) -> (String, AgentHooks) {
+    let integration = crate::retire::integration_from(&mode.to_config());
+    let shadow = match mode {
+        Mode::Allow(agents) => Mode::Allow(
+            agents
+                .iter()
+                .copied()
+                .filter(|agent| home.wires_by_file(*agent))
+                .collect(),
+        ),
+        Mode::Off => Mode::Off,
+    };
+    (integration, shadow.to_config())
+}
+
+/// Set the agent keys to exactly `mode` ([`keys_for`]), then bring this
 /// machine's files in line with it.
 ///
-/// The key is written **first and under the same lock**: a partial
+/// The keys are written **first and under the same lock**: a partial
 /// reconcile leaves the permission durable (a later `roostctl agent
 /// ensure` retries what failed), where a key written afterwards would be
 /// lost by every failure and by any concurrent [`raise`]. A key that
@@ -431,8 +455,9 @@ pub fn set_hooks(
     // a token this build cannot name goes with the rest of the old value.
     // That is the difference between an explicit local answer and a
     // raise — the user is looking at the list they just chose.
-    let desired = mode.to_config();
-    let wrote = write_hooks(home, &read_hooks(home)?, &desired, &lock)?;
+    let (integration, desired) = keys_for(home, mode);
+    let mut wrote = write_integration(home, &integration, &lock)?;
+    wrote |= write_hooks(home, &read_hooks(home)?, &desired, &lock)?;
     let mut outcome = reconcile_locked(home, mode, by, guard, &FILE_AGENTS, &lock)
         .map_err(|source| after_key(&desired, source))?;
     outcome.wrote |= wrote;
@@ -604,6 +629,7 @@ pub fn uninstall(home: &Home, agents: &[Agent], guard: Guard) -> Result<Outcome,
 pub fn status(home: &Home, mode: &Mode) -> Result<Vec<Status>, InstallError> {
     let (record, _) = state::load(home)?;
     let tombstones = crate::retire::load(home)?;
+    let switches = crate::retire::switches(home)?;
     ALL_AGENTS
         .into_iter()
         .map(|agent| {
@@ -635,6 +661,7 @@ pub fn status(home: &Home, mode: &Mode) -> Result<Vec<Status>, InstallError> {
                     None => Some(SkipReason::NotPresent),
                 },
                 warnings: plan.map(|p| p.warnings).unwrap_or_default(),
+                on: switches.on(agent),
                 retired: tombstones.get(agent.source()).cloned(),
                 came_back: present && crate::retire::came_back(home, agent, &tombstones),
             })
@@ -680,6 +707,22 @@ fn write_hooks(
         .to_config_value()
         .expect("a Mode is never Ask, and only Ask has no config value");
     roost_ui_model::config::set_key_locked(lock, path, "agent-hooks", &value)
+        .map_err(|e| InstallError::io(path, e))?;
+    Ok(true)
+}
+
+/// Write `agent-integration`, unless it already says exactly `value`.
+fn write_integration(home: &Home, value: &str, lock: &ConfigLock) -> Result<bool, InstallError> {
+    let path = home.config_path();
+    let current = match std::fs::read_to_string(path) {
+        Ok(text) => RoostConfig::parse(&text).agent_integration,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(InstallError::io(path, e)),
+    };
+    if current == roost_ui_model::config::AgentIntegration::parse(value) {
+        return Ok(false);
+    }
+    roost_ui_model::config::set_key_locked(lock, path, "agent-integration", value)
         .map_err(|e| InstallError::io(path, e))?;
     Ok(true)
 }

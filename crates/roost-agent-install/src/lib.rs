@@ -106,8 +106,8 @@ mod acceptance;
 pub use codex::{trust_entries, TrustEntry};
 pub use command::{installed_command, is_roost_command, owned_commands, INTEGRATION_VERSION};
 pub use ensure::{
-    agent_names, ensure, install, plan, raise, reconcile, reconcile_file_agents, resolve_names,
-    set_hooks, status, Mode, Outcome, Status, FILE_AGENTS,
+    agent_names, ensure, install, keys_for, plan, raise, reconcile, reconcile_file_agents,
+    resolve_names, set_hooks, status, Mode, Outcome, Status, FILE_AGENTS,
 };
 pub use error::{AgentError, AgentSkip, AgentWarning, InstallError, SkipReason, Warning};
 pub use home::Home;

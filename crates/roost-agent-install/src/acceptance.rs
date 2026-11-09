@@ -2223,6 +2223,76 @@ mod retire_cases {
         assert_eq!(key_line(&home, "agent-integration").as_deref(), Some("off"));
         assert_eq!(key_line(&home, "agent-hooks").as_deref(), Some("off"));
         assert_eq!(outcome.unnoticed, outcome.retired);
+        assert!(outcome.carried_off, "the one-time \"they stay off\" notice");
+        assert!(!retire_now(&home).carried_off, "it is said once");
+    }
+
+    /// Only a carried-over `off` earns the "they stay off" notice.
+    #[test]
+    fn a_carried_over_list_is_not_off() {
+        let (_dir, home) = cursor_home(Some("agent-hooks = claude, cursor"));
+        assert!(!retire_now(&home).carried_off);
+        let (_dir, home) = cursor_home(Some("agent-integration = off"));
+        assert!(!retire_now(&home).carried_off, "nothing was carried over");
+    }
+
+    /// A deferred retire still owes this machine the notice of a retire
+    /// the local session's own start already did.
+    #[test]
+    fn a_deferred_retire_reports_the_sessions_unannounced_retire() {
+        let (_dir, home) = cursor_home(Some("agent-hooks = off"));
+        let done = retire_now(&home);
+        assert!(!done.unnoticed.is_empty());
+        let deferred = retire::retire(&home, Guard::PERMITTED, true).unwrap();
+        assert!(deferred.deferred);
+        assert_eq!(deferred.unnoticed, done.unnoticed);
+        retire::mark_noticed(&home, &deferred.unnoticed).unwrap();
+        assert!(retire::retire(&home, Guard::PERMITTED, true)
+            .unwrap()
+            .unnoticed
+            .is_empty());
+    }
+
+    /// The card's Apply and `agent set` say which agents are on in
+    /// `agent-integration`, which is what the tab environment reads, and
+    /// narrow `agent-hooks` to the file agents, so neither this build's
+    /// ensure nor an older one wires Claude by file again.
+    #[test]
+    fn set_hooks_writes_the_switches_and_the_file_shadow() {
+        let (_dir, home) = cursor_home(Some("agent-integration = -opencode"));
+        retire_now(&home);
+        let read = |home: &Home| {
+            let text = std::fs::read_to_string(home.config_path()).unwrap();
+            let switches = roost_ui_model::config::AgentSwitches::read(&text);
+            ALL_AGENTS
+                .into_iter()
+                .filter(|agent| switches.on(*agent))
+                .collect::<Vec<_>>()
+        };
+
+        ensure::set_hooks(
+            &home,
+            &allow(&[Agent::Claude, Agent::Opencode]),
+            "local",
+            Guard::PERMITTED,
+        )
+        .unwrap();
+        assert_eq!(read(&home), [Agent::Claude, Agent::Opencode]);
+        assert_eq!(key_line(&home, "agent-hooks").as_deref(), Some("off"));
+
+        ensure::set_hooks(
+            &home,
+            &allow(&[Agent::Codex, Agent::Cursor]),
+            "local",
+            Guard::PERMITTED,
+        )
+        .unwrap();
+        assert_eq!(read(&home), [Agent::Codex, Agent::Cursor]);
+        assert_eq!(key_line(&home, "agent-hooks").as_deref(), Some("cursor"));
+
+        ensure::set_hooks(&home, &ensure::Mode::Off, "local", Guard::PERMITTED).unwrap();
+        assert!(read(&home).is_empty());
+        assert_eq!(key_line(&home, "agent-integration").as_deref(), Some("off"));
     }
 
     /// An older session still serves this machine: nothing moves.

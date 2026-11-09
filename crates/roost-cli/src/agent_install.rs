@@ -830,6 +830,7 @@ mod tests {
             files: vec!["/home/u/.codex/hooks.json".into()],
             skipped: None,
             warnings: Vec::new(),
+            on: true,
             retired: None,
             came_back: false,
         }

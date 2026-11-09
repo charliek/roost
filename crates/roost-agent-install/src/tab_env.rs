@@ -178,6 +178,60 @@ pub fn read_policy_record(dir: &Path) -> Option<PolicyRecord> {
     serde_json::from_slice(&fs::read(dir.join(POLICY_RECORD)).ok()?).ok()
 }
 
+/// The Claude policy as a reader that runs no probe sees it (doctor,
+/// `roostctl agent status`, the settings card): a managed-settings file
+/// or Claude's cached server settings under `home` that set
+/// `disableSideloadFlags`, else the last verdict any serving process on
+/// this machine recorded (a block first, since one serving process is
+/// enough for Claude to be skipped in its tabs). `None` when nothing
+/// has been recorded.
+pub fn claude_policy_here(home: &crate::Home) -> Option<ClaudePolicy> {
+    let records: Vec<PathBuf> = [
+        roost_ipc::paths::BundleProfileKind::Mac,
+        roost_ipc::paths::BundleProfileKind::Linux,
+        roost_ipc::paths::BundleProfileKind::Iced,
+        roost_ipc::paths::BundleProfileKind::Session,
+    ]
+    .into_iter()
+    .filter_map(|kind| BundleProfile::for_kind(kind).ok()?.agent_integration_dir().ok())
+    .collect();
+    let managed: Vec<PathBuf> = MANAGED_SETTINGS_DIRS.iter().map(PathBuf::from).collect();
+    claude_policy_from(
+        &managed,
+        &home.agent_dir(Agent::Claude).join("remote-settings.json"),
+        &records,
+    )
+}
+
+fn claude_policy_from(
+    managed: &[PathBuf],
+    remote_settings: &Path,
+    records: &[PathBuf],
+) -> Option<ClaudePolicy> {
+    if let Some(file) = managed_block(managed) {
+        return Some(ClaudePolicy::Blocked(format!(
+            "disableSideloadFlags in {}",
+            file.display()
+        )));
+    }
+    if remote_block(remote_settings) {
+        return Some(ClaudePolicy::Blocked(format!(
+            "disableSideloadFlags in {}",
+            remote_settings.display()
+        )));
+    }
+    let recorded: Vec<ClaudePolicy> = records
+        .iter()
+        .filter_map(|dir| read_policy_record(dir))
+        .map(|record| record.policy)
+        .collect();
+    recorded
+        .iter()
+        .find(|policy| policy.blocks())
+        .or_else(|| recorded.first())
+        .cloned()
+}
+
 /// The managed-settings file under `roots` that sets
 /// `disableSideloadFlags`, applying the base file and then its drop-ins
 /// in name order, as Claude does: a later file's value wins.
@@ -1030,6 +1084,50 @@ mod tests {
             fs::write(&remote, r#"{"settings":{"disableSideloadFlags":false}}"#).unwrap();
             assert_eq!(roost_dirs(&world.tab("", &[])).len(), 1, "{cached}");
         }
+    }
+
+    /// A reader with no probe of its own: the files that set the policy
+    /// first, then any serving process's block over another's allow.
+    #[test]
+    fn a_reader_sees_any_serving_process_block() {
+        let root = tempfile::tempdir().unwrap();
+        let record = |name: &str, policy: ClaudePolicy| {
+            let dir = root.path().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            let record = PolicyRecord {
+                policy,
+                remote_settings_cached: false,
+            };
+            fs::write(dir.join(POLICY_RECORD), serde_json::to_vec(&record).unwrap()).unwrap();
+            dir
+        };
+        let ui = record("ui", ClaudePolicy::Allowed);
+        let session = record("session", ClaudePolicy::Blocked("probe".into()));
+        let managed = root.path().join("managed");
+        let remote = root.path().join("remote-settings.json");
+
+        let read = |records: &[PathBuf]| claude_policy_from(&[managed.clone()], &remote, records);
+        assert_eq!(read(&[]), None);
+        assert_eq!(read(&[ui.clone()]), Some(ClaudePolicy::Allowed));
+        assert_eq!(
+            read(&[ui.clone(), session.clone()]),
+            Some(ClaudePolicy::Blocked("probe".into()))
+        );
+
+        fs::write(&remote, r#"{"settings":{"disableSideloadFlags":true}}"#).unwrap();
+        assert!(read(&[ui.clone()]).is_some_and(|p| p.blocks()));
+        fs::remove_file(&remote).unwrap();
+
+        fs::create_dir_all(&managed).unwrap();
+        fs::write(
+            managed.join("managed-settings.json"),
+            r#"{"disableSideloadFlags":true}"#,
+        )
+        .unwrap();
+        let Some(ClaudePolicy::Blocked(why)) = read(&[ui]) else {
+            panic!("a managed file must block");
+        };
+        assert!(why.contains("managed-settings.json"), "{why}");
     }
 
     /// With no verdict at all, a spawn waits (boundedly) for the first

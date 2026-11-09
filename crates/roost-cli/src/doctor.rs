@@ -6288,6 +6288,7 @@ mod tests {
                     files: Vec::new(),
                     skipped: None,
                     warnings: Vec::new(),
+                    on: true,
                     retired: None,
                     came_back: false,
                 })
@@ -7544,6 +7545,7 @@ mod tests {
             files: Vec::new(),
             skipped,
             warnings,
+            on: true,
             retired: None,
             came_back: false,
         }

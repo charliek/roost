@@ -197,7 +197,9 @@ pub fn needed(agent: Agent, switches: &AgentSwitches) -> bool {
     agent == Agent::Cursor && (switches.on(agent) || !answered(switches))
 }
 
-fn answered(switches: &AgentSwitches) -> bool {
+/// Whether the user has given any answer: either key set. Until then
+/// Cursor's opt-in is the one question still open.
+pub fn answered(switches: &AgentSwitches) -> bool {
     switches.integration.is_some() || !matches!(switches.legacy, AgentHooks::Ask)
 }
 
@@ -318,6 +320,10 @@ pub struct RetireOutcome {
     /// `config.conf` could not take the carry-over. The removals and the
     /// tombstones stand; the keys are written at the next run.
     pub key_error: Option<InstallError>,
+    /// This run carried a legacy `agent-hooks = off` over to
+    /// `agent-integration = off`. It happens once, so it is what the
+    /// one-time "they stay off" notice keys on.
+    pub carried_off: bool,
     pub wrote: bool,
 }
 
@@ -329,8 +335,11 @@ pub struct RetireOutcome {
 pub fn retire(home: &Home, guard: Guard, defer: bool) -> Result<RetireOutcome, InstallError> {
     guard.check()?;
     if defer {
+        // The session's own start may already have retired: its notice
+        // is still this machine's to show.
         return Ok(RetireOutcome {
             deferred: true,
+            unnoticed: unnoticed(&load(home)?),
             ..RetireOutcome::default()
         });
     }
@@ -464,7 +473,10 @@ fn retire_locked(
     outcome.wrote |= state::save(home, &record)?;
     outcome.wrote |= save(home, &tombstones)?;
     match carry_over(home, &switches, lock) {
-        Ok(wrote) => outcome.wrote |= wrote,
+        Ok(carried) => {
+            outcome.wrote |= carried.wrote;
+            outcome.carried_off = carried.from_off;
+        }
         Err(error) => outcome.key_error = Some(error),
     }
     outcome.unnoticed = unnoticed(&tombstones);
@@ -473,7 +485,7 @@ fn retire_locked(
 
 /// The two agent keys in this home's `config.conf`; an absent file
 /// answers nothing.
-fn switches(home: &Home) -> Result<AgentSwitches, InstallError> {
+pub fn switches(home: &Home) -> Result<AgentSwitches, InstallError> {
     match std::fs::read_to_string(home.config_path()) {
         Ok(text) => Ok(AgentSwitches::read(&text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AgentSwitches::default()),
@@ -518,19 +530,20 @@ fn carry_over(
     home: &Home,
     switches: &AgentSwitches,
     lock: &ConfigLock,
-) -> Result<bool, InstallError> {
+) -> Result<CarriedOver, InstallError> {
     if !answered(switches) {
-        return Ok(false);
+        return Ok(CarriedOver::default());
     }
     let path = home.config_path();
     let set = |key: &str, value: &str| {
         roost_ui_model::config::set_key_locked(lock, path, key, value)
             .map_err(|e| InstallError::io(path, e))
     };
-    let mut wrote = false;
+    let mut carried = CarriedOver::default();
     if switches.integration.is_none() {
         set("agent-integration", &integration_from(&switches.legacy))?;
-        wrote = true;
+        carried.wrote = true;
+        carried.from_off = switches.legacy == AgentHooks::Off;
     }
     let shadow = if switches.on(Agent::Cursor) {
         AgentHooks::allow([Agent::Cursor.source()])
@@ -542,15 +555,21 @@ fn carry_over(
             .to_config_value()
             .expect("an allow-list or off always has a spelling");
         set("agent-hooks", &value)?;
-        wrote = true;
+        carried.wrote = true;
     }
-    Ok(wrote)
+    Ok(carried)
+}
+
+#[derive(Debug, Default)]
+struct CarriedOver {
+    wrote: bool,
+    from_off: bool,
 }
 
 /// An answered `agent-hooks` spelled as `agent-integration`: what it
 /// listed is on and every default-on agent it left out is off, so the
 /// carry-over changes nothing about which agents are on.
-fn integration_from(legacy: &AgentHooks) -> String {
+pub(crate) fn integration_from(legacy: &AgentHooks) -> String {
     let AgentHooks::Allow { agents, unknown } = legacy else {
         return "off".to_string();
     };

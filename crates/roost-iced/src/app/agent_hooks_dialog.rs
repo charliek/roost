@@ -448,6 +448,7 @@ mod tests {
             files: roost_agent_install::owned_files(&Home::rooted("/home/u"), agent),
             skipped: None,
             warnings: Vec::new(),
+            on: true,
             retired: None,
             came_back: false,
         }
