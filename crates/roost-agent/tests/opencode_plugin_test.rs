@@ -1370,3 +1370,57 @@ fn the_proxy_honors_the_username_override() {
     assert_eq!(run.probes[0]["status"], json!(401));
     assert_eq!(run.probes[1]["status"], json!(200));
 }
+
+/// Two copies of the plugin in one opencode process (the old `plugins/`
+/// file beside the env-named one, or an inherited Roost directory beside
+/// this process's own) would forward every event twice. The first copy
+/// to start keeps the process; the second installs no handlers. The
+/// first copy, called again for a second project instance, still does.
+#[test]
+fn a_second_copy_of_the_plugin_in_one_process_installs_nothing() {
+    if node_is_missing() {
+        return;
+    }
+    let scratch = tempfile::tempdir().expect("scratch tree");
+    let dir = scratch.path();
+    for copy in ["a", "b"] {
+        fs::create_dir(dir.join(copy)).expect("copy dir");
+        write(&dir.join(copy).join("roost-agent-state.js"), PLUGIN);
+    }
+    write(&dir.join("package.json"), "{ \"type\": \"module\" }\n");
+    write(
+        &dir.join("copies.mjs"),
+        r#"
+import { RoostAgentState as first } from "./a/roost-agent-state.js";
+import { RoostAgentState as second } from "./b/roost-agent-state.js";
+const keys = async (plugin) => Object.keys(await plugin({})).sort();
+const a = await keys(first);
+const b = await keys(second);
+const again = await keys(first);
+console.log(JSON.stringify({ a, b, again }));
+"#,
+    );
+
+    let out = Command::new("node")
+        .arg("copies.mjs")
+        .current_dir(dir)
+        .env("ROOST_AGENT_HOOK", dir.join("no-such-hook"))
+        .env("ROOST_TAB_ID", "7")
+        .env("ROOST_SOCKET", dir.join("roost.sock"))
+        .output()
+        .expect("node runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let seen: Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        seen,
+        json!({
+            "a": ["dispose", "event"],
+            "b": [],
+            "again": ["dispose", "event"],
+        })
+    );
+}
