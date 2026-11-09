@@ -244,13 +244,7 @@ pub(crate) fn retire_line(agents: &[Agent], leftovers: usize) -> Option<String> 
     if agents.is_empty() {
         return None;
     }
-    let label = |agent: &Agent| match agent {
-        Agent::Claude => "Claude Code",
-        Agent::Codex => "Codex",
-        Agent::Grok => "Grok",
-        Agent::Cursor => "Cursor",
-        Agent::Opencode => "OpenCode",
-    };
+    let label = |agent: &Agent| roost_ui_model::agent_palette::agent_display_name(agent.source());
     let env: Vec<&str> = agents
         .iter()
         .filter(|a| matches!(a, Agent::Claude | Agent::Opencode))

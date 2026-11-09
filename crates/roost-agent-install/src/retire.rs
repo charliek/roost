@@ -173,14 +173,19 @@ pub fn load(home: &Home) -> Result<Tombstones, InstallError> {
 }
 
 fn save(home: &Home, tombstones: &Tombstones) -> Result<bool, InstallError> {
-    let path = tombstone_path(home);
-    let mut text = serde_json::to_string_pretty(tombstones)
-        .map_err(|e| InstallError::io(&path, std::io::Error::other(e)))?;
+    save_json(&tombstone_path(home), tombstones)
+}
+
+/// Write `value` as pretty JSON, private, unless the file already says
+/// exactly that.
+fn save_json(path: &Path, value: &impl Serialize) -> Result<bool, InstallError> {
+    let mut text = serde_json::to_string_pretty(value)
+        .map_err(|e| InstallError::io(path, std::io::Error::other(e)))?;
     text.push('\n');
-    if std::fs::read(&path).ok().as_deref() == Some(text.as_bytes()) {
+    if std::fs::read(path).ok().as_deref() == Some(text.as_bytes()) {
         return Ok(false);
     }
-    write::write_atomic(&path, text.as_bytes(), PRIVATE_MODE)?;
+    write::write_atomic(path, text.as_bytes(), PRIVATE_MODE)?;
     Ok(true)
 }
 
@@ -432,9 +437,12 @@ fn retire_locked(
             outcome.wrote = true;
         }
         // The record's facts (files created, codex's flag pre-image) are
-        // what an explicit uninstall of a leftover still needs.
-        if entry.complete && entry.leftovers.is_empty() && record.remove(agent.source()).is_some() {
-            outcome.wrote = true;
+        // what an explicit uninstall of a leftover still needs. A kept
+        // entry is never announced as wired: the agent no longer is.
+        if entry.complete && entry.leftovers.is_empty() {
+            outcome.wrote |= record.remove(agent.source()).is_some();
+        } else if let Some(kept) = record.get_mut(agent.source()) {
+            kept.noticed = true;
         }
         outcome
             .leftovers
@@ -602,10 +610,7 @@ fn backup(
         made.push(path);
     }
 
-    let mut text = serde_json::to_string_pretty(&index)
-        .map_err(|e| InstallError::io(&index_path, std::io::Error::other(e)))?;
-    text.push('\n');
-    write::write_atomic(&index_path, text.as_bytes(), PRIVATE_MODE)?;
+    save_json(&index_path, &index)?;
     Ok(made)
 }
 

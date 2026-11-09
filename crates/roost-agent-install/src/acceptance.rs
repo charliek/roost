@@ -1838,6 +1838,8 @@ mod retire_cases {
     fn a_changed_timeout_is_left_as_edited() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::rooted(dir.path());
+        std::fs::create_dir_all(home.agent_dir(Agent::Claude)).unwrap();
+        ensure::install(&home, &[Agent::Claude], "local", Guard::PERMITTED).unwrap();
         write_claude(
             &home,
             vec![("Stop", vec![group(vec![handler(Agent::Claude, 30)])])],
@@ -1849,6 +1851,11 @@ mod retire_cases {
         assert_eq!(claude_text(&home), before);
         // The leftover keeps the record's facts for an explicit uninstall.
         assert!(!retire::load(&home).unwrap()["claude"].leftovers.is_empty());
+        let (record, _) = state::load(&home).unwrap();
+        assert!(
+            record["claude"].noticed,
+            "a kept entry is still on the toast list"
+        );
     }
 
     #[test]
