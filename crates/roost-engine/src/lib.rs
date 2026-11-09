@@ -19,6 +19,7 @@ pub mod git_metrics;
 #[cfg(feature = "vt")]
 pub mod images;
 pub mod ipc;
+mod locale;
 #[cfg(feature = "vt")]
 pub mod memory;
 pub mod opener;

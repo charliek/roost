@@ -2588,11 +2588,13 @@ fn roost_resources_dir() -> Option<&'static std::path::Path> {
 /// `XDG_RUNTIME_DIR` when one derived ([`user_runtime_dir`]), then the
 /// variables `opener` brings. Neither kind of opener inherits the
 /// starter's: a local tab gets its opener's display, a remote one its
-/// opener's SSH identity.
+/// opener's SSH identity. A tab with no locale gets `system_lang`'s `LANG`
+/// ([`crate::locale::fill_lang`]).
 fn tab_environment(
     starter: impl Iterator<Item = (OsString, OsString)>,
     opener: &TabOpener,
     runtime_dir: Option<PathBuf>,
+    system_lang: impl FnOnce() -> Option<&'static str>,
 ) -> Vec<(OsString, OsString)> {
     let mut env: BTreeMap<OsString, OsString> = starter
         .filter(|(name, _)| !OPENER_SET.iter().any(|opened| name == opened))
@@ -2603,6 +2605,7 @@ fn tab_environment(
     for (name, value) in opener.vars() {
         env.insert(name.into(), value.into());
     }
+    crate::locale::fill_lang(&mut env, system_lang);
     env.into_iter().collect()
 }
 
@@ -2690,7 +2693,12 @@ fn build_command(
     }
     set_environment(
         &mut cmd,
-        tab_environment(std::env::vars_os(), opener, user_runtime_dir()),
+        tab_environment(
+            std::env::vars_os(),
+            opener,
+            user_runtime_dir(),
+            crate::locale::system_lang,
+        ),
     );
     // Advertise the terminal Roost provides — force TERM rather than
     // inheriting the launching terminal's (a child seeing an inherited
@@ -3324,7 +3332,12 @@ mod tests {
 
     #[test]
     fn the_baseline_drops_every_opener_variable_and_keeps_the_rest() {
-        let env = tab_environment(crowded_starter().into_iter(), &TabOpener::None, None);
+        let env = tab_environment(
+            crowded_starter().into_iter(),
+            &TabOpener::None,
+            None,
+            || None,
+        );
         assert_eq!(openers(&env), BTreeMap::new());
         assert_eq!(get(&env, "PATH"), Some("/usr/bin:/bin"));
         assert_eq!(get(&env, "HOME"), Some("/home/u"));
@@ -3338,7 +3351,7 @@ mod tests {
     #[test]
     fn a_local_opener_adds_exactly_its_values_empty_ones_included() {
         let local = TabOpener::Local(values(&[("DISPLAY", ":7"), ("SSH_AUTH_SOCK", "")]));
-        let env = tab_environment(crowded_starter().into_iter(), &local, None);
+        let env = tab_environment(crowded_starter().into_iter(), &local, None, || None);
         assert_eq!(
             openers(&env),
             values(&[("DISPLAY", ":7"), ("SSH_AUTH_SOCK", "")])
@@ -3351,7 +3364,7 @@ mod tests {
             ssh_connection: Some("3.3.3.3 3 4.4.4.4 22".into()),
             ssh_client: Some("3.3.3.3 3 22".into()),
         };
-        let env = tab_environment(crowded_starter().into_iter(), &remote, None);
+        let env = tab_environment(crowded_starter().into_iter(), &remote, None, || None);
         assert_eq!(
             openers(&env),
             values(&[
@@ -3367,14 +3380,35 @@ mod tests {
             crowded_starter().into_iter(),
             &TabOpener::None,
             Some(PathBuf::from("/run/user/4242")),
+            || None,
         );
         assert_eq!(get(&env, "XDG_RUNTIME_DIR"), Some("/run/user/4242"));
         let bare = tab_environment(
             os_env(&[("PATH", "/bin")]).into_iter(),
             &TabOpener::None,
             Some(PathBuf::from("/run/user/4242")),
+            || None,
         );
         assert_eq!(get(&bare, "XDG_RUNTIME_DIR"), Some("/run/user/4242"));
+    }
+
+    #[test]
+    fn a_tab_with_no_locale_gets_the_system_lang_and_a_named_one_is_kept() {
+        let system = || Some("sv_SE.UTF-8");
+        let bare = tab_environment(
+            crowded_starter().into_iter(),
+            &TabOpener::None,
+            None,
+            system,
+        );
+        assert_eq!(get(&bare, "LANG"), Some("sv_SE.UTF-8"));
+        let named = tab_environment(
+            os_env(&[("LC_ALL", "C")]).into_iter(),
+            &TabOpener::None,
+            None,
+            system,
+        );
+        assert_eq!(get(&named, "LANG"), None);
     }
 
     #[test]

@@ -491,6 +491,15 @@ value alone.
 |---|---|
 | `ROOST_TEST_USER_RUNTIME_DIR` | An absolute directory standing in for `/run/user/<uid>`; the same directory-and-owner check applies. Read by **debug builds, or any build with `ROOST_TEST_MODE=1`** (the release e2e lane sets it). An empty or relative value derives nothing, so the tab keeps the process's own `XDG_RUNTIME_DIR`. The harness sets it to each launched process's own runtime directory so no test tab points at the real `/run/user/<uid>`. |
 
+### `LANG` in a macOS tab
+
+An app started from Finder or the Dock inherits no locale, so on macOS a
+tab whose `LANG`, `LC_ALL` and `LC_CTYPE` are all unset or empty gets
+`LANG=<language>_<region>.UTF-8` from the system's language and region
+settings, or `en_US.UTF-8` when that pair is not an installed locale. A
+locale already set, even `LC_ALL=C`, is kept. This applies to the UI's
+own tabs and `roost-session`'s; Linux tabs keep the locale they inherit.
+
 ### Terminal advertisement
 
 | Variable               | Value             | Purpose                                                                  |
