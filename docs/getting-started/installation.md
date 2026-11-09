@@ -70,7 +70,8 @@ use the separate `Roost-iced` paths, so they run beside an installed
   [Sparkle](https://sparkle-project.org) once a day in the background, and
   you can check any time with **Check for Updates…** in the app menu. When
   a new version is out, Sparkle shows its release notes and asks before
-  installing; it never installs on its own. The feed (`appcast.xml`) is
+  installing. It installs without asking only if you opt in to automatic
+  installs in that update alert. The feed (`appcast.xml`) is
   served from this documentation site.
 - **Linux.** Updates come from apt: `sudo apt update && sudo apt upgrade`
   (or just `sudo apt install --only-upgrade roost`). The package upgrades

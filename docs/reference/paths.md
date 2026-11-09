@@ -409,7 +409,7 @@ Pre-rewrite builds stored their state under lowercase `~/Library/Application Sup
 
 `config.conf` is a tiny `key = value` file (no sections, no nesting). Lines starting with `#` are comments. Missing file → built-in defaults; unknown keys are ignored, with a warning in the log (Ghostty's own keys stay silent, so a pasted Ghostty config is fine). Keybindings use Ghostty's `keybind = trigger=action` syntax — see [Keybindings](../getting-started/keybindings.md#custom-keybindings) for the full action list. The full reference (including the `copy-on-select` semantics) lives in [`config.md`](config.md).
 
-Keys use Ghostty-style hyphens (`font-family`, not `font_family`); a misspelled key is ignored with a log warning that suggests the key you likely meant.
+Keys use Ghostty-style hyphens (`font-family`, not `font_family`); an unknown key is ignored with a log warning. The warning names the key you likely meant only when the slip is case or `_` for `-` (`Font_Size` for `font-size`); any other misspelling, such as `font-szie`, gets the warning without a suggestion.
 
 | Key              | Default                              | Effect                                                 |
 |------------------|--------------------------------------|--------------------------------------------------------|
@@ -495,8 +495,9 @@ value alone.
 
 An app started from Finder or the Dock inherits no locale, so on macOS a
 tab whose `LANG`, `LC_ALL` and `LC_CTYPE` are all unset or empty gets
-`LANG=<language>_<region>.UTF-8` from the system's language and region
-settings, or `en_US.UTF-8` when that pair is not an installed locale. A
+`LANG=<language>_<region>.UTF-8` from the system's preferred languages
+and region (the first preferred language with an installed pair wins),
+or `en_US.UTF-8` when no such pair is an installed locale. A
 locale already set, even `LC_ALL=C`, is kept. This applies to the UI's
 own tabs and `roost-session`'s; Linux tabs keep the locale they inherit.
 

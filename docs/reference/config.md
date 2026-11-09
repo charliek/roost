@@ -13,9 +13,11 @@ dropped rather than erroring, so a portable file stays valid everywhere.
 The file is plain text, one `key = value` per line, `#`-prefixed comments
 allowed, whitespace forgiving. Unknown keys are dropped rather than
 erroring, which keeps user files forward-compatible with future Roost
-versions. Each one logs a warning naming its line, with a "did you mean"
-for a slip such as `font_size` for `font-size`; a key Ghostty consumes but
-Roost doesn't stays silent, so a pasted Ghostty config is fine.
+versions. Each one logs a warning naming its line. The warning adds a
+"did you mean" only for a case or `_`-for-`-` slip, such as `font_size`
+for `font-size`; any other misspelling gets the warning alone. A key
+Ghostty consumes but Roost doesn't stays silent, so a pasted Ghostty
+config is fine.
 
 A missing file is fine: every setting has a compiled-in default.
 
