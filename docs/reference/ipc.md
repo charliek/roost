@@ -3262,7 +3262,7 @@ ever enters the ring, so **no resumed stream ever receives one from its
 gap, for any subscriber**:
 
 - [`tab.effect`](#events) (bells, OSC 52 clipboard writes —
-  [DL-18](../development/vision.md#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29)),
+  [DL-26](../development/decision-history.md#dl-26-there-is-no-lease-2026-09-12)),
   because replaying a clipboard write from thirty seconds ago is wrong
   regardless of who resumes into it;
 - [`workspace.durability_changed`](#events), because the standing value
@@ -3595,7 +3595,7 @@ there is no window to measure a size from — a UI socket keeps its usual
 `80x24` default. On start, a session **hydrates** its saved
 `state.json` layout headlessly: it re-opens each tab's saved `{title,
 cwd}` as a fresh shell (same "layout, not live state" contract as a UI —
-[DL-7](../development/vision.md#dl-7-tabs-persist-as-layout-not-live-state-revised-2026-05-24))
+[DL-7](../development/decision-history.md#dl-7-tabs-persist-as-layout-not-live-state-revised-2026-05-24))
 and attaches a per-tab OSC drain to each one so title/cwd/notification
 facts keep flowing with no terminal or renderer present. `SIGTERM` and
 `SIGINT` converge on the same shutdown path as an IPC-driven

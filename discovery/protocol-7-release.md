@@ -743,8 +743,8 @@ This overturns plan 057 R15, "last interactor sets geometry"
 (`attach.rs:209-210`). Both are pinned by tests that M3 rewrites,
 including `tools/roosttest/test_session_attach.py` and
 `crates/roost-engine/tests/attach_forwarder_test.rs`. The decision-log
-entry in `docs/development/vision.md` is
-[DL-31](../docs/development/vision.md#dl-31-a-tab-has-one-size-owner-2026-10-30);
+entry in `docs/development/decision-history.md` is
+[DL-31](../docs/development/decision-history.md#dl-31-a-tab-has-one-size-owner-2026-10-30);
 it names both.
 
 *How it shipped (plan 084 corrections to this section). The rule text

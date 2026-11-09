@@ -1,140 +1,211 @@
-# Roost architecture & principles
+# Roost vision
 
-This is Roost's **living architecture** and the principles behind it —
-the north star every PR is measured against.
+Where Roost is going, the rules every change is measured against, and an
+index of the decisions behind them. Updated 2026-11-08, after v0.1.0.
 
-## The product
+This page is short on purpose. The full text of every decision, and the
+history of how Roost got its current shape, is in
+[Decision history](decision-history.md). Depth on the code is in
+[Architecture](../reference/architecture.md) and the pages under
+[Related docs](#related-docs).
 
-A single-window, cross-platform terminal multiplexer: a sidebar of
-projects, tabs per project, one terminal per tab. The differentiator is
-the multi-project workspace with **notification routing for AI coding
-agents** (Claude Code, Codex, …). It ships **one desktop implementation,
-embedding the workspace + PTY supervisor in-process** — Rust + iced, on
-macOS (`Roost.app`) and Linux (`roost`, the packaged `.deb`). Before
-v0.1.0 the Mac app was Swift + AppKit; it is retired
-([DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)).
-`libghostty-vt` is vendored once and linked in for in-process VT parsing
-and rendering. There is no daemon by default, except a fresh install,
-which starts its local tabs on a `roost-session` it manages. The other opt-in exception
-is `roost-session`, a headless daemon for host-sessions
-([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)).
+## What Roost is for {: #the-product }
 
-## The command core (north star)
+Roost is the place to run and supervise coding agents across your
+machines. You keep several agents busy at once, in several projects, on
+the laptop in front of you and on the boxes you reach over SSH. Roost
+tells you which one needs you, and lets you pick up any of them from any
+screen, including a phone.
 
-Every way to drive Roost — **mouse/clicks, hotkeys, the `roostctl` CLI,
-and any future scripting surface** — converges on **one core: the
-workspace operation set** (open/close/focus tab,
-create/rename/delete/reorder project, set-state, notify, dump, … plus a
-few view ops like screenshot / open-palette). Each surface is a *thin
-adapter* onto that core, and the **UI is a reaction to the core's
-events — never its own source of truth.**
+It stays simple. A sidebar of projects, tabs in each project, a terminal
+in each tab, and a command line (`roostctl`) that can do anything the
+window can. New work should make running agents better, not make Roost
+bigger. When a choice is between a mode and a default, pick the default.
+
+## Who it serves
+
+- **A developer running agents in parallel.** Claude Code, Codex, Cursor,
+  Grok CLI, OpenCode and others, several at a time, across projects.
+  They need to see at a glance which agent is working, waiting or done,
+  and get a notification when one needs them.
+- **The same developer on more than one machine.** A laptop at the desk,
+  a Linux box with the real workload, a Mac over SSH. Work should not
+  care where they sit: start on one, watch or type on another.
+- **The same developer away from the desk.** Roost mobile checks on a
+  host's agents and answers them from a phone or tablet.
+- **The agents themselves.** An agent drives Roost through `roostctl`
+  and the shipped skill (`skills/roost/SKILL.md`): open a tab running a
+  command, send input, read a screen, wait on a state, notify the human.
+  An agent is a client of the op set like any other surface.
+
+## The product today
+
+As of v0.1.0 (2026-11-07):
+
+- **One desktop app**, Rust + iced, on macOS (`Roost.app`) and Linux
+  (`roost`, from the `.deb`). The Swift app is retired
+  ([DL-33](decision-history.md#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)).
+  libghostty-vt is the terminal engine; the renderer is Roost's own, on
+  iced + wgpu.
+- **Sessions are the backend.** `roost-session` is the same engine with
+  no window. A tab's shell runs either in the app (`in-process`) or in a
+  session, so it outlives the window. A fresh install starts its local
+  tabs on a session it manages; an existing setup keeps what it has
+  ([DL-27](decision-history.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14)).
+- **Hosts in the sidebar.** A session on another machine, reached over
+  SSH, is a host: one sidebar band each, with a connection dot and an
+  agent rollup. Roost installs and upgrades `roost-session` on a Linux
+  or Apple-silicon Mac host, reconnects after a drop, and lets several
+  machines attach to one tab at once.
+- **Agent awareness.** Tab state and notifications come from what
+  agents and shells write to the terminal (OSC 133, OSC 7501, OSC
+  9/99/777) and from agent hooks that `roostctl agent install` writes
+  into each agent's config, with consent. The sidebar has an Agents
+  panel.
+- **A scriptable surface.** `roostctl`, the JSON IPC socket and the
+  agent skill reach every op the window does.
+- **Roost mobile**, a prototype: a Flutter + Rust Android client of
+  `roost-session` over Tailscale SSH, built from source until it reaches
+  the Play Store
+  ([DL-34](decision-history.md#dl-34-a-mobile-client-of-roost-session-2026-11-03)).
+
+## The north star: one op set {: #the-command-core-north-star }
+
+Every way to drive Roost converges on **one core, the workspace
+operation set**: open, close and focus a tab; create, rename and reorder
+a project; report agent state; notify; dump; and a few view ops such as
+screenshot. Clicks, hotkeys, `roostctl`, agent hooks, the agent skill and
+any future scripting surface are thin adapters onto it. **The UI is a
+reaction to the core's events, never its own source of truth.**
 
 ```
-  roostctl (CLI) ──┐
-  (future scripts) ┤──▶ IPC handler ──┐
-                                      ├─▶  workspace op set  ──emit──▶ events ──▶ UI re-renders
-  mouse / clicks ─┐                   │       (THE CORE)
-  hotkeys ────────┤──▶ UI dispatch ───┘
+  roostctl, agent hooks, skill ──┐
+  (future scripts) ──────────────┤──▶ IPC handler ──┐
+                                                    ├─▶ workspace op set ──emit──▶ events ──▶ UI re-renders
+  mouse / clicks ─┐                                 │      (THE CORE)
+  hotkeys ────────┤──▶ UI dispatch ─────────────────┘
 ```
 
-- **The CLI** is out-of-process → reaches the core over the IPC socket
-  (the handler is its adapter). A scripting surface, when one lands
-  (DL-12), sits on top of that same op set rather than beside it.
-- **Clicks + hotkeys** are in-process → call the same op set directly
-  (their adapter is the UI command / keybind handler).
-- A hotkey (`Cmd+Shift+T`) and a `roostctl` call invoke the **same**
-  command — e.g. "run action" or "open tab".
+A `roost-session` runs the same op set with no UI. Every client reaches
+it over its session socket, and every client's display is a reaction to
+the session's events:
 
-**One contract, one desktop implementation.** The contract is the IPC
-op set in [`crates/roost-ipc`](../reference/ipc.md); the one desktop
-implementation is **Rust + iced** on macOS and Linux, over the
-toolkit-neutral `roost-engine`. A mobile client of `roost-session` is
-planned, and would be a second client of the same contract. The E2E suite
+```
+  Roost (a host, or local tabs on a session) ──┐
+  Roost mobile ────────────────────────────────┤──▶ session socket ──▶ roost-session's op set ──emit──▶ events ──▶ every client re-renders
+  roostctl, agent hooks ───────────────────────┘
+```
+
+**One contract, one desktop implementation.** The contract is the op set
+in [`roost-ipc`](../reference/ipc.md). The desktop implementation is the
+iced app over the toolkit-neutral `roost-engine`. Roost mobile is a
+second client of the same contract. The E2E suite
 ([test-automation.md](test-automation.md)) drives that contract on both
-host OSes.
+desktop OSes.
 
-**Two seams** connect the surfaces to the core:
+**One way back to the window.** An op that needs the window (screenshot,
+dump, activate) reaches it through `roost-engine`'s one `UiRequest` port,
+delivered over the single engine feed the UI drains on its main thread.
+It is matched exhaustively, never with a wildcard arm, and no op gets a
+channel of its own
+([Shared Rust engine](shared-rust-engine.md#boundary)).
 
-1. **surfaces → core** (commands in): the CLI via IPC, UI/hotkeys
-   direct. Every UI/hotkey action should route through the op set, not
-   carry divergent local logic. *Convergence is an ongoing invariant —
-   each place the UI keeps its own truth instead of reacting to a core
-   event is a bug to retire.*
-2. **core → UI** (view reach-back: screenshot / dump / activate):
-   `roost-engine`'s one `UiRequest` port, delivered to the iced UI over
-   the single engine feed it drains on the main thread — a single
-   registered path from the IPC handler to the main thread, not an
-   ad-hoc channel per op.
+**Why it is the north star.** It buys three things at once:
 
-**Why this is the north star.** It buys the three things Roost optimizes
-for at once:
+- **Testability.** Tests drive the op set users drive and assert on its
+  events. There is no test-only backdoor to drift from reality.
+- **Programmability.** The op set is the public surface. An agent, a
+  script and the CLI are first-class clients, the same as the window.
+- **Clean architecture.** One place owns each mutation. Adding a
+  capability is an op plus thin adapters, not logic per surface.
 
-- **Testability** — tests drive the same op set users do and assert on
-  its events/state. No test-only backdoors that can drift from reality.
-- **Programmability** — the op set *is* the public surface; the launcher
-  (and a future scripting surface) are first-class clients of it, same
-  as the CLI.
-- **Clean architecture** — one place owns each mutation; the UI is a
-  pure projection of core state; adding a capability is "add an op +
-  thin adapters", not bespoke logic per surface.
+Measure every change against one question: *does it route through the
+one op set and keep the UI reactive?* Each place the UI keeps its own
+truth instead of reacting to an event is a bug to retire.
 
-Every decision below — and every new feature — is measured against it:
-*does it route through the one op set and keep the UI reactive?*
+## Principles
+
+The rules that bind today, one line each. The linked entry has the
+reasoning.
+
+- **One op set, thin adapters, a reactive UI**
+  ([DL-11](decision-history.md#dl-11-one-command-core-thin-per-surface-adapters-2026-05-26)).
+- **One process owns one workspace; every other surface is its client**
+  ([DL-4](decision-history.md#dl-4-each-ui-owns-its-own-workspace-revised-2026-05-23),
+  [DL-17](decision-history.md#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)).
+- **A UI socket may forward a mutation to the session that owns it,**
+  under one written rule
+  ([DL-20](decision-history.md#dl-20-a-ui-socket-may-route-a-mutation-to-a-session-2026-09-04)).
+- **The session is the authority, and there is no lease.** Effects and
+  notifications go to every client; each applies them to its own window
+  ([DL-26](decision-history.md#dl-26-there-is-no-lease-2026-09-12)).
+- **A tab has one size owner**
+  ([DL-31](decision-history.md#dl-31-a-tab-has-one-size-owner-2026-10-30)).
+- **A tab's environment comes from whoever opened it**
+  ([DL-32](decision-history.md#dl-32-a-tabs-environment-reflects-who-opened-it-2026-10-31)).
+- **A session comes up on demand; no supervisor artifact** without a case
+  that needs one
+  ([DL-24](decision-history.md#dl-24-no-supervisor-artifact-a-session-comes-up-on-demand-2026-09-08)).
+- **The local backend is the user's choice**
+  ([DL-27](decision-history.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14)).
+- **Local Unix sockets only, with a same-UID check.** A remote host is
+  reached over SSH, never through a listener
+  ([DL-3](decision-history.md#dl-3-unix-domain-socket-not-tcp)).
+- **A JSON control plane; raw PTY bytes on the data plane**
+  ([DL-2](decision-history.md#dl-2-json-ipc-not-grpc-revised-2026-05-23)).
+- **Tabs persist as layout, not live state.** Work survives quitting
+  Roost only where a session keeps running it
+  ([DL-7](decision-history.md#dl-7-tabs-persist-as-layout-not-live-state-revised-2026-05-24)).
+- **Turning terminal output into agent state is the differentiator**
+  ([DL-8](decision-history.md#dl-8-osc-routing-is-the-differentiator)).
+- **Agent state is derived, never written directly**
+  ([DL-13](decision-history.md#dl-13-the-agent-state-model-four-axes-one-derivation-2026-07-27)).
+  Ownership is a label
+  ([DL-14](decision-history.md#dl-14-ownership-is-a-label-not-a-suppression-switch-2026-07-27)).
+- **An agent's own OSC 7501 report sits above the hook layer**
+  ([DL-29](decision-history.md#dl-29-program-status-is-a-fourth-per-tab-axis-composed-above-the-hook-layer-2026-10-28)),
+  and each sink terminal has one OSC 133 parser
+  ([DL-30](decision-history.md#dl-30-one-osc-133-parser-per-sink-terminal-2026-10-28)).
+- **Files cross a host boundary as bytes through the op set,** pasted as
+  validated host paths; an op an older peer could not refuse meaningfully
+  bumps the session protocol
+  ([DL-22](decision-history.md#dl-22-files-cross-a-host-boundary-as-bytes-through-the-op-set-pasted-as-bare-host-paths-the-client-has-validated-2026-09-06)).
+- **Test through the op set**
+  ([DL-12](decision-history.md#dl-12-pytest-drives-the-tests-lua-is-a-user-scripting-surface-2026-05-26)).
+  A decision is a pure function over the narrowest constructible state,
+  and every guard gets a negative control
+  ([DL-21](decision-history.md#dl-21-app-stays-unconstructible-in-tests-guards-are-lifted-app-delegates-2026-09-04)).
+- **One desktop UI; `roost-engine` and `roost-ui-model` stay
+  toolkit-neutral**
+  ([DL-33](decision-history.md#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)).
+- **A mobile client adds no ops, and Dart holds no core logic**
+  ([DL-34](decision-history.md#dl-34-a-mobile-client-of-roost-session-2026-11-03)).
+- **One Ghostty pin, in `third_party/ghostty/build.sh`**
+  ([DL-10](decision-history.md#dl-10-ghostty-sha-pinned-in-third_partyghosttybuildsh)).
 
 ## Why this shape
 
-**One UI toolkit.** iced runs on Linux and macOS, so one Rust codebase
-covers both host OSes. The macOS-specific surface (menu bar, Dock badge,
-notifications, the Sparkle updater, Secure Keyboard Entry) lives behind
-`objc2` seams in `crates/roost-iced/src/macos/`, not in a second
-application. The trade is accessibility: an iced canvas gives essentially
-no VoiceOver support where AppKit gives it for free, accepted knowingly
-in [DL-16](#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25).
+- **One UI toolkit.** iced runs on both desktop OSes, so one Rust
+  codebase covers them. macOS specifics (menu bar, Dock badge,
+  notifications, Sparkle, Secure Keyboard Entry) sit behind `objc2`
+  seams, not in a second app. The accepted cost: an iced canvas gives
+  VoiceOver almost nothing.
+- **No daemon unless the tabs should outlive the window.** The
+  in-process backend is one process with no daemon to supervise.
+- **`roost-session` is the daemon when one is wanted.** The same engine,
+  the same op set, on this machine or another. Nothing starts it at boot.
+- **JSON, not gRPC.** The control plane is small. Newline-delimited JSON
+  over a Unix socket is debuggable with `nc -U`, and both ends ship from
+  this repo.
+- **Raw bytes, not rendered frames.** PTY bytes are the smallest thing to
+  send, and every client already has a terminal engine to parse them.
+- **Rust everywhere below the pixels.** PTY lifecycle, OSC parsing, IPC
+  framing and the engine are Rust on every client, mobile included.
 
-**No daemon.** The UI is a single process that owns its PTY supervisor,
-workspace state, and IPC server. There is no separate `roost-core`
-binary to spawn, supervise, or lifecycle. An earlier design had a gRPC
-daemon owning state for thin clients; the realistic deployment is one
-user, one UI process, with `roostctl` and Claude hooks as occasional
-control-plane callers. Collapsing the daemon into the UI removed the
-cross-process serialization, the gRPC bindings (`tonic`, `prost`,
-`grpc-swift`), SQLite, and the entire `proto/` directory — ~4,400 LOC of
-plumbing.
-
-**The one exception is opt-in.** `roost-session`
-([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28))
-is a headless daemon for host-sessions — a workspace that outlives any
-UI attached to it, e.g. left running on a remote host — not a
-replacement for the one-user-one-UI-process deployment this paragraph
-describes. A user opts in with `roostctl session start`; nothing changes
-for anyone who doesn't.
-
-**JSON IPC, not gRPC.** With control-plane traffic only (no streaming
-PTY bytes), the wire surface is small enough that a hand-rolled
-newline-delimited JSON framing protocol over a Unix socket is simpler
-than HTTP/2 + protobuf. Frame cap is 16 MiB, the schema is one Markdown
-file, hand-debuggable with `nc -U`. Dropping protobuf evolution rules is
-acceptable because the only producers + consumers are versioned together
-in this repo.
-
-**Rust core (UI + IPC + CLI).** Memory-safe, ergonomic FFI in both
-directions, mature async (`tokio`), small static binaries. The
-systems-level work — PTY lifecycle, OSC parsing, IPC framing — is
-exactly what Rust is good at.
-
-**History: gtk4-rs was the first Linux UI.** Roost's Linux UI shipped on
-gtk4-rs — chosen over Go + GTK for the same toolchain as the rest of the
-workspace: one Cargo build, no cgo, no `gotk4` binding gotchas. After
-the iced cutover it stayed in-repo a while longer as the parity
-reference iced was measured against, and was removed once iced *was* the
-product. See [DL-15](#dl-15-linux-ships-iced-gtk4-rs-is-retired-and-removed-2026-08-25).
-
-**History: Swift + AppKit was the first Mac UI.** The Mac app was Swift
-+ AppKit until v0.1.0, with the JSON IPC wire format and the PTY/workspace
-state machines mirrored idiomatically in each language and pinned to each
-other by shared fixture corpora. That duplication is what
-[DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)
-retires.
+How Roost got here (the Rust + Swift port, the gtk4-rs UI, the iced
+migration, the Swift retirement) is in
+[Decision history](decision-history.md#migration-history) and
+[Iced migration](iced-migration.md).
 
 ## Architecture
 
@@ -142,1361 +213,193 @@ retires.
 flowchart LR
   subgraph App["Roost.app / roost (Rust + iced)"]
     view["Cell renderer<br/>(iced + wgpu)"]
-    vt["libghostty-vt<br/>(in-process VT parse)"]
-    ws["Workspace + PtySupervisor<br/>(tokio + portable-pty)"]
-    ipc["JSON IPC server<br/>(tokio UnixListener)"]
+    vt["libghostty-vt"]
+    ws["Workspace + PTY supervisor<br/>(in-process backend)"]
+    ipc["JSON IPC server<br/>(UI socket)"]
+    hc["Host connections<br/>(roost-client)"]
     view --- vt --- ws
     ws --- ipc
+    vt --- hc
+  end
+
+  subgraph Session["roost-session (headless)"]
+    sws["Workspace + PTY supervisor"]
+    svt["libghostty-vt<br/>(server terminal)"]
+    sock["Session socket<br/>(control + data plane)"]
+    sws --- svt
+    sws --- sock
+  end
+
+  subgraph Mobile["Roost mobile (Flutter + Rust)"]
+    mob["roost-mobile + roost-client<br/>(libghostty-vt mirror)"]
   end
 
   subgraph External["External tooling"]
-    roostctl["roostctl CLI"]
-    claude["Claude Code hooks"]
+    roostctl["roostctl, agent skill"]
+    hooks["Agent hooks"]
   end
 
-  roostctl -- "UDS<br/>JSON IPC" --- ipc
-  claude -- "UDS<br/>JSON IPC" --- ipc
+  roostctl -- "UDS, JSON" --- ipc
+  roostctl -- "UDS, JSON" --- sock
+  hooks -- "UDS, JSON" --- ipc
+  hooks -- "UDS, JSON" --- sock
+  hc -- "UDS, or SSH stdio" --- sock
+  mob -- "in-process SSH" --- sock
 ```
 
-**Hot path.** PTY bytes flow `kernel → master fd → in-process drain task
-→ libghostty-vt vt_write → renderer`. Everything is in the same process;
-the IPC socket carries only control messages and event broadcasts, never
-PTY content.
+**An in-process tab.** PTY bytes flow from the kernel to a drain task, to
+libghostty-vt, to the renderer, all in one process. The UI socket
+carries control messages and events, never PTY content.
 
-**Why the renderer stays out of the IPC.** Putting cell deltas or
-rendered frames over a socket means every redraw is a context switch and
-a serialization cost. With the workspace in-process, PTY bytes never
-cross any process boundary — the hot path is one kernel `read()` per
-chunk, then everything else is in-process memory.
+**A session tab.** The session's drain feeds its own server terminal,
+which answers terminal queries and reads OSC 133 and 7501 marks. It
+streams the same raw bytes to each attached client as data-plane frames
+([ipc.md](../reference/ipc.md#data-plane)). Each client parses them with
+its own libghostty-vt mirror and draws locally.
+
+The crate layout and the threading contract are in
+[Architecture](../reference/architecture.md); how a client attaches,
+sizes and reconnects is in [Host sessions](host-sessions.md); the shared
+engine is in [Shared Rust engine](shared-rust-engine.md).
 
 ## Non-goals
 
-- **No web/Electron UI.** Native renderers only.
-- **No Windows.** macOS and Linux exclusively.
-- **No multi-window.** One window per Roost instance, projects in the
-  sidebar, tabs in the projects.
-- **No split-pane.** One terminal per tab.
-- **No remote / network IPC.** Unix domain socket only — including the
-  session socket `roost-session`
-  ([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28))
-  serves, which is still a local UDS with a same-UID peer check, not a
-  network listener. The JSON wire format is local IPC, not a public API.
-  A planned bridge for reaching a session on a remote host (HS-3) tunnels
-  over SSH stdio rather than networking the protocol itself.
-- **No rendered output over the wire.** PTY bytes only ever live
-  in-process.
-- **No per-platform UI forks.** One iced codebase serves macOS and
-  Linux; platform specifics live behind seams.
-- **No core rewrites in third languages.** Rust for the UI + CLI + IPC +
-  supporting crates. Lua, if it ever lands,
-  is an *embedded scripting surface* for user automation (see DL-12),
-  not a third implementation language.
-
-## Decision log
-
-Short ADR-style entries. Each captures a live decision so it is not
-relitigated by accident.
-
-### DL-1: Swift + AppKit on Mac, not Rust
-
-**Superseded by [DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03).**
-
-Swift owns the macOS native experience: HIG, AppKit lifecycle,
-accessibility, notarization, App Store-adjacent tooling. A Rust UI on
-Mac would either depend on a cross-platform toolkit (loses native feel)
-or hand-roll Cocoa bindings (multiplies cost). The JSON IPC boundary
-makes mixing languages costless.
-
-### DL-2: JSON IPC, not gRPC (revised 2026-05-23)
-
-Original DL-2 chose protobuf + gRPC because the architecture had a
-daemon serving streaming PTY bytes to thin remote-style clients. That
-premise dissolved in the inline-core refactor: each UI now owns its PTY
-supervisor in-process, so the IPC surface is small (a few dozen control
-ops + an event subscription), strictly local, and small enough to
-inspect by hand. Newline-delimited JSON over a Unix socket with a 16 MiB
-frame cap costs ~600 lines (`crates/roost-ipc`) vs. a multi-crate tonic +
-prost dependency. The wire spec lives in [`ipc.md`](../reference/ipc.md).
-The pre-rewrite proto schema is preserved at
-[`docs/archive/roost.proto`](../archive/roost.proto) for reference.
-
-### DL-3: Unix domain socket, not TCP
-
-Roost is a local desktop app. UDS gets filesystem permissions for free,
-no port allocation, no exposure to network attackers, lower latency. If
-a future need warrants remote access, that is a separate proxy concern,
-not a contract change.
-
-### DL-4: Each UI owns its own workspace (revised 2026-05-23)
-
-The pre-rewrite design had a shared `roost-core` daemon owning workspace
-state in SQLite; UIs were thin gRPC clients. The realistic deployment is
-one user, one UI process, plus occasional control-plane callers.
-Collapsing the workspace into each UI removed the gRPC pump, SQLite,
-cross-process serialization, and the "cross-client convergence" rabbit
-hole. State persistence is a small `state.json` (atomic tmp + rename;
-write-through, fsync on clean exit) carrying projects + `next_id` + each
-project's tab **layout** (title + cwd + position) + active selection (see
-DL-7).
-
-### DL-5: Two languages, not Rust everywhere
-
-**Superseded by [DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03).**
-
-Considered and rejected: Rust + gtk4-rs on Mac. This still requires
-hand-rolled AppKit/macOS integration for menus, dock, notifications, and
-notarization metadata. Net effort is higher than just using Swift, and
-the Mac feel is worse. The unification benefit does not pay for itself
-when the AppKit surface is the larger half of a Mac terminal's native
-experience.
-
-*[2026-08-25: the toolkit this rejected was gtk4-rs. The same question
-is open again for a different toolkit — see
-[DL-16](#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25)
-and [Direction](#direction-under-evaluation). The AppKit-surface
-argument above is the bar that evaluation has to clear.]*
-
-### DL-6: gtk4-rs does not need a `pangoextra` workaround
-
-**Retired 2026-08-25 — moot.** The gtk4-rs UI was removed
-([DL-15](#dl-15-linux-ships-iced-gtk4-rs-is-retired-and-removed-2026-08-25));
-kept as the record of a `gotk4` gotcha that never applied to us.
-
-`gtk4-rs` calls `pango_cairo_context_set_font_options` directly via raw
-FFI and does not have the `gotk4` `cairo.FontOptions` record-struct
-mismatch that would otherwise force a separate `pangocairo` FFI
-workaround.
-
-### DL-7: Tabs persist as layout, not live state (revised 2026-05-24)
-
-`state.json` stores each project's tab **layout** — `{title, cwd,
-position}` per tab, plus the active project + active tab position. On
-relaunch each project re-opens its prior tabs as **fresh shells** in
-their saved directories. What is *not* restored: the live process and
-scrollback ("preserving" those was always a fiction since the daemon-era
-`StreamPty` re-spawned the shell on attach anyway). The `tabs` array +
-`active_*` fields are additive + defaulted, so a file written by one
-build (or the other UI) still loads in the other. Coupled with the
-last-tab cascade (closing a project's last tab closes the project;
-emptying the workspace quits), relaunch is predictable: same projects +
-tabs, same directories, fresh shells.
-
-### DL-8: OSC routing is the differentiator
-
-The OSC scanner (`crates/roost-osc`, `mac/Sources/Roost/OscScanner.swift`)
-plus the per-tab `set_hook_active` suppression rule is subtle and is what
-makes Roost useful to anyone running multiple AI coding agents in
-parallel. It is treated as a first-class slice, not bundled into
-structural feature parity.
-
-### DL-9: CLI is `roostctl`
-
-`crates/roost-cli` ships a `roostctl` binary. The Mac bundle embeds it
-under `Contents/Resources/bin/roostctl`, and each tab's
-`$ROOST_AGENT_HOOK` points at that copy — so an agent hook installed
-from inside `Roost.app` runs the bundled binary without any absolute
-path being written into the agent's own config.
-
-### DL-10: Ghostty SHA pinned in `third_party/ghostty/build.sh`
-
-`third_party/ghostty/build.sh` pins the libghostty-vt commit for the
-Rust + Swift builds — the single source of the pin.
-
-### DL-11: One command core, thin per-surface adapters (2026-05-26)
-
-Every input surface — UI clicks, hotkeys, `roostctl`, and any scripting
-surface added later — routes
-through the **same workspace operation set**; the UI is a reaction to the
-core's events, not a parallel source of truth. Adding a capability means
-adding an op + thin adapters, not per-surface logic. This is the
-[north star](#the-command-core-north-star); it is the test applied to
-every change, because it is what buys testability, programmability, and a
-clean architecture simultaneously. Concretely it forbids: UI state that
-diverges from the workspace, ops reachable from one surface but not
-another without reason, and the two implementations drifting out of
-behavioral parity.
-
-### DL-12: pytest drives the tests; Lua is a user-scripting surface (2026-05-26)
-
-**Status: the pytest half shipped; the Lua half is not implemented** —
-there is no Lua engine, no `mlua` dependency, and no `.lua` anywhere in
-the tree. What follows is the settled *role split*, not a description of
-shipped behavior.
-
-Two distinct roles, one shared core:
-
-- **Tests** are driven by **pytest** over the IPC op set (plus
-  `roostctl`/shell for simple cases) — mature fixtures, parametrization
-  over both UIs, and reporting, with the affordances that actually kill
-  flakiness (`roostctl wait`, `tab.dump`) living in the app, not the
-  runner. See [test-automation.md](test-automation.md). **Shipped** as
-  [`tools/roosttest/`](https://github.com/charliek/roost/blob/main/tools/roosttest/README.md).
-- **Lua**, *if and when it lands*, is an **embedded user-scripting
-  surface** for the Cmd+Shift+T launcher and complex user-authored
-  multi-step actions — a first-class client of the same op set,
-  deliberately **scoped, not the test mechanism**. We add it where it
-  earns user-facing programmability and avoid over-investing it as test
-  infrastructure. The launcher ships today driven by config-declared
-  commands, not scripts.
-
-Both would remain thin adapters onto the one command core (DL-11): a
-scripted action and a pytest step invoke the same ops.
-
-### DL-13: The agent state model — four axes, one derivation (2026-07-27)
-
-Replaced the two-field agent model (`Tab.state` + `Tab.hook_active`,
-three unrelated writers sharing one field) with four independent axes
-— shell state (OSC 133 marks), agent lifecycle (agent adapters),
-attention (notifications), and ownership (`{source, session_id,
-last_event_at, detail, metadata}`) — living in `roost-ipc::agent`
-(`crates/roost-ipc/src/agent.rs`) and mirrored in
-`mac/Sources/Roost/AgentState.swift`. `tab.state` on the wire becomes a
-**derived projection**, computed by a pure function
-(`agent::effective`) rather than written directly by any of the three
-former writers; `Tab.hook_active` is likewise derived, from ownership's
-liveness. `AgentLifecycle::Failed` projects onto `TabState::NeedsInput`
-— not a new wire value — because `tab.state` is pinned as a closed
-four-value enum for both Swift decoders (`IPCTabState`,
-`Workspace.TabState` have no fallback case) and this doc's own
-Versioning section (see [`ipc.md`](../reference/ipc.md)), which
-classifies a new enum value as a breaking change. The full mapping,
-the op that writes it (`tab.agent_report`), and the compatibility
-contract are in [`ipc.md`](../reference/ipc.md).
-
-Parity between the two UIs *[at the time: Swift and the gtk4-rs Linux
-UI; the Rust half is now `crates/roost-iced`, pinned by the same corpus]*
-is held the same way `tests/word-fixtures/`
-already pins tokenization: a shared, language-neutral corpus —
-`tests/agent-state-fixtures/*.json` — drives both
-`crates/roost-ipc/tests/agent_state_fixtures.rs` and
-`mac/Tests/RoostTests/AgentStateFixtureTests.swift`. It covers
-derivation, the `rank()` ordering the sidebar rollup and (eventually)
-the agent switcher share, and report-transition semantics — the
-higher-risk half, since it's state-machine logic, not a pure function
-over static input. A behavioral drift between the two ports surfaces
-as a red fixture test, not a bug report. *[This entry was one layer of a
-four-layer agent-roadmap document (L0 state model, L1 agent adapter
-seam, L2 diagnostics, L3 agent UX). That document was deleted once the
-spike completed; the state model it produced is what this entry
-records.]*
-
-### DL-14: Ownership is a label, not a suppression switch (2026-07-27)
-
-Ownership identity is the **pair** `(source, session_id)`, not
-`session_id` alone — two agents could otherwise collide on an opaque
-id from a different source. There is deliberately **no TTL or
-heartbeat**: Claude fires no periodic hook, so a long tool call would
-look stale and get released mid-turn under any lease scheme, which is
-worse than the alternative. Instead, a stale owner degrades
-*cosmetically* — because derivation falls through to shell state the
-moment the agent axis stops driving (`agent_lifecycle == inactive` or
-no live ownership), a dead agent leaves a tab mislabeled ("this tab
-still says `claude`") rather than broken. Ownership is cleared only by
-an explicit rule: a matching release, an unconditional `claim`
-(supersede — the only path that can take a tab from a live owner), or
-PTY replacement (tab close today; #170's hard-restart lands the same
-rule without a hardcoded path, since it's stated as "the PTY was
-replaced," not "the tab was closed"). (Amended by plan 052: the
-`pty_replaced` primitive was removed with no caller; a close drops
-the row, and #170's hard-restart rebuilds the reset with its
-respawn.) (Amended 2026-10-10: a claim is no longer quite
-unconditional. One from a different agent while the owner is mid-turn
-under a foreground process is a *nested* agent the owner is running,
-which inherited `ROOST_TAB_ID`, and it is dropped. The shell axis,
-not a timestamp, makes that call, so AD-3 stands. See
-[`tab.agent_report`](../reference/ipc.md#tabagent_report).)
-
-Raw-OSC suppression (dropping OSC 9/99/777 while a live agent owns the
-tab) is the **one exception that gets a real failsafe**, because it's
-the one place a stale owner is actually harmful — muting a tab's
-notifications forever with no agent left to unmute it. An OSC 133
-`A`/`B`/`D` mark (the shell reaching a prompt, which only happens once
-whatever the agent was running has exited) drops the lifecycle to
-`inactive` while keeping ownership as a label, which simultaneously
-re-derives shell state and re-opens raw OSC. Every other consumer of
-ownership (the tab tint, the rollup, the switcher) needs no equivalent
-failsafe, because the cosmetic-degradation argument in the paragraph
-above already covers them. See
-[`notifications.md`](../guides/notifications.md#hook-session-osc-suppression)
-for the user-facing behavior.
-
-### DL-15: Linux ships iced; gtk4-rs is retired and removed (2026-08-25)
-
-The Linux product is `crates/roost-iced` — the `.deb` installs it as
-`/usr/bin/roost` (v0.0.18) — and the gtk4-rs UI (`crates/roost-linux`)
-is deleted from the repo.
-
-Why iced won:
-
-- **The renderer was already ours.** Both UIs walked libghostty-vt's
-  render state and drew cell-aligned rects + text themselves, so Cairo +
-  Pango bought nothing the terminal grid needed; iced + wgpu puts the
-  same draw on the GPU.
-- **One Rust codebase, two host OSes.** iced runs on Linux *and* macOS,
-  so the binary that ships the `.deb` is the binary the macOS
-  experiment bundles — versus a toolkit that only exists on one of the
-  two target platforms.
-- **`roost-engine` is shared, not duplicated.** Both Rust UIs already
-  sat on the toolkit-neutral engine, so retiring one adapter removed
-  ~16k LOC of adapter, four CI jobs, a clippy config, and two harness
-  lanes without touching the core.
-- **The parity-reference role expired.** GTK's remaining job after the
-  Linux cutover was to be the thing iced was measured against. Once
-  iced *was* the product, the reference was the product.
-
-What was deliberately **kept**: the on-disk contract. The packaged Linux
-build resolves the same profile paths the GTK package owned — socket,
-`state.json`, both locks, log dir — and `packaging/roost-gtk-alias.desktop`
-keeps launcher pins created before the rename working, so an in-place
-upgrade needs no migration step. Only the profile's *name* changed
-(`roostctl --target gtk` → `--target linux`,
-`ROOST_BUNDLE_PROFILE=gtk` → `=linux`).
-
-### DL-16: An experimental mac-iced build ships beside Swift (2026-08-25)
-
-**Superseded by [DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)** — the hypothesis held.
-
-v0.0.18 added `Roost-Iced-<version>.dmg` — the same iced binary bundled
-for macOS with its own bundle id (`ai.stridelabs.Roost.iced`), its own
-socket/state/log paths, its own Sparkle feed and signing key
-(`docs/appcast-iced.xml`), a native menu bar, a Dock badge, and
-`UNUserNotificationCenter` banners (plans 027 / 028 / 030). It is opt-in,
-installs beside `Roost.app`, and never appears in the Swift app's
-release artifacts. **The Swift app remains the macOS product.**
-
-**This entry records a hypothesis, not a decision.** The *convergence
-hypothesis* is that one iced codebase can serve both platforms well
-enough to retire the second implementation — and the only place to test
-that against the Swift app is daily use, which is what this build exists
-for. What the evaluation turns on, and what each outcome implies, is in
-[Direction](#direction-under-evaluation).
-
-Accepted going in, decided rather than discovered: **accessibility**.
-AppKit gives the Swift sidebar and menus VoiceOver support for free; an
-iced canvas gives essentially none. Named here so it stays a conscious
-trade rather than a late surprise.
-
-### DL-17: an opt-in headless roost-session daemon for host-sessions (2026-08-28)
-
-Plan 035 (HS-1a) added `crates/roost-session`, a headless daemon built on
-`roost-engine` that owns a workspace + PTY supervisor with no UI
-attached — the first exception to
-[DL-3](#dl-3-unix-domain-socket-not-tcp)'s "local desktop app" framing
-and [DL-4](#dl-4-each-ui-owns-its-own-workspace-revised-2026-05-23)'s
-"each UI owns its own workspace," and to the "no daemon" language in
-[Why this shape](#why-this-shape) and the non-goals above. It exists for
-[host-sessions](https://github.com/charliek/roost/blob/main/discovery/host-sessions.md):
-a workspace that outlives any UI connecting to it, e.g. left running on
-a remote Linux host. It does not change the default deployment — a UI
-still owns its PTY supervisor in-process unless a user opts in with
-`roostctl session start`.
-
-DL-3 and DL-4 otherwise still hold: the session socket is a Unix domain
-socket with a same-UID peer check and `0700`/`0600` posture, not TCP,
-and session ops are gated to that one socket — UI sockets report
-`session.*` as `unknown-op` and `events.subscribe` as `not-implemented`,
-byte-identical to before this landed. See
-[ipc.md](../reference/ipc.md#session-sockets) for the wire contract.
-
-**Three deviations from the architecture doc are provisional, not
-final**, and tracked to close in HS-1b *(since closed — HS-1b shipped
-all three, including the lease as the anticipated breaking wire change;
-the list below is the deviation state as recorded on 2026-08-28, kept
-for the historical record. See
-[ipc.md](../reference/ipc.md#session-sockets) for the shipped contract
-and DL-18 below for the HS-2 client built on it)*
-([`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md)):
-`events.subscribe` ships leaseless, ahead of the `session.connect` lease
-[the architecture doc](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md)
-specifies — HS-1b's lease will be a breaking wire change for any client
-written against HS-1a; `session.stop` notifies push clients by closing
-the connection rather than the architecture doc's labeled envelope; and
-headless tabs have no server VT, so terminal-generated queries (DA/DSR/
-color) go unanswered until HS-1b adds one. Full deviation list in
-[ipc.md](../reference/ipc.md).
-
-### DL-18: hosts UX, attach-on-focus, effects + theme reseed, and the Mac gate (2026-08-29)
-
-Plan 037 (HS-2) is the first user-visible ship of host sessions: the
-iced UI attaches to a `roost-session` daemon as a "host" in the
-sidebar, so closing the app no longer kills what was running in it.
-Four decisions pinned there, each recorded because it proved
-non-obvious enough to relitigate otherwise:
-
-- **Hosts UX.** The single "PROJECTS" sidebar header becomes one band
-  per host once at least one is saved — LOCAL first, then each saved
-  host by label, each with a connection dot and an agent rollup —
-  while zero saved hosts renders exactly today's sidebar (the
-  roadmap's D8 zero-change rule). Every host action lives in the
-  command palette rather than a host menu: one row per (verb, host)
-  pair, appearing only when it applies (Stop only while connected,
-  Remove only while disconnected). Add Host is the one flow that needs
-  free text and is a small modal dialog, validating by dialing
-  `session.identify` before it saves.
-- **Attach-on-focus.** A client attaches a tab's data connection only
-  while it is the focused tab, detaching — never stopping — on
-  switch-away; a background host tab stays current through the events
-  mirror alone (titles, agent state), with its scrollback living
-  server-side. This bounds client memory and live data connections at
-  one per host, nowhere near the server's own 32-connection cap, at the
-  cost of a small per-focus round trip that resume makes cheap.
-- **Effects + theme reseed.** The two open questions
-  [DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)
-  left on the server side close as the smallest useful slice: a
-  session forwards a tab's bell and OSC 52 clipboard writes to
-  whichever client holds its lease (`tab.effect` events, 256 KiB
-  clipboard cap), and a connecting client seeds every tab's server
-  `Terminal` with its own palette (`session.set_theme`) so a color
-  query answers with what the client is actually rendering rather than
-  the server's factory default. Both are additive;
-  `SESSION_PROTOCOL_VERSION` stays `2`.
-- **The Mac gate**, refining rather than contradicting the roadmap's
-  "no visible dead end" rule: there is no macOS `roost-session` build,
-  so the Roost-Iced Mac client hides the `localhost` surface entirely
-  — no seeded Connect row, no launch auto-reconnect, no
-  spawn-if-missing. **Add Host stays** on macOS regardless: pointing it
-  at an `ssh -L` forward to a Linux host is the feature's whole
-  Mac→Linux payoff, not a dead end.
-  *Superseded by [DL-19](#dl-19-macos-ships-roost-session-too-the-mac-gate-lifts-2026-09-01) — the gate lifted in HS-4b.*
-
-See [`guides/host-sessions.md`](../guides/host-sessions.md) for the
-user-facing shape and
-[`development/host-sessions.md`](host-sessions.md) for the
-architecture (component topology, the attach sequence, the
-lease/takeover lifecycle); the roadmap's D11 — Hosts UX
-([`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md))
-is the source decision this entry summarizes.
-
-### DL-19: macOS ships `roost-session` too, the Mac gate lifts (2026-09-01)
-
-Plan 041 (HS-4b) closes the gap
-[DL-18](#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29)
-left open: `roost-session` now builds, bundles, and ships inside
-`Roost-Iced.app` (`Contents/MacOS/roost-session`, individually signed,
-with a relative symlink beside the bundled `roostctl` so its own
-sibling-of-exe lookup resolves the daemon too), so the Mac gate lifts
-unconditionally — every build now offers the `localhost` surface: the
-seeded **Connect Host: localhost** row,
-spawn-if-missing, and launch-time auto-reconnect (connect-if-present,
-localhost-only, never spawning) all behave identically on macOS and
-Linux. A host session's projects and tabs now persist across quitting
-Roost on both platforms — the same "host-section state outlives the
-app, an ordinary local tab doesn't" contract Linux already had under
-DL-18.
-
-What's still not shipped: connecting *to* a Mac as an SSH host (the
-install/upgrade bootstrap's `check_os` still refuses a Darwin remote)
-and a standalone darwin `roost-session` release artifact — both
-deliberately deferred to HS-4c. The Swift `Roost.app` remains
-permanently excluded, unchanged from DL-18.
-
-*Superseded 2026-10-18:* both have shipped. The probe maps `uname` onto
-a published platform (`linux-amd64`, `linux-arm64`, `darwin-arm64`), so
-an Apple-silicon Mac is an SSH host the bootstrap installs and upgrades,
-and `release.yml` publishes `roost-session-<version>-darwin-arm64` from
-the bundle's own copy. An Intel Mac still has no build.
-
-See [`guides/host-sessions.md`](../guides/host-sessions.md) for the
-user-facing shape, including the new [launchd supervision
-recipe](../guides/host-sessions.md#surviving-reboots-launchd) for
-surviving a Mac's own reboots.
-
-### DL-20: a UI socket may route a mutation to a session (2026-09-04)
-
-Plan 044 (#398) made `tab.reorder` and `project.reorder` accept the
-host-qualified `h<host>.<id>` spelling on a **UI socket**, and that is a
-first worth writing down. Every earlier host-qualified op on a UI socket
-— `tab.dump`, `tab.focus` and their siblings — answers from **client**
-state: a terminal this client has already hydrated, a selection this
-client owns. The two reorder ops are the first to forward a **mutation**
-to another process and answer with *its* verdict. Two consequences fall
-straight out of that and are otherwise unexplainable. The App's arm
-cannot answer inside `update` the way every other host request does,
-because it has to await a network round trip — so it moves the reply
-into the spawned future and answers from there (a dropped one surfaces
-as `internal: UI dropped reply`, deliberately loud). And
-`host-unavailable` had to exist at all: a UI socket that forwards can
-now fail in a way no local op can, by not reaching the far side.
-
-**This does not reopen
-[DL-4](#dl-4-each-ui-owns-its-own-workspace-revised-2026-05-23).** The
-UI still owns exactly one workspace — its own — and a host-routed
-reorder never touches it (a lane asserts precisely that). The qualified
-id does not fold a session's workspace into this UI; it names a
-workspace this UI is a *client* of, which
-[DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)
-already carved out. Ownership is unmoved: the session decides, the reply
-is the session's, and the sidebar's new order arrives on the session's
-own `tabs.reordered` / `projects.reordered` event rather than from the
-reply. The client never mints an order of its own.
-
-**Nor
-[DL-11](#dl-11-one-command-core-thin-per-surface-adapters-2026-05-26).**
-It is one op set: one op name, one param shape, one set of partial-order
-rules, honoured identically at both ends. The routing *is* the thin
-adapter — a request is read, its id-space is decided, and it goes to the
-one instance that owns it. And it closes an asymmetry DL-11 explicitly
-forbids: before 044 a host section's order was reachable by mouse and by
-nothing else — no op, therefore no `roostctl`, no script, and no test.
-The tension a reader feels is real but narrow, and worth naming so
-nobody has to rediscover it: one op name now resolves against two
-different workspaces depending on how an id is spelled. The spelling is
-the entire disambiguator, which is why it must be canonical, why a
-request may carry only one id-space, and why a mixed one is refused
-rather than guessed at.
-
-**The rule for the next op that wants to route this way** — stated as a
-rule because the second one will not get the same review the first did:
-
-- **One id-space per request.** All-bare goes local; all-qualified on
-  one incarnation goes to that host. Anything mixed is `invalid-param`
-  naming the rule — never a partial application, never a guess. Decide
-  what an **empty** list means and write it down, because "all bare" and
-  "all qualified" are both vacuously true of one: for these two ops an
-  empty `project_ids` routes local, while an empty `tab_ids` follows its
-  `project_id`, which is the only ref that can carry an id-space. See
-  [ipc.md's routing matrix](../reference/ipc.md#the-reorder-routing-matrix).
-- **A session socket refuses the qualified form** (`invalid-param`), so
-  the spelling means "client, route this" and can never mean anything
-  else.
-- **Answer from the spawned future, not from `update`.** A routed op is
-  a round trip; replying before the far side has spoken is answering
-  for it.
-- **Display state follows the session's event, not the reply.** The two
-  ride separate connections with no ordering between them. The held drag
-  preview is the corollary, not a special case.
-- **Which codes may cross.** A session's own refusal keeps its code when
-  that code is one both sockets share, so a caller matching
-  `invalid-param` sees the same thing whichever end refused. (Ten when
-  this was written; DL-22's `too-large` and `store-full` joined the list
-  later — [`ipc.md`](../reference/ipc.md#wire-format) is the current
-  one.) A
-  session-scoped code must **fold**: `shutting-down` is session-socket
-  only, and so is anything a newer session invents — both become
-  `host-unavailable` with the original code and sentence kept in
-  `message`. A UI socket must never answer a code its own list does not
-  name. A connection that is not there is `host-unavailable`; an
-  incarnation this client is not connected to is `not-found`.
-
-See [`development/host-sessions.md`](host-sessions.md) for how a
-reorder actually travels and why the preview is held, and
-[`reference/ipc.md`](../reference/ipc.md#tabreorder) for the wire form.
-
-### DL-21: `App` stays unconstructible in tests — guards are lifted, `App` delegates (2026-09-04)
-
-Plan 045 (#383) settled a question plan 044 had answered three times by
-necessity. `App` has one constructor, `App::bootstrap`
-(`crates/roost-iced/src/app.rs`), and it measures fonts through iced,
-builds a tokio runtime, hydrates the workspace and binds the socket. The
-issue's first sketch was a test constructor that skips those. It was
-refused on evidence, not taste: `App` has 89 fields, and the five guard
-paths the issue names read eight of them. A test constructor would build
-81 fields nothing under test reads, and it would be a second `App` —
-one that passes while production fails, the failure mode plan 040 §3.6
-named. The codebase had already answered the other way:
-`app/interactions.rs` has 87 tests and not one of them constructs an
-`App` — every decision it tests is a free function over explicit state,
-and its `impl App` blocks hold the delegations — and `host_conn.rs`'s
-suite already tests an app-side decision (`offer_for`) against a real
-`HostConnSet`.
-
-**The rule, in three shapes — pick by what the thing under test *is*:**
-
-- A **decision** is a pure function over its inputs (`offer_for`,
-  `hold_verdict`, `current_stop`, `step`).
-- A **decision with state effects** is a function over the *narrowest
-  constructible cluster* it reads and writes. `ExitState`, `HostConnSet`
-  and `BootstrapsInFlight` are constructible in a unit test; `App` is
-  not, and a test constructor for it is refused by default — revisited
-  only for a behaviour that genuinely depends on an `App`-wide invariant
-  no cluster can carry, recorded here when it happens. (`reconnect_due`,
-  `tunnel_ready`, `dial_saved_host` in `app/host_lifecycle.rs`.)
-- **Wiring** — "the drain calls X on edge Y" — is tested by lifting the
-  *edge handler* so the call is inside it (`settle_host_state` carries
-  the probe cancel a `Disconnected` must make).
-
-What stays on `App` is a delegation plus the effects that need a
-window, a workspace or a spawned task — never a branch of its own. New
-guards follow this shape from the start rather than reaching it through
-a 340-line refactor after the bug.
-
-**The limit, stated:** the lifted function is fenced; the one-line
-delegation to it is not, and neither are the window/workspace/task
-effects the caller performs on what it returns. A change that bypasses
-the lift is caught by review and by the e2e lanes, not by a unit test.
-When a returned value *is* the next decision (an offer to raise, a
-reason to show), carry it in the return — `TunnelLanding::Landed
-{ reason }`, `HostEdge { offer }` — so the wiring between two decisions
-is inside the fence rather than in the caller. Every fence is proven
-with a negative control — stub the guard, watch the test fail, revert,
-watch it pass — because a guard whose test passes with the guard
-deleted has not been tested.
-
-**The seam this does not bless, and tolerates:** a `#[cfg(test)]` arm
-in a production enum (`DeadTunnel::Recorded`) is a last resort,
-acceptable only when the value's *source* is another crate's private
-state that no constructible cluster can reach. That is why it stays
-until #385's seam is cheap (costed in plan 045 §3.4).
-
-### DL-22: files cross a host boundary as bytes through the op set, pasted as bare host paths the client has validated (2026-09-06)
-
-Plan 047 (#406) made a pasted image and a dropped file work in a host
-tab. The mechanism is worth writing down because the obvious one is
-wrong. Pasting an image into an agent looks like a clipboard feature,
-and it is not: **every** agent Roost supports reads the clipboard
-*itself* on Ctrl+V, on the machine it is running on. Over SSH that
-machine is not the one holding the clipboard, so no amount of clipboard
-plumbing composes. What every agent *also* accepts is a filesystem path
-it can open. That is the only contract that survives the boundary, so
-that is the one Roost targets: the bytes travel as an **op**
-(`session.put_file` — lease-gated, one frame, 10 MiB, answering with the
-host path), and the client pastes the path that comes back.
-
-**Bare, not quoted or escaped.** The single spelling every agent
-unquotes identically is no quoting at all. The five parsers each strip
-*something* — one shlex-tokenizes, one un-backslashes, they disagree on
-`file://` — and there is no guarantee of parity across them for any
-escaped form, so escaping the returned path (which is what the local
-drop route does to a local one) would be betting the feature on five
-independent implementations agreeing. Instead, "paste-safe" becomes a
-property of the whole path rather than a transformation applied at the
-end: `name` is validated, never repaired
-(`[A-Za-z0-9._-]`, refused otherwise), and the session checks its
-*entire* resolved store path against `[A-Za-z0-9._/-]` at start, moving
-to a `/tmp` root if a `$HOME` with a space in it would have made every
-upload unpasteable.
-
-**And the client re-checks the reply before it types it.** The returned
-path must be absolute, in that grammar, end in exactly the `name` that
-was sent, and report the byte count that was sent. This is not
-belt-and-braces about our own session: a path from a socket becomes
-*typed input into a live shell*, which is the one place a malformed or
-hostile answer would be executed rather than displayed. Validating at
-the point of use is what makes the guarantee independent of who answered.
-
-**The op set is the whole surface, as usual.** One entry point,
-`tab.send_file`, is what a native drop, a clipboard-image paste and
-`roostctl tab send-file` all drive — the drop *is* the op minus the
-window event, which is also why the e2e can exercise drops without
-XDND. Policy (what uploads, what is skipped, what a batch costs) is a
-pure planner in `roost-ui-model` so the Swift fold-in mirrors it rather
-than re-deriving it; inspection and upload are the impure layers around
-it. Uploads ride a **dedicated per-incarnation dispatcher** on their own
-connection, never the control leg, because that loop awaits each call
-inline and could not admit an upload while one was in flight.
-
-**The contract this is written against**, from the agents' own sources
-(2026-09):
-
-| Agent | A pasted absolute path |
-|---|---|
-| Claude Code | Attaches images and PDFs. |
-| Codex | Attaches images, gated on the user's `image_paste_enabled`; a single path per paste. |
-| OpenCode | Attaches images and PDFs; a single path per paste. |
-| grok / gx | Attaches images; rejects tiny ones, so fixtures must be real-sized. |
-| cursor-agent | **Does not attach** a pasted path — verified live, and identically for a local paste, so the gap is its composer, not the host path. |
-
-Two consequences are load-bearing, not incidental. **A multi-path paste
-attaches in none of them**, so a multi-file drop is a paste of real host
-paths and nothing more — which is honest, and is why the guide says so.
-And **any regular file uploads**, not only images: the deliverable is a
-working host path, and whether it becomes an attachment chip is the
-agent's decision, not Roost's.
-
-**What this cost, stated plainly:** `SESSION_PROTOCOL_VERSION` moved
-2 → 3, which disables *every* host session until its far side is
-updated, not just file paste. The rule that made it move is now written
-on the constant — an additive op bumps when a pre-bump peer could not
-refuse it meaningfully — and a pre-047 session could only answer
-`unknown-op` to a file the user had just pasted. The alternative (keep
-`2`, degrade per paste) was narrower and equally honest; it was declined
-rather than overlooked, because carrying that fallback forever is a debt
-and this is a young protocol.
-
-See [`reference/ipc.md`](../reference/ipc.md#tabsend_file) for both ops'
-wire shapes, [`reference/paths.md`](../reference/paths.md#session-profile)
-for where the files land, and the [host-sessions
-guide](../guides/host-sessions.md#pasting-images-and-files-into-a-host-tab)
-for the user-facing shape.
-
-### DL-23: the interactive lease is re-cut — reads free, attach input + `tab.write` owned (2026-09-07)
-
-Plan 049 (R1, [#418](https://github.com/charliek/roost/issues/418))
-found the lease gating the wrong axis. HS-1b put `events.subscribe` and
-attach behind it and left `tab.write` open to anything that could
-reach the socket — a phone watching a session the desktop drives is
-exactly backwards from that: the read was locked and the write was
-wide open. Every multi-client story past this point needs
-reads-free/writes-owned, so R1 flips both halves at once.
-
-**The lease is interactive-ownership coordination, not a security
-boundary** — restated, not new: any same-UID client could already
-`session.connect{takeover: true}` on purpose, and still can. What
-changed is what the lease *gates*. `events.subscribe` no longer
-requires one at all; presenting one now only **classifies** the
-resulting stream — a current lease gets the driver's full feed
-including `tab.effect` (bells, OSC 52 clipboard writes, still scoped to
-the driver alone per [DL-18](#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29)),
-anything else gets an observer feed of workspace state plus
-`notification.fired`. What becomes **owned** is precisely attach input
-(unchanged from HS-1b) and, newly, `tab.write` on a session socket —
-not "writes" as a category: `tab.resize` and the administrative
-mutations (`tab.open`, `project.*`, `tab.agent_report`) stay lease-free,
-same-UID control-plane use exactly as before.
-
-**Takeover stopped being terminal for event streams.** A driver's
-control and data connections still close on takeover, same as always
-*(reversed by [DL-25](#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08): a takeover now closes nothing)*,
-but its event stream now survives, reclassified to observer in place
-and told once via the new non-terminal `session.driver_changed{taken_by}`
-envelope — the sibling of the terminal `session.stopping`, not a
-replacement for it. This is what lets the displaced iced window keep
-its tab list, titles, agent status, and notifications live while only
-the terminal grid freezes, and what lets a second client watch a
-session without ever claiming the lease at all.
-
-**The label is display metadata, never identity.** `taken_by` carries
-whatever the connecting client's `session.connect{client_label}` stated
-about itself — a hostname, an app name — normalized (trimmed,
-control-stripped, capped) but never authenticated; the UI renders it as
-what the client "reports itself as." A phone can call itself anything.
-
-`SESSION_PROTOCOL_VERSION` moved `3` → `4` for the breaking half of
-this (a `3` client's leaseless write is refused by a `4` session, and a
-`4` client's leaseless subscribe is refused by a `3` one); the new
-`session.identify.features` open list exists precisely so the *next*
-additive session op doesn't need a fifth generation the way
-`session.put_file` needed a fourth.
-
-See [`reference/ipc.md`](../reference/ipc.md#eventssubscribe) and
-[`reference/ipc-compatibility.md`](../reference/ipc-compatibility.md#version-bumps)
-for the wire contract, and
-[`development/host-sessions.md`'s lease/takeover lifecycle](host-sessions.md#the-leasetakeover-lifecycle)
-for the shipped mechanics.
-
-*Amended by [DL-25](#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08) — the "attach input + `tab.write` owned" half is reversed; reads-free stands.*
-
-*Superseded by [DL-26](#dl-26-there-is-no-lease-2026-09-12) — the lease itself, and everything it gated, is retired at protocol 5.*
-
-### DL-24: no supervisor artifact — a session comes up on demand (2026-09-08)
-
-A session comes up exactly three ways: a client's own localhost
-`Connect` walking the launch ladder, the SSH bootstrap ladder reaching a
-remote box, or `roostctl session start` run by hand. All three are
-client-initiated. Nothing needs a session up *before* a client exists to
-connect to it — a reboot ends every shell inside a session regardless of
-whether the session itself was pre-started, and the only thing a
-pre-started session buys over the first `Connect` starting it fresh is
-skipping the few hundred milliseconds it takes to open shells in their
-saved directories, which the first `Connect` does anyway.
-
-The opt-in daemon from [DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)
-shipped a supervisor artifact for it in this cycle — `roostctl session
-autostart install|uninstall`, writing a `systemd --user` unit or a
-launchd LaunchAgent (plan 052, [#424](https://github.com/charliek/roost/issues/424)).
-It grew a profile-collision defect
-([#438](https://github.com/charliek/roost/issues/438)) whose fix was a
-~2,500-line hardening pass (plan 055) that was abandoned rather than
-landed. Decision: remove the artifact
-([#454](https://github.com/charliek/roost/issues/454)) before it ever
-shipped in a release, rather than pay that hardening cost for a verb
-with no consumer. herdr, the substrate roost measures itself against,
-ships no supervisor either.
-
-The standing rule going forward: do not add a unit, a plist, or a
-doctor probe for one, without a case that needs a session up before any
-client exists. The [user guide](../guides/host-sessions.md#surviving-reboots-launchd)
-still shows a hand-written `systemd --user` unit and launchd LaunchAgent
-for anyone who wants reboot survival anyway — that is a recipe the
-reader owns and edits, not a feature roost ships, installs, or verifies
-for them.
-
-### DL-25: raw input is open to every same-UID client; the lease is the foreground (2026-09-08)
-
-[DL-23](#dl-23-the-interactive-lease-is-re-cut-reads-free-attach-input-tabwrite-owned-2026-09-07)
-(plan 049, R1) made reads free and writes owned: `events.subscribe`
-needed no lease any more, but attach input and `tab.write` did. Plan
-057 (R15, [#453](https://github.com/charliek/roost/issues/453))
-reverses the second half on purpose, leaving the first exactly as it
-was — this is not a retreat from R1, it is R1's other half turning out
-to have been the wrong call.
-
-The 2026-09-08 measurement against tmux and herdr, the two substrates
-roost keeps comparing itself to, is what forced the call: tmux lets
-every attached client type into a shared pane, and any same-UID process
-can `send-keys` into one whether or not it is attached at all; herdr's
-multi-client attach has no owner concept for input in the first place.
-Both still put bells, clipboard writes, and pane sizing on one
-foreground client — neither substrate gates *typing* on ownership, only
-the side effects that have to pick a single recipient. Roost's owned
-input was stricter than either for no product gain, and it had a real
-cost: the product's pitch is "start it on the desktop, pick it up on
-the phone, sit back down," and a phone that wanted to type one line had
-to depose the desktop to do it, which froze the desktop's grid in the
-old lease semantics. That is a worse multi-device story than either
-thing roost measures itself against ships today.
-
-**What the lease still means.** Being the foreground is exactly four
-things: the connection's `events.subscribe` stream is classified driver
-and receives `tab.effect` (bells, OSC 52 clipboard writes); its
-reported focus is the one that mutes notifications;
-`session.driver_changed` names it; and the session-wide settings and
-upload ops — `session.set_theme`, `session.set_agent_hooks`,
-`session.put_file`, and the since-deleted `session.set_focus` — accept
-only its lease. It
-never again gates `tab.write` or attach. `session.connect
-{takeover}` itself is unchanged: one holder, takeover invalidates and
-tombstones the old one, `already-connected` without `takeover` — what
-changed is what holding the lease is *for*, not how it changes hands.
-
-**Geometry follows the last client that interacted, not the lease.**
-herdr's rule — the last geometry-bearing interaction (a focused attach,
-a data-plane INPUT or RESIZE frame, `tab.resize`) sizes the PTY — is
-adopted as-is. Smallest-wins, the alternative considered, was rejected
-because it makes a phone glancing at a tab shrink the desktop's grid
-for everyone; last-interactor-wins at least ties the resize to someone
-actually doing something with the tab, even though two clients
-alternating keystrokes will flap the size between them. That flapping
-is accepted, not solved, here.
-
-**Additive, not a new generation.** `SESSION_PROTOCOL_VERSION` stays
-`4`; the reopened gate is advertised as `open_input` in
-`session.identify.features`, so a `4` session that has not yet picked
-this up still answers a leaseless write with `connect-required` and a
-client feature-detects the difference rather than assuming it from the
-number. Because nothing about `tests/ipc-vectors/session.identify.response.v4.json`
-moved — `features` is asserted as a subset, not compared field-for-field
-— shed's pinned identify vector needs no re-pin for this.
-
-See [`reference/ipc.md`](../reference/ipc.md#sessionconnect),
-[`reference/ipc-compatibility.md`](../reference/ipc-compatibility.md#version-bumps),
-and
-[`development/host-sessions.md`'s lease/takeover lifecycle](host-sessions.md#the-leasetakeover-lifecycle)
-for the shipped mechanics.
-
-*Superseded by [DL-26](#dl-26-there-is-no-lease-2026-09-12) — the lease itself is retired at protocol 5.*
-
-*Its geometry half ("Geometry follows the last client that interacted") is superseded by [DL-31](#dl-31-a-tab-has-one-size-owner-2026-10-30): a tab has one size owner, and typing, a focused resize or Take size takes it; merely attaching to an owned tab does not.*
-
-### DL-26: there is no lease (2026-09-12)
-
-[DL-23](#dl-23-the-interactive-lease-is-re-cut-reads-free-attach-input-tabwrite-owned-2026-09-07)
-and [DL-25](#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)
-kept narrowing what the interactive lease gated until what was left —
-"the foreground" — was four things: which stream got `tab.effect`,
-whose focus muted notifications, who `session.driver_changed` named,
-and which connection the session-wide settings ops would accept.
-Measured against the two substrates roost keeps comparing itself to,
-that residue bought nothing *for roost's requirement* — though the
-measurement deserves stating precisely, because an earlier draft of this
-entry overstated it. **tmux** is the clean case: bells and OSC 52 go to
-every attached client, sizing follows the latest, and none of it is
-gated on an owner. **herdr is not an owner-free design**, and citing it
-as one was wrong. It keeps a `foreground_client_id` — "the client
-currently driving session-wide host presentation and side effects"
-(`src/server/headless.rs:210`) — and its bells, window title and PTY
-sizing (`effective_size`) all key off that one client. Its *direct*
-terminal attach goes further still, with a single writable owner per
-terminal (`terminal_attach_owners`) that a second client must pass
-`--takeover` to seize.
-
-Two things distinguish it from what roost retired, and they are the
-whole of the argument. herdr's foreground is **derived, not claimed**:
-`latest_shell_client` is simply the connection with the newest activity
-stamp, promoted automatically, never a token a client holds and another
-must take. And its ordinary multi-pane client mode gates **no input** on
-any of it — the owner exists only for the raw single-terminal attach.
-Roost's lease was the other shape: an explicitly minted token, held
-across reconnects, seized by an announced takeover. Roost also goes
-further than herdr rather than copying it — effects reach every
-subscriber and the viewing client decides what to apply, and muting is a
-union rather than one elected client's property. What
-the residue *cost* was most of the host-session client's complexity —
-the reconnect probe, observer mode, deposed-but-serving, the in-place
-retake, the carried lease through an outage, the takeover banner — for
-a coordination problem that turned out not to need a single answer.
-
-**Charlie's product requirement is simpler than a lease:** the client
-you are viewing from gets the notifications; other connected clients
-may get them too. That is "deliver to every subscriber, and each
-client applies an effect to the tab it is viewing" — not an election.
-The one thing that looked like it needed a single answer — which tab is
-muted because someone is looking at it — turned out not to need an
-answer at the session at all (see rule 2).
-
-**Two rules replace the lease, in full:**
-
-1. **Effects fan out; the viewing client applies them.** Every
-   subscriber receives every `tab.effect`. A bell is worth marking on
-   any tab a client owns; an OSC 52 clipboard write is applied only to
-   the tab that client is actually viewing, independent of window
-   focus. There is no "driver" stream and no `session.driver_changed`
-   — every stream is the same stream.
-2. **Notifications fan out; each client answers for its own window.**
-   A session suppresses nothing — it has no window, so it has nothing
-   to suppress *with*. Every raise sets the pending bit and pushes
-   `tab.notification` and `notification.fired` to every subscriber; the
-   client that is showing that tab, focused, raises no banner and sends
-   a generation-checked `tab.clear_notification`, which takes the dot
-   down everywhere. *Amended 2026-09-15 (#474):* this rule first read
-   "focus is a union" — each connection stated what it was viewing via
-   a `session.set_focus` op and a tab was muted while any connection
-   claimed it. A union mutes the wrong people: a phone left open on a
-   tab silenced the laptop. The op is deleted; the predicate it fed now
-   reads only the workspace's own window.
-
-Session protocol `5` retires `session.connect`, the `lease` field on
-every op, `session.driver_changed`, and the four retired refusal codes
-(`connect-required`, `already-connected`, `taken-over`, `superseded`) —
-a hard,
-breaking bump with no compatibility shim in either direction, because
-nothing built on this wire had shipped past v0.0.19's protocol `2`
-(see CHANGELOG). Geometry stayed last-interactor
-([DL-25](#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)) —
-that rule never depended on the lease and needed no change *(superseded
-by [DL-31](#dl-31-a-tab-has-one-size-owner-2026-10-30): a tab now has one
-size owner)*. `roostctl`,
-same-UID access, and the attach path are unchanged; only the
-authority layer on top of them is gone.
-
-See [`reference/ipc.md`](../reference/ipc.md#sessionconnect) for the
-wire contract at `5` and
-[`development/host-sessions.md`'s multiple-clients section](host-sessions.md#the-leasetakeover-lifecycle)
-for the shipped mechanics.
-
-### DL-27: the local backend is a user's choice, not a default flip (2026-09-14)
-
-Plan 063 (R9, [#426](https://github.com/charliek/roost/issues/426)) gives
-`local-backend = in-process | session` a switch, not a flip. Every
-existing setup keeps running its own tabs in-process, exactly as it
-always has; only a genuinely fresh install — no `state.json` and no
-`config.conf` — starts on `session` and records the key, because that is
-the only machine on which "session" is not a behavior change to
-anyone's saved layout. Two palette verbs move the layout between the two
-in place afterward: forward replays the in-process projects onto a local
-`roost-session` daemon (the *slot*) and ends the in-process shells;
-reverse is **No-Replay** — it flips the key back and brings the
-in-process band up from its own persisted state, and deliberately never
-copies the session's layout back. The slot's work stays exactly where it
-is, one click away under a `LOCALHOST` band, and nothing is ever
-duplicated by flipping back and forth.
-
-**Flipping the default itself for existing setups is still open**,
-tracked as its own follow-up
-([#480](https://github.com/charliek/roost/issues/480)) rather than
-decided here — R9 shipped the machinery a flip would need (the config
-ladder, the switch, and the launch-time migration below) but not the
-flip.
-
-**A launch may now spawn a daemon — scoped to the slot alone.** This
-amends the standing "no daemon by default" rule this file opens with:
-under `session`, launch dials the slot `SpawnIfMissing` the same way an
-explicit Connect always has, because a UI that comes up in session mode
-with nothing listening is a UI with no local band at all. Every other
-host keeps today's rule — connect-if-present, never spawn — unchanged.
-
-**A populated in-process workspace found under `session` at launch
-migrates on its own**, once the slot connects: a hand-edited key today,
-the eventual default flip's on-ramp tomorrow. It is the same six-phase
-switch above, armed with the retained layout instead of a confirm
-dialog, so there is exactly one migration path to keep correct rather
-than two that drift. A slot that never connects parks the migration
-rather than wedging the window — no journal, no refused input, and the
-next launch tries again.
-
-**The Swift Mac app is unchanged by all of this.** It stays in-process
-always, keeps seeding a project named "Roost" (the iced UIs now seed
-`Untitled 1` at `$HOME` instead — see
-[`reference/config.md`](../reference/config.md#local-backend)), never
-reads `local-backend`, and carries the new `recent_hosts` snapshot field
-verbatim the way it already carries `hosts` — a write-through it does
-not understand still cannot drop a field it never parses out. Nothing
-here reopens [DL-1](#dl-1-swift-appkit-on-mac-not-rust): this is a
-gap between the two UIs, recorded rather than closed, the same way
-DL-19's Mac gate and DL-15's GTK retirement were.
-
-See [`guides/host-sessions.md`](../guides/host-sessions.md#switching-the-local-backend)
-for the user-facing shape and
-[`reference/ipc.md`](../reference/ipc.md#identify) for the wire fields.
-
-### DL-28: Roost-Iced becomes the recommended Mac install for agent-driving users (2026-09-19, pending)
-
-**Superseded by [DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03).**
-
-**This is a pending decision, not a shipped one.** From the release
-after v0.0.19, [`getting-started/installation.md`](../getting-started/installation.md)
-steers Mac users who drive Roost from an agent — the Claude skill,
-`roostctl open`/`wait`/`events`, `tab prompt` — onto `Roost-Iced.app`
-rather than the classic Swift `Roost.app`, because the Swift build does
-not serve that surface: no `project.ensure` (`open` is `unsupported`),
-no `activate` (`--no-activate` is `unknown-field`), and no event stream
-(`events` and `tab prompt` fail, `wait` polls) — see
-[`reference/cli.md`](../reference/cli.md).
-
-Charlie's own framing of what comes after this release, recorded here
-rather than decided: Roost will either sunset the Swift app and make
-Roost-Iced the Mac default, or rebuild the Swift UI as a thin layer over
-the same Rust core Roost-Iced already uses. Either branch puts the
-agent-control surface in the Rust core — this is additive to
-[DL-16](#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25)'s
-convergence hypothesis and the (a)/(b) branches in
-[Direction](#direction-under-evaluation) below, not a
-resolution of it.
-
-### DL-29: program status is a fourth per-tab axis, composed above the hook layer (2026-10-28)
-
-Plan 082 (protocol 7) lets an agent report its own state in the
-terminal with OSC 7501. It is not routed through `tab.agent_report`,
-and the pure functions of [DL-13](#dl-13-the-agent-state-model-four-axes-one-derivation-2026-07-27)
-keep their behavior and their shared fixtures (DL-13's axes are,
-counted this way, the shell, the hook layer and attention): the records
-are a separate per-tab layer in `roost-engine` (`program_status.rs`), and one
-composition reads that layer and the hook layer together into the
-lifecycle every surface shows (`Tab::effective_lifecycle()`, `Tab.state`
-on the wire). The tab's **authoritative terminal** is the only one that
-listens — a session tab's server terminal, an in-process iced tab's own;
-a host tab's client mirror and the Swift app keep no records — and it
-hands records and OSC 133 prompt marks to that layer as one stream in
-byte order, so the result never depends on where a PTY read split the
-bytes. (Since [DL-30](#dl-30-one-osc-133-parser-per-sink-terminal-2026-10-28)
-the hook layer reads its marks from that stream too.) While a record is
-mid-turn the program decides; hooks keep ownership and identity, their
-state changes are vetoed (counted, not dropped), and a claim from a
-different agent is refused (`foreign_app`).
-
-Two of the rules are Charlie's calls on departures from the release
-doc ([`protocol-7-release.md`](https://github.com/charliek/roost/blob/main/discovery/protocol-7-release.md)):
-
-- **(b) A kept `done`/`error` ends at the next command.** The release
-  doc keeps a finished root record displayed after a prompt with no end
-  condition, which would leave a killed agent's `error` showing
-  NeedsInput forever. The next OSC 133 `C` after a prompt — the user
-  starting another command — retires it.
-- **(c) Claude Code's Screen Reader marks count as prompt marks.** They
-  are indistinguishable from the shell's in the bytes and in
-  libghostty's event, so the record layer treats them alike and the
-  resulting sequences are pinned by tests. Scoping the drop to the
-  shell's own prompts needs a command id in OSC 133, upstream.
-
-Prompt marks are A, B and D, not only A, because Roost's bash and zsh
-integration never sends A. The user-facing rules are in
-[`guides/agents.md`](../guides/agents.md#program-status-osc-7501); the
-wire shape is [`Tab.program_status`](../reference/ipc.md#tabprogram_status-osc-7501).
-
-### DL-30: one OSC 133 parser per sink terminal (2026-10-28)
-
-Plan 083 (#650) reverses plan 082's D4.3, which left the hook layer
-reading OSC 133 through `roost-osc` while the records of
-[DL-29](#dl-29-program-status-is-a-fourth-per-tab-axis-composed-above-the-hook-layer-2026-10-28)
-read libghostty's ordered semantic-prompt stream. The two parsers
-disagree on real forms — libghostty reads `133;P;k=i` and `133;N` as a
-primary prompt start and filters `133;A;k=s`, `roost-osc` took the first
-letter — so a banner could depend on where a PTY read split the bytes,
-and 082 needed a pairing layer to line the hook layer's raw-OSC
-suppression up with the record layer's. Two sources of truth for the
-same bytes cost a bug and a layer, and every later feature built on
-marks would have inherited both views.
-
-On a **sink terminal** — a session tab's server terminal and an
-in-process iced tab's, the ones with a status sink, which are exactly
-the ones whose bytes `roost-osc` scans — the hook layer now takes its
-marks from that same stream: `Workspace::apply_program_status` advances
-the hook state through each prompt mark in byte order, inside the one
-lock that applies the records, and `roost-engine`'s `OscRouter` maps
-`roost-osc`'s 133 to nothing. `agent::apply_shell_mark`, the shared
-agent fixtures and the failsafe are unchanged; what changes is which
-forms reach them (spec-correct, the table in
-[`guides/agents.md`](../guides/agents.md#which-marks-count)), and a
-mark libghostty drops — one over its 2048-byte OSC buffer — moves
-nothing. A raw OSC 9 / 777 libghostty places is judged where it falls
-against both the records and the hook layer as the chunk had moved
-them. For that, `roost-osc` now frames an OSC as libghostty's parser
-does: it follows libghostty through escapes, CSIs, DCSs and SOS/PM/APC
-strings (8-bit controls included, where libghostty honours them), so
-an OSC starts where libghostty starts one, and it ends one at a BEL or
-at an `ESC` whatever follows it, with CAN or SUB cancelling it, instead
-of waiting for the `\` of an ST. A notification and its place then land
-in the same read however the bytes split, and no sequence is a
-notification to one parser and nothing to the other; a differential
-test feeds both parsers hundreds of thousands of byte strings to hold
-them to it. A form only one parser accepts is
-still judged at its chunk's end (the residuals listed on
-`RawOscAuthority`). Host mirrors keep taking `shell_state` from the
-wire. Roost.app keeps its own scanner, its framing and the first-letter
-rule: the Swift app is frozen for this release, and these forms are not
-worth a change there.
-
-*Rejected:* applying both parsers (idempotent for the plain letters, but
-the divergent forms stay divergent); skipping the second reading at its
-consumers (the iced batch tail would need a sink lookup for a tab that
-may be gone); teaching `roost-osc` libghostty's grammar (a second
-grammar to keep in step).
-
-### DL-31: a tab has one size owner (2026-10-30)
-
-Plan 084 (protocol-7 release M3, G2) replaces two rules that had stopped
-fitting a session more than one machine attaches to.
-[DL-25](#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)
-(plan 057 R15) sized the PTY by the last geometry-bearing interaction,
-and the host-sessions roadmap's D7 said a detach never resizes back.
-With the iced client attaching to every tab it selected as "focused",
-*looking* at a tab on one machine resized it to that machine's window
-under another machine's feet, and the docs promised that a client that
-only watches never shrinks the one that is working — which no shipped
-client could do. This entry supersedes both.
-
-**The rule.** A session tab has at most one **size owner**: an
-attachment, named on the wire by client id and label. The owner's grid is
-the PTY's. Every attachment keeps an *advisory* grid of its own, owner or
-not, and a client's terminal is always the PTY's grid; a client whose
-window is another size draws it inside the window, with a "Sized by
-`<label>`" badge and a Take size action. **Deliberate interaction takes the
-tab; watching never does.** What takes it: an explicit tab switch, keys
-and paste (resized first, then delivered), clicks and the wheel
-(delivered first, then taken), a copy (after the text is captured), a
-settled scroll, a window resize while it has focus, and Take size. What
-does not: showing a tab, an automatic re-attach, an unfocused resize,
-focus reports, automatic replies, `tab.write`, and any attach to a tab
-someone else owns. A tab nobody owns is taken by any attach.
-
-**Leaving.** A deliberate detach, or a release, hands the size on at
-once — to another attachment of the same client, else to the most
-recently updated advisory grid. A disconnect keeps the tab owned for a
-5 s grace so a reconnecting owner (same client id) gets it back with no
-reflow. With nobody left the tab keeps its size and has no owner. A
-control-plane `tab.resize` (iced's background wave, `roostctl tab resize`)
-only sizes an unowned tab and is refused `owned` otherwise.
-
-**One serializer, ordered with output.** The ownership state machine
-(`size_owner.rs`) is pure, with an injected clock, and the tab task is
-the only thing that applies its decisions, so two attaches to one tab at
-the same moment resolve there. Every change of grid or owner is
-announced in band as a data-plane `GRID` frame, ordered with the PTY
-output it follows, and to every subscriber as the live-only
-`tab.resized`; a client resizes its mirror when it reaches the frame, so
-output for the old and the new grid is never mixed.
-
-**A reading Charlie accepted.** A `take: true` attach has to resize
-before the snapshot and be seen doing so, so one that then fails or is
-cancelled may have been announced as owner for a moment. It never ends up
-owning: its take is rolled back, at the cost of a possible second reflow.
-
-**Identity.** Ownership needs to tell clients apart: `client.hello`
-carries a client id and label on the session socket, and a bridge writes
-a preamble so the session knows a connection came over ssh (used by M4's
-environment-by-opener).
-
-**Rejected:** smallest-wins and a `session-geometry` setting (still
-possible later, now that the pieces exist); "announce the geometry but not
-the owner until commit", which leaves the previous owner told it owns a
-tab whose PTY is at another grid.
-
-Protocol 7 is amended in place, with no generation bump. See
-[`reference/ipc.md`](../reference/ipc.md#size-ownership) for the wire,
-[`development/host-sessions.md`](host-sessions.md#who-sizes-a-tab) for
-the mechanics, and the [user guide](../guides/host-sessions.md#who-sizes-a-tab).
-
-### DL-32: a tab's environment reflects who opened it (2026-10-31)
-
-Plan 085 (protocol-7 release M4, G9). A tab used to inherit the
-environment of whatever process served it, so whoever *started* the
-daemon decided every tab's. A `roost-session` started over SSH from a
-laptop handed every tab the laptop's `SSH_CLIENT` and no `DISPLAY`, so a
-headed browser at the desk failed with "Missing X server or $DISPLAY".
-Tools decide "am I remote?" from `SSH_CONNECTION` (Claude Code picks its
-clipboard path and whether to open a browser from it), and a forwarded
-`SSH_AUTH_SOCK` dies with the SSH connection that started the daemon, so
-a long-lived tab held a dead agent.
-
-**The rule.** Each tab's environment is built for that tab, not inherited
-and then trimmed. It starts from the server's own environment minus seven
-variables: `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`,
-`SSH_AUTH_SOCK`, `SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY`. Those come only
-from the tab's **opener**. A local opener (the desk's Roost-Iced, or
-`roostctl` run at the machine) states its display, bus and agent on
-`tab.open`. A remote opener (a connection through a `client-bridge`, or a
-caller declaring itself remote) gets its `SSH_CONNECTION` and `SSH_CLIENT`
-and nothing else, so its tabs act remote and cannot reach the desk's
-display or the agent. A request on a local connection that states neither
-gets the baseline. The
-opener is saved with the tab, so a restart restores a tab as it was opened;
-a local session start may refresh the saved display, bus and agent with its
-own. `XDG_RUNTIME_DIR` is the machine's and the user's, not the opener's:
-on Linux every tab gets `/run/user/<uid>` when that is a directory the uid
-owns. The wire is in [ipc.md](../reference/ipc.md#tab-environment), the user
-side in the [host-sessions guide](../guides/host-sessions.md#environment).
-
-**Rejected: tmux's `update-environment`**, which copies a list of variables
-from the most recent attaching client into the session. A process's
-environment is fixed when it starts, so only tabs opened afterwards could
-follow a client at all; and a daemon-wide "latest attach" environment flips
-as clients come and go, so a tab opened at the desk could get the laptop's
-display because the laptop attached later. Per-opener ties a tab to the one
-who opened it and never to who looked last. The release doc's reasoning is
-in `discovery/protocol-7-release.md` M4.
-
-**Known limit.** A remote tab keeps `XDG_RUNTIME_DIR` (so `systemctl --user`
-and podman work in it), which means libwayland's `wayland-0` default and the
-`$XDG_RUNTIME_DIR/bus` default can still reach the desk's compositor and bus
-from a remote tab. M4 controls the opener *variables*, not what a program
-finds by default.
-
-The values are advisory, like the bridge preamble: any process of the
-session's uid can state either. Protocol 7 is amended in place, with no
-generation bump.
-
-### DL-33: The Swift app is retired; iced is the only desktop UI (2026-11-03)
-
-v0.1.0 ships one desktop UI. The iced build takes over `Roost.app` and the
-bundle id `ai.stridelabs.Roost`; the Swift + AppKit app is gone from this
-repo (its sources live on in the private archive repo
-`charliek/roost-legacy-swift`, a snapshot of v0.0.27). This resolves
-[Direction](#direction-under-evaluation) to branch (a) and supersedes
-[DL-1](#dl-1-swift-appkit-on-mac-not-rust),
-[DL-5](#dl-5-two-languages-not-rust-everywhere),
-[DL-16](#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25)
-and
-[DL-28](#dl-28-roost-iced-becomes-the-recommended-mac-install-for-agent-driving-users-2026-09-19-pending).
-
-- **Why.** Two implementations of one contract was the cost the
-  convergence hypothesis existed to remove, and daily use showed the iced
-  build serving the full agent-facing surface (`open`, `events`,
-  `tab prompt`, host sessions) that the Swift app never would. What the
-  Swift app still did better was accessibility, which stays a known,
-  accepted regression ([DL-16](#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25)).
-- **Upgrade path.** The production iced build resolves the same Mac
-  paths the Swift app used (`~/Library/Caches/Roost/roost.sock`,
-  `~/Library/Application Support/Roost`, `~/Library/Logs/Roost`) and the
-  same Sparkle key and feed (`docs/appcast.xml`), so a Swift user updates
-  in place and keeps their projects, tab layout and selection.
-- **`Roost-Iced.app` users switch by hand.** Its bundle id and feed are
-  separate and the feed (`docs/appcast-iced.xml`) is frozen, ending in an
-  informational item that points at the switch steps; see
-  [Roost-Iced.app users](../getting-started/installation.md#roost-icedapp-users).
-  Dev builds keep the `Roost-Iced.app` name and the separate
-  `Roost-iced` paths.
-- **The north star keeps its shape.** One contract (`roost-ipc`'s op
-  set), now with one desktop implementation; a mobile client of
-  `roost-session` is planned. The parity language goes, and so do the
-  Swift CI jobs, the `--roost-target mac` lane and the engine facade.
-- **Still true of the code.** `roost-engine` and `roost-ui-model` stay
-  toolkit-neutral, so a second client does not need a rewrite.
-
-### DL-34: a mobile client of roost-session (2026-11-03)
-
-Plan 090 (`discovery/mobile-client.md`). Roost gains a phone and tablet
-client: a Flutter app in `mobile/`, Android first, for driving a host's
-projects, tabs and agents from a device. It is a **client of
-`roost-session`**, exactly as Roost-Iced is when it shows a host — the same
-control plane, events and data-plane attach, and no new ops — so the one-op-set
-north star holds: the app is one more reaction to the session's events.
-
-**Shape.** Flutter draws; Rust does everything below the pixels. Dart never
-touches libghostty: `crates/roost-mobile` owns each attached tab's terminal on
-one owner thread and hands Flutter a binary frame of dirty rows per vsync,
-over flutter_rust_bridge. The transport-agnostic client core is
-`roost-client` (a `Dialer` seam, `HostClient`, `AttachStream`); `roost-ssh` is
-an in-process russh dialer, so there is no loopback port another app could
-reach. iced keeps its own connection task for now; converging it onto
-`roost-client`'s (B2) is a later milestone.
-
-**Choices.** Tailscale SSH (`none` auth, trust-on-first-use host keys) is the
-only login in the first build; key auth has a seam. Size follows protocol 7
-ownership (DL-31): opening a tab on the phone takes it, typing takes it, going
-to the background releases it; the compose box and quick replies use
-`tab.write` and never take it. The app requires an exact `session_protocol`
-match, built from the same tree as the session it talks to.
-
-**Rejected:** dartssh2 with a loopback forward (any app on the device could
-reach the session through it); a client-local reflow instead of size
-ownership (the session is the authority); a third copy of the connection logic
-inside the app crate.
-
-This amends the [non-goals](#non-goals): Dart is a UI language for the
-mobile client alone, like Swift was for the Mac UI, and no core logic is
-written in it.
-
-## Direction {: #direction-under-evaluation }
-
-**Status: resolved to branch (a) by
-[DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)**
-(v0.1.0). This section used to be *Direction (under evaluation)*; the
-anchor is kept because other pages link to it.
-
-**The fixed point was one shared Rust core.** Maintaining two full
-codebases delays features: the workspace state machine, the agent-state
-derivation, config/theme/keybind parsing, URL detection and word
-selection, and the IPC wire types all existed twice, once in Rust and
-once in Swift, pinned to each other by shared fixture corpora precisely
-*because* they were duplicates.
-
-**The open question was the Mac shell**, gated on whether iced visuals on
-macOS could reach parity with the Swift app:
-
-- **(a) If they can** — converge on iced as the single codebase, with the
-  platform-specific items (menu bar, notifications, Dock, updater, TCC)
-  behind seams instead of in a second application. **This is what
-  happened.**
-- **(b) If they cannot** — keep Swift as the Mac shell and drive it to
-  reuse much more of the Rust core. Not taken; the Swift-facing facade
-  ([#286](https://github.com/charliek/roost/issues/286)) that was its seam
-  has been deleted.
-
-**What it unlocks** is the `discovery/` backlog as the candidate roadmap.
-The first spike, **remote host support without needing tmux or herdr**
-([`discovery/host-sessions.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions.md)),
-landed: `roost-session`
-([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)),
-an opt-in session daemon built from `roost-engine` with the UI as one of
-its clients. Its companion, **agent watching**
-([`discovery/agent-watching.md`](https://github.com/charliek/roost/blob/main/discovery/agent-watching.md)),
-adding screen/process observation as a fallback writer into the four
-agent axes rather than a replacement for hooks, remains an unscheduled
-discovery note. A mobile client of `roost-session` is planned.
-
-## Migration history
-
-The Rust + Swift port is **complete** (cutover to `main` 2026-05-23). The
-phased plan that built it — direction-setter → FFI spikes → (interim
-gRPC daemon) → Mac UI → Linux UI → inline-core refactor (daemon → JSON
-IPC, `roostctl`, delete `roost-core`/`roost-proto`/`roost-common`/
-`roost-smoke`) → bundling → cutover — is done; Roost has been Swift
-(macOS) + Rust (Linux) over in-process JSON IPC since.
-
-**The iced migration (M1–M6, 2026-08).** A second Rust UI,
-`crates/roost-iced`, began as a POC on the `poc/iced` branch alongside a
-toolkit-neutral engine extraction (`roost-engine` + `roost-ui-model`)
-that both Rust UIs then shared. It merged to `main` on 2026-08-02 as
-merge-quality work rather than a throwaway (M1–M2), then reached
-functional parity with the GTK UI over a series of slices — `app.rs`
-decomposition, project lifecycle, sidebar resize, push subscriptions in
-place of a tick, chrome polish, native D-Bus notifications (M3) —
-carried by the render-path work that made it viable: dirty-row tracking,
-sprite/box-drawing parity, IME input, and crash robustness (the engine
-track). **M4** swapped the Linux `.deb`: `/usr/bin/roost` became the
-iced binary, built with the `linux-package` feature so it adopts the
-production profile the GTK package owned — same socket, same
-`state.json`, no migration step. **M5** (Rust under Swift) was dropped.
-**M6** bundled the same binary for macOS as the experimental
-`Roost-Iced.dmg` — bundle + parallel install, an `objc2` native seam,
-Sparkle, menu bar, macOS notifications (plans 027 / 028 / 030). Both
-shipped in **v0.0.18** (2026-08-25). Plan 031 then removed
-`crates/roost-linux` and the "three implementations" framing with it.
-**v0.1.0 (2026-11)** retired the Swift app: the iced build took over the
-`Roost.app` name and bundle id, and the Swift sources moved to a private
-archive repo
-([DL-33](#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)).
-The full account is in
-[Iced migration — history & status](iced-migration.md).
-
-## Relationship to existing docs
+- **No web or Electron UI.** The desktop draws natively with iced + wgpu.
+  Mobile draws with Flutter, with Rust below the pixels.
+- **No Windows.** The desktop is macOS and Linux.
+- **No multi-window.** One window per Roost instance.
+- **No network IPC.** Unix domain sockets only, the session socket
+  included. A remote session is reached over SSH; the JSON wire format is
+  local IPC, not a public API.
+- **No rendered output over the wire.** Frames and cell deltas never
+  cross a process boundary.
+- **No per-platform desktop forks.** One iced codebase, with platform
+  specifics behind seams.
+- **No core logic outside Rust.** Dart is a UI language for mobile only.
+  Lua, if it lands, is a user-scripting surface on the op set
+  ([DL-12](decision-history.md#dl-12-pytest-drives-the-tests-lua-is-a-user-scripting-surface-2026-05-26)),
+  not a second implementation.
+
+## Directions under discovery {: #direction-under-evaluation }
+
+None of these is decided. Each has a discovery note in `discovery/`,
+which is outside the docs site, so the notes are named by repo path. A
+note turns into a plan, and a plan that changes a rule adds a decision
+here.
+
+**Backlog plans.** Small fixes that reach every user come first:
+background update checks (#134) and a UTF-8 locale for Mac tabs (#697).
+Then separate small plans: confirm before closing a running agent
+(#706), configurable scrollback and find (#707, #167, #169), everyday
+actions and the terminal menu (#710, #165), clickable paths and config
+reload (#708, #709). Note: `discovery/backlog-triage-2026-11.md`.
+
+**Agent integration without writing into agents' configs.** The main
+feature track. Today `roostctl agent install` merges hooks into
+`~/.claude/settings.json`, `~/.codex/hooks.json` and `config.toml`, and
+`~/.cursor/hooks.json`, and owns a file under Grok's and OpenCode's
+config. The goal is to stop writing users' configs where possible and
+make the integration better at the same time: OSC 7501 as the state
+source, hooks delivered through the tab's environment where an agent
+allows it, and process identity to clear a dead agent's state (#519,
+#621). Entries Roost wrote are removed automatically once nothing needs
+them, and only those Roost can prove it wrote; the first-run prompt that
+asks which integrations to turn on changes with it. A change here amends
+DL-13, DL-14 and DL-29, and the consent flow.
+Note: `discovery/agent-integration.md`.
+
+**Chrome comfort: size, color, opacity.** Make the chrome easier on the
+eyes for the light, the hour and the mood. A chrome font size first,
+including the sidebar's Projects and Agents text. Then chrome color
+themes and user overrides (#584) and translucency, in either order.
+Following the system's light/dark setting (#164) is a later, lower
+priority. Note: `discovery/chrome-themes.md`.
+
+**Terminal text and fonts.** The desktop draws no SGR decorations (dim,
+underline, strikethrough), which every Claude Code session hits; agent
+spinner glyphs fall back to mismatched faces (#592); and the chrome
+fonts in the left panel. Pursued later. Note:
+`discovery/text-rendering.md`.
+
+**Sessions everywhere.** Sessions as the normal backend on every
+machine, so a tab can be picked up from any screen. Flipping the
+default for existing setups is #480; retiring in-process tabs is a later
+question. Notes: `discovery/sessions-everywhere.md`, and HS-4e
+porcelain in `discovery/host-sessions-roadmap.md`.
+
+**Roost mobile past the prototype.** A notification inbox, Share to
+Roost, Kitty images, selection and copy, key auth beyond Tailscale SSH,
+the Play Store; and moving the desktop onto `roost-client`'s connection
+logic. Note: `discovery/mobile-client.md`.
+
+**Lua scripting.** The role is settled
+([DL-12](decision-history.md#dl-12-pytest-drives-the-tests-lua-is-a-user-scripting-surface-2026-05-26)).
+Nothing is scheduled.
+
+**Considered: split panes.** Not planned, and behind every direction above
+([DL-35](decision-history.md#dl-35-split-panes-leave-the-non-goals-under-discovery-2026-11-08)
+took them off the non-goals). If pursued, the goal is agents that drive
+panes themselves, as in herdr and cmux, several agents side by side in
+one window, and a plain terminal beside an agent, with Roost's native
+chrome. Note: `discovery/split-panes.md`.
+
+## Decision index {: #decision-log }
+
+Every decision-log entry, in order. **Current** holds as written;
+**Amended** holds with the changes its record names; **Superseded** and
+**Retired** stay listed so a DL number never disappears. The full text,
+with a dated status line on each entry, is in
+[Decision history](decision-history.md#decision-log). A new decision gets
+its record there and a row here, in the PR that builds it.
+
+| DL | Decision | Date | Status | Today |
+|---|---|---|---|---|
+| [1](decision-history.md#dl-1-swift-appkit-on-mac-not-rust) | Swift + AppKit on Mac | 2026-05-09 | Superseded (DL-33) | The Mac app is iced. |
+| [2](decision-history.md#dl-2-json-ipc-not-grpc-revised-2026-05-23) | JSON IPC, not gRPC | 2026-05-23 | Current | NDJSON control plane, 16 MiB frames; binary data plane for PTY bytes. |
+| [3](decision-history.md#dl-3-unix-domain-socket-not-tcp) | Unix domain socket, not TCP | 2026-05-09 | Current | Remote reach is SSH, never a listener. |
+| [4](decision-history.md#dl-4-each-ui-owns-its-own-workspace-revised-2026-05-23) | Each UI owns its own workspace | 2026-05-23 | Amended (DL-17, 20, 27) | A process owns one workspace; every other surface is its client. |
+| [5](decision-history.md#dl-5-two-languages-not-rust-everywhere) | Two languages, not Rust everywhere | 2026-05-09 | Superseded (DL-33) | Rust everywhere below the pixels. |
+| [6](decision-history.md#dl-6-gtk4-rs-does-not-need-a-pangoextra-workaround) | gtk4-rs needs no `pangoextra` workaround | 2026-05-09 | Retired | The gtk4-rs UI is gone. |
+| [7](decision-history.md#dl-7-tabs-persist-as-layout-not-live-state-revised-2026-05-24) | Tabs persist as layout, not live state | 2026-05-24 | Current | Relaunch reopens fresh shells; sessions keep live work. |
+| [8](decision-history.md#dl-8-osc-routing-is-the-differentiator) | OSC routing is the differentiator | 2026-05-09 | Current | Terminal output becomes tab state and notifications. |
+| [9](decision-history.md#dl-9-cli-is-roostctl) | The CLI is `roostctl` | 2026-05-09 | Current | Shipped with the app; each tab's `$ROOST_AGENT_HOOK` names it. |
+| [10](decision-history.md#dl-10-ghostty-sha-pinned-in-third_partyghosttybuildsh) | Ghostty SHA pinned in `build.sh` | 2026-05-09 | Current | One pin, one file. |
+| [11](decision-history.md#dl-11-one-command-core-thin-per-surface-adapters-2026-05-26) | One command core, thin adapters | 2026-05-26 | Current | The north star. |
+| [12](decision-history.md#dl-12-pytest-drives-the-tests-lua-is-a-user-scripting-surface-2026-05-26) | pytest drives tests; Lua is for users | 2026-05-26 | Current | pytest shipped; no Lua engine. |
+| [13](decision-history.md#dl-13-the-agent-state-model-four-axes-one-derivation-2026-07-27) | Agent state: four axes, one derivation | 2026-07-27 | Current | `tab.state` is derived, never written. |
+| [14](decision-history.md#dl-14-ownership-is-a-label-not-a-suppression-switch-2026-07-27) | Ownership is a label | 2026-07-27 | Current (amended in place) | No TTL; a nested agent's claim is dropped. |
+| [15](decision-history.md#dl-15-linux-ships-iced-gtk4-rs-is-retired-and-removed-2026-08-25) | Linux ships iced; gtk4-rs removed | 2026-08-25 | Current (done) | `/usr/bin/roost` is iced since v0.0.18. |
+| [16](decision-history.md#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25) | Experimental mac-iced beside Swift | 2026-08-25 | Superseded (DL-33) | The hypothesis held. |
+| [17](decision-history.md#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28) | A headless `roost-session` daemon | 2026-08-28 | Amended (DL-27) | Also the local backend on fresh installs. |
+| [18](decision-history.md#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29) | Hosts UX, attach-on-focus, theme reseed | 2026-08-29 | Partly current | Effects rule gone (DL-26); Mac gate gone (DL-19). |
+| [19](decision-history.md#dl-19-macos-ships-roost-session-too-the-mac-gate-lifts-2026-09-01) | macOS ships `roost-session` too | 2026-09-01 | Current (done) | Apple-silicon Macs are SSH hosts since v0.0.26. |
+| [20](decision-history.md#dl-20-a-ui-socket-may-route-a-mutation-to-a-session-2026-09-04) | A UI socket may route a mutation | 2026-09-04 | Current | A host-qualified id names the owning session. |
+| [21](decision-history.md#dl-21-app-stays-unconstructible-in-tests-guards-are-lifted-app-delegates-2026-09-04) | `App` stays unconstructible in tests | 2026-09-04 | Current | Decisions are pure functions; guards get negative controls. |
+| [22](decision-history.md#dl-22-files-cross-a-host-boundary-as-bytes-through-the-op-set-pasted-as-bare-host-paths-the-client-has-validated-2026-09-06) | Files cross a host boundary as bytes | 2026-09-06 | Current | `session.put_file`, then paste the host path. |
+| [23](decision-history.md#dl-23-the-interactive-lease-is-re-cut-reads-free-attach-input-tabwrite-owned-2026-09-07) | The lease is re-cut | 2026-09-07 | Superseded (DL-25, 26) | No lease. |
+| [24](decision-history.md#dl-24-no-supervisor-artifact-a-session-comes-up-on-demand-2026-09-08) | No supervisor artifact | 2026-09-08 | Current | Sessions start when a client needs one. |
+| [25](decision-history.md#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08) | Raw input open to every same-UID client | 2026-09-08 | Superseded (DL-26, 31) | Open input still holds. |
+| [26](decision-history.md#dl-26-there-is-no-lease-2026-09-12) | There is no lease | 2026-09-12 | Current | Effects fan out; each client decides. Since protocol 5. |
+| [27](decision-history.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14) | The local backend is a user's choice | 2026-09-14 | Current | Fresh installs start on `session`; #480 is open. |
+| [28](decision-history.md#dl-28-roost-iced-becomes-the-recommended-mac-install-for-agent-driving-users-2026-09-19-pending) | Roost-Iced recommended on Mac | 2026-09-19 | Superseded (DL-33) | `Roost.app` is iced. |
+| [29](decision-history.md#dl-29-program-status-is-a-fourth-per-tab-axis-composed-above-the-hook-layer-2026-10-28) | Program status above the hook layer | 2026-10-28 | Current | OSC 7501 decides mid-turn; hooks keep identity. |
+| [30](decision-history.md#dl-30-one-osc-133-parser-per-sink-terminal-2026-10-28) | One OSC 133 parser per sink terminal | 2026-10-28 | Current | libghostty's stream feeds both layers. |
+| [31](decision-history.md#dl-31-a-tab-has-one-size-owner-2026-10-30) | A tab has one size owner | 2026-10-30 | Current | Deliberate use takes the size; watching never does. |
+| [32](decision-history.md#dl-32-a-tabs-environment-reflects-who-opened-it-2026-10-31) | A tab's environment reflects its opener | 2026-10-31 | Current | Display, bus, agent and `SSH_*` variables come from the opener. |
+| [33](decision-history.md#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03) | Swift retired; iced is the one desktop UI | 2026-11-03 | Current | Shipped in v0.1.0. |
+| [34](decision-history.md#dl-34-a-mobile-client-of-roost-session-2026-11-03) | A mobile client of `roost-session` | 2026-11-03 | Current | A prototype shipped in v0.1.0. |
+| [35](decision-history.md#dl-35-split-panes-leave-the-non-goals-under-discovery-2026-11-08) | Split panes leave the non-goals | 2026-11-08 | Current | Not a non-goal, not planned; a tab is one terminal. |
+
+## Related docs
 
 | Document | Role |
 |---|---|
-| `docs/development/vision.md` (this file) | The **living architecture + principles**. Every PR is measured against the north star + decision log here. |
-| [`docs/development/test-automation.md`](test-automation.md) | How the north star is verified: the three-layer harness map, the CI lanes, and the determinism principles. |
-| [`docs/development/iced-migration.md`](iced-migration.md) | How Roost got to one implementation — the iced migration's milestones, status, and what remains. |
-| [`docs/reference/ipc.md`](../reference/ipc.md) | JSON IPC wire format spec — the canonical command contract. |
-| [`docs/reference/architecture.md`](../reference/architecture.md) | Package layout + threading contract for the in-process implementation. |
-| [`docs/archive/roost.proto`](../archive/roost.proto) | Historical reference for the pre-rewrite gRPC contract. |
-| `CLAUDE.md` | Project conventions enforced by review; mirrors the principles here. |
+| [Decision history](decision-history.md) | The full record of every decision, with a status line each, and the migration history. |
+| [Architecture](../reference/architecture.md) | Crate layout and the threading contract. |
+| [IPC reference](../reference/ipc.md) | The JSON wire format: the op set every surface speaks. |
+| [Host sessions](host-sessions.md) | How sessions and hosts work: topology, attach, sizing, several clients. |
+| [Shared Rust engine](shared-rust-engine.md) | The toolkit-neutral engine every client builds on. |
+| [Test automation](test-automation.md) | How the north star is verified: harness layers, CI lanes, determinism. |
+| [Iced migration](iced-migration.md) | How Roost got to one implementation. |
+| `CLAUDE.md` | Project conventions enforced by review; it restates the north star and non-goals. |
+| `discovery/` | Working notes for the directions above. Not product commitments. |

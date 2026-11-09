@@ -23,4 +23,4 @@ The daemon-era crates (`roost-core`, `roost-proto`, `roost-common`,
 `roost-smoke`) were removed in the inline-core refactor; the historical
 proto schema lives at [`../docs/archive/roost.proto`](../docs/archive/roost.proto).
 
-See [../docs/development/vision.md](../docs/development/vision.md) for the architecture, principles, and decision log.
+See [../docs/development/vision.md](../docs/development/vision.md) for the direction, principles, and decision index, and [../docs/development/decision-history.md](../docs/development/decision-history.md) for the full decision records.
