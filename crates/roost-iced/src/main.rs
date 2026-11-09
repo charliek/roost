@@ -461,13 +461,7 @@ fn run(profile: &BundleProfile, bundle_id: Option<&str>) -> anyhow::Result<()> {
     // make its event loop and panics only after the bootstrap has bound
     // the socket and dialled the session (issue #712), most often when
     // `roost` was typed over ssh in place of `roostctl`.
-    if !HOST_MACOS && !has_display(|name| std::env::var_os(name)) {
-        anyhow::bail!(
-            "no display: DISPLAY, WAYLAND_DISPLAY and WAYLAND_SOCKET are all unset. \
-             Start Roost from a desktop session; to drive a running Roost from here, \
-             use `roostctl`."
-        );
-    }
+    display_preflight(HOST_MACOS, |name| std::env::var_os(name))?;
 
     // Single-instance via flock-on-pidfile, one lock per resource: the
     // socket/bind lock (taken first) and the state lock. Both are fatal
@@ -544,12 +538,24 @@ fn forced_test_panic() {
     }
 }
 
-/// Whether a Linux desktop is reachable: any of the variables winit
-/// dials an X11 or Wayland server through is set to a non-empty value.
-fn has_display(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
-    ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"]
+/// Refuse to start on Linux when no desktop is reachable: none of the
+/// variables winit dials an X11 or Wayland server through is set to a
+/// non-empty value. macOS always has its window server.
+fn display_preflight(
+    host_macos: bool,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> anyhow::Result<()> {
+    let has_display = ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"]
         .into_iter()
-        .any(|name| var(name).is_some_and(|value| !value.is_empty()))
+        .any(|name| var(name).is_some_and(|value| !value.is_empty()));
+    if host_macos || has_display {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "no display: DISPLAY, WAYLAND_DISPLAY and WAYLAND_SOCKET are all unset. \
+         Start Roost from a desktop session; to drive a running Roost from here, \
+         use `roostctl`."
+    )
 }
 
 /// macOS `titlebar_transparent` drops the standard titlebar material so the
@@ -1453,24 +1459,30 @@ impl UiTask for app::UiTask {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-
-    #[test]
-    fn a_display_is_any_non_empty_x11_or_wayland_variable() {
-        let only = |set: &'static str, value: &'static str| {
-            move |name: &str| (name == set).then(|| value.into())
-        };
-        assert!(!has_display(|_| None));
-        assert!(!has_display(only("DISPLAY", "")));
-        assert!(has_display(only("DISPLAY", ":0")));
-        assert!(has_display(only("WAYLAND_DISPLAY", "wayland-1")));
-        assert!(has_display(only("WAYLAND_SOCKET", "3")));
-    }
     use std::hash::Hasher as _;
 
     use super::*;
     use iced::advanced::subscription;
     use iced::keyboard::key::{Code, Physical};
     use iced::keyboard::Location;
+
+    #[test]
+    fn linux_starts_only_with_a_non_empty_x11_or_wayland_variable() {
+        let only = |set: &'static str, value: &'static str| {
+            move |name: &str| (name == set).then(|| value.into())
+        };
+        let refusal = display_preflight(false, |_| None).unwrap_err();
+        assert!(refusal.to_string().contains("roostctl"), "{refusal}");
+        assert!(display_preflight(false, only("DISPLAY", "")).is_err());
+        assert!(display_preflight(false, only("DISPLAY", ":0")).is_ok());
+        assert!(display_preflight(false, only("WAYLAND_DISPLAY", "wayland-1")).is_ok());
+        assert!(display_preflight(false, only("WAYLAND_SOCKET", "3")).is_ok());
+    }
+
+    #[test]
+    fn macos_starts_without_any_display_variable() {
+        assert!(display_preflight(true, |_| None).is_ok());
+    }
 
     fn press(key: Key) -> keyboard::Event {
         keyboard::Event::KeyPressed {

@@ -1439,10 +1439,10 @@ jobs:
           done
           echo "OK: no SUFeedURL / SUPublicEDKey"
 
-          # Present AND true — an absent key would trigger Sparkle's
-          # first-run auto-check prompt. Daily background checks that
-          # prompt rather than install (#134).
-          for kv in SUEnableAutomaticChecks=true SUScheduledCheckInterval=86400 SUAutomaticallyUpdate=false; do
+          # Present AND false — an absent key would trigger Sparkle's
+          # first-run auto-check prompt, and a feedless bundle has nothing
+          # to check. Inserting the feed turns checks on (#134).
+          for kv in SUEnableAutomaticChecks=false SUScheduledCheckInterval=86400 SUAutomaticallyUpdate=false; do
             [ "$(plist_value "$INFO" "${kv%%=*}")" = "${kv#*=}" ] \
               || { echo "FAIL: ${kv%%=*} missing or not ${kv#*=}"; exit 1; }
             echo "OK: ${kv%%=*} = ${kv#*=}"

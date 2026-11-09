@@ -580,7 +580,9 @@ impl RoostConfig {
 
     pub fn load_from(path: &Path) -> Self {
         let mut cfg = match fs::read_to_string(path) {
-            Ok(content) => Self::parse(&content),
+            Ok(content) => Self::parse_reporting(&content, |line, warning| {
+                tracing::warn!(line, "{warning}");
+            }),
             Err(_) => Self::default(),
         };
         // Discovered providers append after any `provider =` config
@@ -590,7 +592,16 @@ impl RoostConfig {
         cfg
     }
 
+    /// Parse without the unknown-key warnings: only [`Self::load_from`]
+    /// reports those, so a reader that re-parses for one key (the
+    /// agent-hooks check on every host connect) does not repeat them.
     pub fn parse(content: &str) -> Self {
+        Self::parse_reporting(content, |_, _| {})
+    }
+
+    /// [`Self::parse`], handing each unknown key's 1-based line and
+    /// warning to `unknown`.
+    fn parse_reporting(content: &str, mut unknown: impl FnMut(usize, &str)) -> Self {
         let mut cfg = Self::default();
         for (index, raw) in content.lines().enumerate() {
             let line = raw.trim();
@@ -809,7 +820,7 @@ impl RoostConfig {
                 }
                 _ => {
                     if let Some(warning) = unknown_key_warning(key) {
-                        tracing::warn!(line = index + 1, "{warning}");
+                        unknown(index + 1, &warning);
                     }
                 }
             }
@@ -2128,12 +2139,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_reporting_names_each_unknown_key_by_its_line() {
+        let mut reported = Vec::new();
+        let cfg = RoostConfig::parse_reporting(
+            "# comment\nfont_size = 15\nscrollback-limit = 100\nfont-size = 12\nbogus = 1\n",
+            |line, warning| reported.push((line, warning.to_string())),
+        );
+        assert_eq!(cfg.font_size, Some(12.0));
+        assert_eq!(
+            reported,
+            [
+                (
+                    2,
+                    "unknown config key `font_size`, ignored; did you mean `font-size`?"
+                        .to_string()
+                ),
+                (5, "unknown config key `bogus`, ignored".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn a_ghostty_key_roost_does_not_read_is_silent() {
         for key in [
             "cursor-style",
             "window-padding-x",
             "background",
             "font-family-bold",
+            "scrollback-limit",
+            "bold-is-bright",
         ] {
             assert_eq!(unknown_key_warning(key), None, "{key}");
         }

@@ -132,4 +132,19 @@ mod tests {
         assert_eq!(utf8_lang("en", Some("DE"), installed), FALLBACK);
         assert_eq!(utf8_lang("sv", None, installed), FALLBACK);
     }
+
+    /// The real `NSLocale` read, which no other test reaches: whatever
+    /// the runner's locale, the result must be a locale macOS installs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_system_lang_is_an_installed_utf8_locale() {
+        let lang = system_lang().expect("macOS always names a locale");
+        assert!(lang.ends_with(".UTF-8"), "{lang}");
+        assert!(
+            std::path::Path::new("/usr/share/locale")
+                .join(lang)
+                .is_dir(),
+            "{lang}"
+        );
+    }
 }

@@ -188,6 +188,7 @@ roost_insert_sparkle_feed() {
   echo "==> Inserting Sparkle feed keys (SUFeedURL=${feed_url})"
   /usr/libexec/PlistBuddy -c "Add :SUFeedURL string ${feed_url}" "${plist}"
   /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string ${ed_public_key}" "${plist}"
+  /usr/libexec/PlistBuddy -c "Set :SUEnableAutomaticChecks true" "${plist}"
 }
 
 # roost_write_pkginfo APP_DIR

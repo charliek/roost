@@ -3,7 +3,8 @@
 Roost reads font settings from `~/.config/roost/config.conf` (more
 precisely `$XDG_CONFIG_HOME/roost/config.conf`) on both platforms. Family
 changes take effect on the next launch — same model as themes. Font
-*size* also responds to runtime hotkeys per tab; see
+*size* also responds to runtime hotkeys, which resize every tab and save
+the new size to `font-size`; see
 [Keybindings](../getting-started/keybindings.md#font-sizing).
 
 ```conf
@@ -21,7 +22,7 @@ and, for a slip like `font_size`, the key you likely meant.
 | Key           | Default                 | Effect                                                                                 |
 |---------------|-------------------------|----------------------------------------------------------------------------------------|
 | `font-family` | `JetBrains Mono, Monospace`, which is always [JetBrains Mono](#the-bundled-terminal-font) | Terminal cell font. Quote values containing spaces (`"JetBrains Mono"`). |
-| `font-size`   | `13` (Linux) / `14` (macOS) | Point size for the terminal font (see [Font size](#font-size)). Must be `> 0`. Adjustable per tab at runtime via `Cmd-+` / `Cmd--` (`Alt-+` / `Alt--` on Linux). |
+| `font-size`   | `13` (Linux) / `14` (macOS) | Point size for the terminal font (see [Font size](#font-size)). Must be `> 0`. Adjustable at runtime via `Cmd-+` / `Cmd--` (`Alt-+` / `Alt--` on Linux), which resizes every tab and saves the new value here. |
 
 ### How `font-family` resolves
 
@@ -94,4 +95,4 @@ sidebar rows, tab pill labels, palette rows — uses its own font,
   a warning in the log.
 - **Chrome fonts are not configurable.** See above.
 - **Family changes need a relaunch.** Only `Cmd-+` / `Cmd--` / `Cmd-0`
-  (`Alt-` on Linux) rescale live, per tab.
+  (`Alt-` on Linux) rescale live, and they rescale every tab.

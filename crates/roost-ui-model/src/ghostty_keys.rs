@@ -1,5 +1,7 @@
 //! Every key Ghostty's config accepts, at the pinned Ghostty SHA
-//! (`third_party/ghostty/build.sh`), read off `src/config/Config.zig`.
+//! (`third_party/ghostty/build.sh`), read off `src/config/Config.zig`:
+//! its fields plus the old names its `compatibility` map still takes
+//! (`scrollback-limit`, `bold-is-bright`, ...).
 //! A Ghostty config pasted into Roost's is legal: these keys are ignored
 //! without the unknown-key warning (issue #714). Sorted for
 //! `binary_search`.
@@ -19,6 +21,7 @@ pub(crate) const GHOSTTY_KEYS: &[&str] = &[
     "adjust-strikethrough-thickness",
     "adjust-underline-position",
     "adjust-underline-thickness",
+    "adw-toolbar-style",
     "alpha-blending",
     "app-notifications",
     "async-backend",
@@ -26,6 +29,7 @@ pub(crate) const GHOSTTY_KEYS: &[&str] = &[
     "auto-update-channel",
     "background",
     "background-blur",
+    "background-blur-radius",
     "background-image",
     "background-image-fit",
     "background-image-opacity",
@@ -37,6 +41,7 @@ pub(crate) const GHOSTTY_KEYS: &[&str] = &[
     "bell-audio-volume",
     "bell-features",
     "bold-color",
+    "bold-is-bright",
     "class",
     "click-repeat-interval",
     "clipboard-codepoint-map",
@@ -54,6 +59,7 @@ pub(crate) const GHOSTTY_KEYS: &[&str] = &[
     "copy-on-select",
     "cursor-click-to-move",
     "cursor-color",
+    "cursor-invert-fg-bg",
     "cursor-opacity",
     "cursor-style",
     "cursor-style-blink",
@@ -164,6 +170,7 @@ pub(crate) const GHOSTTY_KEYS: &[&str] = &[
     "right-click-action",
     "scroll-to-bottom",
     "scrollback-compression",
+    "scrollback-limit",
     "scrollback-limit-bytes",
     "scrollback-limit-lines",
     "scrollbar",
@@ -175,6 +182,7 @@ pub(crate) const GHOSTTY_KEYS: &[&str] = &[
     "selection-clear-on-copy",
     "selection-clear-on-typing",
     "selection-foreground",
+    "selection-invert-fg-bg",
     "selection-word-chars",
     "shell-integration",
     "shell-integration-features",
