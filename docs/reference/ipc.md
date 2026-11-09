@@ -2920,8 +2920,9 @@ host, in stable connection order — each either the host's own `result`
 (its raise's outcome) or an `error` string for a host that could not be
 asked (not connected, refused the raise, timed out).
 
-`config_path` names where this machine's `agent-hooks` key now lives,
-for the confirmation surface to show.
+`config_path` names the file that holds this machine's
+`agent-integration` key and its `agent-hooks` shadow, for the
+confirmation surface to show.
 
 **Test-mode fenced like the install engine's other write paths**: with
 `ROOST_TEST_MODE=1` set and no `ROOST_AGENT_HOOKS_FORCE=1` override,

@@ -225,7 +225,17 @@ fn ensure_after_retire(
             return Ok(i32::from(retire_failed(retired)));
         }
     };
-    let outcome = outcome.map_err(|e| CliError::Failed(format!("agent: {e}")))?;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // The retire has already run and may have changed files and
+            // made backups; a script still gets that record.
+            if json {
+                println!("{}", serde_json::json!({ "retire": retire_json(retired) }));
+            }
+            return Err(CliError::Failed(format!("agent: {error}")));
+        }
+    };
     if json {
         let mut body = outcome_json(&outcome);
         body["retire"] = retire_json(retired);

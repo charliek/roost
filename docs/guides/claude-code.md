@@ -90,13 +90,16 @@ you guessing from the symptom — see [Agent integration →
 Troubleshooting](agents.md#troubleshooting) for the full per-agent
 `Agents` section.
 
-- **Hooks don't fire** — check `roostctl doctor -v`'s `agent.hook_binary`
-  check: a wrapper that strips the tab's environment (`env -i`, a `sudo`
-  re-exec, a sanitizing launcher) makes the installed hook silently
-  inert even though the settings file is correct. `claude.hook_events`
-  and `claude.hook_command` confirm the settings file itself registers
-  every event and resolves to a runnable `roostctl`; `claude.observed`
-  says whether Roost has actually seen a hook fire on this tab.
+- **Hooks don't fire** — check that the tab has `CLAUDE_CODE_PLUGIN_DIRS`
+  ending with a folder under Roost's `agent-integration` cache directory:
+  a tab opened before Claude was switched on lacks it (open a new one),
+  and Claude Code older than 2.1.280 ignores it. Then `roostctl doctor
+  -v`'s `agent.hook_binary` check: a wrapper that strips the tab's
+  environment (`env -i`, a `sudo` re-exec, a sanitizing launcher) drops
+  the plugin variable and the hook's own. `claude.hook_events` and
+  `claude.hook_command` report Roost commands left in `settings.json`,
+  not missing ones; `claude.observed` says whether Roost has actually
+  seen a hook fire on this tab.
 - **Click-through doesn't focus** — on Linux, your notification daemon must support default actions (mako, dunst, GNOME Shell all do). On Wayland without an XDG-activation token, the window may only request attention rather than raise.
 - **OSC 9 banners still appear from inside Claude** — that means the `SessionStart` hook didn't reach Roost (no ownership claimed, so raw OSC isn't suppressed). Doctor's `tab.raw_osc` check reports whether suppression is currently active on the tab; check `roostctl identify` and re-source your rc if it isn't.
 - **The dot stopped moving after Claude errored out mid-session** — if Claude was killed or crashed without a `SessionEnd`, an OSC 133 prompt mark from the shell (reaching a fresh prompt) automatically releases the stale lifecycle and falls back to shell state; typing a command and pressing enter should clear it. See [Notifications → Hook-session OSC suppression](notifications.md#hook-session-osc-suppression) for the mechanism.

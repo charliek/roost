@@ -1202,17 +1202,17 @@ Claude Code (process)
 
 Agents (process)
   skipped agent.hook_binary        not running inside a Roost tab
-  ok      agent.claude.wired       wired@v3
+  ok      agent.claude.wired       connected through the tab environment; nothing written · old entries retired (v4) · backup ~/.config/roost/agent-backups/…
   skipped agent.claude.owning      unavailable (no tab.list from a running UI)
   ok      agent.claude.legacy_settings no leftover ~/.config/roost/claude-settings.json or shell alias found
-  ok      agent.codex.wired        wired@v3
-  ok      agent.codex.trust        8 trusted hashes match what codex would compute
+  ok      agent.codex.wired        reports over OSC 7501; nothing written · old entries retired (v4) · backup ~/.config/roost/agent-backups/…
+  skipped agent.codex.trust        nothing wired for codex yet
   skipped agent.codex.owning       unavailable (no tab.list from a running UI)
-  ok      agent.grok.wired         wired@v3
+  ok      agent.grok.wired         reports over OSC 7501; nothing written
   skipped agent.grok.owning        unavailable (no tab.list from a running UI)
   ok      agent.cursor.wired       wired@v3
   skipped agent.cursor.owning      unavailable (no tab.list from a running UI)
-  ok      agent.opencode.wired     wired@v3
+  ok      agent.opencode.wired     connected through the tab environment; nothing written · old entries retired (v4) · backup ~/.config/roost/agent-backups/…
   skipped agent.opencode.owning    unavailable (no tab.list from a running UI)
 
 • 2 issues found — exit 1 (https://charliek.github.io/roost/reference/cli/#exit-codes):
@@ -1221,11 +1221,13 @@ Agents (process)
 ```
 
 Paths are this machine's own (`/Users/charliek/...`) — expect your own
-absolute paths, not these. The five `agent.*.wired`/`agent.codex.trust`
-`ok`s above reflect this dev checkout's own machine already having run
-`roostctl agent ensure` for real — an agent whose config directory
-doesn't exist at all shows `skipped: not installed` instead, and a
-present-but-never-wired agent shows `warn: not wired` rather than `ok`.
+absolute paths, not these. Only Cursor is wired by a file of its own, so
+only its `agent.cursor.wired` reports a `wired@v` version: the other four
+say how they connect and that nothing was written, plus "old entries
+retired" on a machine whose earlier file entries the upgrade took out.
+An agent whose config directory doesn't exist at all shows `skipped: not
+installed` instead, and Cursor present but never wired shows `warn: not
+wired` rather than `ok`.
 
 `--json` carries the same facts as JSON — a top-level `schema_version: 2`,
 an explicit `exit_code` (so a script never has to re-derive "did

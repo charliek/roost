@@ -442,6 +442,21 @@ pub fn strip(env: &mut BTreeMap<OsString, OsString>) {
     deliver(env, None, None);
 }
 
+/// `CLAUDE_CODE_PLUGIN_DIRS` is colon-separated, so a plugin dir with a
+/// `:` in it (from `$HOME` or `XDG_CACHE_HOME`) cannot be named there.
+/// Said once per process: it is decided per tab spawn.
+fn usable_in_a_path_list(dir: &Path) -> bool {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let usable = !dir.as_os_str().as_bytes().contains(&b':');
+    if !usable && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            dir = %dir.display(),
+            "the Claude plugin dir holds a `:`, which CLAUDE_CODE_PLUGIN_DIRS cannot carry; tabs get no Claude plugin"
+        );
+    }
+    usable
+}
+
 /// Merge `plugin_dir` and `opencode_plugin` (each `None` to add none)
 /// into a tab's variables, stripping inherited Roost entries.
 fn deliver(
@@ -596,7 +611,7 @@ impl TabEnv {
             .as_ref()
             .filter(|_| claude)
             .map(|assets| assets.claude_plugin_dir.as_path())
-            .filter(|dir| !dir.as_os_str().as_bytes().contains(&b':'));
+            .filter(|dir| usable_in_a_path_list(dir));
         let plugin = assets
             .as_ref()
             .filter(|_| opencode)

@@ -142,4 +142,4 @@ printf '\033]777;notify;Title;Body text\007'
 - Body length is capped at 1 MiB on the OSC parser to bound buffer growth on a misbehaving sender. Longer bodies are truncated.
 - On Wayland, a client cannot raise its own window without an `xdg-activation` token handed to it by the compositor, and iced 0.14 has no way to consume one. So a programmatic raise — a click on a notification banner, or a CLI script calling `roostctl tab focus` — may only flash the taskbar entry instead of bringing the window forward. The tab focus itself always applies; it is only the window raise that the compositor can refuse.
 
-See the [Agent integration](agents.md) guide for how the sticky indicator and the hook-session OSC suppression above get wired up for all five supported agents, and [Claude Code Hooks](claude-code.md) for what's specific to Claude.
+See the [Agent integration](agents.md) guide for how the sticky indicator and the hook-session OSC suppression above get connected for each of the five supported agents (through the tab environment, the agent's own OSC 7501 reports, or, for Cursor, a file), and [Claude Code Hooks](claude-code.md) for what's specific to Claude.

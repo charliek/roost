@@ -3234,7 +3234,8 @@ fn hook_command_check(inputs: &Inputs) -> Check {
             format!("no Roost command, and none needed: {CLAUDE_BY_ENV}"),
         );
     }
-    let delivered = agent_status_row(inputs, Agent::Claude).is_none_or(|row| row.on)
+    let row = agent_status_row(inputs, Agent::Claude);
+    let delivered = row.is_none_or(|row| row.on)
         && !inputs
             .claude_policy
             .as_ref()
@@ -3244,14 +3245,28 @@ fn hook_command_check(inputs: &Inputs) -> Check {
     } else {
         "Roost no longer uses them"
     };
+    // The retire runs once per version: what it left, or what came back
+    // after it, the next launch does not take out.
+    let next = match row {
+        Some(row) if row.came_back => {
+            "They came back after the retire, which does not remove them again; \
+             `roostctl agent uninstall claude` removes them"
+        }
+        Some(row) if row.retired.as_ref().is_some_and(|r| r.finished()) => {
+            "The retire left them in place, since Roost can't be sure it added them as \
+             they stand; remove them by hand if Roost added them"
+        }
+        _ => {
+            "The next launch or `roostctl agent ensure` retires them, and `roostctl agent \
+             uninstall claude` removes them"
+        }
+    };
     check(
         ID,
         TITLE,
         Status::Warn,
         format!(
-            "Roost's old commands are still in settings.json for {}; {effect}. The next launch \
-             or `roostctl agent ensure` retires them, and `roostctl agent uninstall claude` \
-             removes them",
+            "Roost's old commands are still in settings.json for {}; {effect}. {next}",
             ours.join(", ")
         ),
     )
@@ -5327,6 +5342,44 @@ mod tests {
             assert!(c.detail.contains("no longer uses them"), "{}", c.detail);
             assert!(!c.detail.contains("twice"), "{}", c.detail);
         }
+    }
+
+    /// The next launch retires only what the retire has not finished:
+    /// what it left, or what came back after it, needs another way out.
+    #[test]
+    fn a_roost_hook_the_retire_already_saw_is_not_promised_to_the_next_launch() {
+        let retired = roost_agent_install::retire::Retired {
+            version: roost_agent_install::RETIRE_VERSION,
+            at: 1,
+            complete: true,
+            misses: 0,
+            changed: Vec::new(),
+            backups: Vec::new(),
+            leftovers: Vec::new(),
+            noticed: true,
+        };
+        let detail = |retired: Option<roost_agent_install::retire::Retired>, came_back| {
+            let inputs = Inputs {
+                agent_status: vec![AgentInstallStatus {
+                    retired,
+                    came_back,
+                    ..make_agent_status(Agent::Claude, true, true, None, false, None, vec![])
+                }],
+                ..configured(hook_commands(HookKind::Current))
+            };
+            find(&evaluate(&inputs), "claude.hook_command")
+                .detail
+                .clone()
+        };
+
+        let pending = detail(None, false);
+        assert!(pending.contains("The next launch"), "{pending}");
+        let left = detail(Some(retired.clone()), false);
+        assert!(!left.contains("next launch"), "{left}");
+        assert!(left.contains("by hand"), "{left}");
+        let back = detail(Some(retired), true);
+        assert!(!back.contains("next launch"), "{back}");
+        assert!(back.contains("roostctl agent uninstall claude"), "{back}");
     }
 
     #[test]

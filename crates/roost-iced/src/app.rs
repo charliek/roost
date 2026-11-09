@@ -4462,7 +4462,7 @@ impl App {
             &self.runtime_handle,
             &self.feed_tx,
             &self.config,
-            self.config.local_backend == roost_ui_model::config::LocalBackend::Session,
+            self.local_backend == LocalBackendMode::Session,
         );
         // Nobody has answered the key yet, so ask — once per process,
         // never under the harness fence, and only once the status walk

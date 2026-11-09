@@ -656,7 +656,12 @@ pub fn uninstall(home: &Home, agents: &[Agent], guard: Guard) -> Result<Outcome,
 /// Read-only: what `roostctl agent status` and doctor render.
 pub fn status(home: &Home, mode: &Mode) -> Result<Vec<Status>, InstallError> {
     let (record, _) = state::load(home)?;
-    let tombstones = crate::retire::load(home)?;
+    // Unreadable tombstones cost only the `retired` and `came_back`
+    // columns, as they cost the retire's deferral only its notice.
+    let tombstones = crate::retire::load(home).unwrap_or_else(|error| {
+        tracing::warn!(%error, "agent status without the retire record");
+        crate::retire::Tombstones::default()
+    });
     // An unreadable config may say `off`, as the tab environment reads it.
     let switches = crate::retire::switches(home)
         .unwrap_or_else(|_| roost_ui_model::config::AgentSwitches::all_off());
