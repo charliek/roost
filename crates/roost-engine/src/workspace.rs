@@ -7730,8 +7730,6 @@ mod tests {
 
     /// Plan 082 B4: program status (OSC 7501) wired into the workspace.
     mod program_status {
-        use std::sync::Arc;
-
         use super::*;
         use roost_ipc::program_status::{
             DecidedBy, ProgramStatusKind, ProgramStatusReport, ProgramStatusState as S, PromptMark,
@@ -8210,18 +8208,10 @@ mod tests {
                 .collect();
             assert_eq!(children.len(), 257);
 
-            let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
-            let writer = Arc::clone(&captured);
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .with_writer(move || CapturedLog(Arc::clone(&writer)))
-                .finish();
-            tracing::subscriber::with_default(subscriber, || {
+            let ((), log) = crate::test_log::capture(tracing::Level::WARN, || {
                 ws.apply_program_status(tid, children, LATE).unwrap();
             });
 
-            let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
             assert_eq!(
                 log.matches("the tab is at its child-record cap").count(),
                 1,
@@ -8229,19 +8219,6 @@ mod tests {
             );
             assert!(log.contains(&format!("tab_id={tid}")), "{log}");
             assert!(log.contains("id=\"c255\""), "{log}");
-        }
-
-        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for CapturedLog {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
         }
 
         /// A claim from an agent other than the deciding record's is a

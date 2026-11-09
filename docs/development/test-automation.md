@@ -222,11 +222,11 @@ incarnation counter and the default session socket, so two at once bind
 probes to each other's terminals and fail looking exactly like a product
 bug. The Makefile targets and the CI steps both carry that warning.
 
-Two notes on the soft lane: it pins `ROOST_REQUIRE_REAL_INPUT=1` so a
-missing `cage`, `/dev/uinput`, or binary fails rather than silently
-passing as a skip, and it tees diagnostics to an uploaded artifact —
-`continue-on-error` hides a failure's *conclusion*, so the log body has
-to be the honest record. Promotion to required is tracked separately.
+Two notes on the `e2e-iced-wayland-drag` lane: it pins
+`ROOST_REQUIRE_REAL_INPUT=1` so a missing `cage`, `/dev/uinput`, or
+binary fails rather than silently passing as a skip, and it tees its
+diagnostics to an uploaded log artifact, since a failure under `cage`
+leaves little in the step output itself.
 
 The required E2E lanes run `--roost-fresh` with a throwaway
 `ROOST_STATE_DIR` and upload diagnostics on failure. None reruns failed tests: a genuine

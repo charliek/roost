@@ -411,10 +411,10 @@ impl TabSession {
     }
 }
 
-/// A resize that races the tab's exit finds no PTY; that is expected,
-/// so it is not worth a warning (#713).
+/// A resize that races the tab's exit finds its PTY gone or closing;
+/// that is expected, so it is not worth a warning (#713).
 fn log_resize_failure(tab_id: i64, err: &PtyError) {
-    if matches!(err, PtyError::NotFound(_)) {
+    if matches!(err, PtyError::NotFound(_) | PtyError::Closed(_)) {
         tracing::debug!(?err, tab_id, "pty resize failed");
     } else {
         tracing::warn!(?err, tab_id, "pty resize failed");
@@ -428,25 +428,25 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn a_resize_that_finds_no_pty_logs_at_debug_and_others_at_warn() {
-        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let writer = Arc::clone(&captured);
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .with_writer(move || crate::pty::tests::CapturedLog(Arc::clone(&writer)))
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
+    fn a_resize_that_races_the_exit_logs_at_debug_and_others_at_warn() {
+        let ((), log) = crate::test_log::capture(tracing::Level::DEBUG, || {
             log_resize_failure(1, &PtyError::NotFound(1));
             log_resize_failure(2, &PtyError::Closed(2));
+            log_resize_failure(
+                3,
+                &PtyError::Resize {
+                    tab_id: 3,
+                    message: "refused".into(),
+                },
+            );
         });
-        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
         let logged = |level: &str, tab: &str| {
             log.lines()
                 .any(|line| line.contains(level) && line.contains(tab))
         };
         assert!(logged(" DEBUG ", "tab_id=1"), "{log}");
-        assert!(logged(" WARN ", "tab_id=2"), "{log}");
+        assert!(logged(" DEBUG ", "tab_id=2"), "{log}");
+        assert!(logged(" WARN ", "tab_id=3"), "{log}");
     }
 
     /// #80 A3: rapid `send_input` calls must reach the PTY in
