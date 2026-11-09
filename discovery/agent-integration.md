@@ -7,9 +7,14 @@ hazards, phase sizes; see [Review](#review-2026-11-08)). Later that day
 Charlie answered the first round of key questions; his decisions, the
 Codex-without-hooks discovery, the startup prompt design and a
 plain-language note on ownership after an agent dies are folded in
-(see [Second pass](#second-pass-charlies-answers)). File and line
-references are as of main @ 68231b9b. Third-party references are pinned
-in [References](#references-and-licenses).
+(see [Second pass](#second-pass-charlies-answers)). In the evening
+Charlie answered the second round (drop gx, Cursor as an unchecked
+opt-in, a startup card only when there is something to ask, Claude's
+policy handling, no old Claude, the skill in the env plugin), and four
+Phase 0 probes ran against the agents he had just updated (see [Third
+pass](#third-pass-charlies-second-answers-and-phase-0-probes)). File and
+line references are as of main @ 68231b9b. Third-party references are
+pinned in [References](#references-and-licenses).
 
 This note merges three research passes (what Roost writes and how to
 stop; which delivery routes work, probed live; how to make the agent
@@ -20,8 +25,9 @@ what did not hold.
 Related notes:
 
 - [`agent-program-status.md`](agent-program-status.md) is the **capture
-  record**: what each agent sends over OSC 7501, captured 2026-10-28.
-  Phase 0 below re-captures into it.
+  record**: what each agent sends over OSC 7501, captured 2026-10-28 and
+  re-captured 2026-11-08 for grok 1.0.77, Codex 0.167.0, opencode 1.19.5,
+  cursor-agent 2026.11.05 and crush 0.97.1.
 - [`agent-watching.md`](agent-watching.md) (2026-08-22). This note
   supersedes its "Two philosophies" table, its Codex spike step (shipped)
   and its premise that screen rules come second. Still valid there:
@@ -58,46 +64,90 @@ Evidence labels used below:
 - **Two agents can take Roost's hooks from the tab environment, with no
   file of theirs touched. Both proven.**
   - Claude Code: `CLAUDE_CODE_PLUGIN_DIRS` pointing at a Roost-owned
-    plugin folder. Proven in `-p` and in the interactive TUI. Floor
-    v2.1.280 (Docs).
+    plugin folder. Proven in `-p` and in the interactive TUI, and
+    **additive**: a marketplace-installed user plugin, the user's own
+    env folder and Roost's appended folder all load and fire, with
+    `settings.json` untouched (Proven, 2.1.319). Floor v2.1.280 (Docs).
   - opencode: `OPENCODE_CONFIG_CONTENT` naming a Roost-owned plugin file.
     Proven with a user `opencode.json` present; the user's file was
-    byte-identical afterwards.
+    byte-identical afterwards (re-proven on 1.19.5).
 - **Codex can take hooks per launch on argv only**: `-c` hooks plus one
   inline-table `hooks.state` with hashes Roost computes. Proven in `exec`
   and the TUI, with no trust bypass and a negative control. The user's
   own trusted hooks, in `hooks.json` or in `config.toml`, keep running
   beside it (Proven in review, a0–a4). It needs a shell function to
   reach argv.
-- **Grok has no non-file route for its TUI. cursor's `--plugin-dir` is
-  unproven** (it needs auth). gx has no 7501 at all.
+- **Grok needs no route: 7501 alone gives it a live, clickable row**
+  (grok 1.0.77, Proven captures; the row from code). **cursor's
+  `--plugin-dir` is proven but partial**: with a real login it delivers
+  session start and end, thought and tool events with no file written,
+  but cursor runs `beforeSubmitPrompt`, `afterAgentResponse` and `stop`
+  only when `~/.cursor/hooks.json` or a project `.cursor/hooks.json`
+  lists them, so a plugin-only cursor has no turn-end signal (Proven,
+  2026.11.05).
 - **7501 already covers the states Roost shows** for Claude, Codex and
-  Grok CLI. crush and pi send less in what was captured: crush showed no
-  `blocked`, and pi only `idle` and `clear` (no turn ran). Phase 0
-  re-captures both. What only hooks add is identity and detail: session
-  id, start source, model and title, the tool on a Codex approval, error
-  class, background-task counts.
-- **So a default with zero writes is reachable.** Claude and opencode by
-  environment, Codex and Grok on 7501 alone, cursor's file only if the
-  user opts in. gx needs 7501 in the fork first.
+  Grok CLI. grok 1.0.77 also sends child records for subagents. crush and
+  pi send less in what was captured: crush showed no `blocked` (and the
+  installed apt 0.97.1 sends no 7501 at all), and pi only `idle` and
+  `clear` (no turn ran). What only hooks add is identity and detail:
+  session id, start source, model and title, the tool on a Codex
+  approval, error class, background-task counts.
+- **So a default with zero writes is reachable now.** Claude and opencode
+  by environment, Codex and Grok on 7501 alone, cursor's file only if
+  the user opts in.
 - **Decided (Charlie, 2026-11-08): Roost removes its own entries
   automatically once they are no longer needed**, but only what it can
-  prove it wrote; everything else is left and named. The startup prompt
-  is updated to match. See [Migration](#migration-off-config-writes) and
-  [The startup prompt](#the-startup-prompt-agent-integration).
+  prove it wrote; everything else is left and named. See
+  [Migration](#migration-off-config-writes).
+- **Decided (Charlie, 2026-11-08, second round):**
+  - **Drop gx support entirely.** Grok moves to 7501 with no Roost file;
+    `~/.grok/hooks/roost.json` is retired by the same proven-ownership
+    retire, and the gx-specific code, docs and tests are deleted (Phase
+    4). No 7501 work in the fork and no gx upstream ask.
+  - **Cursor:** file delivery stays an explicit opt-in, **unchecked by
+    default**. It is the one agent that still needs a user file.
+  - **The startup card appears only when it has something to ask**: a
+    file-writing opt-in for an installed agent (today only Cursor).
+    Otherwise there is no card; env and 7501 agents are simply on, with
+    per-agent off switches in settings, config and `roostctl`. Upgraders
+    whose old entries are retired get a one-time toast, not a modal. See
+    [The startup prompt](#the-startup-prompt-agent-integration).
+  - **Claude:** env plugin via `CLAUDE_CODE_PLUGIN_DIRS`, additive to the
+    user's plugins. Policy handling is option A+C: detect
+    `disableSideloadFlags` with a cheap probe and skip, plus a doctor line
+    and the per-agent off switch. **No support for Claude older than
+    2.1.280** and no `--file` fallback; the marketplace or plugin-install
+    route can be revisited later if env delivery fails, but is not
+    pursued now.
+  - **The Roost skill rides in the same env plugin**, which is named
+    `roost` so that inside a Roost tab it replaces the marketplace `roost`
+    plugin instead of loading twice (Proven).
+- **A bug in today's code, found by the grok probe.** grok 1.0.77 reports
+  `app=grok`, not `grok-build`. Roost maps the `grok` hook source to
+  `grok-build` (`crates/roost-engine/src/program_status.rs:604-611`), so
+  with today's `roost.json` installed every grok hook claim is dropped as
+  `ForeignApp`, and the row is labelled lower-case `grok` (`app_label`,
+  `crates/roost-ipc/src/program_status.rs:175-185`). Two match arms fix
+  it; ship the fix before anything else (Inferred from code, high
+  confidence; the `app` value is Proven).
 - **Codex without hooks already meets Charlie's bar.** A hook-free Codex
   gets an Agents panel row and an agents palette row that update, show
   status and take you to the tab: proven from code, CI tests and a live
-  Codex 0.165.0. A hooked Codex already shows 7501's state today, so
-  dropping its hooks is almost invisible. See [Codex without
-  hooks](#codex-without-hooks).
+  Codex 0.165.0; its 7501 stream is unchanged on 0.167.0 (Proven). A
+  hooked Codex already shows 7501's state today, so dropping its hooks is
+  almost invisible. See [Codex without hooks](#codex-without-hooks).
+  Charlie's second-round answers assume Codex needs no file (key question
+  5).
 - **A dead agent can leave a stale row or a stuck tab today.** Ending
   ownership when the agent's process is gone fixes it; see [Ownership
   after an agent dies](#ownership-after-an-agent-dies).
 - **New risks.**
   - A managed `disableSideloadFlags` policy makes Claude **exit 1 without
-    starting** when `CLAUDE_CODE_PLUGIN_DIRS` is set (Docs; not
-    reproduced). A server-managed policy is invisible to Roost.
+    starting** when `CLAUDE_CODE_PLUGIN_DIRS` is set (now **Proven**,
+    reproduced rootless on Linux in a user and mount namespace). A
+    0.1 s probe, `claude plugin list --json` with the variable set,
+    detects it; whether it also catches a server-managed policy is
+    Inferred (only once an earlier Claude run has cached that policy).
   - A `roost-session` keeps running across a UI upgrade. If the new UI
     removes the file entries while an older session still serves tabs,
     those tabs get neither file nor env delivery. The retire has to wait
@@ -107,6 +157,15 @@ Evidence labels used below:
     command (Proven). Roost raises a banner per report with no dedupe
     (`crates/roost-engine/src/workspace.rs:3384`). The migration window
     needs a small engine fix.
+  - Roost's cursor installer writes `hooks.json` under
+    `CURSOR_CONFIG_DIR` (`crates/roost-agent-install/src/home.rs:23`),
+    but cursor 2026.11.05 reads user hooks only from
+    `$HOME/.cursor/hooks.json` (Proven). A user who sets the variable
+    gets hooks cursor never runs.
+  - Codex 0.167.0 and cursor both leave a detached background process
+    that outlives the TUI (Codex's managed app-server daemon, cursor's
+    `worker-server`; Proven). The process layer must key presence on the
+    TUI process, not on these.
 - **Better integration, at the same time.**
   - A process layer: the foreground process names the agent and its exit
     ends stale state. That closes #519 and #621 and meets the 7501 spec's
@@ -116,9 +175,11 @@ Evidence labels used below:
   - Kind-specific copy ("Needs approval", "Has a question", "Needs
     sign-in"), child rows (#649), done-until-seen, a safer `tab prompt`
     (#516), and resume on restore.
-- **Roadmap:** nine phases, ten plans (Phase 3 is two). Env delivery and
-  the retire of file entries come first and ship in one release; the
-  process layer can run in parallel. Phases 1, 2, 3 and 5 are each L or
+- **Roadmap:** nine phases, ten plans (Phase 3 is two), after a small
+  standalone fix for grok's `app=grok`. Env delivery and the retire of
+  file entries (now Claude, opencode, Codex and Grok together) come first
+  and ship in one release; the process layer can run in parallel. Phase 4
+  shrinks to cursor and deleting gx. Phases 1, 2, 3 and 5 are each L or
   more. See [Roadmap](#roadmap).
 
 ---
@@ -242,7 +303,7 @@ Adapters are pure (`crates/roost-agent/src/`). They emit
 | StopFailure / session.error class | Claude, opencode | Failed banner text |
 | `agent_id` inside a subagent | Claude | subagent events cannot move the owner's state |
 | `server_url` | opencode plugin's loopback listener | driving an opencode session |
-| `gx.remote` | grok/gx | doctor display |
+| `gx.remote` | grok/gx | doctor display. Goes when gx support is dropped (Phase 4) |
 
 Agents panel and palette rows already appear for 7501-only tabs
 (`crates/roost-ui-model/src/agent_palette.rs:221-244`). `roostctl wait`
@@ -261,9 +322,17 @@ and `tab prompt` read the composed `tab.state`, so both already work from
   reads `~/.claude/settings.json` and `~/.cursor/hooks.json`
   (`crates/codegen/xai-grok-hooks/src/discovery.rs:342-400`). cursor
   loads `~/.claude/settings.json` hooks (`claudeUserHooks`; Strings). So
-  a grok event in a Roost tab runs Roost's grok, Claude and cursor
-  entries. The adapters reject foreign payloads, but the processes are
-  spent.
+  a grok event in a Roost tab runs Roost's grok and Claude entries. The
+  adapters reject foreign payloads (Claude's rejects grok's camelCase
+  `hookEventName`, `crates/roost-agent/src/claude.rs:132`), but the
+  processes are spent. grok 1.0.77, live (Proven): it fires hooks from
+  an isolated `~/.claude/settings.json` (SessionStart, UserPromptSubmit,
+  Stop); it does **not** run Roost's flat `~/.cursor/hooks.json` entries
+  (only matcher-group entries); and **any** hook file, Roost's own
+  `roost.json` included, costs a "Trust this folder?" prompt in each new
+  folder. With no hook file, grok starts with no trust prompt. Moving
+  Claude to the env plugin ends the cross-fire: grok's binary has no
+  `CLAUDE_CODE_PLUGIN*` string (Strings).
 - Codex trust keys break when entries are reordered or `CODEX_HOME`
   moves. Each break is one review dialog.
 - #485: a hand-deleted entry comes back on the next `ensure`.
@@ -306,22 +375,28 @@ in Phase 2):
 
 All probes ran with `env -i`, a fresh `HOME`, the XDG trio, `CODEX_HOME`,
 `GROK_HOME` and `TMPDIR` under the scratchpad, and no `ROOST_*`,
-`CLAUDE*`, `CODEX_*` or `HERDR_*` variables. No agent was logged in;
-Claude and Codex ran with fake API keys. Claude, Codex, opencode and pi fire their start and prompt hooks before
-the auth check, so delivery is proven for those four. cursor checks auth
-first.
+`CLAUDE*`, `CODEX_*` or `HERDR_*` variables. In the first passes no agent
+was logged in; Claude and Codex ran with fake API keys. Claude, Codex,
+opencode and pi fire their start and prompt hooks before the auth check,
+so delivery is proven for those four. cursor checks auth first. The
+2026-11-08 evening probes copied **only** the login file into the
+isolated home for cursor (`~/.config/cursor/auth.json`), grok
+(`~/.grok/auth.json`) and Codex (`~/.codex/auth.json`), confirmed each copy
+was never refreshed, and deleted them; Claude still ran with a fake key.
+Before-and-after sha256 of the real config dirs were identical in every
+probe.
 
 | Agent (installed) | Route | Status | Floor | Caveats |
 |---|---|---|---|---|
-| **Claude Code** 2.1.319 | `CLAUDE_CODE_PLUGIN_DIRS=<roost dir>` in the tab env. The dir holds `.claude-plugin/plugin.json` and `hooks/hooks.json` | **Proven**, `-p` (c1) and interactive TUI in a PTY (c2): SessionStart, UserPromptSubmit, StopFailure, SessionEnd fired. No `settings.json` created | **v2.1.280** (Docs, env-vars page; CHANGELOG never names it) | See the Claude caveats below |
-| | Second route: `--settings '<inline JSON>'` on argv | **Proven** (c6) | | Needs a shell function. Not covered by `disableSideloadFlags` (Docs list only `--plugin-dir`, `--plugin-url`, `--agents`, `--mcp-config`); not run against a policy |
-| **opencode** 1.19.4 (npm latest 1.19.5) | `OPENCODE_CONFIG_CONTENT='{"plugin":["file:///<roost>.js"]}'` | **Proven** (o1). With a user `opencode.json` declaring its own plugin, both plugins got every event, and the user file was byte-identical (`cmp`) | v1.x (Source: `config.ts:482-495` at v1.19.5) | `plugin` lists accumulate across sources and dedupe by identity; other keys deep-merge, env last. Send only `plugin`. Merge into a user value (one variable). The legacy plugin file plus the env plugin both run (o2). opencode still writes its own `package.json` and `node_modules` in its config dir |
-| **Codex** 0.165.0 | argv only: `-c 'hooks.<Event>=[{hooks=[{type="command",command=…,timeout=N}]}]'` per event, plus **one** `-c 'hooks.state={"/<session-flags>/config.toml:<label>:<g>:<h>"={trusted_hash="sha256:…"}, …}'` | **Proven** with no bypass flag, in `exec` (x2, x7) and the TUI (x5). Negative control (x3): a wrong SessionStart hash silently skipped SessionStart while UserPromptSubmit still ran. `features.hooks` not needed (x7). Codex wrote no hooks or state to `config.toml` | Trust formula is version-coupled; HEAD `4e4767ffa7` still matches Roost's port | The dotted-key form of `hooks.state` is "ignored" (x1); only the inline table works. The session-flags key is machine-independent, so the hashes are per-integration-version constants. If a hash drifts, the TUI shows "Hooks need review" on every launch (x6), and "Trust all" writes `hooks.state` into the user's `config.toml` (Source: `tui/src/hooks_rpc.rs:64-95`). No env route: `CODEX_HOME` also moves auth and history |
-| **cursor-agent** 2026.10.22 | argv only: `--plugin-dir <dir>` (`.cursor-plugin/` or `.claude-plugin/` manifest, `hooks/hooks.json`) | **Inferred.** The flag is validated ("path does not exist"); with a dummy key it fails auth before any hook (k1). The bundle may read the list only when `enableUserLocalPlugins` is set (Strings) | n/a | No env route. No 7501 and no blocked signal either way |
-| **Grok CLI** 1.0.70 | **None for the TUI.** `--plugin-dir` exists only on `grok agent`: `grok --plugin-dir` is "unexpected argument" (g1, Proven negative). Source says it is ignored in leader mode (`xai-grok-pager-bin/src/main.rs:1223,1336`) | Keep the Roost-owned file, or rely on 7501 | n/a | Grok dedupes same-content hooks across sources (first pass; not re-run) |
-| **gx** 1.0.45+gx.17 | Same as grok. Charlie owns the fork, so a route (7501, or a plugin-dirs variable) can be added there | Inferred | n/a | No 7501 (re-captured today: only OSC 9;4;0 and OSC 112) |
+| **Claude Code** 2.1.319 | `CLAUDE_CODE_PLUGIN_DIRS=<roost dir>` in the tab env. The dir holds `.claude-plugin/plugin.json`, `hooks/hooks.json` and (decided) `skills/roost/SKILL.md` | **Proven**, `-p` (c1) and interactive TUI in a PTY (c2): SessionStart, UserPromptSubmit, SessionEnd fired (StopFailure only sometimes; see caveat 11). No `settings.json` created. **Additive** (p0 a): a marketplace-installed `userplug@localmkt`, the user's own env folder and Roost's appended folder all fired, three runs; `settings.json` and `installed_plugins.json` byte-identical | **v2.1.280** (Docs, env-vars page; CHANGELOG never names it). Decided: no support below it | See the Claude caveats below |
+| | Second route: `--settings '<inline JSON>'` on argv | **Proven** (c6) | | Needs a shell function. **Not blocked by `disableSideloadFlags`** (Proven under a reproduced policy, p0 c). Using it there would knowingly get around an org's sideload ban, so it is **not** a fallback |
+| **opencode** 1.19.5 (installed and npm `latest`) | `OPENCODE_CONFIG_CONTENT='{"plugin":["file:///<roost>.js"]}'` | **Proven** (o1, re-proven on 1.19.5 in a real turn). With a user `opencode.json` declaring its own plugin, both plugins got the same events with the same counts, and the user file was byte-identical (`cmp`) | v1.x (Source: `config.ts:482-495` at v1.19.5) | `plugin` lists accumulate across sources and dedupe by identity; other keys deep-merge, env last. Send only `plugin`. Merge into a user value (one variable). The legacy plugin file plus the env plugin both run (o2). opencode still writes its own `package.json` and `node_modules` in its config dir. The first launch with a plugin is blank for over 4 s while it installs dependencies |
+| **Codex** 0.165.0 (argv route); 0.167.0 installed | argv only: `-c 'hooks.<Event>=[{hooks=[{type="command",command=…,timeout=N}]}]'` per event, plus **one** `-c 'hooks.state={"/<session-flags>/config.toml:<label>:<g>:<h>"={trusted_hash="sha256:…"}, …}'` | **Proven** with no bypass flag, in `exec` (x2, x7) and the TUI (x5). Negative control (x3): a wrong SessionStart hash silently skipped SessionStart while UserPromptSubmit still ran. `features.hooks` not needed (x7). Codex wrote no hooks or state to `config.toml` | Trust formula is version-coupled; HEAD `4e4767ffa7` still matches Roost's port | The dotted-key form of `hooks.state` is "ignored" (x1); only the inline table works. The session-flags key is machine-independent, so the hashes are per-integration-version constants. If a hash drifts, the TUI shows "Hooks need review" on every launch (x6), and "Trust all" writes `hooks.state` into the user's `config.toml` (Source: `tui/src/hooks_rpc.rs:64-95`). No env route: `CODEX_HOME` also moves auth and history |
+| **cursor-agent** 2026.11.05-86047df (logged in) | argv only: `--plugin-dir <dir>` (`.cursor-plugin/` or `.claude-plugin/` manifest, `hooks/hooks.json` in cursor's or Claude's nested format) | **Proven, but partial** (p0 cursor, real login). Loads in `-p` and the TUI with no setting and no approval. Fired: `sessionStart`, `afterAgentThought`, tool events (`preToolUse`, `beforeShellExecution`, `postToolUse`; seen in `-p`), `sessionEnd`. **Never from a plugin:** `beforeSubmitPrompt`, `afterAgentResponse`, `stop`. The TUI runs those three only when `$HOME/.cursor/hooks.json` or `<workspace>/.cursor/hooks.json` lists the same event (source gate checks only user and project hooks); `-p` never runs them. Payloads carry `cursor_version` and `session_id`; hooks inherit the tab env. Writes nothing to `~/.cursor` | n/a | No env route (`--plugin-dir` has no env binding). `enableUserLocalPlugins` is a runtime capability, true when signed in, not a setting. A shell function can add the flag (both `agent` and `cursor-agent` names point at one launcher), giving presence and working state but **no turn end**. User hooks are read only from `$HOME/.cursor/hooks.json`, never from `CURSOR_CONFIG_DIR` or `$XDG_CONFIG_HOME/cursor` (Proven), which Roost's installer gets wrong. No 7501, no 9;4, no blocked signal |
+| **Grok CLI** 1.0.77 | **Not needed.** 7501 alone gives a live row (decided: no Roost file). For the record: `--plugin-dir` exists only on `grok agent`, not the TUI (g1 on 1.0.70, Proven negative) | Decided: 7501 only | n/a | Grok dedupes same-content hooks across sources (first pass; not re-run). Any hook file costs a per-folder trust prompt (Proven, 1.0.77) |
+| **gx** 1.0.45+gx.17 | **Dropped** (Charlie, 2026-11-08) | n/a | n/a | No 7501. Roost removes its gx-specific code in Phase 4 |
 | **pi** 1.5.0 (`@earendil-works/pi-coding-agent`, via npx; not on PATH) | argv only: `-e <ext.ts>` | **Proven** (p1): `session_start`, `input`, `session_shutdown` | n/a | Roost has no pi adapter. 7501 covers it |
-| **crush** 0.97.1 installed (0.98.2 tarball captured 2026-10-28) | **None.** `CRUSH_GLOBAL_CONFIG` relocates the whole config | Inferred (help, docs) | n/a | Has a `hooks` config. FSL-1.1-MIT: docs and design only. 7501 only |
+| **crush** 0.97.1 installed (0.98.2 tarball captured 2026-10-28) | **None.** `CRUSH_GLOBAL_CONFIG` relocates the whole config | Inferred (help, docs) | n/a | Has a `hooks` config. FSL-1.1-MIT: docs and design only. 7501 only, and the apt 0.97.1 sends **no** 7501 (Proven); 7501 needs crush 0.98 or newer (Inferred) |
 
 **Claude caveats** (all from c3–c7 unless marked):
 
@@ -331,11 +406,24 @@ first.
 2. **`disableSideloadFlags`.** A managed setting that makes Claude
    "exit `1` without starting" when the variable names a plugin folder
    (Docs: plugins CLI reference and settings reference, "Requires Claude
-   Code v2.1.280 or later"). Not reproduced:
-   `CLAUDE_CODE_MANAGED_SETTINGS_PATH` was ignored (c4, c4b) and `/etc`
-   needs root. Managed settings also come from MDM and from
-   **server-managed settings** fetched from the claude.ai console, which
-   Roost cannot see on disk.
+   Code v2.1.280 or later"). **Now Proven** (p0 c, 2.1.319), rootless:
+   `unshare -rm` with a tmpfs overlay on `/etc` holding
+   `/etc/claude-code/managed-settings.json` = `{"disableSideloadFlags":true}`
+   (also as a `managed-settings.d/` drop-in, and as uid 1000 in a nested
+   namespace; the host `/etc` untouched). `-p`, the interactive TUI and
+   `claude plugin list` all exit 1 before any hook, with stderr
+   "CLAUDE_CODE_PLUGIN_DIRS is disabled by your organization's managed
+   settings (disableSideloadFlags). … Unset CLAUDE_CODE_PLUGIN_DIRS …".
+   Any absolute path trips it, even one that does not exist. Controls:
+   policy `{}` with the variable runs; policy on without the variable
+   runs. `CLAUDE_CODE_MANAGED_SETTINGS_PATH` and
+   `CLAUDE_CODE_REMOTE_SETTINGS_PATH` are compiled out of release builds
+   (Source), which is why c4 failed. Where policy comes from (Source):
+   `/etc/claude-code/` on Linux, `/Library/Application Support/ClaudeCode/`
+   on macOS, macOS MDM plists under `/Library/Managed Preferences/`
+   (root-owned), and **server-managed settings**, cached at
+   `$CLAUDE_CONFIG_DIR/remote-settings.json` with a signature. Detection
+   is caveat 10.
 3. **`disableAllHooks: true`** in user settings silences the plugin's
    hooks too (c5). `allowManagedHooksOnly` blocks them, but it blocks
    today's `settings.json` hooks equally.
@@ -351,17 +439,43 @@ first.
 8. **A value with two folders loads both** (Proven in review, b1:
    interactive TUI, a user plugin first and Roost's second, both fired
    all four events, no `settings.json` created). So appending to a
-   user's own value works.
+   user's own value works. **And it is additive to installed plugins**
+   (p0 a): a marketplace-installed user plugin kept firing beside both
+   env folders.
 9. **Two folders whose plugins share a name load only the first**
-   (Proven in review, b2: both named `roost-agent-state`, only the first
-   folder's hooks fired). Two consequences. Keep the plugin's name
-   constant across versions, so a stale inherited Roost folder can never
-   double-fire. And strip inherited Roost folders before appending,
-   because the **first** one wins: a stale older copy earlier in the list
-   would shadow the current one. The name should also differ from the
-   skill plugin's `roost` (`.claude-plugin/plugin.json`). Whether an
-   inline plugin clashes with a marketplace one of the same name was not
-   tested; Claude counts the env plugin as `<name>@inline`.
+   (Proven in review, b2: only the first folder's hooks fired). Keep the
+   plugin's name constant across versions, so a stale inherited Roost
+   folder can never double-fire, and strip inherited Roost folders before
+   appending, because the **first** one wins: a stale older copy earlier
+   in the list would shadow the current one. **The name is `roost`**
+   (decided with the skill, p0 b): an env plugin named like an installed
+   marketplace plugin **replaces** it for that session (debug log:
+   `Plugin "roost" from --plugin-dir overrides installed version`). With
+   the marketplace `roost@roost` installed (with hooks in a test copy),
+   only the env copy's hooks fired and its SKILL.md text was the one
+   used; one `roost:roost` skill, no duplicate (Proven). `claude plugin
+   list` still shows both `roost@roost` (enabled) and `roost@inline`, so
+   doctor must not read that pair as duplicate hooks. Only an enabled env
+   copy shadows (Source). If managed settings **lock** a plugin named
+   `roost`, the env copy is dropped with a warning and Claude runs on
+   (Source, not run).
+10. **Detecting the sideload policy** (p0 c, Proven): `CLAUDE_CODE_PLUGIN_DIRS=<roost
+    dir> claude plugin list --json </dev/null`. No policy: rc 0 and JSON
+    on stdout; policy: rc 1, empty stdout, `disableSideloadFlags` on
+    stderr; 0.09–0.15 s. It wrote nothing on an existing home (a brand-new
+    home gets Claude's own `.claude.json`). `claude --version` and
+    `--help` do **not** detect it (they exit before the check). The check
+    reads the whole policy layer, so run as the user with the real
+    environment it covers files and MDM. A **server-managed** policy is
+    caught only once an earlier Claude run has cached it (Inferred: no
+    eligible org account to reproduce; the override variables are
+    compiled out). The existence of `$CLAUDE_CONFIG_DIR/remote-settings.json`
+    is a cheap doctor hint, not proof. `CLAUDE_CODE_RESTRICT_PERSONAL_CONFIG`
+    strips the variable when a user `settings.json` `env` block sets it,
+    not when it comes from the process environment (Source).
+11. **StopFailure is unreliable when `-p` ends in an auth error** (p0 a):
+    it fired for some plugins in some runs and none in others, likely
+    racing the exit (Inferred). No test may pass on it.
 
 **Codex beside the user's own hooks** (Proven in review, `rev/a0`–`a4`,
 codex-cli 0.165.0, fake API key, no bypass flag). The user's own trusted
@@ -393,18 +507,18 @@ for this reason; the merge must likewise strip inherited Roost entries
 ### Signals per agent
 
 "Hooks" means Roost's adapter as shipped. 7501 rows come from
-`agent-program-status.md` (2026-10-28) plus today's startup-only
-re-captures.
+`agent-program-status.md` (2026-10-28, plus the 2026-11-08 re-captures of
+grok, Codex, opencode, cursor and crush).
 
 | Agent | Roost hooks | OSC 7501 | OSC 9 / 777 / BEL | OSC 9;4 | Process |
 |---|---|---|---|---|---|
 | **Claude Code** (2.1.312 captured; 2.1.319 startup re-checked) | 11 events; no interrupt hook (#622) | Probes; silent without a reply. idle, working (activity msg), blocked `permission` with "approve <Tool>: <cmd>", done, clear. Esc gives idle in about 0.1 s. No `id`, `title` or children seen in 2.1.312 | `auto` channel matches no terminal under `TERM_PROGRAM=Roost` (Strings) | `terminalProgressBarEnabled` setting exists (Strings); not observed under Roost | `claude` |
-| **Codex** 0.165.0 | 8 events incl. Interrupt | No probe. idle, working, done, blocked `permission` with **no msg**, clear; a startup flash | BEL under Roost (Source: `notifications/mod.rs:21-33`) | | `codex` |
-| **Grok CLI** 1.0.70 | 11 events, no PermissionRequest | Probes. blocked (trust prompt, `kind=auth` when signed out), working with msg, done with summary, clear | | herdr's grok manifest matches `4;1;-1` | `grok` |
-| **gx** 1.0.45+gx.17 | shares grok's file | **none** | | emits 9;4 | `gx` |
-| **cursor-agent** 2026.10.22 | 8 events; no blocked signal | **none** | | | `cursor-agent` |
-| **opencode** 1.19.4 | plugin, 10 bus events incl. permission and question | **none** in any npm release. Source has a root record plus a child per pending session from `d0a2ce32de` (2026-10-13); first tag v2.2.6 (2026-11-06); npm `latest` is 1.19.5 | | | `opencode` (a node/bun runtime underneath) |
-| **crush** | none | No probe. idle, working, error | | | `crush` |
+| **Codex** 0.167.0 (0.165.0 captured; same states) | 8 events incl. Interrupt | No probe. idle, working, done, blocked `permission` with **no msg**, error with no msg, Esc gives idle, clear; a startup flash | BEL under Roost (Source: `notifications/mod.rs:21-33`) | | `codex`, plus (0.167.0) a detached `codex app-server … --managed-daemon` that outlives the TUI |
+| **Grok CLI** 1.0.77 (1.0.70 captured earlier) | 11 events, no PermissionRequest. Decided: retired | Probes. **`app=grok`** (was `grok-build`). idle at start (a trust prompt only when a hook file exists), working with msg, blocked `permission` with the tool's summary, blocked `kind=auth` signed out, done with a summary, **child records** for subagents (`id`, `title`; cleared when the root is done), Ctrl-C gives idle, clear on exit. A rejected prompt goes to idle with no done; Esc does not interrupt | | herdr's grok manifest matches `4;1;-1`; 9;4;0 on exit | `grok` |
+| **gx** 1.0.45+gx.17 | shares grok's file. **Dropped** | **none** | | emits 9;4 | `gx` |
+| **cursor-agent** 2026.11.05 | 8 events; no blocked signal | **none** (re-checked: only OSC 0 titles and OSC 11 queries) | OSC 777 / 9 / 99 "waiting for you" only for terminals it recognises by env (`GHOSTTY_RESOURCES_DIR`, `ITERM_SESSION_ID`, …) and only while unfocused; **nothing under `TERM_PROGRAM=Roost`** (Proven) | none | `cursor-agent`, plus a detached `node … worker-server` that outlives the session |
+| **opencode** 1.19.5 | plugin, 10 bus events incl. permission and question | **none** in any npm release (re-captured on 1.19.5 through a real turn: no probe, no record). Source has a root record plus a child per pending session from `d0a2ce32de` (2026-10-13); first tag v2.2.6 (2026-11-06); npm `latest` is 1.19.5 | | | `opencode` (a node/bun runtime underneath) |
+| **crush** 0.98.2 captured; 0.97.1 installed | none | 0.98.2: no probe. idle, working, error. **0.97.1 (apt): none** | | | `crush` |
 | **pi** 1.5.0 | none | Probes. idle, clear | | | `pi` (node) |
 
 **Claude 2.1.319's 7501 may be much richer (Strings, unconfirmed).** The
@@ -446,6 +560,16 @@ live on 0.165.0):
   and 0.165+ runs threads in a detached managed app-server daemon (seen
   live). See [Codex without hooks](#codex-without-hooks) for why that
   matters to Phase 3b.
+- **0.167.0 (Proven):** launching the TUI starts `codex app-server
+  --listen unix:// --managed-daemon`, a `pid-update-loop` and
+  `codex-code-mode-host`, installs the daemon under `CODEX_HOME`, and
+  these outlive the TUI. On exit Codex says "Disconnected from this task.
+  Any running work continues. To reconnect, run: codex resume <id>". So
+  `clear` means "the TUI left this tab", not "the agent stopped". Phase
+  3a keys Codex's presence on the TUI process; Phase 7 could use the
+  printed `codex resume <id>`. Whether a turn really keeps running after
+  Ctrl-C mid-turn was not tested. Isolated probes must kill the daemons
+  they start.
 
 ---
 
@@ -519,12 +643,12 @@ them on argv. Nobody but cmux and Roost reads 7501 as state.
 
 | Agent | Delivery | Roost writes into the agent's config |
 |---|---|---|
-| Claude Code | Roost-owned plugin folder via `CLAUDE_CODE_PLUGIN_DIRS` on every tab (local, local session, host session), plus 7501 | Nothing |
+| Claude Code (2.1.280 or newer; older is unsupported) | Roost-owned plugin folder named `roost` (hooks plus the Roost skill) via `CLAUDE_CODE_PLUGIN_DIRS` on every tab (local, local session, host session), plus 7501. Skipped where the sideload probe finds the policy | Nothing |
 | opencode | Roost-owned plugin file via `OPENCODE_CONFIG_CONTENT`, merged with a user value. Once a 7501 release reaches npm `latest`, the plugin keeps only identity (`session_id`, `server_url`) | Nothing |
-| Codex | **Recommended:** 7501 alone now (meets Charlie's bar today; see [Codex without hooks](#codex-without-hooks)), plus the process layer once Phase 3a lands. Option, not recommended: a `codex()` shell function passing `-c` hooks and `hooks.state` | Nothing |
-| Grok CLI | **Recommended:** 7501 plus the process layer, once gx no longer needs the shared file. Option: keep `hooks/roost.json` | Nothing, or one Roost-owned file |
-| gx | 7501 in the fork | Nothing |
-| cursor-agent | Off by default. File delivery kept as an explicit opt-in until `--plugin-dir` is proven. Process identity gives presence and exit | `~/.cursor/hooks.json` only if opted in |
+| Codex | **Recommended, and assumed by Charlie's card answer:** 7501 alone now (meets Charlie's bar today; see [Codex without hooks](#codex-without-hooks)), plus the process layer once Phase 3a lands. Option, not recommended: a `codex()` shell function passing `-c` hooks and `hooks.state` | Nothing |
+| Grok CLI | **Decided:** 7501 plus the process layer. `hooks/roost.json` retired | Nothing |
+| gx | **Dropped** (decided) | Nothing |
+| cursor-agent | **Decided:** file delivery is an explicit opt-in, unchecked by default; without it, process identity gives presence and exit. Option: a `cursor-agent()` shell function adding `--plugin-dir` gives presence and working state with no write, but no turn end (Proven partial) | `~/.cursor/hooks.json` only if opted in |
 | pi, crush | 7501 plus the process layer | Nothing |
 
 ### Inputs
@@ -815,8 +939,8 @@ treating an agent as the tab's owner once the agent's process is gone?
 rule applies to Claude, Codex, Grok and cursor):
 
 1. **The agent crashes or exits without saying goodbye, in bash, zsh or
-   fish** (`kill -9`, a crash, gx's `/exit` per grok-build#26, a hook that
-   timed out). The shell's prompt mark drops the state to Idle, but Roost
+   fish** (`kill -9`, a crash, an `/exit` that skips the end hook as in
+   grok-build#26, a hook that timed out). The shell's prompt mark drops the state to Idle, but Roost
    keeps the dead agent as the tab's owner, as a "label" (DL-14). The
    Agents panel and the palette keep a row reading **"<agent> · Idle"**
    for a program that no longer exists, until the tab closes or another
@@ -897,9 +1021,14 @@ changes that we aren't confident were made by Roost."
 ### Config and consent
 
 **One source of truth: `agent-integration`** in `config.conf`. A list,
-`off`, or absent (unanswered). Unknown tokens are kept (#486's rule). The
-UI, the local session, a host session, `roostctl` and doctor all read
-only this key for decisions.
+`off`, or absent (the defaults: env and 7501 agents on, file agents off;
+decided 2026-11-08, see [The startup
+prompt](#the-startup-prompt-agent-integration)). Unknown tokens are kept
+(#486's rule). The UI, the local session, a host session, `roostctl` and
+doctor all read only this key for decisions. A Phase 1 detail to settle:
+a user who switches one agent off should not, by writing a full list,
+also opt out of agents a later release adds; recording only the
+departures from the defaults avoids that.
 
 **The legacy `agent-hooks` key becomes a shadow for older builds.** A new
 build reads it once, to carry the answer over, and afterwards only writes
@@ -922,21 +1051,26 @@ or `off`.
 
 | On disk before | `agent-integration` | Card | Retire | Notice (once) |
 |---|---|---|---|---|
-| Neither key (fresh install, or an earlier "Decide later") | left absent until answered | yes, if a switchable agent is installed | exact entries of agents no longer delivered by file; file agents wait for the answer | — |
-| `agent-hooks = off` | `off` | no | every exact entry | "Roost can now connect … without editing their settings files. They stay off" |
-| `agent-hooks = <list>` | the same list | no | every agent no longer delivered by file | "… now connect without changes to their settings files. Roost removed …" |
+| Neither key (fresh install, or an earlier "Decide later") | left absent: the defaults (env agents on, Cursor off) | **only if Cursor is installed** (its opt-in); otherwise none | exact entries of every agent no longer delivered by file (an old "Decide later" left none); Cursor's wait for an answer | — |
+| `agent-hooks = off` | `off` | no | every exact entry | toast: "Roost can now connect … without editing their settings files. They stay off" |
+| `agent-hooks = <list>` | the same list | no (Cursor keeps its earlier answer) | every agent no longer delivered by file | toast: "… now connect without changes to their settings files. Roost removed …" |
 | `agent-integration` set | unchanged | no | per its value | — |
 
 This has to be in Phase 1, before any tab is spawned with the plugin
 variables. Otherwise a user who said `off` gets Roost's hooks back in
 every tab, with no file touched.
 
-**Until answered, nothing is connected.** The tab environment carries no
-plugin variables; 7501 status shows as it does today. Env delivery writes
-nothing, but it still runs a Roost process inside the agent on every
-event, Claude records its own plugin state (caveat 6), and a sideload
-policy makes Claude exit (caveat 2). That earns one question; see [The
-startup prompt](#the-startup-prompt-agent-integration).
+**On by default, no question (decided 2026-11-08).** An earlier draft
+connected nothing until the user answered a card, because env delivery
+still runs a Roost process inside the agent on every event, Claude
+records its own plugin state (caveat 6), and a sideload policy makes
+Claude exit (caveat 2). Charlie's second-round answer: show a card only
+when a user file would change. The other costs are met without a
+question: the sideload probe skips Claude where a policy would make it
+exit (caveat 10), doctor names every agent's delivery, and each agent has
+an off switch in "Agent integration…", `config.conf` and `roostctl agent
+set`. A user who once chose "Decide later" is now on the defaults; that
+user had no entries, so nothing is retired and no toast is due.
 
 **Hosts.** A host session reads its own `agent-integration`.
 
@@ -952,7 +1086,9 @@ startup prompt](#the-startup-prompt-agent-integration).
 ### The startup prompt: Agent integration
 
 Charlie asked for the popup that asks which integrations to turn on to be
-updated. This is the proposed design.
+updated. In the second round (2026-11-08) he **decided** it appears only
+when it has something to ask: a file-writing opt-in for an installed
+agent. This is the design.
 
 **Today's card** (`crates/roost-iced/src/app/agent_hooks_dialog.rs`), for
 contrast:
@@ -977,109 +1113,131 @@ contrast:
   "Agent Hooks…" in the palette (`roost-ui-model/src/palette.rs:238`) and
   the Mac menu (`macos/menu.rs:712`).
 
-**When the new card appears:**
+**When the card appears** (decided 2026-11-08: only when it has
+something to ask):
 
 | State on disk | Card? | Instead |
 |---|---|---|
-| Neither key set, and at least one installed agent has a switch | **yes**, once per process, until answered | — |
-| Same, but only built-in (7501) agents are installed | no | nothing to ask; status still shows |
-| `agent-hooks = <list>` (had hooks on) | **no**: the answer carries over | automatic retire, one notice |
-| `agent-hooks = off` (said no) | **no**: `off` carries over | retire of any exact leftovers, one notice |
+| An installed agent needs a user file changed and its answer is not recorded (today only Cursor: installed, and `agent-integration` absent) | **yes**, once per process, until answered | — |
+| No installed agent needs a user file changed | **no** | nothing to ask: env and 7501 agents are on (the defaults). A toast only if the sideload probe skipped Claude (below) |
+| `agent-hooks = <list>` (had hooks on) | **no**: the answer carries over, Cursor's included | automatic retire, one toast |
+| `agent-hooks = off` (said no) | **no**: `off` carries over | retire of any exact leftovers, one toast |
 | `agent-integration` set | never again | — |
 | `ROOST_TEST_MODE` without the fence lifted | no | — |
 
-Not re-asking upgraders is deliberate: their answer maps exactly onto
-the new key.
+Cursor installed later, after a first run with no card: the card appears
+at the next launch, because Cursor's answer is still unrecorded. Not
+re-asking upgraders is deliberate: their answer maps exactly onto the new
+key. No modal ever explains the migration; upgraders get toasts.
 
 **Rows, by delivery in this build:**
 
-| Agent | Delivery | Row | First-run switch |
+| Agent | Delivery | First-run card | Preferences ("Agent integration…") |
 |---|---|---|---|
-| Claude Code | env plugin | switch | on if found |
-| OpenCode | env plugin | switch | on if found |
-| Codex (recommended: 7501 only) | built in | **no switch**, a "Built in" label | — |
-| Codex, during Phase 2 before Phase 4 | file (`hooks.json` + `config.toml`) | switch | **off**; an upgrader's answer carries over |
-| Grok, while gx lacks 7501 | a file Roost owns | switch | off. Grok 1.0.70 shows status without it; gx needs it |
-| Grok, once gx speaks 7501 | built in | no switch | — |
-| cursor | file (merge into `hooks.json`) | switch | off |
-| crush, pi | built in | one combined "Built in" line | — |
+| Claude Code | env plugin `roost` | not on the card | switch, **on** by default. Shown off with the reason when the sideload probe finds the policy |
+| OpenCode | env plugin | not on the card | switch, on |
+| Codex | 7501 (built in) | not on the card | switch, on, labelled "Built in" |
+| Grok | 7501 (built in) | not on the card | switch, on, labelled "Built in" |
+| Cursor | file (merge into `$HOME/.cursor/hooks.json`) | **the card's one row, unchecked** | switch, off by default |
+| crush, pi | 7501 (built in) | not on the card | one combined "Built in" line |
+
+The off switch for an env agent stops injecting its variable. For a
+built-in (7501) agent there is nothing to stop delivering; off means Roost
+ignores that agent's records for rows and banners (a proposal; small, in
+the composition layer).
 
 **Copy (draft):**
 
 - **Title:** "Agent integration"
-- **Lede:** "Roost shows what your coding agents are doing (working, needs
-  you, done) in the sidebar, the Agents panel and notifications.
-  Connecting an agent adds detail, such as which tool is waiting for your
-  approval. Connecting changes nothing in an agent's own settings, unless
-  a row below says so."
+- **First-run lede** (names only installed agents): "Roost shows what
+  your coding agents are doing (working, needs you, done) in the sidebar,
+  the Agents panel and notifications. Claude Code, Codex and Grok are
+  already connected, with nothing written to their settings. One agent
+  needs a change to its own settings file to report fully:"
+- **Cursor:** "Adds Roost's entries to ~/.cursor/hooks.json, because
+  Cursor reads its turn-end hook only from that file. Without it, Roost
+  shows only that Cursor is running." (The last clause needs Phase 3a;
+  before that, "shows nothing for Cursor".)
+- **First-run footer:** "Change this, or switch any agent off, from Agent
+  integration… in the command palette."
+- **First-run buttons:** "Decide later" (writes nothing; the card returns
+  next launch) and "Continue" (records the answer; Cursor is connected
+  only if checked).
+- **Preferences lede:** "Roost shows what your coding agents are doing in
+  the sidebar, the Agents panel and notifications. Only rows that say so
+  change an agent's own settings."
 - **Claude Code:** "Connected inside Roost tabs only. Nothing is written
-  to ~/.claude." Note: "Needs Claude Code 2.1.280 or newer. If your
-  organization's Claude policy blocks plugins, leave this off."
+  to ~/.claude. Needs Claude Code 2.1.280 or newer." Under a policy:
+  "Not connected: your organization's Claude Code policy blocks plugin
+  folders (disableSideloadFlags). Status still shows from the terminal."
 - **OpenCode:** "Connected inside Roost tabs only. Nothing is written to
   ~/.config/opencode."
-- **Codex (built in):** "Built in. Codex reports its status to the
-  terminal itself. Nothing to turn on."
-- **Codex (Phase 2 interim):** "Edits ~/.codex/hooks.json and adds trust
-  lines to config.toml. Off by default: Codex shows its status without
-  it."
-- **Grok (file):** "Writes one file of Roost's own,
-  ~/.grok/hooks/roost.json. Grok shows status without it; gx needs it."
-- **Cursor:** "Edits ~/.cursor/hooks.json, because Cursor has no other way
-  in. Without it, Roost shows only that Cursor is running." (The last
-  clause needs Phase 3a; before that, "shows nothing for Cursor".)
+- **Codex, Grok (built in):** "Built in. <Agent> reports its status to
+  the terminal itself."
 - **Built-in line:** "Also built in: crush and pi report their status on
   their own."
-- **Footer:** "Change this any time from Agent integration… in the
-  command palette. Hosts you connect to follow this choice unless they
-  have their own."
-- **Buttons:** first run "Decide later" and "Connect N" (or "Connect
-  none"); preferences "Cancel" and "Apply".
-- **Preferences status lines:** "Connected · nothing written"; "Off:
-  status from the terminal only"; "Wired v3 · ~/.cursor/hooks.json"; "Old
-  Roost entries left in <file> (you changed them) — Remove…"; "Came back
-  after Roost removed it (synced from an older Roost?) — Remove…".
+- **Preferences footer:** "Hosts you connect to follow this choice unless
+  they have their own."
+- **Preferences buttons:** "Cancel" and "Apply".
+- **Preferences status lines:** "Connected · nothing written"; "Off";
+  "Skipped: blocked by your organization's Claude policy"; "Wired v3 ·
+  ~/.cursor/hooks.json"; "Old Roost entries left in <file> (you changed
+  them) — Remove…"; "Came back after Roost removed it (synced from an
+  older Roost?) — Remove…".
 
-**Mockup** (first run; Codex built in, Grok as a file):
+**Mockup, first run** (only when Cursor is installed):
 
 ```
 ┌─ Agent integration ──────────────────────────────────────────────┐
 │ Roost shows what your coding agents are doing (working, needs    │
 │ you, done) in the sidebar, the Agents panel and notifications.   │
-│ Connecting an agent adds detail, such as which tool is waiting   │
-│ for your approval. Connecting changes nothing in an agent's own  │
-│ settings, unless a row below says so.                            │
+│ Claude Code, Codex and Grok are already connected, with nothing  │
+│ written to their settings. One agent needs a change to its own   │
+│ settings file to report fully:                                   │
 │                                                                  │
-│ [■■] Claude Code              found here                         │
+│ [  ] Cursor                   found here                         │
+│      Adds Roost's entries to ~/.cursor/hooks.json, because Cursor│
+│      reads its turn-end hook only from that file. Without it,    │
+│      Roost shows only that Cursor is running.                    │
+│                                                                  │
+│ Change this, or switch any agent off, from Agent integration…    │
+│ in the command palette.                                          │
+│                                  [ Decide later ]  [ Continue ]  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Mockup, preferences** (from the palette or the Mac menu):
+
+```
+┌─ Agent integration ──────────────────────────────────────────────┐
+│ Roost shows what your coding agents are doing in the sidebar,    │
+│ the Agents panel and notifications. Only rows that say so change │
+│ an agent's own settings.                                         │
+│                                                                  │
+│ [■■] Claude Code    found here   Connected · nothing written     │
 │      Connected inside Roost tabs only. Nothing is written to     │
-│      ~/.claude. Needs Claude Code 2.1.280 or newer. If your      │
-│      organization's Claude policy blocks plugins, leave this off.│
-│ [■■] OpenCode                 found here                         │
-│      Connected inside Roost tabs only. Nothing is written to     │
-│      ~/.config/opencode.                                         │
-│ [  ] Grok                     found here                         │
-│      Writes one file of Roost's own, ~/.grok/hooks/roost.json.   │
-│      Grok shows status without it; gx needs it.                  │
-│ [  ] Cursor                   not found here                     │
-│      Edits ~/.cursor/hooks.json, because Cursor has no other way │
-│      in. Without it, Roost shows only that Cursor is running.    │
-│  ──  Codex                    found here          Built in       │
-│      Codex reports its status to the terminal itself.            │
+│      ~/.claude. Needs Claude Code 2.1.280 or newer.              │
+│ [■■] OpenCode       found here   Connected · nothing written     │
+│ [■■] Codex          found here   Built in                        │
+│ [■■] Grok           found here   Built in                        │
+│ [  ] Cursor         found here   Off                             │
+│      Adds Roost's entries to ~/.cursor/hooks.json, because Cursor│
+│      reads its turn-end hook only from that file.                │
 │  ──  Also built in: crush and pi report their status on their own│
 │                                                                  │
-│ Change this any time from Agent integration… in the command      │
-│ palette. Hosts you connect to follow this choice unless they     │
-│ have their own.                                                  │
-│                                  [ Decide later ]  [ Connect 2 ] │
+│ Hosts you connect to follow this choice unless they have their   │
+│ own.                                           [ Cancel ] [Apply]│
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 **What an upgrader sees** (each toast once, through the record's notice
-flag, as `noticed` today):
+flag, as `noticed` today; never a modal):
 
 - **Had hooks on, clean removal:** "Claude Code and OpenCode now connect
-  to Roost without changes to their settings files. Roost removed the
-  entries it had added (backup in ~/.config/roost/agent-backups). Agent
-  integration… to change."
+  to Roost without changes to their settings files, and Codex and Grok
+  report their status on their own. Roost removed the entries it had
+  added (backup in ~/.config/roost/agent-backups). Agent integration… to
+  change." (Names only the agents whose entries were retired.)
 - **With leftovers:** the same, plus "Roost left 1 entry it can't be sure
   it added: roostctl agent status lists it."
 - **Had `off`:** "Roost can now connect Claude Code and OpenCode without
@@ -1089,9 +1247,14 @@ flag, as `noticed` today):
   ~/.config/roost/agent-backups)."
 - **A host:** "on <host>: Roost removed its old agent entries there
   (backup on <host> in ~/.config/roost/agent-backups)."
+- **Claude skipped by policy** (anyone, once per machine while it holds):
+  "Claude Code isn't connected: your organization's Claude policy blocks
+  plugin folders. Its status still shows from the terminal." Doctor keeps
+  the line.
 
-Confirm still goes through `agent.set_hooks`, which now writes
-`agent-integration` and the shadow, and sends `off` for none.
+"Continue" and "Apply" still go through `agent.set_hooks`, which now
+writes `agent-integration` and the shadow, and sends `off` when every
+switch is off. "Continue" records the defaults plus Cursor's answer.
 
 ### The retire step (integration version 4)
 
@@ -1281,9 +1444,11 @@ embedding process hands in a directory it owns, written the way
 `roost_resources_dir` writes shell integration under
 `$XDG_CACHE_HOME/roost/` (`pty.rs:2561`). Version the folder so a running
 `claude` keeps its own, and rewrite it at spawn if a cache clean removed
-it. Keep the plugin's **name** constant across versions (caveat 9). Strip
-inherited Roost entries from both variables before appending (the second
-gap above). This is consistent with DL-32: these are server variables,
+it. Keep the plugin's **name** constant across versions: `roost`, the
+marketplace plugin's name, so inside a Roost tab it replaces an installed
+`roost@roost` (caveat 9). The folder carries the hooks and
+`skills/roost/SKILL.md`. Strip inherited Roost entries from both
+variables before appending (the second gap above). This is consistent with DL-32: these are server variables,
 not opener ones.
 
 ### Rollback
@@ -1293,15 +1458,20 @@ not opener ones.
   `roostctl agent status` print the path and the `cp` that restores it.
   There is no restore verb: a restore would overwrite whatever the user
   or the agent changed since.
-- **Per user:** `roostctl agent install claude --file` restores v3 file
-  delivery (the existing writer, behind a flag).
+- **Per user:** none for Claude. Decided 2026-11-08: no `--file`
+  fallback and no support below Claude 2.1.280. If env delivery ever
+  fails in the field, the marketplace or plugin-install route can be
+  revisited; it is not pursued now. Cursor keeps its file writer as its
+  opt-in.
 - **Per release:** a point release can stop injecting and leave the
   retire alone. 7501 still covers Claude's state. A release does not
   undo the retire.
 - **Downgrade:** see the version-skew table.
-- **Policy:** if a Claude in a Roost tab exits at once with the sideload
-  message, the user switches Claude off in "Agent integration", or Roost
-  falls back (key question 8).
+- **Policy:** the sideload probe skips Claude where a policy would make
+  it exit (caveat 10). If one slips through (a server policy not cached
+  yet), Claude's own message says to unset the variable, and the user
+  switches Claude off in "Agent integration…". No argv fallback (decided,
+  key question 8).
 
 ### What `roostctl`, the UI and the docs become
 
@@ -1309,14 +1479,15 @@ not opener ones.
 |---|---|
 | `agent status` | per agent: delivery (`env`/`file`/`7501`/`none`), 7501 seen, files Roost touched, `retired {version, at, backups}`, `leftovers [{file, event, reason}]`, `came_back` |
 | `agent set <list\|off>` | sets `agent-integration` and the `agent-hooks` shadow; raises hosts per the version-skew table |
-| `agent install <a>` | env and built-in agents: "nothing to install", pointing at `set`. `--file` keeps the old writer |
+| `agent install <a>` | env and built-in agents: "nothing to install", pointing at `set`. Cursor, the one file agent, keeps the writer (fixed to write `$HOME/.cursor/hooks.json`). No `--file` for Claude (decided) |
 | `agent uninstall <a>\|--all` | removes any Roost entries whose command is owned (today's rule), now with a backup and the reformat check |
 | `agent ensure` | reconcile file agents; run the retire if pending |
-| The card | "Agent integration": first run (unanswered key only) and preferences; rows by delivery; built-in agents without a switch; "Remove…" for leftovers and entries that came back |
+| The card | "Agent integration": first run only when an installed agent needs a file opt-in (today Cursor); preferences with a switch per agent; "Remove…" for leftovers and entries that came back |
 | Palette and Mac menu | "Agent Hooks…" becomes "Agent integration…"; the palette also matches "hooks" |
-| Toasts | one retire notice per machine; one "now possible without editing files" for users who said `off`; "wired" only for file agents |
+| Toasts | one retire notice per machine; one "now possible without editing files" for users who said `off`; one "Claude isn't connected" while the sideload policy holds; "wired" only for Cursor |
 | `docs/guides/agents.md` | "Agent integration": delivery table, the retire and its strict rule, leftovers, backups, the file fallback, an honest note on what Claude writes for itself |
-| `docs/getting-started/first-run.md` | the new card, and when it appears |
+| `docs/getting-started/first-run.md` | no card for most users; the Cursor card, and when it appears |
+| `docs/guides/agent-skill.md` | inside a Roost tab the skill arrives with the env plugin; `/plugin install roost@roost` is for Claude outside Roost tabs. Keep the marketplace `SKILL.md` identical to the env copy |
 | Decision log | a new DL (next free number is DL-36) replacing plan 064's consent model, which has no DL; amendments to DL-13, DL-14 and DL-29 when Phase 3 and Phase 5 land |
 
 ---
@@ -1331,22 +1502,42 @@ draft sized several multi-commit plans as M.
 
 ### Phase 0: Facts (M)
 
+**Already proven** (2026-11-08 evening, isolated homes, real configs
+hash-checked unchanged; see [Third
+pass](#third-pass-charlies-second-answers-and-phase-0-probes)):
+
+- 7501 re-captures of grok 1.0.77 (with child records and `app=grok`),
+  Codex 0.167.0, opencode 1.19.5 (none), cursor 2026.11.05 (none) and the
+  apt crush 0.97.1 (none), appended to `agent-program-status.md`.
+- `disableSideloadFlags` reproduced rootless on Linux (no shed needed),
+  and the `claude plugin list --json` detection probe.
+- Claude's env plugin additive with installed and env user plugins; the
+  name `roost` replacing the marketplace plugin; the skill loading from
+  the env folder.
+- cursor `--plugin-dir` with a real login: proven, partial.
+- grok's cross-execution of other agents' hook files, and its trust
+  prompt.
+
+**Still open:**
+
 - **Scope.**
-  - Live 7501 captures with `tools/agent-status/` of Claude 2.1.319
-    (children, kinds, progress, auth, error), opencode v2.2.6, current
-    Codex, grok, gx. Needs a logged-in Claude in a **temporary**
-    `CLAUDE_CONFIG_DIR`, never the real one.
-  - Whether Claude emits OSC 9;4 under `TERM_PROGRAM=Roost`.
-  - `disableSideloadFlags` with a real `managed-settings.json`, in a shed
-    VM (needs root).
-  - cursor `--plugin-dir` with a real login.
-  - The session id and parent chain of each agent's hook process, and of
-    the codex app-server and opencode server (#624), on Linux and macOS.
-  - A full turn from pi and crush (working, blocked), which the
-    2026-10-28 captures did not reach.
+  - Claude 2.1.319's 7501 with a real login (children, kinds, progress,
+    auth, error), in a **temporary** `CLAUDE_CONFIG_DIR`, never the real
+    one; and whether Claude emits OSC 9;4 under `TERM_PROGRAM=Roost`.
   - Claude with real auth: PermissionRequest, Notification and Stop
     through the env plugin. The probes reached only the hooks that fire
     before the auth check.
+  - grok's `error` record (documented, not captured) and its "still
+    running" count for work left after a turn.
+  - Re-capture `gx-gate.jsonl` with grok before Phase 4 deletes it: it is
+    the only evidence for the Stop-gate and subagent-drop behaviour.
+  - The session id and parent chain of each agent's hook process, and of
+    the codex app-server daemon, cursor's `worker-server` and the
+    opencode server (#624), on Linux and macOS.
+  - A full turn from pi and from crush 0.98 or newer (working, blocked).
+  - The sideload probe on macOS against an MDM or `/Library/Application
+    Support/ClaudeCode/` policy (root needed, so a spare Mac), and,
+    if an org account turns up, against a server-managed policy.
   - Log in only on Linux. On macOS Claude keeps its credential in the
     login Keychain, which a temporary `CLAUDE_CONFIG_DIR` may not
     isolate (Inferred).
@@ -1354,14 +1545,24 @@ draft sized several multi-commit plans as M.
     byte for byte through Roost's own printer (on Linux and macOS, more
     than one machine), and the handler timeouts each release wrote, read
     from the release tags.
-  - **Probe hygiene for Codex:** put `check_for_update_on_startup =
-    false` at the top of the isolated `$CODEX_HOME/config.toml`. Without
-    it a single Enter on Codex's startup update prompt picks "Update now"
-    and runs a **global** `npm install -g @openai/codex`, outside the
-    isolated home (it happened in the second pass; see
-    [Second pass](#second-pass-charlies-answers)).
-- **Why M, not S.** Five agents with logins, a shed VM with root, and two
-    platforms for the parent-chain check.
+  - **Probe hygiene:** put `check_for_update_on_startup = false` at the
+    top of the isolated `$CODEX_HOME/config.toml` (a single Enter on
+    Codex's update prompt once ran a **global** `npm install -g
+    @openai/codex`; see [Second pass](#second-pass-charlies-answers)).
+    Turn off every agent's updater in isolated runs: `DISABLE_AUTOUPDATER=1`
+    for Claude; `"autoupdate": false` or `OPENCODE_DISABLE_AUTOUPDATE=1`
+    for opencode; `GROK_DISABLE_AUTOUPDATER=1`, `--no-auto-update` and
+    `[cli] auto_update = false` for grok; `"channel":"static"` in the
+    isolated `cli-config.json` for cursor. Kill the Codex daemons and
+    cursor `worker-server` an isolated run starts.
+- **A code fix that cannot wait (S, standalone; filed as #716).** Map `app=grok` in
+  `app_for_source` and `app_label`. To keep grok 1.0.70 and older working,
+  let the `ForeignApp` check (`program_status.rs:553-556`) accept either
+  `grok` or `grok-build` for the `grok` source. Update the tests at `program_status.rs:1132-1135`, `:1863` and
+  `:1901`. Without it, grok 1.0.77's hooks are dropped as `ForeignApp`
+  and its rows read `grok`. Fits backlog Plan A.
+- **Why M, not S.** A logged-in Claude, a root-capable Mac, and two
+  platforms for the parent-chain check.
 - **Output.** Appended sections in `agent-program-status.md`.
 - **Closes.** None. Feeds #622 and #624.
 - **Exit.** Every "Strings" or "Inferred" row this roadmap depends on is
@@ -1372,8 +1573,11 @@ draft sized several multi-commit plans as M.
 - **Scope.**
   - A Roost-owned integration folder per process (UI, local session,
     host session), versioned.
-  - The Claude plugin generated from `CLAUDE_HOOK_EVENTS`, with the same
-    fail-safe wrapper and a distinct `--via env` spelling.
+  - The Claude plugin, named `roost`, generated from `CLAUDE_HOOK_EVENTS`,
+    with the same fail-safe wrapper and a distinct `--via env` spelling,
+    plus `skills/roost/SKILL.md` (decided: the skill rides in the env
+    plugin). One source for the SKILL.md, so the env copy and the
+    marketplace copy cannot drift.
   - The opencode plugin with a `globalThis` single-instance guard.
   - Injection in `roost-engine`, appending to a user's
     `CLAUDE_CODE_PLUGIN_DIRS` and merging a user's
@@ -1381,26 +1585,46 @@ draft sized several multi-commit plans as M.
   - bash and zsh integration re-append after the user's rc.
   - **The `agent-integration` key as the single reader**, with the
     one-time carry-over from `agent-hooks` (see [Config and
-    consent](#config-and-consent)). An unanswered key injects nothing.
+    consent](#config-and-consent)). An absent key means the defaults:
+    Claude and opencode injected (decided 2026-11-08); `off` injects
+    nothing.
   - The new build's own `ensure` stops wiring Claude and opencode by file
     wherever it injects them. Otherwise it keeps re-adding the entries
     Phase 2 removes.
   - Strip inherited Roost entries from both variables before appending;
     a constant plugin name.
-  - Skip Claude injection when a local managed-settings file sets
-    `disableSideloadFlags`; doctor says why.
+  - **The sideload probe (decided, option A+C).** Run
+    `CLAUDE_CODE_PLUGIN_DIRS=<roost dir> claude plugin list --json`
+    with the serving process's environment, stdin `/dev/null`,
+    `DISABLE_AUTOUPDATER=1` and a short timeout, off the UI thread, in
+    each serving process (UI, local session, host session: the policy
+    is per machine). rc 1 with `disableSideloadFlags` on stderr: skip
+    Claude's variable, a doctor line, the one-time toast. rc 0, or no
+    `claude` on PATH: inject. Anything else: inject and show "unknown"
+    in doctor. The serving process's PATH may lack what the user's rc
+    adds (`~/.local/bin`), so resolve `claude` as a login shell would.
+    Cache the answer and re-probe at each launch and on a
+    TTL (a server policy may arrive after the first fetch). Never
+    `--version`. Doctor also notes a cached
+    `$CLAUDE_CONFIG_DIR/remote-settings.json` as a hint. No argv
+    fallback: `--settings` would get around the org's ban.
   - D1.
-  - Doctor delivery rows.
+  - Doctor delivery rows. Doctor reads `claude plugin list` showing both
+    `roost@roost` and `roost@inline` as normal (only the env copy loads).
+  - The defaults with no card: env agents on when `agent-integration` is
+    absent; per-agent off switches in config and `roostctl agent set`.
   - #622's new events can ride along: the plugin is generated, so no
     user file churns.
 - **Closes.** #622 if it rides along.
 - **Tests.**
   - Unit: env merge (empty, user value, unparseable), plugin generation
-    snapshot against `CLAUDE_HOOK_EVENTS`, managed-file detection.
+    snapshot against `CLAUDE_HOOK_EVENTS` (with the skill), the probe's
+    three outcomes from a fake `claude` (rc 0; rc 1 with the marker;
+    timeout).
   - Unit, carry-over table: `agent-hooks = off` → `agent-integration =
     off` and no variables; a list without `claude` → no Claude variable;
-    both keys absent → no variables; `agent-integration` set → the legacy
-    key is never read again.
+    both keys absent → the defaults (Claude and opencode variables set);
+    `agent-integration` set → the legacy key is never read again.
   - Unit: an inherited value that already holds a Roost folder comes out
     with exactly one, the current one.
   - roosttest: a tab's environment carries both variables with a user
@@ -1415,11 +1639,19 @@ draft sized several multi-commit plans as M.
   - Run each new test once with the fix removed, and record that it fails
     (the negative control).
   - Manual, agent-status harness: Claude 2.1.319 and opencode in a Roost
-    tab with an empty config dir.
+    tab with an empty config dir. Claude's `-p --output-format
+    stream-json --verbose` init event lists `plugins[]` and `skills[]`
+    (`roost@inline`, `roost:roost`) with no auth, which suits a roosttest
+    assertion with a real Claude where one is installed.
+  - The policy itself, rootless: the p0 `unshare -rm` overlay recipe on a
+    Linux runner that allows unprivileged user namespaces (else a shed),
+    asserting Roost skips the variable and doctor names the policy.
 - **Exit.** In a Roost tab, Claude and opencode report working, waiting
   and finished with nothing written by Roost under `~/.claude` or
   `~/.config/opencode`, locally and on a host session. A user who said
-  `off`, or never answered, gets neither variable.
+  `off` gets neither variable; a fresh install gets both with no card;
+  under a reproduced sideload policy Claude starts normally in a Roost tab
+  because Roost skipped its variable.
 
 ### Phase 2: Retire file delivery, integration v4 (L)
 
@@ -1440,10 +1672,18 @@ draft sized several multi-commit plans as M.
   - The `agent-hooks` shadow write; `session.set_agent_hooks` per agent
     on a v4 session, including an empty list; the client choosing what to
     send by the host session's version.
-  - The "Agent integration" card (both modes, rows by delivery, built-in
-    rows without a switch, "Remove…" for leftovers; see [The startup
+  - **Codex and Grok off files, in this phase** (moved from Phase 4:
+    with gx dropped and Codex 7501-only decided, nothing keeps either as
+    a file agent, and the no-card design has no switch for them in the
+    gap). The retire removes Codex's `hooks.json` handlers with their
+    canonical trust keys and restores `[features] hooks` from the
+    pre-image; it deletes `$GROK_HOME/hooks/roost.json` when `is_ours`
+    holds. Depends on the standalone `app=grok` fix.
+  - The "Agent integration" card (first run only for a file opt-in, i.e.
+    Cursor; preferences with a switch per agent; "Remove…" for
+    leftovers; see [The startup
     prompt](#the-startup-prompt-agent-integration)), the palette and Mac
-    menu rename, and the two one-time notices.
+    menu rename, and the one-time toasts.
   - The `roostctl` verb changes; `uninstall` gains the backup and the
     layout check.
   - The docs rewrite, the stale-doc fixes listed under Today, and the new
@@ -1455,9 +1695,11 @@ draft sized several multi-commit plans as M.
   Phase 2 needs a byte-span JSON removal first (+M). And the per-release
   handler timeouts, built from the release tags, not assumed to be 10
   (Codex clamps two events to 3, `codex.rs:57`).
-- **Closes.** #485 and #492 for the moved agents. Close both outright if
-  Phase 4 leaves no file agent on by default; otherwise narrow them to
-  cursor. Shrinks #553 item 2.
+- **Closes.** #485 and #492 for the moved agents; Cursor is the only
+  file agent left, and it is off by default, so both can be narrowed to
+  Cursor or closed. Shrinks #553 item 2.
+- **Size.** Still L; Codex and Grok add acceptance cases, not new
+  machinery.
 - **Tests.**
   - `crates/roost-agent-install/src/acceptance.rs`, one case per row of
     both tables in [What Roost may remove](#what-roost-may-remove):
@@ -1475,7 +1717,11 @@ draft sized several multi-commit plans as M.
   - `agent-hooks = off` with exact entries on disk: retired, the key
     stays `off`, the "now possible" notice is shown once.
   - Unanswered key with cursor entries on disk: cursor kept until the
-    card is answered; Claude entries retired.
+    card is answered; Claude, Codex and Grok entries retired.
+  - The strict Codex retire across both files (an edited handler keeps
+    its non-canonical trust key; an orphaned canonical key goes),
+    pre-image restore. A `roost.json` with a user `matcher` is left as
+    `foreign`; Roost's exact `roost.json` is deleted.
   - Idempotent: a second run writes nothing, makes no backup, shows no
     toast. A cut after one agent completes on the next run with no
     second backup of the finished agent's files. A lost record re-runs
@@ -1491,12 +1737,14 @@ draft sized several multi-commit plans as M.
     the jailed home; an empty list from a v4 client is accepted and
     carries the host's notice.
   - roosttest `test_agent_hooks_dialog.py`, reworked: `app.dialog_dump`
-    reports rows with `delivery` and no switch for built-in agents; the
-    first-run card appears only with both keys absent and a switchable
-    agent installed; an answered upgrader gets no card; "Decide later"
-    writes nothing.
+    reports rows with `delivery`; the first-run card appears only with
+    both keys absent and Cursor installed, and lists Cursor alone,
+    unchecked; with only Claude, Codex and Grok installed there is no
+    card; an answered upgrader gets no card; "Decide later" writes
+    nothing.
 - **Exit.** Upgrading a machine with v3 entries leaves no provably-Roost
-  entry in `settings.json` or `plugins/`, names every other one in doctor
+  entry in `settings.json`, `plugins/`, `~/.codex` or `~/.grok`, names
+  every other one in doctor
   and `agent status`, has a backup of every changed file, and Claude
   still reports. A host is cleaned at its first v4 session start. No
   machine passes through a window where a running session's tabs have
@@ -1521,8 +1769,8 @@ draft sized several multi-commit plans as M.
   - DL-14 and DL-29 amendments; shared fixtures updated.
   - Codex runs hook commands in a new session and its threads in a
     detached daemon (Source; seen live), so 3b's same-session check would
-    class every Codex hook `not_in_tab`. Under Phase 4's recommendation
-    Codex has no hooks, so this matters only if Codex hooks remain.
+    class every Codex hook `not_in_tab`. Under the recommendation (retired
+    in Phase 2) Codex has no hooks, so this matters only if Codex hooks remain.
 - **Closes.** #519, #621. #623 and #624 when enforcement flips (this plan
   or the next release).
 - **Tests.**
@@ -1541,64 +1789,119 @@ draft sized several multi-commit plans as M.
   off. Would-drop counts per reason are visible in doctor; they are not
   in `Tab.dropped_reports`, which holds only a total and the last drop.
 
-### Phase 4: Codex, Grok and cursor off files (S–M)
+### Phase 4: Cursor, and dropping gx (S–M)
+
+Codex and Grok moved into Phase 2 (2026-11-08). What is left:
 
 - **Depends on** Phase 2's machinery (the strict retire, the card's
-  delivery table).
-- **Until this phase**, Codex and Grok stay file agents: an upgrader's
-  answer carries over, and the first-run default for both is off. 7501
-  already shows their status, rows and banners.
+  delivery table). The `gx-gate` re-capture with grok (Phase 0) before
+  its fixture is deleted.
 - **Scope.**
-  - **Codex, per key question 5.**
-    - Recommended, (a) 7501 only: meets Charlie's bar today (see [Codex
-      without hooks](#codex-without-hooks)). The card row becomes "Built
-      in", with no switch. The retire removes the `hooks.json` handlers
-      and their canonical trust keys strictly, and restores
-      `[features] hooks` from the pre-image. A `codex` token left in
-      `agent-integration` is kept as the user's stated wish and does
-      nothing. Doctor says "status via terminal". Grows into (d) when
-      Phase 3a lands, at S on top of it.
-    - Not recommended, (b): a `codex()` shell function with `-c` hooks
-      and one inline `hooks.state`, using the `declare -F` skip pattern
-      so a user's own function wins. Phase 3b would drop its hooks (Codex
-      runs them in a new session).
-  - **Grok, per key question 6:** 7501 only once gx speaks 7501. Then the
-    row becomes "Built in" and the retire deletes `hooks/roost.json` if
-    `is_ours` holds.
-  - **cursor:** off by default; file opt-in kept; `--plugin-dir` proven
-    or dropped. Its entries are retired only when the user switches it
-    off.
+  - **Cursor (decided: file opt-in, unchecked).**
+    - Fix the installer to write `$HOME/.cursor/hooks.json` whatever
+      `CURSOR_CONFIG_DIR` says (`roost-agent-install/src/home.rs:23`);
+      cursor 2026.11.05 reads user hooks only there (Proven). The retire
+      and `uninstall` keep looking in the old location through the
+      record. Can ship earlier as a standalone fix.
+    - Its entries are retired only when the user switches it off.
+    - Optional no-write tier: a `cursor-agent()` (and `agent()`, only
+      when it resolves to cursor's launcher) shell function adding
+      `--plugin-dir <roost cursor dir>`. Gives presence, working and
+      session end, but **no turn end**, because cursor gates
+      `beforeSubmitPrompt`, `afterAgentResponse` and `stop` on the user
+      or project `hooks.json` (Proven). Not recommended as the default;
+      worth it only if Charlie wants Cursor "working" with no opt-in.
+      Untested: whether `resume`, `ls` and `persist` take a leading
+      `--plugin-dir`.
+    - Not a route: advertising Ghostty (`GHOSTTY_RESOURCES_DIR`) would
+      make cursor send OSC 777 "waiting for you" while unfocused, but
+      would make every other program think the terminal is Ghostty.
+  - **Drop gx (decided).** Delete, from the grok probe's inventory
+    (main @ 68231b9b):
+    - `crates/roost-agent/src/grok.rs`: the gx mentions in the module
+      docs (lines 1–71), the `gxRemote` → `gx.remote` metadata stamp
+      (about 159–187) and its notes at 245, 268, 303–304 and 352. Keep
+      `loopback_base_url` in `common.rs` (opencode's `server_url` uses
+      it).
+    - `crates/roost-agent/tests/grok_events_test.rs:486-596`: the two
+      `gx.remote` tests.
+    - Fixtures `crates/roost-agent/tests/fixtures/gx.jsonl`,
+      `gx-gate.jsonl`, `gx-failure.jsonl`; their names in
+      `crates/roost-agent/src/hook.rs:280-282`; the 23 references in
+      `crates/roost-agent/tests/fixture_replay_test.rs`, including the
+      leader-mode note at 433 (grok-build#14).
+    - `crates/roost-cli/src/doctor.rs`: `"gx.remote"` in the metadata
+      allowlist (1617), its loopback display (1629), the test at
+      5493–5501.
+    - The "gx is not its own agent name" pins:
+      `crates/roost-agent/src/lib.rs:52,163-176`,
+      `crates/roost-agent-install/src/ensure.rs:926-932`,
+      `crates/roost-cli/src/agent_install.rs:641-642`, the help text at
+      `crates/roost-cli/src/main.rs:455`.
+    - Comments: `crates/roost-agent/src/codex.rs:82`,
+      `crates/roost-agent/src/common.rs:41`,
+      `crates/roost-agent/tests/codex_events_test.rs:212`,
+      `crates/roost-ipc/src/agent.rs:546`,
+      `crates/roost-agent/assets/opencode/roost-agent-state.js:71`,
+      `crates/roost-agent-install/src/grok.rs:1,6`; and
+      `crates/roost-engine/src/program_status.rs:603,1132`, which the
+      `app=grok` fix already rewrites.
+    - Docs: `docs/guides/agents.md` (intro line 5, table row 28, lines
+      33, 45, 100–102, 168, the `## gx` section 690–735, the `gx.remote`
+      cross-reference at 805, the leader-mode caveat 827–855, "gx shares
+      grok's file" 876–879); `docs/reference/config.md:44,484`;
+      `docs/reference/cli.md:834`; `docs/reference/ipc.md:1588` (pick a
+      new metadata example); `docs/guides/notifications.md:90`;
+      `docs/guides/host-sessions.md:260`;
+      `docs/getting-started/first-run.md:59`;
+      `docs/development/vision.md:796`.
+    - Tools: `tools/agent-status/README.md:59` and
+      `scripts/gx-startup.json`. `tools/roosttest/test_real_input_mac.py:434`
+      names gx only in a docstring; the Shift+Enter test stays.
+    - Keep: `CHANGELOG.md`'s 12 historical mentions. `skills/` has none.
+  - Whether the grok hook **adapter** itself goes too (grok has no hooks
+    after Phase 2) is a one-back question: a leftover `roost.json` the
+    retire could not prove still calls `agent-hook grok`. Keep the
+    adapter for the compatibility window, then remove it with the
+    `grok` agent token's install path.
 - **What Codex loses under (a)**, in user terms (accepted by choosing
-  it):
+  it; the retire itself is in Phase 2):
   - an approval reads "Needs your input" rather than "Needs permission to
     use <tool>" until Codex's `msg` ask lands;
   - no row on Codex's sign-in, trust and update screens, and the row
     leaves on Ctrl-Z and returns on `fg`, until Phase 3a;
   - `roostctl doctor` loses the Codex owner, model and session lines (the
     model was never in the UI, and Codex never sent a session title);
-  - no exact "Resume Codex" (Phase 7) without a session id.
+  - no exact "Resume Codex" (Phase 7) without a session id, though Codex
+    0.167.0 prints `codex resume <id>` on exit.
+
+  What Grok loses without hooks: the session id and ownership (its row is
+  the ownerless 7501 kind), `SessionStart.source`, the hooks'
+  `idle_prompt` and `agent_error` notification types, StopFailure's error
+  class, and the model and permission-mode lines in doctor. It gains
+  subagent child records, a more specific blocked `msg` (the tool
+  summary, "Trust this folder?", "Allow <subagent>?") and no per-folder
+  trust prompt.
 
   Nested-agent protection and duplicate-notification muting stay (see
   [Codex without hooks](#codex-without-hooks)). Agents run inside tmux,
   screen or zellij in a Roost tab lose state entirely: the multiplexer
   does not pass 7501 through, and Phase 3b drops their hooks once
   enforced. Doctor should say so.
-- **Closes.** #485 and #492 fully if no file agent is on by default.
+- **Closes.** What remains of #485 and #492, narrowed to Cursor.
 - **Tests.**
-  - acceptance: the strict Codex retire across both files (an edited
-    handler keeps its non-canonical trust key; an orphaned canonical key
-    goes), pre-image restore.
-  - Grok: a `roost.json` with a user `matcher` is left as `foreign`.
-  - Card: the Codex and Grok rows switch to "Built in" by the delivery
-    table, with no other code change.
+  - Cursor: the installer writes `$HOME/.cursor/hooks.json` with
+    `CURSOR_CONFIG_DIR` set; an entry in the old location is still found
+    by `uninstall` and the retire.
+  - After the gx deletion, `cargo test` and the fixture replay stay green
+    on the re-captured grok `gate` fixture.
   - The existing record-only row tests (`agent_palette.rs:660`,
-    `test_program_status.py:587`) stay green; add an `app=codex` record
-    case that activates through the palette.
-  - If the shell function ships: a unit test that Roost's hashes match
-    the live-proven x2 vectors (`sha256:9efc4d17…` for
-    `session_start:0:0`), and a roosttest that the function's argv
-    carries one inline `hooks.state`.
-- **Exit.** A default install writes nothing into any agent's config.
+    `test_program_status.py:587`) stay green; add an `app=codex` and an
+    `app=grok` record case that activates through the palette.
+  - If the cursor shell function ships: a roosttest that its argv carries
+    `--plugin-dir` and that a user's own `cursor-agent` function wins.
+- **Exit.** A default install writes nothing into any agent's config, and
+  no gx code or doc remains outside `CHANGELOG.md`.
 
 ### Phase 5: Presentation (L)
 
@@ -1640,7 +1943,9 @@ draft sized several multi-commit plans as M.
 - **Closes.** None (backlog-triage item 13, unfiled).
 - **Limits.** Needs a session id, so Codex is out under 7501-only (its
   `codex resume --last` filters by cwd, so it is wrong when two Codex
-  tabs share a directory). A
+  tabs share a directory; 0.167.0 prints `codex resume <id>` on exit,
+  which Roost could read from the screen, Inferred). Grok, also
+  7501-only, has the same gap. A
   host-session tab persists in `roost-session`'s state, so the record
   goes there too; a mobile client needs the affordance as an op, not
   only a button.
@@ -1669,7 +1974,8 @@ draft sized several multi-commit plans as M.
 - #560 (window ops from remote-host tabs; the outbound control surface,
   not hooks).
 - #509 (skill packaging for Codex and opencode). The Claude skill
-  already ships as the `roost` plugin. The opencode env route could carry
+  already ships as the `roost` plugin, and (decided) rides in the env
+  plugin inside Roost tabs. The opencode env route could carry
   the skill too, which is #509's opencode half.
 
 ### Order
@@ -1678,13 +1984,16 @@ This is the main feature track. Backlog Plan A (v0.1.1 quick wins, in
 `backlog-triage-2026-11.md`) ships first; Phases 1–2 can then run beside
 backlog Plan C.
 
-1. Phase 0's delivery facts (Claude with auth, the sideload policy) first
-   or as Phase 1's first commit. Its 7501 captures only gate Phase 5.
-   Then Phase 1 and Phase 2 together, in one release.
+0. Now, standalone: the `app=grok` fix (and, if convenient, Cursor's
+   `$HOME/.cursor/hooks.json` path fix). Both fit backlog Plan A.
+1. Phase 0's remaining delivery fact (Claude with auth) first or as
+   Phase 1's first commit; the sideload policy is already proven. Its
+   7501 captures only gate Phase 5. Then Phase 1 and Phase 2 together,
+   in one release; Phase 2 now retires Codex and Grok as well.
 2. Phase 3a in parallel. It is needed for spec compliance whatever is
    decided about hooks. Phase 3b after, with its observe-only release.
-3. Phase 4 once Charlie confirms Codex's route (7501 only is recommended
-   and needs only Phase 2's machinery) and Grok's.
+3. Phase 4 (Cursor and the gx deletion) after Phase 2, once grok's gate
+   fixture is re-captured.
 4. Phase 5, then Phase 6.
 5. Phases 7 and 8 whenever there is room.
 
@@ -1698,9 +2007,9 @@ backlog Plan C.
 | Send the session name as the root `title`, and a session id | Claude Code (closed) | Ownership and resume without hooks |
 | A `session=` key for an opaque resumable session id | OSC 7501 spec (Superlogical) | Lets 7501 carry DL-14 identity and resume for every agent. Unknown keys are ignored, so it degrades safely |
 | Release 7501 to npm `latest` | opencode (MIT) | Already in v2.2.6. Track only |
-| 7501 in gx | charliek/grok-build (Apache-2.0) | gx is hook-only, and is the last thing pinning grok's file |
-| Honour `--plugin-dir` in leader mode, or a plugin-dirs variable | xAI grok-build (Apache-2.0) | A non-file route for Grok's hooks |
 | 7501 | cursor-agent (closed) | No blocked signal at all |
+| Run `beforeSubmitPrompt`, `afterAgentResponse` and `stop` for plugin hooks too, not only user and project `hooks.json` | cursor-agent (closed) | Would let `--plugin-dir` carry full state with no file, ending Cursor's opt-in |
+| Read user hooks from `CURSOR_CONFIG_DIR` as it does config and auth, or document `$HOME/.cursor` | cursor-agent (closed) | Today the variable moves everything but hooks |
 | Expose OSC 133 `aid` in the semantic-prompt event | Ghostty (MIT) | DL-29 rule (c): tell an agent's marks from the shell's |
 | Gate 9;4 and 7501 on the 7501 probe, not a `TERM_PROGRAM` list | Claude Code, Codex | A probe is the honest capability check |
 
@@ -1709,10 +2018,13 @@ backlog Plan C.
 ## Risks
 
 - **Claude refuses to start under a sideload policy.** On a machine with
-  managed `disableSideloadFlags`, every Claude in a Roost tab exits 1.
-  Server-managed policy cannot be seen on disk. Mitigations: detect local
-  managed files, a per-agent off switch, doctor, and possibly the
-  `--settings` argv fallback (key question 8).
+  managed `disableSideloadFlags`, every Claude in a Roost tab would exit 1
+  (Proven). Mitigations (decided, A+C): the `claude plugin list` probe
+  skips injection, a doctor line, a one-time toast, the per-agent off
+  switch. Residual: a server-managed policy that no Claude run has cached
+  yet (Inferred), and a `claude` the probe cannot find on the serving
+  process's PATH. Claude's own message then names the variable to unset.
+  No `--settings` fallback: it would get around the org's ban.
 - **Claude's richer 7501 is read from strings only.** Phase 5 must not
   design rows before Phase 0 captures it.
 - **Duplicates during migration.** Proven to happen. D1 makes the user
@@ -1745,8 +2057,9 @@ backlog Plan C.
   Roost tab works today and would show nothing after Phases 3b and 4.
 - **Claude older than v2.1.280** ignores the variable. Once its file
   entries are retired it has no hooks, and 7501 only if it is new enough
-  to speak it. The retire cannot see which `claude` a tab will run
-  (key question 9).
+  to speak it. **Accepted** (decided, key question 9): Claude updates
+  often, and Roost does not support it below the floor. Doctor can name
+  an old `claude` on PATH.
 - **Reversing DL-14's label rule** changes the shared state fixtures. With
   Swift retired (DL-33) there is one port to keep in step.
 - **False release.** A wrapper that execs or forks and exits can look like
@@ -1759,6 +2072,17 @@ backlog Plan C.
   live state; one stat per tab.
 - **"Seen" over several clients.** Simplest rule: any client viewing the
   tab counts, the phone included.
+- **grok's `app` changed under Roost** (`grok-build` to `grok` by
+  1.0.77). Today's hooks fail silently for grok users until the fix
+  ships. Agents rename `app` without notice; a doctor line for a record
+  `app` Roost has no label for would catch the next one.
+- **Detached agent processes.** Codex 0.167.0's app-server daemon and
+  cursor's `worker-server` outlive the TUI, in their own session with no
+  tty. The process layer must not read them as the agent still running.
+- **The env plugin shares the marketplace plugin's name.** Inside a Roost
+  tab Roost's `roost` replaces the user's installed `roost@roost`, so the
+  two SKILL.md copies must stay identical, and a managed lock on a plugin
+  named `roost` drops Roost's hooks with only a warning (Source).
 - **Codex trust coupling** if the shell function is chosen. A formula
   change upstream means a review dialog, and "Trust all" writes the user's
   `config.toml`.
@@ -1770,11 +2094,13 @@ backlog Plan C.
 Numbers are kept stable, because the text above cites them. Answered
 ones say **Decided** and give the answer.
 
-1. **Default. Decided 2026-11-08:** the startup popup stays, updated.
-   Proposed shape: renamed "Agent integration"; asked once, on a fresh
-   install or for a user who never answered; env agents start on, file
-   agents off, built-in agents have no switch; upgraders who already
-   answered are not asked again and get one notice. See [The startup
+1. **Default. Decided 2026-11-08, revised the same evening:** env and
+   7501 agents are simply on, with a per-agent off switch in
+   preferences, config and `roostctl`. The startup card ("Agent
+   integration") appears only when an installed agent needs a user file
+   changed and has not been answered (today only Cursor), and then asks
+   only that. Upgraders who already answered are not asked again and get
+   a one-time toast, never a modal. See [The startup
    prompt](#the-startup-prompt-agent-integration); the copy is question
    23.
 2. **Retire. Decided 2026-11-08:** automatic, once Roost's entries are no
@@ -1791,20 +2117,30 @@ ones say **Decided** and give the answer.
    live). You lose the tool name on approval banners ("Needs your input"
    instead of "Needs permission to use Bash") until Codex sends it, and,
    until Phase 3a, the row on Codex's sign-in screen and while suspended.
-   **Recommended: go 7501-only, no shell function.** Agree? See [Codex
-   without hooks](#codex-without-hooks).
-6. **Grok.** Once gx reports status to the terminal (7501), stop writing
-   `~/.grok/hooks/roost.json`? And will gx get 7501 in the fork?
-7. **cursor.** Cursor has no other way in. Keep its file as an opt-in,
-   off by default, or show only "Cursor is running" until
-   `--plugin-dir` is proven?
-8. **Org policy blocks Claude plugins.** Then Claude exits at once in
-   every Roost tab. Detect the local policy file only and skip, also offer
-   a `claude()` shell function fallback, or accept the risk with a clear
-   doctor line?
-9. **Old Claude (below 2.1.280).** It ignores the env plugin, so after
-   the retire it shows only what 7501 gives (or nothing, if older still).
-   Keep `roostctl agent install claude --file` for it, or rely on 7501?
+   **Recommended: go 7501-only, no shell function.** See [Codex without
+   hooks](#codex-without-hooks). **Decided (Charlie, 2026-11-08):** Codex
+   goes 7501-only. His bar was that the Agents panel and the agent palette
+   update, show status and are clickable, which a hook-free Codex meets. The roadmap now retires Codex's entries
+   in Phase 2. 0.167.0 re-confirmed the 7501 stream.
+6. **Grok and gx. Decided 2026-11-08:** drop gx support entirely. Grok
+   goes 7501-only with no Roost file; `~/.grok/hooks/roost.json` is
+   retired by the proven-ownership retire (Phase 2), and the gx code,
+   docs and tests are deleted (Phase 4). No 7501 in the fork, no gx
+   upstream ask.
+7. **cursor. Decided 2026-11-08:** file delivery stays an explicit
+   opt-in, **unchecked** by default, and the card shows only when Cursor
+   is installed. `--plugin-dir` is now proven but partial (no turn end),
+   so it does not move Cursor into the no-writes group; a shell-function
+   tier is optional (Phase 4).
+8. **Org policy blocks Claude plugins. Decided 2026-11-08: A+C.** Detect
+   the policy with the `claude plugin list --json` probe and skip Claude's
+   variable, plus a doctor line and the per-agent off switch. No shell
+   function and no `--settings` fallback. The probe catches file and MDM
+   policy (Proven on Linux files); a server-managed policy only once
+   cached (Inferred).
+9. **Old Claude (below 2.1.280). Decided 2026-11-08:** not supported.
+   No `--file` fallback. The marketplace or plugin-install route may be
+   revisited if env delivery fails in practice; not pursued now.
 10. **Duplicate banners.** May Roost skip a banner identical to one
     already pending on the tab, everywhere, not only during the
     migration?
@@ -1825,10 +2161,12 @@ ones say **Decided** and give the answer.
     the tab from one sent by a background daemon or a tmux pane. Count
     such hooks for one release before dropping them? Dropping them means
     an agent inside tmux in a Roost tab shows nothing.
-15. **Skill.** Ship the Roost skill inside the env plugin, so every Claude
-    in a Roost tab has it? It costs context for every user and may load
-    twice beside the `roost` marketplace plugin. (#509 is the Codex and
-    opencode half.)
+15. **Skill. Decided 2026-11-08:** yes, the Roost skill rides in the
+    env plugin. The plugin is named `roost`, so inside a Roost tab it
+    replaces an installed marketplace `roost@roost` and the skill loads
+    once (Proven). The marketplace plugin stays for Claude outside Roost
+    tabs, with an identical SKILL.md. (#509 is the Codex and opencode
+    half.)
 16. **Background tasks and `tab prompt`.** Show an agent's background
     tasks as nested rows (top 8) or a badge? Should `tab prompt` refuse a
     tab waiting on a permission prompt by default, but allow a question?
@@ -1842,14 +2180,18 @@ ones say **Decided** and give the answer.
 20. **Host "no".** If an older Roost client connects to a host whose user
     said no, may it switch agent integration on there? Recommended: no
     for Claude and opencode (today's raise widens over `off`).
-21. **"Decide later".** Recommended: it connects nothing, and the card
-    returns next launch. Or should it apply the defaults?
+21. **"Decide later".** Recommended: on the Cursor card it writes
+    nothing and the card returns next launch. (Env and 7501 agents are on
+    by default either way, per question 1.)
 22. **Entries that come back** after the retire (a synced dotfile, an
     older Roost elsewhere). Recommended: report them with a "Remove…",
     don't remove again each launch (that would loop with the older
     Roost). Agree?
-23. **Card copy and mockup** in [The startup
-    prompt](#the-startup-prompt-agent-integration): OK as drafted?
+23. **Card copy and mockups** in [The startup
+    prompt](#the-startup-prompt-agent-integration), redrawn for the
+    Cursor-only first-run card and the preferences card: OK as drafted?
+    Also: should the off switch for a built-in (7501) agent exist, and
+    mean "ignore its records"?
 
 ---
 
@@ -1934,6 +2276,74 @@ What this pass did, and what it checked:
   matter, `chmod -R go+rX` on that package dir. Phase 0 now carries the
   probe-hygiene rule.
 
+### Third pass: Charlie's second answers and Phase 0 probes
+
+**Charlie's second round, 2026-11-08 (decided):**
+
+1. **gx:** "we can drop the gx support entirely if grok itself can be
+   updated to the new method." grok 1.0.77 can (below), so gx support is
+   dropped: Grok goes 7501-only and `roost.json` is retired. Key question
+   6.
+2. **Cursor:** "ok to leave it unchecked by default, but we likely only
+   need to show the card if it is installed". Key question 7.
+3. **Startup card:** "if the rest don't need changing the users files
+   likely we don't need to pop that up at the beginning". No card unless
+   a file opt-in exists for an installed agent; upgraders get a toast.
+   Key question 1 and [The startup
+   prompt](#the-startup-prompt-agent-integration).
+4. **Claude:** the env plugin is fine if additive to the user's own
+   plugins (it is, Proven below); policy option A+C; "we don't need to
+   support older versions at this time … we can fall back to the other
+   plugin install option in the future but I don't want to pursue this
+   now." Key questions 8 and 9.
+5. **Skill:** "including the roost skill also makes sense." Key question
+   15.
+
+Codex 7501-only was later confirmed by Charlie (key question 5).
+
+**Phase 0 probes, same evening.** Charlie had just updated the agents:
+claude 2.1.319, codex-cli 0.167.0, cursor-agent 2026.11.05-86047df (now
+logged in), opencode 1.19.5, grok 1.0.77, crush 0.97.1. Each probe ran
+under `env -i` with a temp `HOME`, XDG dirs, `TMPDIR` and the agent's
+home variable under the scratchpad `p0/<agent>/`, no `ROOST_*`, `CLAUDE*`,
+`CODEX_*` or `HERDR_*`, and every updater off. Only login files were
+copied in (cursor, grok, Codex), never refreshed, then deleted. sha256 of
+the real config dirs before and after were identical, except two files
+written by Charlie's own running gx leader (pid 2806985), which the
+probes did not touch. No update, login or trust prompt was accepted;
+probe-started Codex daemons and a cursor `worker-server` were killed.
+
+| Agent | Result | Status |
+|---|---|---|
+| grok 1.0.77 | 7501 alone gives the states, kinds and messages Roost shows, plus subagent child records; `app=grok` | Proven captures; row from code (Inferred) |
+| grok 1.0.77 | Today's `roost.json` hooks are dropped as `ForeignApp` under 1.0.77, and the row label is `grok` | Inferred from code, high confidence |
+| grok 1.0.77 | Runs `~/.claude/settings.json` hooks; does not run Roost's flat `~/.cursor/hooks.json` entries; any hook file causes a per-folder trust prompt | Proven |
+| cursor 2026.11.05 | `--plugin-dir` delivers start, end, thought and tool events, never `beforeSubmitPrompt`, `afterAgentResponse` or `stop` | Proven; gate read in the bundle |
+| cursor 2026.11.05 | User hooks read only from `$HOME/.cursor/hooks.json`, not `CURSOR_CONFIG_DIR` | Proven |
+| cursor 2026.11.05 | No 7501, no 9;4; OSC 777/9/99 only for terminals it recognises, none for `TERM_PROGRAM=Roost`; a detached `worker-server` outlives it | Proven |
+| Claude 2.1.319 | Env plugin additive to installed and env user plugins; `settings.json` untouched | Proven |
+| Claude 2.1.319 | Env plugin named `roost` replaces the installed marketplace `roost@roost`; one skill, the env copy's text | Proven |
+| Claude 2.1.319 | `disableSideloadFlags` exits 1 for `-p`, TUI and `plugin list`; `plugin list --json` detects it in about 0.1 s; `--version` does not; `--settings` is not blocked | Proven (rootless namespace on Linux) |
+| Claude 2.1.319 | The probe also sees a server-managed policy once cached | Inferred |
+| Claude 2.1.319 | StopFailure under a `-p` auth failure | Failed: unreliable |
+| Codex 0.167.0 | 7501 states unchanged from 0.165.0 (incl. `error` with no msg, Esc gives idle) | Proven |
+| Codex 0.167.0 | A managed app-server daemon outlives the TUI; exit prints `codex resume <id>` | Proven |
+| opencode 1.19.5 | No 7501 through a real turn; the `OPENCODE_CONFIG_CONTENT` plugin route still works beside a user plugin | Proven |
+| crush 0.97.1 (apt) | No 7501 at all | Proven |
+
+**What changed in this note:** the Summary, the delivery and signals
+matrices, the Claude caveats (2, 8, 9 rewritten; 10 and 11 new), the end
+state, consent defaults, the startup card and mockups, rollback, the
+roadmap (a standalone `app=grok` fix; Codex and Grok retired in Phase 2;
+Phase 4 is Cursor and the gx deletion), upstream asks, risks and the key
+questions. Not re-checked by these probes: Claude with a real login, the
+parent chains of hook processes, pi.
+
+**Left for Charlie:** 23 (the
+redrawn card and a built-in agent's off switch), the optional Cursor
+shell-function tier, and whether to stop the gx leader still running
+from `~/.grok`.
+
 ## Corrections to earlier notes and reports
 
 - **Claude strips `CLAUDE_CODE_PLUGIN_DIRS` from a settings `env` block:
@@ -1946,16 +2356,19 @@ What this pass did, and what it checked:
   0.165.0.
 - **Claude's interactive TUI with env delivery: now proven** (c2).
 - **New: `disableSideloadFlags` makes Claude exit 1** when the variable is
-  set (Docs; not reproduced).
+  set (Docs at first; **reproduced** in the third pass, rootless on
+  Linux, with a working detection probe).
 - **Grok:** `--plugin-dir` is on `grok agent` only and is ignored in
-  leader mode, so the TUI has no route. Grok reads `~/.cursor/hooks.json`
-  as well as Claude's file.
+  leader mode, so the TUI has no route (moot now: Grok needs no hooks).
+  Grok reads `~/.cursor/hooks.json` as well as Claude's file, but
+  **does not run Roost's flat entries** in it (third pass, Proven on
+  1.0.77), so "a grok event runs Roost's cursor entries" was wrong.
 - **crush:** the installed binary is 0.97.1 (apt). The 2026-10-28 capture
   used the 0.98.2 tarball. Both are right; the third pass's "not 0.98.2"
   is only about what is installed now.
 - **pi:** now 1.5.0, and `-e` is a proven argv route.
-- **opencode:** npm `latest` is 1.19.5 (1.19.4 installed); 7501 first ships
-  in tag v2.2.6. The earlier note's "2.2.x source" stands.
+- **opencode:** npm `latest` is 1.19.5 (now installed too); 7501 first
+  ships in tag v2.2.6. The earlier note's "2.2.x source" stands.
 - **"Retire the raise op" (third pass): no.** Keep
   `session.set_agent_hooks` on the wire for one-back compatibility and
   reinterpret it per agent. Remove it only after the compatibility window.
@@ -1979,10 +2392,11 @@ What this pass did, and what it checked:
 - **Phase sizes (first draft):** Phases 0, 1, 2, 3 and 5 were each one
   step too small on `backlog-triage-2026-11.md`'s scale.
 - **"Env delivery writes nothing, so it needs no first-run card" (first
-  draft): reversed.** Charlie wants the startup popup kept and updated,
-  and env delivery still runs Roost inside the agent, leaves Claude's
-  own plugin state, and can trip a sideload policy. Nothing is connected
-  until the user answers.
+  draft): reversed, then mostly restored.** The second pass kept a card
+  and connected nothing until answered. Charlie's second round
+  (2026-11-08): no card unless a user file would change (today Cursor);
+  env and 7501 agents are on by default, the sideload probe covers the
+  policy risk, and each agent has an off switch.
 - **"The retire runs exact-match uninstall" (first draft): tightened.**
   Today's uninstall removes any owned command in any shape. The automatic
   retire now also requires the exact shape a release wrote, an
@@ -1999,10 +2413,21 @@ What this pass did, and what it checked:
   peer-session check (Phase 3b) would drop every Codex hook.
 - **New: Codex sends no 7501 on its sign-in, trust and update screens**
   (Proven), and holds `done`/`error` until a key (Source).
+- **"No child records from the installed agents" (2026-10-28 capture):
+  out of date.** grok 1.0.77 sends child records for subagents (third
+  pass), so the highest-ranked-record rule now matters in practice.
+- **"Grok's 7501 `app` is `grok-build`" (2026-10-28): changed upstream.**
+  grok 1.0.77 sends `app=grok`; Roost's mapping is stale (Summary).
+- **"The env plugin's name should differ from the skill plugin's
+  `roost`" (review, caveat 9): reversed.** Sharing the name is what lets
+  the env copy replace the marketplace one with no double load (third
+  pass, Proven).
+- **cursor `--plugin-dir` "may need `enableUserLocalPlugins`" (Strings):
+  no.** It is a runtime capability, true when signed in.
 - **Not checked by anyone:** whether agents run hooks in the tab's session
   (attribution; Codex now answered: a new session), whether the Bash
-  tool's environment keeps `CLAUDE_CODE_PLUGIN_DIRS`, cursor's
-  `--plugin-dir` with auth.
+  tool's environment keeps `CLAUDE_CODE_PLUGIN_DIRS`. cursor's
+  `--plugin-dir` with auth is now checked (third pass).
 
 ---
 
@@ -2043,20 +2468,28 @@ What this pass did, and what it checked:
 - Codex, Apache-2.0, `4e4767ffa7`: `codex-rs/tui/src/terminal_program_status.rs`,
   `tui/src/hooks_rpc.rs`, `tui/src/chatwidget/status_surfaces.rs`,
   `tui/src/app.rs`, `hooks/src/engine/command_runner.rs`,
-  `cli/src/main.rs`. Probed on codex-cli 0.165.0 (the global install is
-  now 0.167.0; see [Second pass](#second-pass-charlies-answers)).
+  `cli/src/main.rs`. Probed on codex-cli 0.165.0; 7501 re-captured on
+  0.167.0, the version now installed (see [Second
+  pass](#second-pass-charlies-answers) for how it got there).
 - grok-build, Apache-2.0, `2bdd1d6a`: `xai-grok-config/src/compat.rs`,
   `xai-grok-hooks/src/discovery.rs`, `xai-grok-pager-bin/src/main.rs`.
-  Installed grok 1.0.70 and gx 1.0.45+gx.17.
+  Probed grok 1.0.70 and gx 1.0.45+gx.17 earlier; grok 1.0.77 (binary
+  `~/.grok/downloads/grok-1.0.77-linux-x86_64`, its embedded docs and
+  strings) in the third pass.
 - opencode, MIT, `1284450a03`: `packages/tui/src/context/program-status.ts`
-  (from `d0a2ce32de`, first in v2.2.6). Installed 1.19.4.
+  (from `d0a2ce32de`, first in v2.2.6). Probed 1.19.4, then 1.19.5.
 - Agent Client Protocol, Apache-2.0, `7441d10`.
 - pi, MIT, 1.5.0 via npx.
-- crush, FSL-1.1-MIT: docs and design only.
-- Claude Code, closed source: 2.1.319 run in isolation; binary strings;
+- crush, FSL-1.1-MIT: docs and design only; the apt 0.97.1 run as a
+  black box for its terminal output.
+- Claude Code, closed source: 2.1.319 run in isolation (including under a
+  reproduced managed policy); binary strings, Linux and (read-only, over
+  ssh) the mac-mini's;
   docs at code.claude.com (env-vars, settings reference, plugins CLI
   reference, hooks), fetched 2026-11-08.
-- cursor-agent, closed source: 2026.10.22 help and bundle strings.
+- cursor-agent, closed source: 2026.10.22 help and bundle strings;
+  2026.11.05-86047df run logged in, and its bundle read for the hook
+  gates, terminal detection and update check.
 
 **Probe evidence** (this session's scratchpad,
 `/tmp/claude-1000/-home-charliek-projects-roost/722ee52e-3f4c-49dd-ac65-84b1c809c9a5/scratchpad/`):
@@ -2074,5 +2507,10 @@ What this pass did, and what it checked:
   `rc.sh`, `tabs.sh`, `events.jsonl`, `ui.log`).
 - `dl/`: the fetched Claude docs.
 - `claude-strings.txt`: the 2.1.319 strings extract.
+- `p0/` (third pass): `grok/` (captures in `g*/out/`, launcher `mk.sh`,
+  credential log, real-config hashes), `cursor/` (hook logs per run,
+  captures in `cap/`, probe plugins, hashes), `claude/` (fixtures, the
+  `iso` wrapper, the policy runs in `ns/`, `log/hooks.log`, hashes),
+  `iso.sh` and `out/` (Codex, opencode and crush captures).
 - Earlier: `verify2/`, `verify-oc/`, `verify-codex/`, `verify-codex2/`,
   `grok-inspect.txt`.

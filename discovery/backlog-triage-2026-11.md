@@ -210,18 +210,23 @@ release. Nothing here needs a ruling or a protocol bump.
      in `README.md`.
 5. **#712.** On Linux, check `DISPLAY` / `WAYLAND_DISPLAY` before the locks and
    `App::bootstrap` (`crates/roost-iced/src/main.rs:463-500`); print a hint and exit.
-6. **#711.** Return early from `set_tab_title_from_osc` and `set_tab_cwd` when the
+6. **#716 grok `app=grok`.** grok 1.0.77 reports `app=grok`, so today every grok hook
+   claim is dropped as `ForeignApp` and its row reads `grok`. Map `grok` in
+   `app_for_source` and `app_label`, accept `grok-build` for older builds. Found
+   2026-11-08 (see `agent-integration.md`). #717 (Cursor hooks under
+   `CURSOR_CONFIG_DIR` never run) is a smaller sibling that can ride along.
+7. **#711.** Return early from `set_tab_title_from_osc` and `set_tab_cwd` when the
    value is unchanged (`crates/roost-engine/src/workspace.rs:1910-1968`).
-7. **#713.** Log `NotFound` from `resize_with_px` at debug
+8. **#713.** Log `NotFound` from `resize_with_px` at debug
    (`crates/roost-engine/src/session.rs:280-284`).
-8. **#268.** Align `PaletteOpenParams` and `PaletteStateResult` doc comments
+9. **#268.** Align `PaletteOpenParams` and `PaletteStateResult` doc comments
    (`crates/roost-ipc/src/messages.rs:615-617`, `:709-714`) and the
    `docs/reference/ipc.md:2984` row with `palettes.rs:980-999`. Close.
-9. **#336.** Drop `continue-on-error` (`ci.yml:2376`), add `e2e-iced-wayland-drag`
+10. **#336.** Drop `continue-on-error` (`ci.yml:2376`), add `e2e-iced-wayland-drag`
    to `ci-success`'s `needs` (`:2727`), remove it from `NON_BLOCKING`. Close.
-10. **#570 test.** "Resize away and back while Requesting" next to
+11. **#570 test.** "Resize away and back while Requesting" next to
     `a_withheld_resize_fires_at_finish` (`host_tab.rs:2465`).
-11. **#273.** Tick an open agent palette on the existing 15 s clock; today the tick
+12. **#273.** Tick an open agent palette on the existing 15 s clock; today the tick
     refreshes only the sidebar (`servicing.rs:3678`), and the palette rebuilds only on
     agent events (`servicing.rs:1453`).
 
