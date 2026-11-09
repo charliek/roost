@@ -456,16 +456,19 @@ pub fn set_hooks(
     // That is the difference between an explicit local answer and a
     // raise — the user is looking at the list they just chose.
     let (integration, desired) = keys_for(home, mode);
-    let mut wrote = write_integration(home, &integration, &lock)?;
-    wrote |= write_hooks(home, &read_hooks(home)?, &desired, &lock)?;
-    let mut outcome =
-        reconcile_locked(home, mode, by, guard, &FILE_AGENTS, &lock).map_err(|source| {
-            InstallError::AfterKey {
-                name: "agent-integration",
-                key: integration,
-                source: Box::new(source),
-            }
-        })?;
+    let current = read_hooks(home)?;
+    let wrote = write_integration(home, &integration, &lock)?;
+    let after = || -> Result<Outcome, InstallError> {
+        let wrote = write_hooks(home, &current, &desired, &lock)?;
+        let mut outcome = reconcile_locked(home, mode, by, guard, &FILE_AGENTS, &lock)?;
+        outcome.wrote |= wrote;
+        Ok(outcome)
+    };
+    let mut outcome = after().map_err(|source| InstallError::AfterKey {
+        name: "agent-integration",
+        key: integration,
+        source: Box::new(source),
+    })?;
     outcome.wrote |= wrote;
     Ok(outcome)
 }

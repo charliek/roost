@@ -337,9 +337,15 @@ pub fn retire(home: &Home, guard: Guard, defer: bool) -> Result<RetireOutcome, I
     if defer {
         // The session's own start may already have retired: its notice
         // is still this machine's to show.
+        // A deferral does nothing, so it never fails: an unreadable
+        // tombstone file only costs the notice.
+        let unnoticed = load(home).map(|tombstones| unnoticed(&tombstones));
         return Ok(RetireOutcome {
             deferred: true,
-            unnoticed: unnoticed(&load(home)?),
+            unnoticed: unnoticed.unwrap_or_else(|error| {
+                tracing::warn!(%error, "agent retire deferred; its notice is unreadable");
+                Vec::new()
+            }),
             ..RetireOutcome::default()
         });
     }

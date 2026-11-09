@@ -181,10 +181,12 @@ pub fn read_policy_record(dir: &Path) -> Option<PolicyRecord> {
 /// The Claude policy as a reader that runs no probe sees it (doctor,
 /// `roostctl agent status`, the settings card): a managed-settings file
 /// or Claude's cached server settings under `home` that set
-/// `disableSideloadFlags`, else the last verdict any serving process on
-/// this machine recorded (a block first, since one serving process is
-/// enough for Claude to be skipped in its tabs). `None` when nothing
-/// has been recorded.
+/// `disableSideloadFlags`, else the newest verdict any serving process on
+/// this machine recorded. Newest, not a block first: the policy is the
+/// user's, not a profile's, and a profile that has stopped running (a
+/// dev build, an old session) never refreshes its record, so its block
+/// would otherwise outlive the policy. `None` when nothing has been
+/// recorded.
 pub fn claude_policy_here(home: &crate::Home) -> Option<ClaudePolicy> {
     let records: Vec<PathBuf> = [
         roost_ipc::paths::BundleProfileKind::Mac,
@@ -212,23 +214,48 @@ pub fn claude_policy_here(home: &crate::Home) -> Option<ClaudePolicy> {
 /// connected" notice was shown for the policy that blocks now.
 const POLICY_NOTICED: &str = "claude-policy-noticed";
 
-/// Whether the one-time "Claude isn't connected" notice is due: the
-/// policy blocks and the notice has not been shown since it started to.
-/// A policy that no longer blocks clears the mark, so a later block is
-/// told again.
-pub fn policy_notice_due(home: &crate::Home, blocked: bool) -> bool {
-    let mark = home.roost_config_dir().join(POLICY_NOTICED);
-    if !blocked {
-        let _ = fs::remove_file(&mark);
-        return false;
+/// What a start does about the one-time "Claude isn't connected" notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyNotice {
+    Show,
+    /// The policy no longer blocks: forget the notice, so a later block
+    /// is told again.
+    Forget,
+    Nothing,
+}
+
+/// The notice step for Claude's switch, the policy as read, and whether
+/// the notice was already shown. Only a verdict that Claude is reached
+/// forgets the notice: no verdict yet, one the probe could not give, or
+/// Claude switched off says nothing about the policy.
+pub fn policy_notice(
+    claude_on: bool,
+    policy: Option<&ClaudePolicy>,
+    noticed: bool,
+) -> PolicyNotice {
+    match policy {
+        _ if !claude_on => PolicyNotice::Nothing,
+        Some(policy) if policy.blocks() && !noticed => PolicyNotice::Show,
+        Some(ClaudePolicy::Allowed | ClaudePolicy::NotInstalled) if noticed => PolicyNotice::Forget,
+        _ => PolicyNotice::Nothing,
     }
-    !mark.exists()
+}
+
+pub fn policy_noticed(home: &crate::Home) -> bool {
+    home.roost_config_dir().join(POLICY_NOTICED).exists()
 }
 
 pub fn mark_policy_noticed(home: &crate::Home) -> std::io::Result<()> {
     let dir = home.roost_config_dir();
     fs::create_dir_all(&dir)?;
     fs::write(dir.join(POLICY_NOTICED), b"")
+}
+
+pub fn forget_policy_noticed(home: &crate::Home) -> std::io::Result<()> {
+    match fs::remove_file(home.roost_config_dir().join(POLICY_NOTICED)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
 }
 
 fn claude_policy_from(
@@ -248,16 +275,16 @@ fn claude_policy_from(
             remote_settings.display()
         )));
     }
-    let recorded: Vec<ClaudePolicy> = records
+    records
         .iter()
-        .filter_map(|dir| read_policy_record(dir))
-        .map(|record| record.policy)
-        .collect();
-    recorded
-        .iter()
-        .find(|policy| policy.blocks())
-        .or_else(|| recorded.first())
-        .cloned()
+        .filter_map(|dir| {
+            let at = fs::metadata(dir.join(POLICY_RECORD))
+                .and_then(|meta| meta.modified())
+                .ok()?;
+            Some((at, read_policy_record(dir)?.policy))
+        })
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, policy)| policy)
 }
 
 /// The managed-settings file under `roots` that sets
@@ -1115,41 +1142,53 @@ mod tests {
     }
 
     /// A reader with no probe of its own: the files that set the policy
-    /// first, then any serving process's block over another's allow.
+    /// first, then the newest verdict any serving process recorded.
     #[test]
-    fn a_reader_sees_any_serving_process_block() {
+    fn a_reader_sees_the_newest_recorded_verdict() {
         let root = tempfile::tempdir().unwrap();
-        let record = |name: &str, policy: ClaudePolicy| {
+        let record = |name: &str, policy: ClaudePolicy, age: u64| {
             let dir = root.path().join(name);
             fs::create_dir_all(&dir).unwrap();
             let record = PolicyRecord {
                 policy,
                 remote_settings_cached: false,
             };
-            fs::write(
-                dir.join(POLICY_RECORD),
-                serde_json::to_vec(&record).unwrap(),
-            )
-            .unwrap();
+            let file = dir.join(POLICY_RECORD);
+            fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(age))
+                .unwrap();
             dir
         };
-        let ui = record("ui", ClaudePolicy::Allowed);
-        let session = record("session", ClaudePolicy::Blocked("probe".into()));
         let managed = root.path().join("managed");
         let remote = root.path().join("remote-settings.json");
-
         let read = |records: &[PathBuf]| {
             claude_policy_from(std::slice::from_ref(&managed), &remote, records)
         };
         assert_eq!(read(&[]), None);
-        assert_eq!(read(std::slice::from_ref(&ui)), Some(ClaudePolicy::Allowed));
+
+        // A dev build that saw a block a day ago and has not run since,
+        // and an old Unknown first in profile order: the live process's
+        // fresh Allowed wins over both.
+        let stale_block = record("dev", ClaudePolicy::Blocked("probe".into()), 86_400);
+        let stale_unknown = record("old", ClaudePolicy::Unknown("timeout".into()), 7_200);
+        let live = record("ui", ClaudePolicy::Allowed, 10);
         assert_eq!(
-            read(&[ui.clone(), session.clone()]),
+            read(&[stale_unknown.clone(), stale_block.clone(), live.clone()]),
+            Some(ClaudePolicy::Allowed)
+        );
+        // A block the live process just found wins over an older allow.
+        let fresh_block = record("session", ClaudePolicy::Blocked("probe".into()), 1);
+        assert_eq!(
+            read(&[live.clone(), fresh_block]),
             Some(ClaudePolicy::Blocked("probe".into()))
         );
 
         fs::write(&remote, r#"{"settings":{"disableSideloadFlags":true}}"#).unwrap();
-        assert!(read(std::slice::from_ref(&ui)).is_some_and(|p| p.blocks()));
+        assert!(read(std::slice::from_ref(&live)).is_some_and(|p| p.blocks()));
         fs::remove_file(&remote).unwrap();
 
         fs::create_dir_all(&managed).unwrap();
@@ -1158,24 +1197,65 @@ mod tests {
             r#"{"disableSideloadFlags":true}"#,
         )
         .unwrap();
-        let Some(ClaudePolicy::Blocked(why)) = read(&[ui]) else {
+        let Some(ClaudePolicy::Blocked(why)) = read(&[live]) else {
             panic!("a managed file must block");
         };
         assert!(why.contains("managed-settings.json"), "{why}");
     }
 
-    /// Once while the policy holds; told again after it lifts and returns.
+    /// Shown once while the policy holds, told again after it lifts and
+    /// returns, and only a verdict that Claude is reached counts as
+    /// lifted.
     #[test]
-    fn the_policy_notice_is_due_once_per_block() {
+    fn the_policy_notice_is_shown_once_per_block() {
+        let blocked = ClaudePolicy::Blocked("probe".into());
+        assert_eq!(
+            policy_notice(true, Some(&blocked), false),
+            PolicyNotice::Show
+        );
+        assert_eq!(
+            policy_notice(true, Some(&blocked), true),
+            PolicyNotice::Nothing
+        );
+        assert_eq!(
+            policy_notice(false, Some(&blocked), false),
+            PolicyNotice::Nothing
+        );
+        for lifted in [ClaudePolicy::Allowed, ClaudePolicy::NotInstalled] {
+            assert_eq!(
+                policy_notice(true, Some(&lifted), true),
+                PolicyNotice::Forget
+            );
+            assert_eq!(
+                policy_notice(true, Some(&lifted), false),
+                PolicyNotice::Nothing
+            );
+        }
+        // No verdict yet, none the probe could give, or Claude off: the
+        // mark stays, so the block is not told a second time.
+        for unsure in [
+            None,
+            Some(ClaudePolicy::Unchecked),
+            Some(ClaudePolicy::Unknown("timeout".into())),
+        ] {
+            assert_eq!(
+                policy_notice(true, unsure.as_ref(), true),
+                PolicyNotice::Nothing
+            );
+        }
+        assert_eq!(
+            policy_notice(false, Some(&ClaudePolicy::Allowed), true),
+            PolicyNotice::Nothing
+        );
+
         let root = tempfile::tempdir().unwrap();
         let home = crate::Home::rooted(root.path());
-        assert!(!policy_notice_due(&home, false));
-        assert!(policy_notice_due(&home, true));
-        assert!(policy_notice_due(&home, true), "due until it is shown");
+        assert!(!policy_noticed(&home));
+        forget_policy_noticed(&home).unwrap();
         mark_policy_noticed(&home).unwrap();
-        assert!(!policy_notice_due(&home, true));
-        assert!(!policy_notice_due(&home, false));
-        assert!(policy_notice_due(&home, true), "a new block is told again");
+        assert!(policy_noticed(&home));
+        forget_policy_noticed(&home).unwrap();
+        assert!(!policy_noticed(&home));
     }
 
     /// With no verdict at all, a spawn waits (boundedly) for the first

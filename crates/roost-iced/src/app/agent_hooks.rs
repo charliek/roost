@@ -207,8 +207,8 @@ pub(crate) struct AgentRetired {
     pub problems: Vec<HookProblem>,
     pub deferred: bool,
     /// This run carried `agent-hooks = off` over: the one-time "they stay
-    /// off" notice.
-    pub carried_off: bool,
+    /// off" notice, naming the installed agents it would now connect.
+    pub carried_off: Option<Vec<Agent>>,
     /// Claude is on, its organization's policy keeps the plugin out, and
     /// the user has not been told since the policy started to.
     pub policy_notice: bool,
@@ -227,9 +227,17 @@ fn retire_blocking(guard: Guard, defer: bool) -> AgentRetired {
             }
         }
     };
+    let mut retired = retire_outcome(roost_agent_install::retire(&home, guard, defer));
+    if let Some(stay_off) = &mut retired.carried_off {
+        stay_off.extend(
+            [Agent::Claude, Agent::Opencode]
+                .into_iter()
+                .filter(|agent| home.is_present(*agent)),
+        );
+    }
     AgentRetired {
         policy_notice: policy_notice_due(&home),
-        ..retire_outcome(roost_agent_install::retire(&home, guard, defer))
+        ..retired
     }
 }
 
@@ -237,12 +245,22 @@ fn retire_blocking(guard: Guard, defer: bool) -> AgentRetired {
 /// own: the tab environment's probe records its verdict, and the managed
 /// files are read here.
 fn policy_notice_due(home: &Home) -> bool {
+    use roost_agent_install::tab_env::{self, PolicyNotice};
     let claude_on = roost_agent_install::retire::switches(home)
         .is_ok_and(|switches| switches.on(Agent::Claude));
-    let blocked = claude_on
-        && roost_agent_install::tab_env::claude_policy_here(home)
-            .is_some_and(|policy| policy.blocks());
-    roost_agent_install::tab_env::policy_notice_due(home, blocked)
+    let policy = claude_on
+        .then(|| tab_env::claude_policy_here(home))
+        .flatten();
+    match tab_env::policy_notice(claude_on, policy.as_ref(), tab_env::policy_noticed(home)) {
+        PolicyNotice::Show => true,
+        PolicyNotice::Forget => {
+            if let Err(error) = tab_env::forget_policy_noticed(home) {
+                tracing::warn!(%error, "could not clear the Claude policy toast's mark");
+            }
+            false
+        }
+        PolicyNotice::Nothing => false,
+    }
 }
 
 fn retire_outcome(
@@ -252,7 +270,7 @@ fn retire_outcome(
         Ok(outcome) => AgentRetired {
             unnoticed: outcome.unnoticed,
             leftovers: outcome.leftovers.len(),
-            carried_off: outcome.carried_off,
+            carried_off: outcome.carried_off.then(Vec::new),
             problems: outcome
                 .errors
                 .into_iter()
@@ -288,63 +306,79 @@ const BACKUP: &str = "backup in ~/.config/roost/agent-backups";
 /// The one-time sentence for an upgrade: the agents whose file entries
 /// the retire removed, connected now through the tab environment or
 /// reporting on their own, and how many entries were left for `agent
-/// status` to name. An upgrader who had said `off` hears instead that
-/// the agents can now connect without editing files, and stay off.
-pub(crate) fn retire_line(agents: &[Agent], leftovers: usize, carried_off: bool) -> Option<String> {
-    let mut line = if carried_off {
-        let mut line = format!(
-            "Roost can now connect Claude Code and OpenCode without editing their settings \
-             files. They stay off; turn them on under {SETTINGS}"
-        );
-        if !agents.is_empty() {
-            line.push_str(&format!(
-                ". Roost also removed hook entries it had added earlier ({BACKUP})"
-            ));
-        }
-        line
-    } else if agents.is_empty() {
-        return None;
-    } else {
-        let label =
-            |agent: &Agent| roost_ui_model::agent_palette::agent_display_name(agent.source());
-        let names = |kinds: &[Agent]| -> Vec<&str> {
-            agents
-                .iter()
-                .filter(|a| kinds.contains(a))
-                .map(label)
-                .collect()
-        };
-        let env = names(&[Agent::Claude, Agent::Opencode]);
-        let own = names(&[Agent::Codex, Agent::Grok]);
-        let mut clauses = Vec::new();
-        if !env.is_empty() {
-            let (verb, their) = if env.len() == 1 {
-                ("connects", "its")
+/// status` to name. An upgrader who had said `off` (`carried_off`, the
+/// installed agents Roost could now connect) hears instead that those
+/// agents can connect without editing files, and stay off.
+pub(crate) fn retire_line(
+    agents: &[Agent],
+    leftovers: usize,
+    carried_off: Option<&[Agent]>,
+) -> Option<String> {
+    let label = |agent: &Agent| roost_ui_model::agent_palette::agent_display_name(agent.source());
+    let mut line = match carried_off {
+        Some(stay_off) if !stay_off.is_empty() => {
+            let names: Vec<&str> = stay_off.iter().map(label).collect();
+            let (its, stays, it) = if names.len() == 1 {
+                ("its", "It stays", "it")
             } else {
-                ("connect", "their")
+                ("their", "They stay", "them")
             };
-            clauses.push(format!(
-                "{} now {verb} to Roost without changes to {their} settings files",
-                env.join(" and ")
-            ));
+            let mut line = format!(
+                "Roost can now connect {} without editing {its} settings files. {stays} off; \
+                 turn {it} on under {SETTINGS}",
+                names.join(" and ")
+            );
+            if !agents.is_empty() {
+                line.push_str(&format!(
+                    ". Roost also removed hook entries it had added earlier ({BACKUP})"
+                ));
+            }
+            line
         }
-        if !own.is_empty() {
-            let (verb, their) = if own.len() == 1 {
-                ("reports", "its")
+        _ if agents.is_empty() => return None,
+        Some(_) => format!("Roost removed hook entries it had added earlier ({BACKUP})"),
+        None => {
+            let names = |kinds: &[Agent]| -> Vec<&str> {
+                agents
+                    .iter()
+                    .filter(|a| kinds.contains(a))
+                    .map(label)
+                    .collect()
+            };
+            let env = names(&[Agent::Claude, Agent::Opencode]);
+            let own = names(&[Agent::Codex, Agent::Grok]);
+            let mut clauses = Vec::new();
+            if !env.is_empty() {
+                let (verb, their) = if env.len() == 1 {
+                    ("connects", "its")
+                } else {
+                    ("connect", "their")
+                };
+                clauses.push(format!(
+                    "{} now {verb} to Roost without changes to {their} settings files",
+                    env.join(" and ")
+                ));
+            }
+            if !own.is_empty() {
+                let (verb, their) = if own.len() == 1 {
+                    ("reports", "its")
+                } else {
+                    ("report", "their")
+                };
+                clauses.push(format!(
+                    "{} {verb} {their} status on {their} own",
+                    own.join(" and ")
+                ));
+            }
+            let lead = if clauses.is_empty() {
+                "Roost no longer needs its hook entries".to_string()
             } else {
-                ("report", "their")
+                clauses.join(", and ")
             };
-            clauses.push(format!(
-                "{} {verb} {their} status on {their} own",
-                own.join(" and ")
-            ));
+            format!(
+                "{lead}. Roost removed the entries it had added ({BACKUP}). {SETTINGS} to change"
+            )
         }
-        let lead = if clauses.is_empty() {
-            "Roost no longer needs its hook entries".to_string()
-        } else {
-            clauses.join(", and ")
-        };
-        format!("{lead}. Roost removed the entries it had added ({BACKUP}). {SETTINGS} to change")
     };
     if leftovers > 0 {
         line.push_str(&format!(
@@ -1112,8 +1146,8 @@ mod tests {
     /// one who had said `off` hears that the agents stay off.
     #[test]
     fn the_upgrade_toast_says_what_replaced_the_entries() {
-        assert_eq!(retire_line(&[], 0, false), None);
-        let line = retire_line(&[Agent::Claude, Agent::Codex], 0, false).unwrap();
+        assert_eq!(retire_line(&[], 0, None), None);
+        let line = retire_line(&[Agent::Claude, Agent::Codex], 0, None).unwrap();
         assert!(
             line.starts_with(
                 "Claude Code now connects to Roost without changes to its settings files, \
@@ -1123,19 +1157,42 @@ mod tests {
         );
         assert!(line.ends_with("Agent Integration… to change"), "{line}");
 
-        let off = retire_line(&[], 0, true).unwrap();
+        let both = [Agent::Claude, Agent::Opencode];
+        let off = retire_line(&[], 0, Some(&both)).unwrap();
+        assert!(off.contains("connect Claude Code and OpenCode"), "{off}");
         assert!(off.contains("They stay off"), "{off}");
         assert!(!off.contains("removed"), "nothing was removed: {off}");
-        let off = retire_line(&[Agent::Claude], 2, true).unwrap();
+        let off = retire_line(&[Agent::Claude], 2, Some(&both)).unwrap();
         assert!(off.contains("Roost also removed hook entries"), "{off}");
         assert!(off.ends_with("roostctl agent status lists them"), "{off}");
+    }
+
+    /// The "they stay off" notice names only the installed agents Roost
+    /// could connect, and says nothing when there are none.
+    #[test]
+    fn the_stay_off_notice_names_only_installed_agents() {
+        let off = retire_line(&[], 0, Some(&[Agent::Opencode])).unwrap();
+        assert!(
+            off.starts_with(
+                "Roost can now connect OpenCode without editing its settings files. It stays off"
+            ),
+            "{off}"
+        );
+        assert!(!off.contains("Claude"), "{off}");
+        assert_eq!(retire_line(&[], 0, Some(&[])), None);
+        let removed = retire_line(&[Agent::Codex], 0, Some(&[])).unwrap();
+        assert!(!removed.contains("stay off"), "{removed}");
+        assert!(
+            removed.starts_with("Roost removed hook entries"),
+            "{removed}"
+        );
     }
 
     /// The policy notice joins the one banner, after the rest.
     #[test]
     fn the_policy_notice_rides_the_banner() {
         let toast = AgentHooksToast {
-            retire: retire_line(&[Agent::Grok], 0, false),
+            retire: retire_line(&[Agent::Grok], 0, None),
             policy: Some(POLICY_LINE),
             ..AgentHooksToast::default()
         };

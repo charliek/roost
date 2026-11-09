@@ -2295,6 +2295,17 @@ mod retire_cases {
         assert_eq!(key_line(&home, "agent-integration").as_deref(), Some("off"));
     }
 
+    /// A deferral does nothing, so an unreadable tombstone file costs only
+    /// its notice, never an error the UI would surface.
+    #[test]
+    fn a_deferred_retire_never_fails_on_an_unreadable_notice() {
+        let (_dir, home) = cursor_home(Some("agent-hooks = off"));
+        std::fs::create_dir_all(retire::tombstone_path(&home)).unwrap();
+        let outcome = retire::retire(&home, Guard::PERMITTED, true).unwrap();
+        assert!(outcome.deferred);
+        assert!(outcome.unnoticed.is_empty());
+    }
+
     /// An older session still serves this machine: nothing moves.
     #[test]
     fn a_deferred_retire_touches_nothing() {

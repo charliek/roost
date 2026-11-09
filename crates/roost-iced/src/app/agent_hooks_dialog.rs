@@ -37,8 +37,8 @@ const PREFERENCES_LEDE: &str = "Roost shows what your coding agents are doing in
 const FIRST_RUN_FOOTER: &str =
     "Change this, or switch any agent off, from Agent Integration… in the command palette.";
 
-const PREFERENCES_FOOTER: &str =
-    "Hosts you connect to follow this choice unless they have their own.";
+const PREFERENCES_FOOTER: &str = "These switches apply to this machine. Turning Cursor on \
+     also asks the hosts you connect to for its hooks.";
 
 /// The agents with no Roost row: they speak OSC 7501 and Roost has
 /// nothing to switch for them.

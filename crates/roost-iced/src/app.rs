@@ -4544,8 +4544,11 @@ impl App {
             deferred = result.deferred,
             "agent retire finished"
         );
-        let line =
-            agent_hooks::retire_line(&result.unnoticed, result.leftovers, result.carried_off);
+        let line = agent_hooks::retire_line(
+            &result.unnoticed,
+            result.leftovers,
+            result.carried_off.as_deref(),
+        );
         if line.is_none() && !result.policy_notice {
             return;
         }

@@ -104,9 +104,8 @@ TAB_AXIS_IDS = (
 # `test_doctor_is_read_only`.
 AGENT_AXES = ("agent_lifecycle", "ownership", "has_notification", "hook_active")
 
-# Must stay `roost_agent::claude::CLAUDE_HOOK_EVENTS`: doctor's
-# `claude.hook_events` check fails a settings file that is missing any
-# of them, so a stale list here reads as a product bug.
+# Mirrors `roost_agent::claude::CLAUDE_HOOK_EVENTS`, the events a
+# settings-file fixture registers.
 CLAUDE_EVENTS = (
     "SessionStart",
     "UserPromptSubmit",
@@ -221,13 +220,11 @@ def write_claude_settings(home: Path, events: tuple[str, ...]) -> Path:
     registering `events` with a command hook — plan 046 re-points doctor's
     `claude.*` checks at Claude's own global settings file rather than the
     retired `~/.config/roost/claude-settings.json`. The command here is
-    deliberately **not** one `agent install claude` would write (that
-    shape has nothing left to parse an event out of — see
-    `HookKind`/`resolve_hook_command` in `doctor.rs`), so this only
-    exercises `claude.hook_events` (which event *keys* are registered);
-    `claude.hook_command` needs a real install, which
-    `test_claude_section_isolated_by_home` drives (phase 3 runs
-    `roostctl claude install` into the throwaway `HOME`). The legacy
+    deliberately **not** one `agent install claude` would write, so
+    doctor reads it as the user's own hook, not Roost's; a Roost entry
+    needs a real install, which `test_claude_section_isolated_by_home`
+    drives (phase 3 runs `roostctl claude install` into the throwaway
+    `HOME`). The legacy
     file's own shape-match and removal are
     `test_legacy_claude_settings_warns_and_uninstall_cleans_it_up`.
     """
@@ -430,10 +427,13 @@ def test_claude_section_isolated_by_home(tmp_path, roost, project, target):
 
     Three phases, one throwaway `HOME` (plan §8 bullet 4):
       1. no settings file, no `claude` on PATH -> the whole section is `skipped`.
-      2. a settings file missing `StopFailure` -> `claude.hook_events` fails.
-      3. `roostctl claude install` (now a bare alias of `agent install
-         claude` — plan 046 §3.5, no `--force`: explicit always wins) into
-         that `HOME` -> it merges in the missing event and passes.
+      2. a settings file with hooks of the user's own and none of Roost's
+         -> healthy: Claude connects through the tab environment, and
+         nothing sends the user to write Roost's hooks back.
+      3. `roostctl claude install` (a bare alias of `agent install
+         claude`, an explicit request) into that `HOME` -> Roost's hooks
+         are in the file beside the env plugin, which doctor warns
+         doubles every event and says how to remove.
     """
     tab = roost.open_tab(project, cwd="/tmp")
     wait_tab_attached(roost, tab)
@@ -460,14 +460,17 @@ def test_claude_section_isolated_by_home(tmp_path, roost, project, target):
     for cid in claude_ids:
         assert checks[cid]["status"] == "skipped", (cid, checks[cid])
 
-    # 2. A settings file that omits StopFailure.
+    # 2. The user's own hooks, none of Roost's: the upgrader's state
+    # after the retire.
     write_claude_settings(home, tuple(e for e in CLAUDE_EVENTS if e != "StopFailure"))
     code, report = run_doctor([], env)
     assert code == report["exit_code"], (code, report["exit_code"])
     checks = checks_by_id(report)
-    assert checks["claude.hook_events"]["status"] == "fail", checks["claude.hook_events"]
+    for cid in ("claude.settings", "claude.hook_events", "claude.hook_command"):
+        assert checks[cid]["status"] == "ok", (cid, checks[cid])
+        assert "agent install" not in checks[cid]["detail"], (cid, checks[cid])
 
-    # 3. `claude install` fixes it — no `--force`, and no `ROOST_TEST_MODE`
+    # 3. An explicit `claude install` — no `ROOST_TEST_MODE`
     # in `env` (it isn't inherited from `os.environ` here), so the install
     # engine's own harness-jail refusal never fires.
     proc = subprocess.run(
@@ -483,7 +486,10 @@ def test_claude_section_isolated_by_home(tmp_path, roost, project, target):
     code, report = run_doctor([], env)
     assert code == report["exit_code"], (code, report["exit_code"])
     checks = checks_by_id(report)
-    assert checks["claude.hook_events"]["status"] == "ok", checks["claude.hook_events"]
+    assert checks["claude.hook_command"]["status"] == "warn", checks["claude.hook_command"]
+    assert "agent uninstall claude" in checks["claude.hook_command"]["detail"], checks[
+        "claude.hook_command"
+    ]
 
 
 # ---------------------------------------------------------------------------

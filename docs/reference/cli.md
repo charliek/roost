@@ -1099,7 +1099,7 @@ judge a *tab* fact unless the selected tab is doctor's own tab.
 | `shell` | process (`shell.marks_observed` is tab-scoped) | Is the shell-integration contract offered, can this shell/version emit the OSC 133 marks that drive the running dot, and has a mark actually been observed on doctor's own tab? |
 | `tab` | tab | Which tab is selected — the one check in the section, and it can fail if a `--tab`/`$ROOST_TAB_ID` no longer exists — then, for that tab, its four agent axes (shell state, agent lifecycle, attention, ownership), the state derived from them, whether raw OSC 9/99/777 is currently suppressed, and the agent reports the tab's server has dropped (how many, the latest, and a note when the latest was dropped while no agent owned the tab and that agent doesn't own it now: if it is still running, it has lost the tab). Those seven are observations, not verdicts. |
 | `session` | process | Is a session running at a socket path this build no longer uses (`session.old_path`)? A warn names each one and the `session stop --old-path` fix; skipped, saying why, where the probe may not run (an override or test mode is in effect) |
-| `claude` | process (`claude.observed` is tab-scoped) | Is `claude` on `PATH`, does `~/.claude/settings.json` parse and register every lifecycle event Roost maps, does each hook command resolve to a runnable `roostctl`, has this tab actually seen a Claude hook fire? Pre-046 checks, kept for the settings-file shape they've always covered — see the `agents` section below for the other four agents and for Claude's newer, agent-hooks-specific facts |
+| `claude` | process (`claude.observed` is tab-scoped) | Is `claude` on `PATH`, does `~/.claude/settings.json` parse, is any Roost hook command still in it (Claude connects through the tab environment, so one left there doubles every event, and doctor says how to remove it), has this tab actually seen a Claude hook fire? Doctor never asks for Roost's hooks in that file — see the `agents` section below for how each agent is connected |
 | `agents` | process (the `owning` checks are tab-scoped) | Is `$ROOST_AGENT_HOOK` set and executable from this tab; per agent (claude, codex, grok, cursor, opencode), is Roost's hook entry present and at the current integration version, and does that source currently own a tab on this UI; for codex, does its `trusted_hash` on disk match what codex would compute; is a legacy `~/.config/roost/claude-settings.json` or shell alias still lying around? See the [Agent integration](../guides/agents.md) guide |
 
 Every entry carries a stable `id` (`env.tab_id`, `ui.socket`,
@@ -1196,8 +1196,8 @@ Selected tab (tab)
 Claude Code (process)
   ok      claude.binary            2.1.261 (Claude Code)
   ok      claude.settings          /Users/charliek/.claude/settings.json parses
-  ok      claude.hook_events       all 11 events registered
-  ok      claude.hook_command      all 11 events have a current Roost command
+  ok      claude.hook_events       none registered, and Roost needs none: Claude connects through the tab environment, not settings.json
+  ok      claude.hook_command      no Roost command, and none needed: Claude connects through the tab environment, not settings.json
   skipped claude.observed          the selected tab's ownership is unavailable (no tab.list from a running UI)
 
 Agents (process)
