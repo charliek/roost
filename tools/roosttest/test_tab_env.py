@@ -38,6 +38,12 @@ ICED_ENV = {
     "SSH_CONNECTION": "100.91.0.1 50100 100.91.0.2 22",
     "SSH_CLIENT": "100.91.0.1 50100 22",
 }
+#: The user's own values for the two variables the agent integration
+#: merges into (agent-integration Phase 1), which a tab must keep.
+ICED_AGENT_ENV = {
+    "CLAUDE_CODE_PLUGIN_DIRS": "/user/claude-plugins",
+    "OPENCODE_CONFIG_CONTENT": '{"plugin":["user-plugin"]}',
+}
 #: `roostctl` at a desk.
 ROOSTCTL_DESK = {
     "DISPLAY": ":93",
@@ -73,7 +79,7 @@ class Iced:
         self.state_dir.mkdir()
         self.binary = ui.rust_binary_path(target)[0]
         shell = tab_env.readable_shell(root) if sys.platform == "darwin" else Path("/bin/sh")
-        self.extra_env = {**ICED_ENV, "SHELL": str(shell)}
+        self.extra_env = {**ICED_ENV, **ICED_AGENT_ENV, "SHELL": str(shell)}
         self.roost: Roost | None = None
         self.pid = 0
         self.env: dict[str, str] = {}
@@ -210,3 +216,56 @@ def test_a_tab_saved_before_openers_restores_with_iceds_values(iced: Iced):
     restored = [int(tab["id"]) for tab in roost.tabs() if tab["title"] == "legacy"]
     assert len(restored) == 1, roost.list()
     assert tab_env.opener_vars(iced.tab_environ(restored[0])) == iced.opener()
+
+
+# ---------------------------------------------------------------------------
+# The agent integration's variables
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def config_line(line: str):
+    """`line` in the UI's config for the block. The UI reads the agent
+    switches at each spawn, so no relaunch is needed."""
+    path = ui.owned_session_config_path()
+    if path is None:
+        pytest.skip("editing the config needs a harness-owned UI")
+    before = path.read_text() if path.exists() else ""
+    path.write_text(f"{before}\n{line}\n")
+    try:
+        yield
+    finally:
+        path.write_text(before)
+
+
+def opened_tab_environ(iced: Iced) -> dict[str, str]:
+    roost = iced.roost
+    tab = roost.open_tab(first_project(roost), cwd="/tmp", argv=tab_env.sleep_argv(600))
+    return iced.tab_environ(tab)
+
+
+def test_a_new_tab_carries_roosts_agent_plugins_after_the_users(iced: Iced):
+    """By default Claude's plugin folder is appended after the user's own
+    and opencode's plugin added to the user's list: nothing replaced."""
+    environ = opened_tab_environ(iced)
+
+    dirs = environ["CLAUDE_CODE_PLUGIN_DIRS"].split(":")
+    assert dirs[0] == ICED_AGENT_ENV["CLAUDE_CODE_PLUGIN_DIRS"], dirs
+    assert len(dirs) == 2, dirs
+    plugin_dir = Path(dirs[1])
+    assert plugin_dir.name == "roost" and plugin_dir.parent.parent.name == "agent-integration", dirs
+    assert json.loads((plugin_dir / ".claude-plugin" / "plugin.json").read_text())["name"] == "roost"
+
+    plugins = json.loads(environ["OPENCODE_CONFIG_CONTENT"])["plugin"]
+    assert plugins[0] == "user-plugin", plugins
+    assert len(plugins) == 2, plugins
+    assert plugins[1].startswith("file://") and plugins[1].endswith(
+        "/opencode/roost-agent-state.js"
+    ), plugins
+
+
+def test_with_agent_integration_off_a_new_tab_keeps_only_the_users_values(iced: Iced):
+    with config_line("agent-integration = off"):
+        environ = opened_tab_environ(iced)
+    for name, value in ICED_AGENT_ENV.items():
+        assert environ.get(name) == value, name

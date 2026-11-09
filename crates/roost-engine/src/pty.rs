@@ -2586,13 +2586,15 @@ fn roost_resources_dir() -> Option<&'static std::path::Path> {
 /// A tab's environment before Roost's own variables (plan 085 D1): the
 /// starter's minus the whole opener set, `runtime_dir` as its
 /// `XDG_RUNTIME_DIR` when one derived ([`user_runtime_dir`]), then the
-/// variables `opener` brings. Neither kind of opener inherits the
-/// starter's: a local tab gets its opener's display, a remote one its
-/// opener's SSH identity.
+/// variables `opener` brings, then what the serving process's `extend`
+/// adds ([`crate::process::set_tab_env`]). Neither kind of opener
+/// inherits the starter's: a local tab gets its opener's display, a
+/// remote one its opener's SSH identity.
 fn tab_environment(
     starter: impl Iterator<Item = (OsString, OsString)>,
     opener: &TabOpener,
     runtime_dir: Option<PathBuf>,
+    extend: Option<&crate::process::TabEnvFn>,
 ) -> Vec<(OsString, OsString)> {
     let mut env: BTreeMap<OsString, OsString> = starter
         .filter(|(name, _)| !OPENER_SET.iter().any(|opened| name == opened))
@@ -2602,6 +2604,9 @@ fn tab_environment(
     }
     for (name, value) in opener.vars() {
         env.insert(name.into(), value.into());
+    }
+    if let Some(extend) = extend {
+        extend(&mut env);
     }
     env.into_iter().collect()
 }
@@ -2690,7 +2695,12 @@ fn build_command(
     }
     set_environment(
         &mut cmd,
-        tab_environment(std::env::vars_os(), opener, user_runtime_dir()),
+        tab_environment(
+            std::env::vars_os(),
+            opener,
+            user_runtime_dir(),
+            crate::process::tab_env(),
+        ),
     );
     // Advertise the terminal Roost provides — force TERM rather than
     // inheriting the launching terminal's (a child seeing an inherited
@@ -3324,7 +3334,7 @@ mod tests {
 
     #[test]
     fn the_baseline_drops_every_opener_variable_and_keeps_the_rest() {
-        let env = tab_environment(crowded_starter().into_iter(), &TabOpener::None, None);
+        let env = tab_environment(crowded_starter().into_iter(), &TabOpener::None, None, None);
         assert_eq!(openers(&env), BTreeMap::new());
         assert_eq!(get(&env, "PATH"), Some("/usr/bin:/bin"));
         assert_eq!(get(&env, "HOME"), Some("/home/u"));
@@ -3338,7 +3348,7 @@ mod tests {
     #[test]
     fn a_local_opener_adds_exactly_its_values_empty_ones_included() {
         let local = TabOpener::Local(values(&[("DISPLAY", ":7"), ("SSH_AUTH_SOCK", "")]));
-        let env = tab_environment(crowded_starter().into_iter(), &local, None);
+        let env = tab_environment(crowded_starter().into_iter(), &local, None, None);
         assert_eq!(
             openers(&env),
             values(&[("DISPLAY", ":7"), ("SSH_AUTH_SOCK", "")])
@@ -3351,7 +3361,7 @@ mod tests {
             ssh_connection: Some("3.3.3.3 3 4.4.4.4 22".into()),
             ssh_client: Some("3.3.3.3 3 22".into()),
         };
-        let env = tab_environment(crowded_starter().into_iter(), &remote, None);
+        let env = tab_environment(crowded_starter().into_iter(), &remote, None, None);
         assert_eq!(
             openers(&env),
             values(&[
@@ -3367,14 +3377,31 @@ mod tests {
             crowded_starter().into_iter(),
             &TabOpener::None,
             Some(PathBuf::from("/run/user/4242")),
+            None,
         );
         assert_eq!(get(&env, "XDG_RUNTIME_DIR"), Some("/run/user/4242"));
         let bare = tab_environment(
             os_env(&[("PATH", "/bin")]).into_iter(),
             &TabOpener::None,
             Some(PathBuf::from("/run/user/4242")),
+            None,
         );
         assert_eq!(get(&bare, "XDG_RUNTIME_DIR"), Some("/run/user/4242"));
+    }
+
+    /// The serving process's extension sees the opener's variables and
+    /// has the last word over the starter's.
+    #[test]
+    fn the_extension_runs_last_over_the_inherited_values() {
+        let local = TabOpener::Local(values(&[("DISPLAY", ":7")]));
+        let extend = |env: &mut BTreeMap<OsString, OsString>| {
+            assert_eq!(env.get(OsStr::new("DISPLAY")), Some(&OsString::from(":7")));
+            env.insert("PATH".into(), "/extended".into());
+            env.remove(OsStr::new("HOME"));
+        };
+        let env = tab_environment(crowded_starter().into_iter(), &local, None, Some(&extend));
+        assert_eq!(get(&env, "PATH"), Some("/extended"));
+        assert_eq!(get(&env, "HOME"), None);
     }
 
     #[test]

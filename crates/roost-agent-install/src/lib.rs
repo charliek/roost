@@ -88,6 +88,7 @@ pub mod home;
 pub mod json;
 pub mod plan;
 pub mod state;
+pub mod tab_env;
 pub mod write;
 
 mod claude;

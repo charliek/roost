@@ -91,6 +91,12 @@ pub struct RoostConfig {
     /// the user has confirmed which agents it may touch.
     pub agent_hooks: AgentHooks,
 
+    /// `agent-integration`: which agents Roost connects, as departures
+    /// from the defaults ([`AgentIntegration`]). `None` when the key is
+    /// absent or empty, which leaves the legacy `agent-hooks` answer in
+    /// force ([`RoostConfig::agent_on`]).
+    pub agent_integration: Option<AgentIntegration>,
+
     /// `local-backend` — where the UI's own tabs run (plan 063 §D1).
     /// Defaults to [`LocalBackend::InProcess`], which an unparseable
     /// value also resolves to.
@@ -141,6 +147,7 @@ impl Default for RoostConfig {
             show_sidebar_agents: true,
             agent_panel_sort: AgentPanelSort::default(),
             agent_hooks: AgentHooks::default(),
+            agent_integration: None,
             local_backend: LocalBackend::default(),
             local_backend_key_present: false,
             chrome_accent: ChromeAccent::default(),
@@ -431,6 +438,114 @@ fn ordered_names(agents: &[Agent]) -> Vec<String> {
         .collect()
 }
 
+/// `agent-integration`: which agents Roost connects, by any delivery
+/// (the tab environment, OSC 7501, or a user file Roost writes).
+///
+/// The value records only **departures from the defaults**, so a later
+/// release's new agent takes its own default instead of being switched
+/// off by a list written before it existed: `-opencode` turns opencode
+/// off, `cursor` turns Cursor on, and an agent the value does not name
+/// keeps [`agent_default_on`]. `off` as the whole value turns every
+/// agent off. A name this build does not know is kept, and allows
+/// nothing here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentIntegration {
+    Off,
+    /// `(name, on)` per token, lower-cased, in the order written; the
+    /// last token for a name wins.
+    Set(Vec<(String, bool)>),
+}
+
+impl AgentIntegration {
+    /// `None` for an empty value, which reads as an absent key.
+    pub fn parse(s: &str) -> Option<AgentIntegration> {
+        let lower = s.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            return None;
+        }
+        if matches!(lower.as_str(), "off" | "false" | "no" | "none") {
+            return Some(AgentIntegration::Off);
+        }
+        let tokens = lower
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(|token| match token.strip_prefix('-') {
+                Some(name) => (name.trim().to_string(), false),
+                None => (token.to_string(), true),
+            })
+            .collect();
+        Some(AgentIntegration::Set(tokens))
+    }
+
+    /// What the value says about `agent`, if it names it.
+    fn says(&self, agent: Agent) -> Option<bool> {
+        match self {
+            AgentIntegration::Off => Some(false),
+            AgentIntegration::Set(tokens) => tokens
+                .iter()
+                .rev()
+                .find(|(name, _)| Agent::parse(name) == Some(agent))
+                .map(|&(_, on)| on),
+        }
+    }
+}
+
+/// An agent's state when nothing says otherwise: on for every agent Roost
+/// connects without touching the user's files, off for Cursor, which
+/// still needs its `hooks.json` written.
+pub fn agent_default_on(agent: Agent) -> bool {
+    agent != Agent::Cursor
+}
+
+/// Whether `agent` is on. `agent-integration` decides when present.
+/// Without it a legacy `agent-hooks` answer carries over exactly: `off`
+/// is every agent off, and a list is those agents on and the rest off,
+/// so a user who never allowed an agent is not connected to it by the
+/// upgrade. Neither key is the defaults.
+pub fn agent_on(integration: Option<&AgentIntegration>, legacy: &AgentHooks, agent: Agent) -> bool {
+    let default = agent_default_on(agent);
+    match integration {
+        Some(integration) => integration.says(agent).unwrap_or(default),
+        None => match legacy {
+            AgentHooks::Off => false,
+            AgentHooks::Allow { agents, .. } => agents.iter().any(|name| name == agent.source()),
+            AgentHooks::Ask => default,
+        },
+    }
+}
+
+/// The two keys [`agent_on`] reads, scanned out of a config file's text
+/// alone: for a reader that decides per tab spawn, where a full
+/// [`RoostConfig::parse`] would re-warn about every other bad line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentSwitches {
+    pub integration: Option<AgentIntegration>,
+    pub legacy: AgentHooks,
+}
+
+impl AgentSwitches {
+    pub fn read(content: &str) -> AgentSwitches {
+        let mut switches = AgentSwitches::default();
+        for (key, raw_value) in entries(content) {
+            match key {
+                "agent-integration" => {
+                    switches.integration = AgentIntegration::parse(unquote(raw_value))
+                }
+                "agent-hooks" => {
+                    switches.legacy = AgentHooks::parse(unquote(raw_value)).unwrap_or_default()
+                }
+                _ => {}
+            }
+        }
+        switches
+    }
+
+    pub fn on(&self, agent: Agent) -> bool {
+        agent_on(self.integration.as_ref(), &self.legacy, agent)
+    }
+}
+
 /// Two-state policy for OSC 52 program-initiated clipboard writes.
 /// Matches the first two values of Ghostty's `clipboard-write`
 /// (`allow | deny`); `ask` is deferred until the consent banner UI
@@ -527,7 +642,26 @@ fn unquote(s: &str) -> &str {
     }
 }
 
+/// Every `key = value` line of a config file, trimmed, the value still
+/// quoted: blank lines, `#` comments and lines with no `=` are dropped.
+fn entries(content: &str) -> impl Iterator<Item = (&str, &str)> {
+    content.lines().filter_map(|raw| {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (key, value) = line.split_once('=')?;
+        Some((key.trim(), value.trim()))
+    })
+}
+
 impl RoostConfig {
+    /// Whether `agent` is switched on, by `agent-integration` or, while
+    /// that key is absent, the legacy `agent-hooks` answer.
+    pub fn agent_on(&self, agent: Agent) -> bool {
+        agent_on(self.agent_integration.as_ref(), &self.agent_hooks, agent)
+    }
+
     pub fn load_default() -> Self {
         let Some(path) = default_path() else {
             return Self::default();
@@ -549,19 +683,10 @@ impl RoostConfig {
 
     pub fn parse(content: &str) -> Self {
         let mut cfg = Self::default();
-        for raw in content.lines() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            let key = key.trim();
+        for (key, raw_value) in entries(content) {
             // `raw_value` keeps quotes intact for the quote-aware
             // `command` / `provider` tokenizers and for `keybind`, whose
             // trigger is taken verbatim; every scalar key uses `value`.
-            let raw_value = value.trim();
             let value = unquote(raw_value);
             match key {
                 "theme" => cfg.theme_name = Some(value.to_string()),
@@ -676,6 +801,7 @@ impl RoostConfig {
                         }
                     };
                 }
+                "agent-integration" => cfg.agent_integration = AgentIntegration::parse(value),
                 "local-backend" => {
                     // Presence is recorded even when the value is
                     // rubbish: it is what tells the launch ladder
@@ -746,7 +872,7 @@ impl RoostConfig {
                         cfg.commands.push(c);
                     } else {
                         tracing::warn!(
-                            line = raw.trim(),
+                            value = raw_value,
                             "skipping malformed `command =` line (needs label + run)"
                         );
                     }
@@ -759,7 +885,7 @@ impl RoostConfig {
                         cfg.providers.push(p);
                     } else {
                         tracing::warn!(
-                            line = raw.trim(),
+                            value = raw_value,
                             "skipping malformed `provider =` line (needs label + run)"
                         );
                     }
@@ -1714,6 +1840,86 @@ mod tests {
         assert!(
             !cfg.macos_secure_keyboard_entry,
             "macos-secure-keyboard-entry"
+        );
+    }
+
+    // ----- agent-integration -----
+
+    fn on(body: &str) -> Vec<&'static str> {
+        let switches = AgentSwitches::read(body);
+        let cfg = RoostConfig::parse(body);
+        ALL_AGENTS
+            .into_iter()
+            .filter(|&agent| {
+                assert_eq!(
+                    switches.on(agent),
+                    cfg.agent_on(agent),
+                    "{body:?}: {agent:?}"
+                );
+                switches.on(agent)
+            })
+            .map(Agent::source)
+            .collect()
+    }
+
+    #[test]
+    fn with_neither_key_every_agent_but_cursor_is_on() {
+        assert_eq!(on(""), ["claude", "codex", "grok", "opencode"]);
+        assert_eq!(
+            on("agent-integration =\nagent-hooks ="),
+            ["claude", "codex", "grok", "opencode"]
+        );
+    }
+
+    #[test]
+    fn agent_integration_records_departures_from_the_defaults() {
+        assert_eq!(
+            on("agent-integration = -opencode"),
+            ["claude", "codex", "grok"]
+        );
+        assert_eq!(
+            on("agent-integration = cursor, -Claude"),
+            ["codex", "grok", "cursor", "opencode"]
+        );
+        // The last token for a name wins; an unknown name changes nothing.
+        assert_eq!(
+            on("agent-integration = -claude, gemini, claude"),
+            ["claude", "codex", "grok", "opencode"]
+        );
+    }
+
+    #[test]
+    fn agent_integration_off_turns_everything_off() {
+        for value in ["off", "OFF", "none", "\"off\""] {
+            assert!(
+                on(&format!("agent-integration = {value}")).is_empty(),
+                "{value}"
+            );
+        }
+    }
+
+    /// An upgrader's `agent-hooks` answer carries over exactly while the
+    /// new key is absent: `off` stays off, and a list allows only what it
+    /// names.
+    #[test]
+    fn without_agent_integration_the_legacy_answer_carries_over() {
+        assert!(on("agent-hooks = off").is_empty());
+        assert_eq!(on("agent-hooks = codex, claude"), ["claude", "codex"]);
+        assert_eq!(
+            on("agent-hooks = banana"),
+            ["claude", "codex", "grok", "opencode"]
+        );
+    }
+
+    #[test]
+    fn agent_integration_wins_over_the_legacy_key() {
+        assert_eq!(
+            on("agent-hooks = off\nagent-integration = -grok"),
+            ["claude", "codex", "opencode"]
+        );
+        assert_eq!(
+            on("agent-integration = -grok\nagent-hooks = claude"),
+            ["claude", "codex", "opencode"]
         );
     }
 
