@@ -36,9 +36,9 @@ use roost_ipc::messages::{
     AgentHooksFailed, AgentHooksOutcome, AgentHooksSkipped, AgentSetHooksAgents,
     AgentSetHooksHostOutcome, AgentSetHooksResult,
 };
-use roost_ui_model::config::{AgentHooks, RoostConfig};
+use roost_ui_model::config::{AgentHooks, AgentIntegration, AgentSwitches, RoostConfig};
 
-use super::agent_hooks_dialog::{AgentHooksRow, CardMode};
+use super::agent_hooks_dialog::{AgentHooksDraft, CardMode};
 use super::local_backend::plural;
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
 use crate::host_conn::queue::HostOpError;
@@ -206,15 +206,53 @@ pub(crate) struct AgentRetired {
     pub leftovers: usize,
     pub problems: Vec<HookProblem>,
     pub deferred: bool,
+    /// This run carried `agent-hooks = off` over: the one-time "they stay
+    /// off" notice.
+    pub carried_off: bool,
+    /// Claude is on, its organization's policy keeps the plugin out, and
+    /// the user has not been told since the policy started to.
+    pub policy_notice: bool,
 }
 
 fn retire_blocking(guard: Guard, defer: bool) -> AgentRetired {
-    let outcome =
-        Home::from_env().and_then(|home| roost_agent_install::retire(&home, guard, defer));
+    let home = match Home::from_env() {
+        Ok(home) => home,
+        Err(error) => {
+            return AgentRetired {
+                problems: vec![HookProblem {
+                    agent: None,
+                    detail: error.to_string(),
+                }],
+                ..AgentRetired::default()
+            }
+        }
+    };
+    AgentRetired {
+        policy_notice: policy_notice_due(&home),
+        ..retire_outcome(roost_agent_install::retire(&home, guard, defer))
+    }
+}
+
+/// The sideload policy's notice, read without a probe of this process's
+/// own: the tab environment's probe records its verdict, and the managed
+/// files are read here.
+fn policy_notice_due(home: &Home) -> bool {
+    let claude_on = roost_agent_install::retire::switches(home)
+        .is_ok_and(|switches| switches.on(Agent::Claude));
+    let blocked = claude_on
+        && roost_agent_install::tab_env::claude_policy_here(home)
+            .is_some_and(|policy| policy.blocks());
+    roost_agent_install::tab_env::policy_notice_due(home, blocked)
+}
+
+fn retire_outcome(
+    outcome: Result<roost_agent_install::RetireOutcome, InstallError>,
+) -> AgentRetired {
     match outcome {
         Ok(outcome) => AgentRetired {
             unnoticed: outcome.unnoticed,
             leftovers: outcome.leftovers.len(),
+            carried_off: outcome.carried_off,
             problems: outcome
                 .errors
                 .into_iter()
@@ -228,6 +266,7 @@ fn retire_blocking(guard: Guard, defer: bool) -> AgentRetired {
                 }))
                 .collect(),
             deferred: outcome.deferred,
+            ..AgentRetired::default()
         },
         // The harness fence: nothing to retire, nothing to say.
         Err(InstallError::TestModeRefused) => AgentRetired::default(),
@@ -241,46 +280,72 @@ fn retire_blocking(guard: Guard, defer: bool) -> AgentRetired {
     }
 }
 
-/// The one-time sentence for a retire that removed entries: the agents
-/// connected through the tab environment, the ones that report on their
-/// own, and how many entries were left for `agent status` to name.
-pub(crate) fn retire_line(agents: &[Agent], leftovers: usize) -> Option<String> {
-    if agents.is_empty() {
+/// What the menu item is called, in every sentence that points at it.
+const SETTINGS: &str = "Agent Integration…";
+
+const BACKUP: &str = "backup in ~/.config/roost/agent-backups";
+
+/// The one-time sentence for an upgrade: the agents whose file entries
+/// the retire removed, connected now through the tab environment or
+/// reporting on their own, and how many entries were left for `agent
+/// status` to name. An upgrader who had said `off` hears instead that
+/// the agents can now connect without editing files, and stay off.
+pub(crate) fn retire_line(agents: &[Agent], leftovers: usize, carried_off: bool) -> Option<String> {
+    let mut line = if carried_off {
+        let mut line = format!(
+            "Roost can now connect Claude Code and OpenCode without editing their settings \
+             files. They stay off; turn them on under {SETTINGS}"
+        );
+        if !agents.is_empty() {
+            line.push_str(&format!(
+                ". Roost also removed hook entries it had added earlier ({BACKUP})"
+            ));
+        }
+        line
+    } else if agents.is_empty() {
         return None;
-    }
-    let label = |agent: &Agent| roost_ui_model::agent_palette::agent_display_name(agent.source());
-    let env: Vec<&str> = agents
-        .iter()
-        .filter(|a| matches!(a, Agent::Claude | Agent::Opencode))
-        .map(label)
-        .collect();
-    let own: Vec<&str> = agents
-        .iter()
-        .filter(|a| matches!(a, Agent::Codex | Agent::Grok))
-        .map(label)
-        .collect();
-    let mut clauses = Vec::new();
-    if !env.is_empty() {
-        clauses.push(format!(
-            "{} now connect to Roost without changes to their settings files",
-            env.join(" and ")
-        ));
-    }
-    if !own.is_empty() {
-        clauses.push(format!(
-            "{} report their status on their own",
-            own.join(" and ")
-        ));
-    }
-    let lead = if clauses.is_empty() {
-        "Roost no longer needs its hook entries".to_string()
     } else {
-        clauses.join(", and ")
+        let label =
+            |agent: &Agent| roost_ui_model::agent_palette::agent_display_name(agent.source());
+        let names = |kinds: &[Agent]| -> Vec<&str> {
+            agents
+                .iter()
+                .filter(|a| kinds.contains(a))
+                .map(label)
+                .collect()
+        };
+        let env = names(&[Agent::Claude, Agent::Opencode]);
+        let own = names(&[Agent::Codex, Agent::Grok]);
+        let mut clauses = Vec::new();
+        if !env.is_empty() {
+            let (verb, their) = if env.len() == 1 {
+                ("connects", "its")
+            } else {
+                ("connect", "their")
+            };
+            clauses.push(format!(
+                "{} now {verb} to Roost without changes to {their} settings files",
+                env.join(" and ")
+            ));
+        }
+        if !own.is_empty() {
+            let (verb, their) = if own.len() == 1 {
+                ("reports", "its")
+            } else {
+                ("report", "their")
+            };
+            clauses.push(format!(
+                "{} {verb} {their} status on {their} own",
+                own.join(" and ")
+            ));
+        }
+        let lead = if clauses.is_empty() {
+            "Roost no longer needs its hook entries".to_string()
+        } else {
+            clauses.join(", and ")
+        };
+        format!("{lead}. Roost removed the entries it had added ({BACKUP}). {SETTINGS} to change")
     };
-    let mut line = format!(
-        "{lead}. Roost removed the entries it had added (backup in \
-         ~/.config/roost/agent-backups)"
-    );
     if leftovers > 0 {
         line.push_str(&format!(
             ". Roost left {leftovers} entr{} it can't be sure it added: roostctl agent status \
@@ -290,6 +355,23 @@ pub(crate) fn retire_line(agents: &[Agent], leftovers: usize) -> Option<String> 
         ));
     }
     Some(line)
+}
+
+/// Said once while the policy holds; doctor keeps the line.
+pub(crate) const POLICY_LINE: &str = "Claude Code isn't connected: your organization's Claude \
+     policy blocks plugin folders. Its status still shows from the terminal";
+
+/// Record that the policy notice was shown, off the UI thread.
+pub(crate) fn spawn_mark_policy_noticed(runtime: &tokio::runtime::Handle) {
+    runtime.spawn_blocking(|| {
+        let result = Home::from_env().and_then(|home| {
+            roost_agent_install::tab_env::mark_policy_noticed(&home)
+                .map_err(|e| InstallError::io(home.roost_config_dir(), e))
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error, "could not record that the Claude policy toast was shown");
+        }
+    });
 }
 
 /// Flip the retire's `noticed` for the agents the toast just named.
@@ -499,18 +581,14 @@ pub(crate) struct AgentHooksSurvey {
 }
 
 pub(crate) struct AgentHooksFound {
-    pub rows: Vec<AgentHooksRow>,
-    /// The key **as the survey read it off disk**, which is not
-    /// necessarily the one the caller decided to ask about: the gate
-    /// runs against the launch-time config, and another process can
-    /// answer the key in between. A first-run card is not raised over an
-    /// answer somebody has already given.
-    pub key: AgentHooks,
-    /// At least one of the five is installed on this machine. The
-    /// first-run card is not raised without one: there is nothing to
-    /// consent about, and the key stays absent rather than being
-    /// answered by a dialog nobody could act on.
-    pub any_present: bool,
+    pub draft: AgentHooksDraft,
+    /// The agent keys **as the survey read them off disk**, which the
+    /// running UI takes when another process answered while this launch
+    /// was asking.
+    pub switches: AgentSwitches,
+    /// Either agent key holds an answer on disk. A first-run card is not
+    /// raised over an answer somebody has already given.
+    pub answered: bool,
 }
 
 /// Read every agent's status for the consent card, off the UI thread.
@@ -521,7 +599,7 @@ pub(crate) struct AgentHooksFound {
 pub(crate) fn spawn_survey(
     mode: CardMode,
     id: u64,
-    fallback: AgentHooks,
+    fallback: AgentSwitches,
     runtime: &tokio::runtime::Handle,
     feed: &EngineFeedSender,
 ) {
@@ -542,18 +620,40 @@ pub(crate) fn spawn_survey(
 /// preferences card is exactly when a key changed by `roostctl agent set
 /// --local`, or raised through this machine's own session, has to be
 /// what the switches show.
-fn survey_blocking(mode: CardMode, fallback: &AgentHooks) -> Result<AgentHooksFound, String> {
+fn survey_blocking(mode: CardMode, fallback: &AgentSwitches) -> Result<AgentHooksFound, String> {
     let home = Home::from_env().map_err(|error| error.to_string())?;
-    let key = hooks_on_disk(fallback);
-    // `Ask` allows nothing: the card reads `Status::allowed` as "named
-    // in the key", and nobody has named anything yet.
-    let resolved = Mode::from_config(&key).unwrap_or_else(|| Mode::Allow(Vec::new()));
-    let statuses = roost_agent_install::status(&home, &resolved).map_err(|e| e.to_string())?;
+    let switches = switches_on_disk(fallback);
+    // `Ask` allows nothing: `Status::allowed` reads as "named in the
+    // file shadow", and nobody has named anything yet.
+    let resolved = Mode::from_config(&switches.legacy).unwrap_or_else(|| Mode::Allow(Vec::new()));
+    let mut statuses = roost_agent_install::status(&home, &resolved).map_err(|e| e.to_string())?;
+    for status in &mut statuses {
+        status.on = switches.on(status.agent);
+    }
+    let claude_blocked = roost_agent_install::tab_env::claude_policy_here(&home)
+        .is_some_and(|policy| policy.blocks());
     Ok(AgentHooksFound {
-        any_present: statuses.iter().any(|status| status.present),
-        rows: super::agent_hooks_dialog::rows(mode, &key, &statuses),
-        key,
+        draft: AgentHooksDraft::new(mode, &statuses, claude_blocked),
+        answered: roost_agent_install::retire::answered(&switches),
+        switches,
     })
+}
+
+/// Both agent keys **as they are on disk right now**, for
+/// [`hooks_on_disk`]'s reason. An unreadable config falls back to what
+/// this process already believes.
+fn switches_on_disk(fallback: &AgentSwitches) -> AgentSwitches {
+    let Some(path) = roost_ui_model::config::config_path() else {
+        return fallback.clone();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => AgentSwitches::read(&text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => AgentSwitches::default(),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "could not re-read the agent keys");
+            fallback.clone()
+        }
+    }
 }
 
 /// The blocking half. Every failure becomes a [`HookProblem`] rather
@@ -692,10 +792,13 @@ pub(crate) struct AgentHooksSet {
     pub ticket: u64,
     pub config_path: String,
     pub outcome: AgentHooksOutcome,
-    /// The key this machine now has, read off the mode that was written
-    /// rather than out of `outcome` — an outcome describes files, and
-    /// the running UI's in-memory config has to match the key.
+    /// The `agent-hooks` shadow this machine now has, from what was
+    /// written ([`roost_agent_install::keys_for`]) rather than out of
+    /// `outcome` — an outcome describes files, and the running UI's
+    /// in-memory config has to match the key.
     pub key: AgentHooks,
+    /// The `agent-integration` value written beside it.
+    pub integration: Option<AgentIntegration>,
     /// The toast list, and what `mark_noticed` is then given. The names
     /// are already in [`AgentHooksOutcome::wired`]; the agents are kept
     /// beside them because that is what both of those take.
@@ -733,6 +836,7 @@ fn set_hooks_in(
     mode: &Mode,
     guard: Guard,
 ) -> Result<AgentHooksSet, String> {
+    let (integration, key) = roost_agent_install::keys_for(home, mode);
     let (outcome, error) = match roost_agent_install::set_hooks(home, mode, BY, guard) {
         Ok(outcome) => (outcome, None),
         Err(error @ InstallError::AfterKey { .. }) => (
@@ -745,7 +849,8 @@ fn set_hooks_in(
         ticket,
         config_path: home.config_path().display().to_string(),
         outcome: wire_outcome(&outcome),
-        key: mode.to_config(),
+        key,
+        integration: AgentIntegration::parse(&integration),
         unnoticed: outcome.unnoticed,
         error,
     })
@@ -918,14 +1023,14 @@ pub(crate) fn wired_toast(agents: &[Agent], host: Option<&str>) -> Option<String
     };
     Some(format!(
         "{prefix}Roost wired agent hooks for {} — change it under \
-         Agent Hooks… in the command palette",
+         {SETTINGS} in the command palette",
         names.join(", ")
     ))
 }
 
 /// This machine's agent-hooks toast: what it says, and the agents it
 /// may spend `noticed` on.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct AgentHooksToast {
     /// [`wired_toast`]'s sentence, when anything is announced.
     pub announcement: Option<String>,
@@ -937,6 +1042,8 @@ pub(crate) struct AgentHooksToast {
     pub retire: Option<String>,
     /// The agents `retire` names, whose retire is flipped to noticed.
     pub retired: Vec<Agent>,
+    /// [`POLICY_LINE`], when it is due; showing it marks it noticed.
+    pub policy: Option<&'static str>,
 }
 
 impl AgentHooksToast {
@@ -946,6 +1053,7 @@ impl AgentHooksToast {
             self.announcement.as_deref(),
             self.problem.as_deref(),
             self.retire.as_deref(),
+            self.policy,
         ]
         .into_iter()
         .flatten()
@@ -972,8 +1080,7 @@ pub(crate) fn toast(unnoticed: Vec<Agent>, problems: &[HookProblem]) -> Option<A
         announcement,
         problem,
         noticed,
-        retire: None,
-        retired: Vec::new(),
+        ..AgentHooksToast::default()
     })
 }
 
@@ -1005,6 +1112,41 @@ mod tests {
 
     fn config(body: &str) -> RoostConfig {
         RoostConfig::parse(body)
+    }
+
+    /// An upgrader whose entries were retired hears what replaced them;
+    /// one who had said `off` hears that the agents stay off.
+    #[test]
+    fn the_upgrade_toast_says_what_replaced_the_entries() {
+        assert_eq!(retire_line(&[], 0, false), None);
+        let line = retire_line(&[Agent::Claude, Agent::Codex], 0, false).unwrap();
+        assert!(
+            line.starts_with(
+                "Claude Code now connects to Roost without changes to its settings files, \
+                 and Codex reports its status on its own. Roost removed the entries"
+            ),
+            "{line}"
+        );
+        assert!(line.ends_with("Agent Integration… to change"), "{line}");
+
+        let off = retire_line(&[], 0, true).unwrap();
+        assert!(off.contains("They stay off"), "{off}");
+        assert!(!off.contains("removed"), "nothing was removed: {off}");
+        let off = retire_line(&[Agent::Claude], 2, true).unwrap();
+        assert!(off.contains("Roost also removed hook entries"), "{off}");
+        assert!(off.ends_with("roostctl agent status lists them"), "{off}");
+    }
+
+    /// The policy notice joins the one banner, after the rest.
+    #[test]
+    fn the_policy_notice_rides_the_banner() {
+        let toast = AgentHooksToast {
+            retire: retire_line(&[Agent::Grok], 0, false),
+            policy: Some(POLICY_LINE),
+            ..AgentHooksToast::default()
+        };
+        assert!(toast.text().ends_with(POLICY_LINE), "{}", toast.text());
+        assert!(toast.text().starts_with("Grok reports"), "{}", toast.text());
     }
 
     /// A name this client cannot parse survives as a name. The host has
@@ -1134,7 +1276,7 @@ mod tests {
         // A directory where the state record belongs: read only after
         // the key is written.
         std::fs::create_dir_all(home.record_path()).unwrap();
-        let mode = Mode::Allow(vec![Agent::Claude]);
+        let mode = Mode::Allow(vec![Agent::Claude, Agent::Cursor]);
 
         let done = set_hooks_in(&home, 7, &mode, Guard::PERMITTED)
             .unwrap_or_else(|error| panic!("the key is on disk, so this is a result: {error}"));
@@ -1143,7 +1285,10 @@ mod tests {
             .as_deref()
             .expect("the failure rides with the key");
         assert!(
-            error.contains("the agent-hooks key `claude` is already on disk"),
+            error.contains(
+                "the agent-integration key `claude, -codex, -grok, cursor, -opencode` is \
+                 already on disk"
+            ),
             "{error}"
         );
         let text = std::fs::read_to_string(home.config_path()).expect("config.conf");
@@ -1185,7 +1330,7 @@ mod tests {
             toast.starts_with("Roost wired agent hooks for claude, codex"),
             "{toast}"
         );
-        assert!(toast.contains("Agent Hooks…"), "{toast}");
+        assert!(toast.contains("Agent Integration…"), "{toast}");
     }
 
     /// C8 wires a host's result through the same text; the prefix is the

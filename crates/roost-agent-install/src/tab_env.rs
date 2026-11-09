@@ -193,7 +193,12 @@ pub fn claude_policy_here(home: &crate::Home) -> Option<ClaudePolicy> {
         roost_ipc::paths::BundleProfileKind::Session,
     ]
     .into_iter()
-    .filter_map(|kind| BundleProfile::for_kind(kind).ok()?.agent_integration_dir().ok())
+    .filter_map(|kind| {
+        BundleProfile::for_kind(kind)
+            .ok()?
+            .agent_integration_dir()
+            .ok()
+    })
     .collect();
     let managed: Vec<PathBuf> = MANAGED_SETTINGS_DIRS.iter().map(PathBuf::from).collect();
     claude_policy_from(
@@ -201,6 +206,29 @@ pub fn claude_policy_here(home: &crate::Home) -> Option<ClaudePolicy> {
         &home.agent_dir(Agent::Claude).join("remote-settings.json"),
         &records,
     )
+}
+
+/// Marks, in Roost's own config folder, that the "Claude isn't
+/// connected" notice was shown for the policy that blocks now.
+const POLICY_NOTICED: &str = "claude-policy-noticed";
+
+/// Whether the one-time "Claude isn't connected" notice is due: the
+/// policy blocks and the notice has not been shown since it started to.
+/// A policy that no longer blocks clears the mark, so a later block is
+/// told again.
+pub fn policy_notice_due(home: &crate::Home, blocked: bool) -> bool {
+    let mark = home.roost_config_dir().join(POLICY_NOTICED);
+    if !blocked {
+        let _ = fs::remove_file(&mark);
+        return false;
+    }
+    !mark.exists()
+}
+
+pub fn mark_policy_noticed(home: &crate::Home) -> std::io::Result<()> {
+    let dir = home.roost_config_dir();
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join(POLICY_NOTICED), b"")
 }
 
 fn claude_policy_from(
@@ -1098,7 +1126,11 @@ mod tests {
                 policy,
                 remote_settings_cached: false,
             };
-            fs::write(dir.join(POLICY_RECORD), serde_json::to_vec(&record).unwrap()).unwrap();
+            fs::write(
+                dir.join(POLICY_RECORD),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
             dir
         };
         let ui = record("ui", ClaudePolicy::Allowed);
@@ -1128,6 +1160,20 @@ mod tests {
             panic!("a managed file must block");
         };
         assert!(why.contains("managed-settings.json"), "{why}");
+    }
+
+    /// Once while the policy holds; told again after it lifts and returns.
+    #[test]
+    fn the_policy_notice_is_due_once_per_block() {
+        let root = tempfile::tempdir().unwrap();
+        let home = crate::Home::rooted(root.path());
+        assert!(!policy_notice_due(&home, false));
+        assert!(policy_notice_due(&home, true));
+        assert!(policy_notice_due(&home, true), "due until it is shown");
+        mark_policy_noticed(&home).unwrap();
+        assert!(!policy_notice_due(&home, true));
+        assert!(!policy_notice_due(&home, false));
+        assert!(policy_notice_due(&home, true), "a new block is told again");
     }
 
     /// With no verdict at all, a spawn waits (boundedly) for the first

@@ -1028,14 +1028,15 @@ pub struct AppDialogDumpResult {
     /// not about a saved host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
-    /// The agent-hooks card's switches, in the install engine's
-    /// `ALL_AGENTS` order — the order the card draws them. Empty for
-    /// every other dialog, which has no rows.
+    /// The agent-integration card's rows, in the install engine's
+    /// `ALL_AGENTS` order — the order the card draws them: every agent
+    /// in preferences, only the installed file agents on first run.
+    /// Empty for every other dialog, which has no rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rows: Vec<AppDialogAgentRow>,
 }
 
-/// One agent's switch on the agent-hooks card.
+/// One agent's row on the agent-integration card.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppDialogAgentRow {
     /// The canonical agent name — `claude`, `codex`, `grok`, `cursor`,
@@ -1046,16 +1047,25 @@ pub struct AppDialogAgentRow {
     pub on: bool,
     /// Whether this agent is installed on this machine.
     pub found: bool,
-    /// The row's status line — `"wired v3"`, `"wired v2, out of date"`,
-    /// `"found, not wired"`, `"wired, not allowed"`, `"not found"`.
+    /// How this build connects the agent: `"env"` (a plugin named in
+    /// the tab environment), `"7501"` (the agent reports over OSC 7501)
+    /// or `"file"` (Roost's entries in the agent's own config). Absent
+    /// from an older build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
+    /// The row's status line — `"Connected · nothing written"`, `"Built
+    /// in"`, `"Off"`, `"not found"`, a Claude policy skip, or for a file
+    /// agent `"wired v3"`, `"wired v2, out of date"`, `"found, not
+    /// wired"`, `"wired, not allowed"`; followed by what the retire left
+    /// behind, if anything.
     /// `null` on the first-run card, which does not render one — sent
     /// as an explicit null rather than omitted, so a reader walking the
     /// rows can tell "no status line" from "this build has no such
     /// field" without consulting the mode.
     #[serde(default)]
     pub status: Option<String>,
-    /// The files this agent's install owns or merges into, as the card
-    /// names them. Two for codex, one for everything else.
+    /// The files Roost would write for this agent, as the card names
+    /// them: only a file agent (`delivery` `"file"`) has any.
     pub files: Vec<String>,
 }
 

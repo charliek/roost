@@ -210,7 +210,7 @@ fn ensure_after_retire(
             // and puts its one human sentence on stderr, rather than
             // breaking a script's decode with prose.
             let note = "agent-hooks is not configured; nothing was wired. Choose agents \
-                        in Roost (Agent Hooks… in the command palette) or run `roostctl \
+                        in Roost (Agent Integration… in the command palette) or run `roostctl \
                         agent set <list|off> --local`.";
             if json {
                 let mut body = outcome_json(&Outcome::default());

@@ -659,16 +659,15 @@ fn agent_hooks_body<'a>(
     let mut body = column![modal_heading(
         chrome,
         agent_hooks_dialog::TITLE.to_string(),
-        agent_hooks_dialog::LEDE
+        draft.lede()
     )];
     for (index, entry) in draft.rows().iter().enumerate() {
         body = body.push(agent_hooks_row(chrome, draft, index, entry));
     }
-    body = body.push(
-        text(agent_hooks_dialog::FOOTER)
-            .size(11)
-            .color(chrome.muted_text),
-    );
+    if let Some(line) = draft.built_in_line() {
+        body = body.push(text(line).size(11).color(chrome.muted_text));
+    }
+    body = body.push(text(draft.footer()).size(11).color(chrome.muted_text));
     body.push(modal_buttons(
         chrome,
         draft.dismiss_label(),
@@ -710,9 +709,11 @@ fn agent_hooks_row<'a>(
     if let Some(status) = &entry.status {
         detail = detail.push(text(status.as_str()).size(10).color(chrome.muted_text));
     }
-    if let Some(note) = agent_hooks_dialog::note(entry.agent) {
-        detail = detail.push(text(note).size(10).color(chrome.muted_text));
-    }
+    detail = detail.push(
+        text(agent_hooks_dialog::note(entry.agent, draft.mode()))
+            .size(10)
+            .color(chrome.muted_text),
+    );
     // The ring wrapper reserves its space whether or not it draws, so
     // stepping the ring never moves the switches under the pointer —
     // the same rule `modal_buttons` follows for the two buttons.
@@ -4481,7 +4482,7 @@ impl App {
             agent_hooks::spawn_survey(
                 agent_hooks_dialog::CardMode::FirstRun,
                 self.claim_agent_hooks_survey(),
-                self.config.agent_hooks.clone(),
+                self.agent_switches(),
                 &self.runtime_handle,
                 &self.feed_tx,
             );
@@ -4543,20 +4544,19 @@ impl App {
             deferred = result.deferred,
             "agent retire finished"
         );
-        let Some(line) = agent_hooks::retire_line(&result.unnoticed, result.leftovers) else {
+        let line =
+            agent_hooks::retire_line(&result.unnoticed, result.leftovers, result.carried_off);
+        if line.is_none() && !result.policy_notice {
             return;
-        };
-        let toast =
-            self.pending_agent_hooks_toast
-                .get_or_insert_with(|| agent_hooks::AgentHooksToast {
-                    announcement: None,
-                    problem: None,
-                    noticed: Vec::new(),
-                    retire: None,
-                    retired: Vec::new(),
-                });
-        toast.retire = Some(line);
-        toast.retired = result.unnoticed;
+        }
+        let toast = self.pending_agent_hooks_toast.get_or_insert_default();
+        if line.is_some() {
+            toast.retire = line;
+            toast.retired = result.unnoticed;
+        }
+        if result.policy_notice {
+            toast.policy = Some(agent_hooks::POLICY_LINE);
+        }
     }
 
     /// Ask a host that has just connected to raise its agent hooks to at
@@ -4774,6 +4774,7 @@ impl App {
         // one FIFO feed carries the answers, so results arrive in ticket
         // order and the last key taken is the last key written.
         self.config.agent_hooks = done.key;
+        self.config.agent_integration = done.integration;
         if let Some(error) = done.error {
             // Its caller was already answered with this error; the log
             // is for a dialog nobody was watching. Nothing was wired, so
@@ -4812,7 +4813,7 @@ impl App {
 
     // ── the agent-hooks consent card (plan 064 §3.5) ────────────────
 
-    /// `Agent Hooks…` — the palette row and the (default-unbound)
+    /// `Agent Integration…` — the palette row and the (default-unbound)
     /// `agent_hooks` action.
     ///
     /// Opening it re-reads the key **from disk** and re-runs the status
@@ -4822,10 +4823,19 @@ impl App {
         agent_hooks::spawn_survey(
             agent_hooks_dialog::CardMode::Preferences,
             self.claim_agent_hooks_survey(),
-            self.config.agent_hooks.clone(),
+            self.agent_switches(),
             &self.runtime_handle,
             &self.feed_tx,
         );
+    }
+
+    /// The agent keys as this process believes them, which a survey
+    /// falls back to when `config.conf` cannot be read.
+    fn agent_switches(&self) -> roost_ui_model::config::AgentSwitches {
+        roost_ui_model::config::AgentSwitches {
+            integration: self.config.agent_integration.clone(),
+            legacy: self.config.agent_hooks.clone(),
+        }
     }
 
     /// The id of the survey starting now, and the only one whose result
@@ -4859,16 +4869,19 @@ impl App {
         };
         match agent_hooks_dialog::survey_verdict(
             survey.mode,
-            found.any_present,
-            &found.key,
+            found.draft.asks(),
+            found.answered,
             self.host_dialog.is_some(),
         ) {
-            agent_hooks_dialog::SurveyVerdict::NoAgent => {
-                tracing::info!("no coding agent is installed here; not asking about agent hooks");
+            agent_hooks_dialog::SurveyVerdict::NothingToAsk => {
+                tracing::info!(
+                    "no agent here needs a file opt-in; not asking about agent integration"
+                );
             }
             agent_hooks_dialog::SurveyVerdict::AlreadyAnswered => {
                 tracing::info!("agent-hooks was answered while this launch asked; no card");
-                self.config.agent_hooks = found.key;
+                self.config.agent_hooks = found.switches.legacy;
+                self.config.agent_integration = found.switches.integration;
             }
             agent_hooks_dialog::SurveyVerdict::ScreenTaken => {
                 tracing::info!("another dialog is open; not raising the agent-hooks card");
@@ -4882,9 +4895,7 @@ impl App {
                 }
             }
             agent_hooks_dialog::SurveyVerdict::Raise => {
-                self.open_host_dialog(host_dialog::HostDialog::AgentHooks(
-                    agent_hooks_dialog::AgentHooksDraft::new(survey.mode, found.rows),
-                ));
+                self.open_host_dialog(host_dialog::HostDialog::AgentHooks(found.draft));
             }
         }
     }
@@ -5012,6 +5023,10 @@ impl App {
         }
         if let Some(retire) = &toast.retire {
             tracing::info!(toast = retire.as_str(), "agent retire toast shown");
+        }
+        if let Some(policy) = toast.policy {
+            tracing::info!(toast = policy, "agent policy toast shown");
+            agent_hooks::spawn_mark_policy_noticed(&self.runtime_handle);
         }
         self.set_status(toast.text());
         agent_hooks::spawn_mark_noticed(&self.runtime_handle, toast.noticed);
@@ -10909,7 +10924,7 @@ fn dialog_shape(dialog: &host_dialog::HostDialog) -> roost_ipc::messages::AppDia
             "agent_hooks",
             None,
             agent_hooks_dialog::TITLE.to_string(),
-            agent_hooks_dialog::LEDE.to_string(),
+            draft.lede().to_string(),
             draft.buttons(),
             None,
         ),
@@ -10926,6 +10941,7 @@ fn dialog_shape(dialog: &host_dialog::HostDialog) -> roost_ipc::messages::AppDia
                     agent: row.agent.source().to_string(),
                     on: row.on,
                     found: row.found,
+                    delivery: Some(row.delivery.as_str().to_string()),
                     status: row.status.clone(),
                     files: row.files.clone(),
                 })
@@ -15536,13 +15552,12 @@ mod tests {
         assert_eq!(restart.buttons, vec!["Not now", "Restart Session"]);
     }
 
-    /// The agent-hooks card's own dump: the pinned copy, the mode, and
-    /// five rows in the install engine's order.
+    /// The agent-integration card's own dump: the pinned copy, the
+    /// mode, and the rows with their delivery.
     ///
-    /// Same reason as the two above — the dump is the harness's only
-    /// view of a card — plus one more: the rows ARE this card's
-    /// question, and a dump that lost them would leave the E2E able to
-    /// press Apply and unable to say what it applied.
+    /// The dump is the harness's only view of a card, and the rows ARE
+    /// this card's question: a dump that lost them would leave the E2E
+    /// able to press Continue and unable to say what it recorded.
     #[test]
     fn the_agent_hooks_card_dumps_its_mode_and_every_switch() {
         let home = roost_agent_install::Home::rooted("/home/u");
@@ -15559,45 +15574,62 @@ mod tests {
                 files: roost_agent_install::owned_files(&home, agent),
                 skipped: None,
                 warnings: Vec::new(),
-                on: true,
+                on: roost_ui_model::config::agent_default_on(agent),
                 retired: None,
                 came_back: false,
             })
             .collect();
-        let rows = agent_hooks_dialog::rows(
-            agent_hooks_dialog::CardMode::FirstRun,
-            &roost_ui_model::config::AgentHooks::Ask,
-            &statuses,
-        );
-        let card = dialog_shape(&host_dialog::HostDialog::AgentHooks(
-            agent_hooks_dialog::AgentHooksDraft::new(agent_hooks_dialog::CardMode::FirstRun, rows),
+        let first_run = dialog_shape(&host_dialog::HostDialog::AgentHooks(
+            agent_hooks_dialog::AgentHooksDraft::new(
+                agent_hooks_dialog::CardMode::FirstRun,
+                &statuses,
+                false,
+            ),
         ));
-        assert_eq!(card.dialog.as_deref(), Some("agent_hooks"));
-        assert_eq!(card.mode.as_deref(), Some("first_run"));
-        assert_eq!(card.host, None);
-        assert_eq!(card.title, "Agent hooks");
+        assert_eq!(first_run.dialog.as_deref(), Some("agent_hooks"));
+        assert_eq!(first_run.mode.as_deref(), Some("first_run"));
+        assert_eq!(first_run.host, None);
+        assert_eq!(first_run.title, "Agent integration");
         assert!(
-            card.body
-                .starts_with("Roost adds a hook to each agent you switch on"),
-            "{card:?}"
+            first_run
+                .body
+                .contains("Claude Code, Codex and OpenCode are already connected"),
+            "only installed agents are named: {first_run:?}"
         );
-        assert!(
-            card.body.contains("roostctl agent uninstall --all"),
-            "the way back has to be in the sentence that says what is edited: {card:?}"
-        );
+        assert_eq!(first_run.rows.len(), 1, "{first_run:?}");
+        let cursor = &first_run.rows[0];
         assert_eq!(
-            card.rows
+            (cursor.agent.as_str(), cursor.on, cursor.delivery.as_deref()),
+            ("cursor", false, Some("file"))
+        );
+        assert_eq!(cursor.status, None);
+        assert_eq!(first_run.buttons, vec!["Decide later", "Continue"]);
+
+        let preferences = dialog_shape(&host_dialog::HostDialog::AgentHooks(
+            agent_hooks_dialog::AgentHooksDraft::new(
+                agent_hooks_dialog::CardMode::Preferences,
+                &statuses,
+                false,
+            ),
+        ));
+        assert_eq!(
+            preferences
+                .rows
                 .iter()
-                .map(|row| row.agent.as_str())
+                .map(|row| (row.agent.as_str(), row.delivery.as_deref().unwrap()))
                 .collect::<Vec<_>>(),
-            ["claude", "codex", "grok", "cursor", "opencode"]
+            [
+                ("claude", "env"),
+                ("codex", "7501"),
+                ("grok", "7501"),
+                ("cursor", "file"),
+                ("opencode", "env"),
+            ]
         );
         assert_eq!(
-            card.rows.iter().map(|row| row.on).collect::<Vec<_>>(),
-            [true, true, false, true, true],
-            "the unanswered key starts the installed agents on and the rest off"
+            preferences.rows[0].status.as_deref(),
+            Some("Connected · nothing written")
         );
-        assert!(card.rows.iter().all(|row| row.status.is_none()));
-        assert_eq!(card.buttons, vec!["Decide later", "Instrument 4"]);
+        assert_eq!(preferences.buttons, vec!["Cancel", "Apply"]);
     }
 }

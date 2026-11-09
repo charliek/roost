@@ -60,7 +60,14 @@ from agent_jail import (
 )
 from client import Roost, scaled_timeout
 from test_agent_lifecycle import agent_tab
-from util import HOOK_DEADLINE, REPO_ROOT, config_value, roostctl_path, run_hook
+from util import (
+    HOOK_DEADLINE,
+    REPO_ROOT,
+    config_value,
+    roostctl_path,
+    run_hook,
+    wait_for_config_line,
+)
 
 FIXTURES = REPO_ROOT / "crates/roost-agent/tests/fixtures"
 
@@ -921,8 +928,9 @@ def test_agent_set_local_wires_and_unwires_exactly_the_named_agents(tmp_path):
     nothing else on this machine — and `off` unwires it again.
 
     Cursor is the one agent still delivered by file; Claude, named
-    beside it, is connected through the tab environment, so the key
-    carries it and no file is written for it."""
+    beside it, is connected through the tab environment, so
+    `agent-integration` carries it, `agent-hooks` (the shadow older
+    builds read) names only Cursor, and no file is written for Claude."""
     jail = Jail(tmp_path, agent_hooks=None)
     assert jail.read_key() is None
 
@@ -930,7 +938,8 @@ def test_agent_set_local_wires_and_unwires_exactly_the_named_agents(tmp_path):
     assert wired.returncode == 0, wired.stdout + wired.stderr
     outcome = json.loads(wired.stdout)
     assert outcome["wired"] == ["cursor"], outcome
-    assert jail.read_key() == "claude, cursor"
+    assert jail.read_key() == "cursor"
+    assert jail.read_integration() == "claude, -codex, -grok, cursor, -opencode"
     assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["cursor"] / "hooks.json").read_text()
     assert not (jail.agent_dirs["claude"] / "settings.json").exists()
     # grok is present in the jail (`INSTALLABLE_AGENTS` default) but was
@@ -942,6 +951,7 @@ def test_agent_set_local_wires_and_unwires_exactly_the_named_agents(tmp_path):
     outcome = json.loads(off.stdout)
     assert outcome["removed"] == ["cursor"], outcome
     assert jail.read_key() == "off"
+    assert jail.read_integration() == "off"
     assert jail.read_record() == {}, "off left the record naming an agent it unwired"
     path = jail.agent_dirs["cursor"] / "hooks.json"
     assert not path.exists() or "ROOST_AGENT_HOOK" not in path.read_text()
@@ -1130,7 +1140,7 @@ def test_the_ui_wires_agent_hooks_at_startup_and_notices_once(short_root):
         assert "for cursor —" in toast, toast
         # Roost has just edited five of the user's config files. The way
         # back has to be in the sentence that says so (plan 064 §3.4).
-        assert "Agent Hooks\u2026" in toast, toast
+        assert "Agent Integration\u2026" in toast, toast
         Roost._wait(
             lambda: jail.record.exists()
             and all(
@@ -1224,7 +1234,7 @@ def test_a_startup_that_leaves_an_agent_unwired_says_so(short_root):
     # a wiring problem: Claude needs no file now.
     assert "couldn't set up cursor — run roostctl agent status" in problem, problem
     assert "Codex and Grok report their status on their own" in retired, retired
-    assert "OpenCode now connect" in retired, retired
+    assert "OpenCode now connects" in retired, retired
     assert "roostctl agent status lists it" in retired, retired
     after = jail.read_record()
     assert after["cursor"] == before["cursor"], (
@@ -1294,10 +1304,11 @@ def test_agent_set_without_local_goes_through_the_running_ui(short_root):
             "the jailed UI to put the agent.set_hooks receipt on the banner",
         )
         assert "for cursor" in toast, toast
-        assert "Agent Hooks…" in toast, toast
+        assert "Agent Integration…" in toast, toast
 
     # Read after the UI has exited, so nothing is still in flight.
-    assert jail.read_key() == "claude, cursor"
+    assert jail.read_key() == "cursor"
+    assert jail.read_integration() == "claude, -codex, -grok, cursor, -opencode"
     assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["cursor"] / "hooks.json").read_text()
     assert not (jail.agent_dirs["claude"] / "settings.json").exists()
     # grok is present in the jail but was never named: "exactly this
@@ -1394,6 +1405,9 @@ def test_two_processes_writing_config_conf_share_one_lock(short_root):
 
     with jailed_ui(jail) as (proc, log):
         wait_for_jailed_window(jail, proc, log)
+        # The startup retire carries the answer over to
+        # `agent-integration` under the same lock; let it land first.
+        wait_for_config_line(jail.config, "agent-integration", "claude, -codex, -grok, -opencode")
         with Roost(str(sock), timeout=scaled_timeout(30)) as roost:
 
             def toggle() -> None:
@@ -1423,7 +1437,9 @@ def test_two_processes_writing_config_conf_share_one_lock(short_root):
                     "the UI wrote config.conf while another process held config.lock:"
                     f"\n{jail.config.read_text()}"
                 )
-                assert jail.read_key() == "claude", jail.config.read_text()
+                assert jail.read_integration() == "claude, -codex, -grok, -opencode", (
+                    jail.config.read_text()
+                )
             finally:
                 fcntl.flock(handle, fcntl.LOCK_UN)
                 os.close(handle)
@@ -1435,7 +1451,9 @@ def test_two_processes_writing_config_conf_share_one_lock(short_root):
                 15.0,
                 "both held writers to land once the lock is free",
             )
-            assert jail.read_key() == "codex", jail.config.read_text()
+            assert jail.read_integration() == "-claude, codex, -grok, -opencode", (
+                jail.config.read_text()
+            )
 
             # And under real overlap, neither key is ever missing.
             refused: list[str] = []
@@ -1454,8 +1472,8 @@ def test_two_processes_writing_config_conf_share_one_lock(short_root):
             try:
                 while writer.is_alive():
                     toggle()
-                    assert jail.read_key() is not None, (
-                        f"the UI's write lost `agent-hooks`:\n{jail.config.read_text()}"
+                    assert jail.read_integration() is not None, (
+                        f"the UI's write lost `agent-integration`:\n{jail.config.read_text()}"
                     )
                     assert config_value(jail.config, "show-sidebar-agents") is not None, (
                         f"roostctl's write lost `show-sidebar-agents`:"
@@ -1467,7 +1485,7 @@ def test_two_processes_writing_config_conf_share_one_lock(short_root):
 
     # Read after the UI has exited, so nothing is still in flight.
     text = jail.config.read_text()
-    assert jail.read_key() is not None, text
+    assert jail.read_integration() is not None, text
     assert config_value(jail.config, "show-sidebar-agents") in ("true", "false"), text
 
 
@@ -1563,7 +1581,9 @@ def test_a_superseded_apply_still_moves_the_running_key(short_root):
         assert second.returncode != 0, "the seam did not refuse the second apply"
         done = first.communicate(timeout=scaled_timeout(60))
         assert first.returncode == 0, done
-        assert jail.read_key() == "claude", jail.config.read_text()
+        assert jail.read_integration() == "claude, -codex, -grok, -opencode", (
+            jail.config.read_text()
+        )
 
         jail.config.chmod(0o000)
         try:
@@ -1608,10 +1628,13 @@ def test_a_failure_after_the_key_write_still_moves_the_running_key(short_root):
         finally:
             jail.record.rmdir()
         assert failed.returncode != 0, failed.stdout + failed.stderr
-        assert "the agent-hooks key `claude` is already on disk" in failed.stderr, (
-            failed.stderr
+        assert (
+            "the agent-integration key `claude, -codex, -grok, -opencode` is already on disk"
+            in failed.stderr
+        ), failed.stderr
+        assert jail.read_integration() == "claude, -codex, -grok, -opencode", (
+            jail.config.read_text()
         )
-        assert jail.read_key() == "claude", jail.config.read_text()
         # Logged after the key is taken, so the card below cannot open
         # ahead of it.
         wait_for_log_line(

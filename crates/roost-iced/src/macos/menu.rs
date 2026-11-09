@@ -709,7 +709,7 @@ fn build(
         None,
         Some(("Toggle Sidebar", KeybindAction::ToggleSidebar)),
         Some(("Toggle Sidebar Agents", KeybindAction::ToggleSidebarAgents)),
-        Some(("Agent Hooks\u{2026}", KeybindAction::AgentHooks)),
+        Some(("Agent Integration\u{2026}", KeybindAction::AgentHooks)),
         None,
         Some(("Jump to Unread", KeybindAction::JumpToUnread)),
         None,

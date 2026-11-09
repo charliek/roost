@@ -458,8 +458,14 @@ pub fn set_hooks(
     let (integration, desired) = keys_for(home, mode);
     let mut wrote = write_integration(home, &integration, &lock)?;
     wrote |= write_hooks(home, &read_hooks(home)?, &desired, &lock)?;
-    let mut outcome = reconcile_locked(home, mode, by, guard, &FILE_AGENTS, &lock)
-        .map_err(|source| after_key(&desired, source))?;
+    let mut outcome =
+        reconcile_locked(home, mode, by, guard, &FILE_AGENTS, &lock).map_err(|source| {
+            InstallError::AfterKey {
+                name: "agent-integration",
+                key: integration,
+                source: Box::new(source),
+            }
+        })?;
     outcome.wrote |= wrote;
     Ok(outcome)
 }
@@ -470,6 +476,7 @@ pub fn set_hooks(
 fn after_key(key: &AgentHooks, source: InstallError) -> InstallError {
     match key.to_config_value() {
         Some(key) => InstallError::AfterKey {
+            name: "agent-hooks",
             key,
             source: Box::new(source),
         },
@@ -629,7 +636,9 @@ pub fn uninstall(home: &Home, agents: &[Agent], guard: Guard) -> Result<Outcome,
 pub fn status(home: &Home, mode: &Mode) -> Result<Vec<Status>, InstallError> {
     let (record, _) = state::load(home)?;
     let tombstones = crate::retire::load(home)?;
-    let switches = crate::retire::switches(home)?;
+    // An unreadable config may say `off`, as the tab environment reads it.
+    let switches = crate::retire::switches(home)
+        .unwrap_or_else(|_| roost_ui_model::config::AgentSwitches::all_off());
     ALL_AGENTS
         .into_iter()
         .map(|agent| {
@@ -1061,12 +1070,17 @@ mod tests {
     /// The key a failed run names, taken apart: it is the key on disk,
     /// and the rendered error carries both it and the failure itself.
     fn assert_names_the_key_on_disk(home: &Home, failed: &InstallError, record: &str) {
-        let InstallError::AfterKey { key, source } = failed else {
+        let InstallError::AfterKey { name, key, source } = failed else {
             panic!("a failure after the key write was not wrapped: {failed:?}");
         };
         assert!(source.to_string().contains(record), "{source}");
+        let text = std::fs::read_to_string(home.config_path()).unwrap();
+        let on_disk = text.lines().find_map(|line| {
+            let (k, v) = line.split_once('=')?;
+            (k.trim() == *name).then(|| v.trim().to_string())
+        });
         assert_eq!(
-            read_hooks(home).unwrap().to_config_value().as_deref(),
+            on_disk.as_deref(),
             Some(key.as_str()),
             "the key named is not the key on disk"
         );
@@ -1089,7 +1103,9 @@ mod tests {
             let failed = set_hooks(&home, &mode, "local", Guard::PERMITTED)
                 .expect_err("the record is unreadable");
             assert!(
-                failed.to_string().contains("`claude, codex`"),
+                failed
+                    .to_string()
+                    .contains("the agent-integration key `claude, codex, -grok, -opencode`"),
                 "{attempt}: {failed}"
             );
             assert_names_the_key_on_disk(&home, &failed, &record);

@@ -125,6 +125,37 @@ pub use roost_ui_model::config::ConfigLock;
 /// rather than as `ensure::uninstall` so the verbs read alike.
 pub use ensure::uninstall;
 
+/// How this build connects an agent to Roost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Roost's entries in the agent's own config file ([`FILE_AGENTS`]).
+    File,
+    /// A plugin named in the tab environment; nothing is written.
+    Env,
+    /// The agent reports its own status over OSC 7501.
+    Osc7501,
+}
+
+impl Delivery {
+    pub fn of(agent: roost_agent::Agent) -> Delivery {
+        use roost_agent::Agent;
+        match agent {
+            Agent::Cursor => Delivery::File,
+            Agent::Claude | Agent::Opencode => Delivery::Env,
+            Agent::Codex | Agent::Grok => Delivery::Osc7501,
+        }
+    }
+
+    /// What `agent status --json` and `app.dialog_dump` say.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Delivery::File => "file",
+            Delivery::Env => "env",
+            Delivery::Osc7501 => "7501",
+        }
+    }
+}
+
 /// The files Roost owns or merges into, per agent — what
 /// `agent status` prints and what an uninstall touches.
 pub fn owned_files(home: &Home, agent: roost_agent::Agent) -> Vec<std::path::PathBuf> {
@@ -182,6 +213,19 @@ mod tests {
             assert!(!installed_command(agent).is_empty(), "{}", agent.source());
         }
         assert_eq!(ALL_AGENTS.len(), 5);
+    }
+
+    /// The file agents are exactly the agents delivered by file.
+    #[test]
+    fn delivery_by_file_is_the_file_agents() {
+        for agent in ALL_AGENTS {
+            assert_eq!(
+                Delivery::of(agent) == Delivery::File,
+                FILE_AGENTS.contains(&agent),
+                "{}",
+                agent.source()
+            );
+        }
     }
 
     /// The inventory here and the adapters' one are the same list.

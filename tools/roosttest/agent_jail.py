@@ -143,6 +143,11 @@ class Jail:
         absent."""
         return config_value(self.config, "agent-hooks")
 
+    def read_integration(self) -> "str | None":
+        """This jail's `agent-integration` value, or `None` if the key is
+        absent."""
+        return config_value(self.config, "agent-integration")
+
     def assert_jailed(self, env: dict) -> None:
         """Every jail variable is set, absolute, and inside this root.
 

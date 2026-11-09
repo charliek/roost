@@ -2926,7 +2926,9 @@ def test_agent_set_hooks_answers_per_host_without_touching_the_local_half(
                 )
                 ui_jail.write_config(agent_hooks=None)
 
-                reply = client.call("agent.set_hooks", {"agents": ["claude"]})
+                # Cursor, the one agent Roost still connects by file, so
+                # the reply has a wiring to report on both sides.
+                reply = client.call("agent.set_hooks", {"agents": ["cursor"]})
                 # `off` reaches no host at all: the wire can only ever
                 # raise, and an off client has no allow-list to raise
                 # one with (plan 064 §3.3). An empty `hosts` is the
@@ -2953,7 +2955,7 @@ def test_agent_set_hooks_answers_per_host_without_touching_the_local_half(
             # would otherwise race the record assertions below.
 
         assert reply["config_path"] == str(ui_jail.config), reply
-        assert reply["local"]["wired"] == ["claude"], reply
+        assert reply["local"]["wired"] == ["cursor"], reply
         assert reply["local"]["errors"] == [], reply
 
         # Stable connection order is the saved-registry order, so it is
@@ -2961,7 +2963,7 @@ def test_agent_set_hooks_answers_per_host_without_touching_the_local_half(
         # hosts happened to answer in.
         assert [entry["host"] for entry in reply["hosts"]] == ["good", "bad"], reply
         good, bad = reply["hosts"]
-        assert good["result"]["wired"] == ["claude"], good
+        assert good["result"]["wired"] == ["cursor"], good
         assert good["result"]["errors"] == [], good
         assert "error" in bad and "result" not in bad, bad
 
@@ -2969,17 +2971,18 @@ def test_agent_set_hooks_answers_per_host_without_touching_the_local_half(
         assert reply["local"]["removed"] == [], reply
 
         assert switched_off["hosts"] == [], switched_off
-        assert switched_off["local"]["removed"] == ["claude"], switched_off
+        assert switched_off["local"]["removed"] == ["cursor"], switched_off
 
         # The local half went back off; the hosts kept what they had,
         # because nothing was sent to them.
         assert ui_jail.read_key() == "off", "the refused call wrote the key anyway"
-        # `grok` from the re-read above, `claude` from the Apply — a
-        # raise only ever widens.
-        assert healthy_jail.read_key() == "claude, grok", (
+        # `grok` from the re-read above, `cursor` from the Apply — a
+        # raise only ever widens. Grok reports over OSC 7501, so only
+        # Cursor has a file.
+        assert healthy_jail.read_key() == "grok, cursor", (
             "a local write that failed still reached a host"
         )
-        assert wired_agents(healthy_jail) == {"claude", "grok"}
+        assert wired_agents(healthy_jail) == {"cursor"}
         assert broken_jail.read_key() is None, "the unwritable host was written anyway"
         assert not broken_jail.record.exists()
     finally:
