@@ -34,6 +34,7 @@ from agent_jail import (
     wait_for_log_line,
 )
 from client import Roost, scaled_timeout
+from util import wait_for_config_line
 
 
 # ---------------------------------------------------------------------------
@@ -205,24 +206,19 @@ def test_confirming_writes_the_key_and_only_the_agents_that_are_here(
             assert card["buttons"] == ["Decide later", "Instrument 2"], card
 
             answer(roost, "confirm")
-            # The receipt, read off the log: no IPC op carries the status
-            # banner (see `wait_for_log_line`).
-            toast = wait_for_log_line(
+            wait_for_log_line(
                 log,
-                "agent hooks toast shown",
-                "the jailed UI to put the agent-hooks receipt on the banner",
+                "agent.set_hooks applied",
+                "the jailed UI to apply the card's answer",
             )
-            # claude alone: the toast names what was *wired*, and codex
-            # is not here to wire.
-            assert "for claude —" in toast, toast
-            assert "Agent Hooks…" in toast, toast
             assert_no_card(roost)
 
     assert jail.read_key() == "claude, codex", "the key must carry the absent agent too"
-    settings = (jail.agent_dirs["claude"] / "settings.json").read_text()
-    assert "ROOST_AGENT_HOOK" in settings and "agent-hook claude" in settings
-    record = jail.read_record()
-    assert sorted(record) == ["claude"], record
+    # Claude takes Roost's hooks from the tab environment, so the answer
+    # writes no file for it.
+    settings = jail.agent_dirs["claude"] / "settings.json"
+    assert not settings.exists() or "ROOST_AGENT_HOOK" not in settings.read_text()
+    assert not jail.record.exists() or jail.read_record() == {}
     assert not jail.agent_dirs["codex"].exists(), (
         "a codex nobody installed got a config directory"
     )
@@ -275,15 +271,13 @@ def test_an_answered_key_asks_nothing(short_root):
         wait_for_jailed_window(allowed, proc, log)
         with client(allowed) as roost:
             assert_no_card(roost)
-        # The allow-list DOES wire, which is the other half of "already
-        # answered": the startup ensure runs and the card does not.
-        wait_for_log_line(
-            log,
-            "agent hooks toast shown",
-            "the jailed UI to wire the agents its key already names",
-        )
-    assert allowed.read_key() == "claude"
-    assert "ROOST_AGENT_HOOK" in (allowed.agent_dirs["claude"] / "settings.json").read_text()
+        # The answer carries over into `agent-integration`, and the
+        # `agent-hooks` shadow narrows to the file agents (none here), so
+        # Claude is on through the tab environment and no file is written.
+        wait_for_config_line(allowed.config, "agent-integration", "claude, -codex, -grok, -opencode")
+    assert allowed.read_key() == "off"
+    settings = allowed.agent_dirs["claude"] / "settings.json"
+    assert not settings.exists() or "ROOST_AGENT_HOOK" not in settings.read_text()
 
 
 def test_the_test_mode_fence_stops_the_card(short_root):
@@ -414,13 +408,14 @@ def test_a_survey_does_not_steal_the_screen_from_another_dialog(short_root):
 def test_preferences_reports_what_is_wired_and_can_turn_it_all_off(
     short_root
 ):
-    """The status line after a real wiring, and the zero case.
+    """The status line after a real wiring, and the zero case. Cursor,
+    the one agent still wired by file, is the one with a status to show.
 
     Every switch off is `off`, not an empty value — an empty value parses
     back as "nobody has answered" and would bring the first-run card
     round again on the next launch — which is why the button says so
     rather than reading a bare "Apply"."""
-    jail = Jail(short_root, agent_hooks="claude", present=("claude", "grok"))
+    jail = Jail(short_root, agent_hooks="cursor", present=("cursor", "grok"))
 
     with jailed_ui(jail) as (proc, log):
         wait_for_jailed_window(jail, proc, log)
@@ -432,13 +427,13 @@ def test_preferences_reports_what_is_wired_and_can_turn_it_all_off(
         with client(jail) as roost:
             card = open_preferences(roost)
             rows = {row["agent"]: row for row in card["rows"]}
-            assert rows["claude"]["status"].startswith("wired v"), rows["claude"]
-            assert rows["claude"]["on"] is True, rows["claude"]
+            assert rows["cursor"]["status"].startswith("wired v"), rows["cursor"]
+            assert rows["cursor"]["on"] is True, rows["cursor"]
             # Installed, and the key does not name it.
             assert rows["grok"]["status"] == "found, not wired", rows["grok"]
             assert rows["grok"]["on"] is False, rows["grok"]
 
-            answer(roost, "toggle:claude")
+            answer(roost, "toggle:cursor")
             card = dump(roost)
             assert all(not row["on"] for row in card["rows"]), card
             assert card["buttons"] == ["Cancel", "Apply: turn off"], card
@@ -455,7 +450,7 @@ def test_preferences_reports_what_is_wired_and_can_turn_it_all_off(
     # Roost created this file, so an uninstall deletes it outright; a
     # file the user already had would be written back without Roost's
     # entry instead. Both are "the entry is gone", which is the claim.
-    settings = jail.agent_dirs["claude"] / "settings.json"
-    assert not settings.exists() or "ROOST_AGENT_HOOK" not in settings.read_text(), (
-        f"turning claude off left its entry behind: {settings.read_text()}"
+    hooks = jail.agent_dirs["cursor"] / "hooks.json"
+    assert not hooks.exists() or "ROOST_AGENT_HOOK" not in hooks.read_text(), (
+        f"turning cursor off left its entry behind: {hooks.read_text()}"
     )

@@ -3433,16 +3433,23 @@ fn no_file_detail(row: &AgentInstallStatus) -> (Status, String) {
             .as_deref()
             .map(|e| format!(" ({e})"))
             .unwrap_or_default();
+        let (them, stays) = if count == 1 {
+            ("it", "it stays")
+        } else {
+            ("them", "they stay")
+        };
+        // Not `agent uninstall`: it has neither the retire's backup nor
+        // its no-reformat check, so it would do to the file what the
+        // retire refused to.
         return (
             Status::Warn,
             format!(
                 "{delivery}; {count} old Roost entr{} left in {}{event}: {} — Roost can't be \
-                 sure it added {}, and while {} it doubles every event; {uninstall}",
+                 sure it added {them}, and while {stays} it doubles every event; remove \
+                 {them} by hand if Roost added {them}",
                 if count == 1 { "y" } else { "ies" },
                 redact(&left.file),
                 left.reason,
-                if count == 1 { "it" } else { "them" },
-                if count == 1 { "it stays" } else { "they stay" },
             ),
         );
     }
@@ -7837,8 +7844,9 @@ mod tests {
             "{}",
             leftover.detail
         );
+        assert!(leftover.detail.contains("by hand"), "{}", leftover.detail);
         assert!(
-            leftover.detail.contains("agent uninstall claude"),
+            !leftover.detail.contains("agent uninstall"),
             "{}",
             leftover.detail
         );

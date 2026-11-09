@@ -205,6 +205,9 @@ fn answered(switches: &AgentSwitches) -> bool {
 #[derive(Debug, Default)]
 pub struct RetirePlan {
     pub edits: Vec<FileEdit>,
+    /// What `edits` takes out, as `(file, event)`; `None` for a whole
+    /// file. A trust key or flag that goes with a handler is not listed.
+    pub removes: Vec<(String, Option<String>)>,
     pub leftovers: Vec<Leftover>,
     /// A file could not be read; try again at the next launch.
     pub retry: bool,
@@ -279,6 +282,10 @@ pub(crate) fn plan_json(
         );
         return Ok((plan, None));
     }
+    plan.removes = removed
+        .into_iter()
+        .map(|event| (path.display().to_string(), Some(event)))
+        .collect();
     tidy(&mut file.doc);
     let after = file.doc.clone();
     plan.edits.extend(file.finish_after_removal(may_delete));
@@ -308,6 +315,9 @@ pub struct RetireOutcome {
     /// Agents whose retire changed something and has not been announced:
     /// the toast list, flipped by [`mark_noticed`] once it is shown.
     pub unnoticed: Vec<Agent>,
+    /// `config.conf` could not take the carry-over. The removals and the
+    /// tombstones stand; the keys are written at the next run.
+    pub key_error: Option<InstallError>,
     pub wrote: bool,
 }
 
@@ -334,18 +344,16 @@ fn retire_locked(
     lock: &ConfigLock,
     now: i64,
 ) -> Result<RetireOutcome, InstallError> {
-    let text = match std::fs::read_to_string(home.config_path()) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(InstallError::io(home.config_path(), e)),
-    };
-    let switches = AgentSwitches::read(&text);
+    let switches = switches(home)?;
     let mut tombstones = load(home)?;
     let (mut record, _) = state::load(home)?;
     let mut outcome = RetireOutcome::default();
 
     for agent in ALL_AGENTS {
         if needed(agent, &switches) {
+            // A file agent turned back on: whatever it is turned off
+            // again, that is a new removal and is retired again.
+            outcome.wrote |= tombstones.remove(agent.source()).is_some();
             continue;
         }
         let previous = tombstones.get(agent.source()).cloned();
@@ -450,11 +458,27 @@ fn retire_locked(
         tombstones.insert(agent.source().to_string(), entry);
     }
 
-    outcome.wrote |= carry_over(home, &switches, lock)?;
+    // The tombstones before the keys: a removal recorded as finished is
+    // never repeated, where one whose key write failed after it would
+    // be redone, with a fresh backup, at every launch.
     outcome.wrote |= state::save(home, &record)?;
     outcome.wrote |= save(home, &tombstones)?;
+    match carry_over(home, &switches, lock) {
+        Ok(wrote) => outcome.wrote |= wrote,
+        Err(error) => outcome.key_error = Some(error),
+    }
     outcome.unnoticed = unnoticed(&tombstones);
     Ok(outcome)
+}
+
+/// The two agent keys in this home's `config.conf`; an absent file
+/// answers nothing.
+fn switches(home: &Home) -> Result<AgentSwitches, InstallError> {
+    match std::fs::read_to_string(home.config_path()) {
+        Ok(text) => Ok(AgentSwitches::read(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AgentSwitches::default()),
+        Err(e) => Err(InstallError::io(home.config_path(), e)),
+    }
 }
 
 fn unnoticed(tombstones: &Tombstones) -> Vec<Agent> {
@@ -557,8 +581,8 @@ pub struct BackupEntry {
 }
 
 /// Copy every file `edits` will change or delete into the backup
-/// folder, before any of them is touched, and keep the last
-/// [`BACKUPS_KEPT`] per original.
+/// folder, before any of them is touched, and keep [`BACKUPS_KEPT`] per
+/// original (see [`prune`]).
 fn backup(
     home: &Home,
     agent: Agent,
@@ -614,19 +638,22 @@ fn backup(
     Ok(made)
 }
 
-/// Drop all but the newest [`BACKUPS_KEPT`] backups of `original`.
+/// Keep the first backup of `original` and the newest of the rest, up
+/// to [`BACKUPS_KEPT`] in all. The first is the file before any retire
+/// touched it: the one a rollback wants, and the one a retire that
+/// repeats itself would otherwise push out.
 fn prune(index: &mut Vec<BackupEntry>, original: &str) -> Result<(), InstallError> {
-    let mut seen = 0;
-    let mut drop = Vec::new();
-    for (i, entry) in index.iter().enumerate().rev() {
-        if entry.original == original {
-            seen += 1;
-            if seen > BACKUPS_KEPT {
-                drop.push(i);
-            }
-        }
+    let mine: Vec<usize> = index
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.original == original)
+        .map(|(i, _)| i)
+        .collect();
+    if mine.len() <= BACKUPS_KEPT {
+        return Ok(());
     }
-    for i in drop {
+    let drop = &mine[1..mine.len() - (BACKUPS_KEPT - 1)];
+    for &i in drop.iter().rev() {
         let entry = index.remove(i);
         write::remove(Path::new(&entry.backup))?;
     }
@@ -656,9 +683,30 @@ fn hex8(digest: &[u8; 32]) -> String {
 /// Read-only: an agent whose retire finished but whose files carry an
 /// exact Roost entry again. Reported, never removed again at this
 /// version.
+///
+/// Not an agent this build delivers by file again (Cursor turned back
+/// on wrote its entries on purpose), and not an exact copy the retire
+/// itself left as a `duplicate` or `shifted` leftover: that one is
+/// already reported, and no older Roost put it back.
 pub fn came_back(home: &Home, agent: Agent, tombstones: &Tombstones) -> bool {
-    tombstones
-        .get(agent.source())
-        .is_some_and(Retired::finished)
-        && plan_retire(agent, home).is_ok_and(|plan| !plan.edits.is_empty())
+    let Some(retired) = tombstones.get(agent.source()).filter(|t| t.finished()) else {
+        return false;
+    };
+    if needed(agent, &switches(home).unwrap_or_default()) {
+        return false;
+    }
+    let left_here = |file: &str, event: &Option<String>| {
+        retired.leftovers.iter().any(|l| {
+            matches!(
+                l.reason,
+                LeftoverReason::Duplicate | LeftoverReason::Shifted
+            ) && l.file == file
+                && l.event == *event
+        })
+    };
+    plan_retire(agent, home).is_ok_and(|plan| {
+        plan.removes
+            .iter()
+            .any(|(file, event)| !left_here(file, event))
+    })
 }

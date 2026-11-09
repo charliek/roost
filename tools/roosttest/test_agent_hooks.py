@@ -917,22 +917,22 @@ def test_agent_hooks_off_wires_nothing_and_leaves_the_record_absent(tmp_path):
 
 def test_agent_set_local_wires_and_unwires_exactly_the_named_agents(tmp_path):
     """`roostctl agent set <list|off> --local` (plan 064 §5 C5): a comma
-    list writes the key and wires exactly what it names — nothing else
-    on this machine — and `off` unwires it again.
+    list writes the key and wires exactly what it names by file —
+    nothing else on this machine — and `off` unwires it again.
 
-    The list form is asserted against two named agents with three more
-    present but unnamed, so "exactly" is the thing under test rather
-    than "wires everything present"."""
+    Cursor is the one agent still delivered by file; Claude, named
+    beside it, is connected through the tab environment, so the key
+    carries it and no file is written for it."""
     jail = Jail(tmp_path, agent_hooks=None)
     assert jail.read_key() is None
 
-    wired = run_agent(jail, "set", "claude,codex", "--local", "--json")
+    wired = run_agent(jail, "set", "claude,cursor", "--local", "--json")
     assert wired.returncode == 0, wired.stdout + wired.stderr
     outcome = json.loads(wired.stdout)
-    assert sorted(outcome["wired"]) == ["claude", "codex"], outcome
-    assert jail.read_key() == "claude, codex"
-    assert (jail.agent_dirs["claude"] / "settings.json").exists()
-    assert (jail.agent_dirs["codex"] / "hooks.json").exists()
+    assert outcome["wired"] == ["cursor"], outcome
+    assert jail.read_key() == "claude, cursor"
+    assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["cursor"] / "hooks.json").read_text()
+    assert not (jail.agent_dirs["claude"] / "settings.json").exists()
     # grok is present in the jail (`INSTALLABLE_AGENTS` default) but was
     # never named, so `set` must have left it alone.
     assert not any(jail.agent_dirs["grok"].iterdir()), "set wired an agent it was not given"
@@ -940,12 +940,11 @@ def test_agent_set_local_wires_and_unwires_exactly_the_named_agents(tmp_path):
     off = run_agent(jail, "set", "off", "--local", "--json")
     assert off.returncode == 0, off.stdout + off.stderr
     outcome = json.loads(off.stdout)
-    assert sorted(outcome["removed"]) == ["claude", "codex"], outcome
+    assert outcome["removed"] == ["cursor"], outcome
     assert jail.read_key() == "off"
     assert jail.read_record() == {}, "off left the record naming an agent it unwired"
-    for agent, filename in (("claude", "settings.json"), ("codex", "hooks.json")):
-        path = jail.agent_dirs[agent] / filename
-        assert not path.exists() or "ROOST_AGENT_HOOK" not in path.read_text()
+    path = jail.agent_dirs["cursor"] / "hooks.json"
+    assert not path.exists() or "ROOST_AGENT_HOOK" not in path.read_text()
 
 
 def test_agent_set_refuses_an_empty_or_unknown_list_and_writes_nothing(tmp_path):
@@ -1279,11 +1278,11 @@ def test_agent_set_without_local_goes_through_the_running_ui(short_root):
 
     with jailed_ui(jail) as (proc, log):
         wait_for_jailed_window(jail, proc, log)
-        applied = run_agent(jail, "set", "claude,codex", "--json", socket=str(sock))
+        applied = run_agent(jail, "set", "claude,cursor", "--json", socket=str(sock))
         assert applied.returncode == 0, applied.stdout + applied.stderr
         reply = json.loads(applied.stdout)
         assert reply["config_path"] == str(jail.config), reply
-        assert sorted(reply["local"]["wired"]) == ["claude", "codex"], reply
+        assert reply["local"]["wired"] == ["cursor"], reply
         assert reply["local"]["errors"] == [], reply
         # Nothing is saved in this UI's own registry, so there is no
         # host to raise and the list is empty rather than absent.
@@ -1294,12 +1293,13 @@ def test_agent_set_without_local_goes_through_the_running_ui(short_root):
             "agent hooks toast shown",
             "the jailed UI to put the agent.set_hooks receipt on the banner",
         )
-        assert "for claude, codex" in toast, toast
+        assert "for cursor" in toast, toast
         assert "Agent Hooks…" in toast, toast
 
     # Read after the UI has exited, so nothing is still in flight.
-    assert jail.read_key() == "claude, codex"
-    assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["claude"] / "settings.json").read_text()
+    assert jail.read_key() == "claude, cursor"
+    assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["cursor"] / "hooks.json").read_text()
+    assert not (jail.agent_dirs["claude"] / "settings.json").exists()
     # grok is present in the jail but was never named: "exactly this
     # list" is the claim, not "everything installed".
     assert not any(jail.agent_dirs["grok"].iterdir()), "the UI wired an agent nobody named"
@@ -1333,15 +1333,15 @@ def test_agent_set_hooks_skips_a_name_this_build_cannot_wire(short_root):
             assert jail.read_key() is None, "an unknown-only list wrote the key"
             assert not jail.record.exists(), "an unknown-only list wired something"
 
-            mixed = roost.call("agent.set_hooks", {"agents": ["claude", "gemini"]})
-            assert mixed["local"]["wired"] == ["claude"], mixed
+            mixed = roost.call("agent.set_hooks", {"agents": ["cursor", "gemini"]})
+            assert mixed["local"]["wired"] == ["cursor"], mixed
             assert {"agent": "gemini", "reason": "unknown"} in mixed["local"]["skipped"], mixed
 
     # Read after the UI has exited, so nothing is still in flight. The
     # key is what was applied: `agent.set_hooks` replaces it, so the name
     # it could not act on is not carried into an answer the user gave.
-    assert jail.read_key() == "claude"
-    assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["claude"] / "settings.json").read_text()
+    assert jail.read_key() == "cursor"
+    assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["cursor"] / "hooks.json").read_text()
 
 
 def holds_open(pid: int, path: Path) -> bool:
@@ -1479,6 +1479,8 @@ def test_two_overlapping_applies_land_in_request_order(short_root):
     writes by the test-mode delay seam, and the second is sent while it
     is held. Independently spawned tasks would run the second to
     completion first and leave `claude` — the *older* answer — on disk.
+    The second names Cursor, the one agent still wired by file, so the
+    winning apply has a receipt to show.
 
     The receipt is asserted too, and it is the other half of the same
     rule: only the newest ticket reaches the banner, so the superseded
@@ -1494,7 +1496,7 @@ def test_two_overlapping_applies_land_in_request_order(short_root):
         # moment it takes it, which is what makes "the second was sent
         # while the first was in flight" true rather than likely.
         wait_for_log_line(log, "agent.set_hooks queued", "the first apply to be queued")
-        second = run_agent(jail, "set", "codex", socket=str(sock))
+        second = run_agent(jail, "set", "cursor", socket=str(sock))
         assert second.returncode == 0, second.stdout + second.stderr
         done = first.communicate(timeout=scaled_timeout(60))
         assert first.returncode == 0, done
@@ -1504,13 +1506,11 @@ def test_two_overlapping_applies_land_in_request_order(short_root):
             "agent hooks toast shown",
             "the jailed UI to put the agent.set_hooks receipt on the banner",
         )
-        assert "for codex" in toast, toast
+        assert "for cursor" in toast, toast
 
-    assert jail.read_key() == "codex", jail.config.read_text()
-    assert any(jail.agent_dirs["codex"].iterdir()), "the winning apply wired nothing"
-    assert not any(jail.agent_dirs["claude"].iterdir()), (
-        "the superseded apply left claude wired"
-    )
+    assert jail.read_key() == "cursor", jail.config.read_text()
+    assert any(jail.agent_dirs["cursor"].iterdir()), "the winning apply wired nothing"
+    assert not any(jail.agent_dirs["claude"].iterdir()), "an apply wrote claude's settings"
 
 
 def wait_for_agent_hooks_card(roost: Roost) -> dict:

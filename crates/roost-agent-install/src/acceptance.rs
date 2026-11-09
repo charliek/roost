@@ -58,7 +58,7 @@ fn copy_tree(src: &Path, dst: &Path) {
 fn fixture(name: &str) -> (TempDir, Home) {
     let dir = tempfile::tempdir().unwrap();
     copy_tree(&fixture_root(name), dir.path());
-    let home = Home::rooted(dir.path());
+    let home = Home::rooted(dir.path()).every_agent_by_file();
     (dir, home)
 }
 
@@ -1228,10 +1228,10 @@ fn an_absent_agent_is_skipped_and_gets_no_directory() {
 
     assert!(outcome.wired.is_empty());
     assert_eq!(outcome.skipped.len(), ALL_AGENTS.len());
-    assert!(outcome
-        .skipped
-        .iter()
-        .all(|s| matches!(s.reason, SkipReason::NotPresent)));
+    assert!(outcome.skipped.iter().all(|s| match s.agent {
+        Agent::Cursor => matches!(s.reason, SkipReason::NotPresent),
+        _ => matches!(s.reason, SkipReason::NoFileNeeded),
+    }));
     for agent in ALL_AGENTS {
         assert!(!home.agent_dir(agent).exists(), "{}", agent.source());
     }
@@ -1880,6 +1880,13 @@ mod retire_cases {
         );
         let (ours, _) = commands_on_disk(&home, Agent::Claude);
         assert_eq!(ours.len(), 1, "exactly the first copy goes");
+
+        // The copy the retire itself left is a leftover, not an entry
+        // that came back.
+        let tombstones = retire::load(&home).unwrap();
+        assert!(!retire::came_back(&home, Agent::Claude, &tombstones));
+        let status = ensure::status(&home, &all()).unwrap();
+        assert!(!row(&status, Agent::Claude).came_back);
     }
 
     #[test]
@@ -2143,6 +2150,19 @@ mod retire_cases {
         )
         .unwrap();
         assert_eq!(state_hashes(&home), [canonical_stop]);
+
+        let tombstones = retire::load(&home).unwrap();
+        let mut doc = parse_file(&path);
+        let stop = doc
+            .get_mut("hooks")
+            .unwrap()
+            .get_mut("Stop")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        stop.pop();
+        std::fs::write(&path, doc.render(&Style::default())).unwrap();
+        assert!(!retire::came_back(&home, Agent::Codex, &tombstones));
     }
 
     fn cursor_home(key: Option<&str>) -> (TempDir, Home) {
@@ -2269,9 +2289,9 @@ mod retire_cases {
             &home,
             vec![("Stop", vec![group(vec![handler(Agent::Claude, 10)])])],
         );
-        let wired = std::fs::read(&path).unwrap();
-        for _ in 0..5 {
-            std::fs::write(&path, &wired).unwrap();
+        let wired = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        for i in 0..5 {
+            std::fs::write(&path, wired.replace("opus", &format!("opus-{i}"))).unwrap();
             std::fs::remove_file(retire::tombstone_path(&home)).ok();
             retire_now(&home);
         }
@@ -2284,6 +2304,113 @@ mod retire_cases {
         )
         .unwrap();
         assert_eq!(index.len(), 3);
+        // The file as it was before any retire is never pruned.
+        let first = std::fs::read_to_string(&index[0].backup).unwrap();
+        assert!(first.contains("opus-0"), "{first}");
+        let last = std::fs::read_to_string(&index[2].backup).unwrap();
+        assert!(last.contains("opus-4"), "{last}");
+    }
+
+    /// Finding: the automatic wiring paths put back what the retire took
+    /// out. After a retire on a fresh home, nothing the consent dialog,
+    /// a host raise or the startup ensure does writes a non-file agent's
+    /// file, whatever the key names.
+    #[test]
+    fn nothing_automatic_rewires_a_retired_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        let settings = write_claude(&home, vec![]);
+        std::fs::create_dir_all(home.agent_dir(Agent::Codex)).unwrap();
+        retire_now(&home);
+        let before = user_files(dir.path());
+
+        let set = ensure::set_hooks(
+            &home,
+            &allow(&[Agent::Claude, Agent::Codex]),
+            "local",
+            Guard::PERMITTED,
+        )
+        .unwrap();
+        assert!(set.wired.is_empty(), "{:?}", set.wired);
+        let raised = ensure::raise(&home, &[Agent::Claude], "mbp", Guard::PERMITTED).unwrap();
+        assert!(raised.wired.is_empty() && raised.unnoticed.is_empty());
+        assert!(raised
+            .skipped
+            .iter()
+            .any(|s| s.agent == Agent::Claude && s.reason == SkipReason::NoFileNeeded));
+        let started = ensure::ensure(&home, "local", Guard::PERMITTED).unwrap();
+        assert!(started.wired.is_empty(), "{:?}", started.wired);
+
+        assert_eq!(user_files(dir.path()), before, "{}", claude_text(&home));
+        assert!(!std::fs::read_to_string(settings)
+            .unwrap()
+            .contains("ROOST_AGENT_HOOK"));
+    }
+
+    /// Finding: a `config.conf` that cannot take the carry-over must not
+    /// cost the tombstones, or every launch removes the entries again
+    /// with a fresh backup.
+    #[test]
+    fn a_key_write_that_fails_keeps_the_tombstones() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        let config = ro.join("config.conf");
+        std::fs::write(&config, "agent-hooks = claude\n").unwrap();
+        std::fs::write(ro.join("config.lock"), "").unwrap();
+        let config_env = config.display().to_string();
+        let home = Home::resolve(dir.path(), |key| {
+            (key == "ROOST_CONFIG").then(|| config_env.clone())
+        });
+        let settings = write_claude(
+            &home,
+            vec![("Stop", vec![group(vec![handler(Agent::Claude, 10)])])],
+        );
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(ro.join("probe"), "").is_ok() {
+            return; // root ignores the mode; nothing to prove here
+        }
+
+        let first = retire_now(&home);
+        assert!(first.key_error.is_some(), "the key write did not fail");
+        assert_eq!(first.retired, [Agent::Claude]);
+        assert!(retire::load(&home).unwrap()["claude"].finished());
+        let cleaned = std::fs::read(&settings).unwrap();
+
+        let second = retire_now(&home);
+        assert!(second.retired.is_empty(), "the retire ran again");
+        let backups = std::fs::read_dir(retire::backups_dir(&home).join("claude"))
+            .unwrap()
+            .count();
+        assert_eq!(backups, 1);
+        ensure::ensure(&home, "local", Guard::PERMITTED).unwrap();
+        assert_eq!(std::fs::read(&settings).unwrap(), cleaned);
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Finding: Cursor turned back on writes its entries on purpose;
+    /// that is not an entry that came back, and its next "off" is
+    /// retired again.
+    #[test]
+    fn cursor_turned_back_on_is_not_came_back() {
+        let (_dir, home) = cursor_home(Some("agent-integration = -claude"));
+        retire_now(&home);
+        assert!(retire::load(&home).unwrap()["cursor"].finished());
+
+        std::fs::write(home.config_path(), "agent-integration = cursor\n").unwrap();
+        ensure::install(&home, &[Agent::Cursor], "local", Guard::PERMITTED).unwrap();
+        std::fs::write(home.config_path(), "agent-integration = cursor\n").unwrap();
+        let tombstones = retire::load(&home).unwrap();
+        assert!(!retire::came_back(&home, Agent::Cursor, &tombstones));
+        let status = ensure::status(&home, &all()).unwrap();
+        assert!(!row(&status, Agent::Cursor).came_back);
+
+        retire_now(&home);
+        assert!(!retire::load(&home).unwrap().contains_key("cursor"));
+        std::fs::write(home.config_path(), "agent-integration = -cursor\n").unwrap();
+        assert_eq!(retire_now(&home).retired, [Agent::Cursor]);
+        assert!(!cursor::hooks_path(&home).exists());
     }
 
     #[test]

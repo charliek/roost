@@ -204,6 +204,11 @@ pub fn plan_retire(home: &Home) -> Result<crate::retire::RetirePlan, InstallErro
         },
         Some(_) => RetirePlan::unreadable(&path),
         None => RetirePlan {
+            removes: if plan.edits.is_empty() {
+                Vec::new()
+            } else {
+                vec![(path.display().to_string(), None)]
+            },
             edits: plan.edits,
             ..RetirePlan::default()
         },

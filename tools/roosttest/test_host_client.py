@@ -96,6 +96,7 @@ from test_kitty_images import (
 from test_program_status import PROBE, PROBE_REPLY, osc7501
 from util import (
     assert_opened_in,
+    config_value,
     drain,
     drain_until_match,
     palette_command,
@@ -2592,7 +2593,8 @@ def assert_inside_the_jail(jail, agent: str) -> None:
 def test_a_client_raises_a_hosts_key_and_a_second_client_widens_it(jailed_host):
     """The remote half of plan 064: a connecting client's allow-list is
     unioned into the host's own `agent-hooks` key, and what the union
-    allows is wired.
+    allows is wired — by file only for Cursor, the one agent still
+    delivered that way.
 
     Two scripted clients, deliberately. The op's reply is readable only
     from a scripted client — no IPC op on the UI side reports what a host
@@ -2601,37 +2603,42 @@ def test_a_client_raises_a_hosts_key_and_a_second_client_widens_it(jailed_host):
     client's grant is still standing afterwards.
     """
     host, jail = jailed_host
+    cursor_hooks = jail.agent_dirs["cursor"] / "hooks.json"
     claude_settings = jail.agent_dirs["claude"] / "settings.json"
     assert not jail.record.exists(), "the session wired something before a client asked"
     assert jail.read_key() is None, "the fixture consented on the host's behalf"
 
     with host.client() as first:
-        reply = raise_hooks(first, ["claude"])
+        reply = raise_hooks(first, ["cursor"])
 
-    assert reply["wired"] == ["claude"], reply
+    assert reply["wired"] == ["cursor"], reply
     assert reply["errors"] == [], reply
     assert reply["removed"] == [], reply
     skipped = {row["agent"]: row["reason"] for row in reply["skipped"]}
-    assert skipped.get("cursor") == "not allowed", reply
+    assert skipped.get("claude") == "not allowed", reply
 
     # The files and the key, not just the reply.
-    assert jail.read_key() == "claude"
-    assert set(jail.read_record()) == {"claude"}
-    assert jail.read_record()["claude"]["by"] == "roosttest"
-    assert_inside_the_jail(jail, "claude")
-    assert "ROOST_AGENT_HOOK" in claude_settings.read_text()
+    assert jail.read_key() == "cursor"
+    assert set(jail.read_record()) == {"cursor"}
+    assert jail.read_record()["cursor"]["by"] == "roosttest"
+    assert_inside_the_jail(jail, "cursor")
+    assert "ROOST_AGENT_HOOK" in cursor_hooks.read_text()
 
+    # A client that names Claude widens the key, and writes no file:
+    # Claude takes Roost's hooks from the tab environment.
     with host.client() as second:
-        widened = raise_hooks(second, ["codex"], by="another-box")
+        widened = raise_hooks(second, ["claude"], by="another-box")
 
-    assert widened["wired"] == ["codex"], widened
+    assert widened["wired"] == [], widened
     assert widened["removed"] == [], widened
-    assert jail.read_key() == "claude, codex", "a raise replaced the key instead of widening it"
-    assert wired_agents(jail) == {"claude", "codex"}
-    assert "ROOST_AGENT_HOOK" in claude_settings.read_text(), (
+    skipped = {row["agent"]: row["reason"] for row in widened["skipped"]}
+    assert skipped.get("claude") == "no file needed", widened
+    assert jail.read_key() == "claude, cursor", "a raise replaced the key instead of widening it"
+    assert wired_agents(jail) == {"cursor"}
+    assert "ROOST_AGENT_HOOK" in cursor_hooks.read_text(), (
         "the second client's raise took the first client's grant back out"
     )
-    assert_inside_the_jail(jail, "codex")
+    assert not claude_settings.exists() or "ROOST_AGENT_HOOK" not in claude_settings.read_text()
 
 
 def test_a_host_whose_key_says_off_is_raised_anyway(session_env):
@@ -2649,13 +2656,13 @@ def test_a_host_whose_key_says_off_is_raised_anyway(session_env):
     assert jail.read_key() == "off"
 
     with session_env.client() as scripted:
-        reply = raise_hooks(scripted, ["claude"])
+        reply = raise_hooks(scripted, ["cursor"])
 
-    assert reply["wired"] == ["claude"], reply
+    assert reply["wired"] == ["cursor"], reply
     assert reply["removed"] == [], reply
-    assert jail.read_key() == "claude"
-    assert wired_agents(jail) == {"claude"}
-    assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["claude"] / "settings.json").read_text()
+    assert jail.read_key() == "cursor"
+    assert wired_agents(jail) == {"cursor"}
+    assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["cursor"] / "hooks.json").read_text()
 
 
 def test_an_empty_agent_list_is_refused(session_env):
@@ -2692,11 +2699,11 @@ def test_a_name_the_host_does_not_know_is_skipped_not_refused(session_env):
     jail = start_jailed_session(session_env)
 
     with session_env.client() as scripted:
-        mixed = raise_hooks(scripted, ["claude", "gemini"])
-        assert mixed["wired"] == ["claude"], mixed
+        mixed = raise_hooks(scripted, ["cursor", "gemini"])
+        assert mixed["wired"] == ["cursor"], mixed
         assert {"agent": "gemini", "reason": "unknown"} in mixed["skipped"], mixed
-        assert jail.read_key() == "claude"
-        assert wired_agents(jail) == {"claude"}
+        assert jail.read_key() == "cursor"
+        assert wired_agents(jail) == {"cursor"}
 
         alone = raise_hooks(scripted, ["gemini", "amp"])
 
@@ -2706,10 +2713,10 @@ def test_a_name_the_host_does_not_know_is_skipped_not_refused(session_env):
         {"agent": "gemini", "reason": "unknown"},
         {"agent": "amp", "reason": "unknown"},
     ], alone
-    # Written by the `claude` raise above and by nothing since: an
+    # Written by the `cursor` raise above and by nothing since: an
     # unknown-only list must not so much as touch the key.
-    assert jail.read_key() == "claude"
-    assert wired_agents(jail) == {"claude"}
+    assert jail.read_key() == "cursor"
+    assert wired_agents(jail) == {"cursor"}
 
 
 def test_a_raise_keeps_a_name_this_host_cannot_wire(session_env):
@@ -2721,15 +2728,21 @@ def test_a_raise_keeps_a_name_this_host_cannot_wire(session_env):
     every connect, and it does so silently.
     """
     jail = start_jailed_session(session_env, agent_hooks="claude, gemini")
+    # The session's own retire carries the answer, unknown name and all,
+    # into `agent-integration` at start; wait for it so the raise below
+    # reads the key it leaves rather than racing it.
+    sessionlib.wait_until(
+        lambda: config_value(jail.config, "agent-integration") is not None,
+        5.0,
+        "the session's retire to carry the answer over",
+    )
 
     with session_env.client() as scripted:
-        raised = raise_hooks(scripted, ["codex"])
+        raised = raise_hooks(scripted, ["cursor"])
 
-    # Both, because the key already allowed claude and neither had been
-    # announced to any client yet — `wired` is the toast list.
-    assert sorted(raised["wired"]) == ["claude", "codex"], raised
-    assert jail.read_key() == "claude, codex, gemini", (
-        "the raise dropped a name this host cannot wire"
+    assert raised["wired"] == ["cursor"], raised
+    assert "gemini" in config_value(jail.config, "agent-integration"), (
+        "the host dropped a name it cannot wire"
     )
 
 
@@ -2777,13 +2790,13 @@ def test_a_client_with_nothing_to_raise_sends_no_agent_hooks_frame(roost, sessio
         assert wired_agents(jail) == set()
 
         with relay.client() as control:
-            raise_hooks(control, ["claude"], by="positive-control")
+            raise_hooks(control, ["cursor"], by="positive-control")
         relay.wait_drained()
         assert "session.set_agent_hooks" in relay.ops(), (
             "the relay cannot see the op it was just sent, so it could not "
             "have seen the client send one either"
         )
-        assert jail.read_key() == "claude"
+        assert jail.read_key() == "cursor"
 
 
 def test_a_session_resolves_the_config_the_ui_wrote_however_it_was_launched(session_env):

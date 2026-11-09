@@ -146,7 +146,8 @@ pub fn plan_retire(home: &Home) -> Result<RetirePlan, InstallError> {
     let mut plan = RetirePlan::default();
     match image.bytes.as_deref() {
         Some(bytes) if bytes == desired().as_slice() => {
-            plan.edits.push(FileEdit { image, after: None })
+            plan.removes.push((path.display().to_string(), None));
+            plan.edits.push(FileEdit { image, after: None });
         }
         Some(bytes) if is_ours(bytes) => plan.leftovers.push(Leftover {
             file: path.display().to_string(),

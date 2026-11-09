@@ -37,7 +37,7 @@ use roost_ipc::messages::{
     ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksHostOutcome, AgentSetHooksParams,
     AgentSetHooksResult,
 };
-use roost_ui_model::config::{AgentHooks, RoostConfig};
+use roost_ui_model::config::{AgentHooks, LocalBackend, RoostConfig};
 
 use crate::error::CliError;
 use crate::UiSocket;
@@ -117,9 +117,13 @@ pub fn run(cmd: &AgentCmd, json: bool) -> Result<i32, CliError> {
             // The retire first: it narrows `agent-hooks` to the agents
             // still delivered by file, which is what the ensure below
             // reads. It is the strict, once-per-version removal; the
-            // reconcile after it touches only the file agents.
+            // reconcile after it touches only the file agents. It waits,
+            // as the UI's does, while the local tabs run on a
+            // `roost-session` that may be an older build still needing
+            // the entries; a v4 session retires at its own start.
+            let defer = RoostConfig::load_default().local_backend == LocalBackend::Session;
             let retired =
-                retire(&home, guard, false).map_err(|e| CliError::Failed(format!("agent: {e}")))?;
+                retire(&home, guard, defer).map_err(|e| CliError::Failed(format!("agent: {e}")))?;
             if !json {
                 print_retire(&retired);
             }
@@ -216,7 +220,7 @@ fn ensure_after_retire(
             } else {
                 println!("{note}");
             }
-            return Ok(i32::from(!retired.errors.is_empty()));
+            return Ok(i32::from(retire_failed(retired)));
         }
     };
     let outcome = outcome.map_err(|e| CliError::Failed(format!("agent: {e}")))?;
@@ -227,7 +231,11 @@ fn ensure_after_retire(
     } else {
         print_outcome(&outcome);
     }
-    Ok(i32::from(!outcome.is_clean() || !retired.errors.is_empty()))
+    Ok(i32::from(!outcome.is_clean() || retire_failed(retired)))
+}
+
+fn retire_failed(retired: &RetireOutcome) -> bool {
+    !retired.errors.is_empty() || retired.key_error.is_some()
 }
 
 fn leftover_json(
@@ -255,6 +263,7 @@ fn retire_json(retired: &RetireOutcome) -> serde_json::Value {
                 "error": e.error.to_string(),
             }))
             .collect::<Vec<_>>(),
+        "key_error": retired.key_error.as_ref().map(ToString::to_string),
     })
 }
 
@@ -277,6 +286,9 @@ fn print_retire(retired: &RetireOutcome) {
     }
     for error in &retired.errors {
         println!("retire error: {}: {}", error.agent.source(), error.error);
+    }
+    if let Some(error) = &retired.key_error {
+        println!("retire error: {error}");
     }
 }
 
@@ -635,9 +647,8 @@ fn print_status(rows: &[Status], unknown: &[String], json: bool) {
             }
             for leftover in &retired.leftovers {
                 println!(
-                    "          left in place: {}; `roostctl agent uninstall {}` removes it",
-                    leftover_line(leftover),
-                    row.agent.source()
+                    "          left in place: {}; remove it by hand if Roost added it",
+                    leftover_line(leftover)
                 );
             }
         }

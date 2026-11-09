@@ -48,6 +48,11 @@ pub struct Home {
     grok: PathBuf,
     cursor: PathBuf,
     opencode: PathBuf,
+    /// Wire every agent by file, as integration version 3 did. The
+    /// writers stay for `agent install`; this keeps the cases that pin
+    /// their contracts through the wiring engine.
+    #[cfg(test)]
+    every_agent_by_file: bool,
 }
 
 impl Home {
@@ -77,6 +82,8 @@ impl Home {
             grok: dir(Agent::Grok),
             cursor: dir(Agent::Cursor),
             opencode: dir(Agent::Opencode),
+            #[cfg(test)]
+            every_agent_by_file: false,
             config: roost_ui_model::config::config_path_in(
                 &home,
                 env("ROOST_CONFIG").as_deref().map(std::ffi::OsStr::new),
@@ -116,6 +123,22 @@ impl Home {
 
     pub fn path(&self) -> &Path {
         &self.home
+    }
+
+    #[cfg(test)]
+    pub(crate) fn every_agent_by_file(mut self) -> Home {
+        self.every_agent_by_file = true;
+        self
+    }
+
+    /// Whether the wiring engine may write `agent`'s file: only the
+    /// agents this build still delivers by file.
+    pub(crate) fn wires_by_file(&self, agent: Agent) -> bool {
+        #[cfg(test)]
+        if self.every_agent_by_file {
+            return true;
+        }
+        crate::FILE_AGENTS.contains(&agent)
     }
 
     /// The same home with one agent's directory pointed somewhere else.

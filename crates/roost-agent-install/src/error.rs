@@ -140,6 +140,9 @@ pub enum SkipReason {
     UnexpectedShape { path: PathBuf, detail: String },
     /// A file Roost owns by name exists but was not written by Roost.
     ForeignFile { path: PathBuf },
+    /// This build connects the agent without a file entry (the tab
+    /// environment, or the agent's own OSC 7501), so none was written.
+    NoFileNeeded,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -157,6 +160,7 @@ impl std::fmt::Display for SkipReason {
             SkipReason::ForeignFile { path } => {
                 write!(f, "{}: not written by Roost", path.display())
             }
+            SkipReason::NoFileNeeded => f.write_str("no file needed"),
         }
     }
 }

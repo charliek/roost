@@ -340,9 +340,10 @@ pub fn ensure(home: &Home, by: &str, guard: Guard) -> Result<Outcome, InstallErr
 
 /// Bring this machine's files in line with `mode`, both ways.
 ///
-/// `Allow` wires and refreshes what it names and **unwires what it does
-/// not** — for every agent present on disk or named in the record, so a
-/// machine whose `~/.config/roost` was wiped still comes clean. `Off`
+/// `Allow` wires and refreshes the [`FILE_AGENTS`] it names and
+/// **unwires what it does not** — for every agent present on disk or
+/// named in the record, so a machine whose `~/.config/roost` was wiped
+/// still comes clean. `Off`
 /// unwires all of them. With nothing to remove it writes nothing.
 ///
 /// What `roostctl agent ensure` and the consent dialog's Apply run. The
@@ -432,7 +433,7 @@ pub fn set_hooks(
     // raise — the user is looking at the list they just chose.
     let desired = mode.to_config();
     let wrote = write_hooks(home, &read_hooks(home)?, &desired, &lock)?;
-    let mut outcome = reconcile_locked(home, mode, by, guard, &ALL_AGENTS, &lock)
+    let mut outcome = reconcile_locked(home, mode, by, guard, &FILE_AGENTS, &lock)
         .map_err(|source| after_key(&desired, source))?;
     outcome.wrote |= wrote;
     Ok(outcome)
@@ -463,7 +464,7 @@ fn wire_locked(
     let (mut record, mut outcome) = start(home)?;
     for agent in ALL_AGENTS {
         if mode.allows(agent) {
-            wire_one(home, agent, by, guard, &mut record, &mut outcome);
+            wire_file_agent(home, agent, by, guard, &mut record, &mut outcome);
         } else {
             outcome.skipped.push(AgentSkip {
                 agent,
@@ -486,7 +487,7 @@ fn reconcile_locked(
     let targets = unwire_targets(home, &record);
     for agent in only.iter().copied() {
         if mode.allows(agent) {
-            wire_one(home, agent, by, guard, &mut record, &mut outcome);
+            wire_file_agent(home, agent, by, guard, &mut record, &mut outcome);
         } else if targets.contains(&agent) {
             unwire_one(home, agent, guard, &mut record, &mut outcome);
         } else {
@@ -782,6 +783,32 @@ fn unwire_targets(home: &Home, record: &Record) -> Vec<Agent> {
         .collect()
 }
 
+/// [`wire_one`] for an agent this build still delivers by file, and a
+/// [`SkipReason::NoFileNeeded`] for any other, whatever the key allows.
+///
+/// The automatic paths (the startup ensure, a host raise, the consent
+/// dialog's apply) must never put back what the retire takes out: a
+/// finished retire does not run again at its version, so an entry
+/// written after it doubles that agent's events for good. Only the
+/// explicit [`install`] still writes them.
+fn wire_file_agent(
+    home: &Home,
+    agent: Agent,
+    by: &str,
+    guard: Guard,
+    record: &mut Record,
+    outcome: &mut Outcome,
+) {
+    if home.wires_by_file(agent) {
+        wire_one(home, agent, by, guard, record, outcome);
+    } else {
+        outcome.skipped.push(AgentSkip {
+            agent,
+            reason: SkipReason::NoFileNeeded,
+        });
+    }
+}
+
 fn wire_one(
     home: &Home,
     agent: Agent,
@@ -960,7 +987,7 @@ mod tests {
 
     fn a_home(root: &std::path::Path) -> Home {
         std::fs::create_dir_all(root.join(".claude")).unwrap();
-        Home::rooted(root)
+        Home::rooted(root).every_agent_by_file()
     }
 
     fn all() -> Mode {

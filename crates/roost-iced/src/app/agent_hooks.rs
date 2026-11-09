@@ -222,6 +222,10 @@ fn retire_blocking(guard: Guard, defer: bool) -> AgentRetired {
                     agent: Some(failure.agent),
                     detail: failure.error.to_string(),
                 })
+                .chain(outcome.key_error.map(|error| HookProblem {
+                    agent: None,
+                    detail: error.to_string(),
+                }))
                 .collect(),
             deferred: outcome.deferred,
         },
@@ -601,7 +605,10 @@ fn leaves_unwired(reason: &SkipReason) -> bool {
         SkipReason::Unparseable { .. }
         | SkipReason::UnexpectedShape { .. }
         | SkipReason::ForeignFile { .. } => true,
-        SkipReason::NotPresent | SkipReason::NotAllowed | SkipReason::ModeOff => false,
+        SkipReason::NotPresent
+        | SkipReason::NotAllowed
+        | SkipReason::ModeOff
+        | SkipReason::NoFileNeeded => false,
     }
 }
 
