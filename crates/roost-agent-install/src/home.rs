@@ -14,14 +14,16 @@ use roost_ui_model::config::ConfigLock;
 use crate::error::InstallError;
 
 /// The environment variable that relocates `agent`'s config directory,
-/// as that agent itself documents it.
-pub const fn config_dir_env(agent: Agent) -> &'static str {
+/// as that agent itself documents it. Cursor has none for hooks:
+/// cursor-agent 2026.11.05 reads user hooks only from
+/// `$HOME/.cursor/hooks.json`, whatever `CURSOR_CONFIG_DIR` says (#717).
+pub const fn config_dir_env(agent: Agent) -> Option<&'static str> {
     match agent {
-        Agent::Claude => "CLAUDE_CONFIG_DIR",
-        Agent::Codex => "CODEX_HOME",
-        Agent::Grok => "GROK_HOME",
-        Agent::Cursor => "CURSOR_CONFIG_DIR",
-        Agent::Opencode => "OPENCODE_CONFIG_DIR",
+        Agent::Claude => Some("CLAUDE_CONFIG_DIR"),
+        Agent::Codex => Some("CODEX_HOME"),
+        Agent::Grok => Some("GROK_HOME"),
+        Agent::Cursor => None,
+        Agent::Opencode => Some("OPENCODE_CONFIG_DIR"),
     }
 }
 
@@ -59,7 +61,10 @@ impl Home {
     pub fn resolve(home: impl Into<PathBuf>, env: impl Fn(&str) -> Option<String>) -> Home {
         let home = home.into();
         let dir = |agent: Agent| -> PathBuf {
-            match env(config_dir_env(agent)).filter(|v| !v.trim().is_empty()) {
+            match config_dir_env(agent)
+                .and_then(&env)
+                .filter(|v| !v.trim().is_empty())
+            {
                 Some(value) => {
                     let path = PathBuf::from(value);
                     if path.is_absolute() {
@@ -217,10 +222,10 @@ mod tests {
     }
 
     /// Each agent's own override wins. This is the jail the e2e harness
-    /// relies on: point all five somewhere else and nothing real is
-    /// reachable.
+    /// relies on: point `HOME` and the four overrides somewhere else and
+    /// nothing real is reachable.
     #[test]
-    fn every_agent_has_an_env_override() {
+    fn every_agent_but_cursor_has_an_env_override() {
         let env = env_of(&[
             ("CLAUDE_CONFIG_DIR", "/jail/claude"),
             ("CODEX_HOME", "/jail/codex"),
@@ -230,9 +235,13 @@ mod tests {
         ]);
         let home = Home::resolve("/home/u", |k| env.get(k).cloned());
         for agent in ALL_AGENTS {
+            let expected = match agent {
+                Agent::Cursor => "/home/u/.cursor".to_owned(),
+                _ => format!("/jail/{}", agent.source()),
+            };
             assert_eq!(
                 home.agent_dir(agent),
-                Path::new(&format!("/jail/{}", agent.source())),
+                Path::new(&expected),
                 "{}",
                 agent.source()
             );
