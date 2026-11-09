@@ -4,7 +4,7 @@
 engine. It is the core of the UI on both platforms — `roost-iced` is an adapter over
 it, not a second implementation of it — and the seam a future second client
 (the planned mobile one) would build on.
-The [direction](vision.md#direction-under-evaluation) resolved to one iced
+The [direction](decision-history.md#direction-under-evaluation) resolved to one iced
 shell on both platforms.
 
 That the engine has exactly one consumer today is a fact about the present,
