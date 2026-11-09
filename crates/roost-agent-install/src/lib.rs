@@ -82,6 +82,7 @@
 
 pub mod codex_hash;
 pub mod command;
+pub mod env_delivery;
 pub mod error;
 pub mod home;
 pub mod json;

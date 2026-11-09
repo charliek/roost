@@ -542,10 +542,35 @@ impl BundleProfile {
     /// policy is testable without mutating process-global env — the
     /// same split [`apply_state_dir_override`] uses.
     fn files_dir_with(&self, state_dir_env: Option<&std::ffi::OsStr>) -> anyhow::Result<PathBuf> {
+        self.cache_subdir_with("files", state_dir_env)
+    }
+
+    /// Where this process materializes the files agents load through
+    /// the tab environment: the Claude plugin `CLAUDE_CODE_PLUGIN_DIRS`
+    /// names and the opencode plugin `OPENCODE_CONFIG_CONTENT` names.
+    ///
+    /// The cache root, like [`Self::files_dir`], and for the same two
+    /// reasons: the Mac state dir has a space in it, which a
+    /// `file://` URL would have to escape, and the contents are
+    /// reproducible, so a cache clean costs only a rewrite at the next
+    /// tab spawn. Per profile, so the UI and a session each own theirs.
+    /// A honoured `ROOST_STATE_DIR` moves it inside the state dir.
+    pub fn agent_integration_dir(&self) -> anyhow::Result<PathBuf> {
+        self.cache_subdir_with(
+            AGENT_INTEGRATION_DIR_NAME,
+            std::env::var_os(STATE_DIR_ENV).as_deref(),
+        )
+    }
+
+    fn cache_subdir_with(
+        &self,
+        name: &str,
+        state_dir_env: Option<&std::ffi::OsStr>,
+    ) -> anyhow::Result<PathBuf> {
         if honoured_state_dir(state_dir_env).is_some() {
-            return Ok(self.state_dir.join("files"));
+            return Ok(self.state_dir.join(name));
         }
-        Ok(resolve_cache_dir(self.kind, self.app_label)?.join("files"))
+        Ok(resolve_cache_dir(self.kind, self.app_label)?.join(name))
     }
 
     /// Where the file store goes when [`Self::files_dir`] resolves to a
@@ -655,6 +680,11 @@ pub fn unrecognized_profile_env() -> Option<String> {
 /// [`crate::session_launch::spawn_and_read_verdict`] *writes* a derived
 /// value onto the `roost-session` it spawns. Frozen by a test.
 pub const STATE_DIR_ENV: &str = "ROOST_STATE_DIR";
+
+/// The leaf of [`BundleProfile::agent_integration_dir`]. Public because
+/// it is also the marker that tells a Roost-materialized plugin path
+/// apart from a user's own in an inherited environment value.
+pub const AGENT_INTEGRATION_DIR_NAME: &str = "agent-integration";
 
 /// The one rule for a `ROOST_STATE_DIR` value: a non-empty, absolute
 /// path is honoured, anything else is not.
@@ -2624,6 +2654,25 @@ mod tests {
             );
             assert!(dir.ends_with("files"));
         }
+    }
+
+    #[test]
+    fn agent_integration_dir_follows_the_files_dir_rule() {
+        let base = BundleProfile::session().expect("session profile");
+        let isolated = Some(std::ffi::OsStr::new("/tmp/roost-isolated-state"));
+        assert_eq!(
+            base.cache_subdir_with(AGENT_INTEGRATION_DIR_NAME, isolated)
+                .expect("dir"),
+            base.state_dir.join("agent-integration")
+        );
+        let cached = base
+            .cache_subdir_with(AGENT_INTEGRATION_DIR_NAME, None)
+            .expect("dir");
+        assert_eq!(
+            cached.parent(),
+            base.files_dir_with(None).expect("files dir").parent()
+        );
+        assert!(cached.ends_with("agent-integration"));
     }
 
     /// A missing / unusable `$HOME` is only fatal when it is actually
