@@ -3178,7 +3178,7 @@ async fn wait_for_output(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
@@ -3649,14 +3649,7 @@ pub(crate) mod tests {
         let not_a_tty = Arc::new(OwnedFd::from(File::open("/dev/null").expect("/dev/null")));
         set_line_discipline(&slave, true, false);
 
-        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let writer = Arc::clone(&captured);
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .with_writer(move || CapturedLog(Arc::clone(&writer)))
-            .finish();
-        let seen = tracing::subscriber::with_default(subscriber, || {
+        let (seen, log) = crate::test_log::capture(tracing::Level::DEBUG, || {
             let mut sampler = PasswordSampler::default();
             let mut seen = reports(sampler.tick(&[probe(3, 1, &master)]));
             for _ in 0..3 {
@@ -3666,25 +3659,11 @@ pub(crate) mod tests {
         });
 
         assert_eq!(seen, [(3, 1, true), (3, 1, false)]);
-        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
         assert_eq!(
             log.matches("tcgetattr on the pty master failed").count(),
             1,
             "{log}"
         );
-    }
-
-    pub(crate) struct CapturedLog(pub(crate) Arc<Mutex<Vec<u8>>>);
-
-    impl Write for CapturedLog {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
 
     /// A tab id respawned under a raised flag: the replacement's first

@@ -40,8 +40,9 @@ a symlinked component, and both `/tmp` (Linux) and `$TMPDIR`
 (`/var/folders/...` on macOS) reach the real path through one.
 
 `HOME` alone is not the whole story once a client can send
-`session.set_agent_hooks`: the five agent config directories are each
-relocatable by an absolute path in the environment, so they are stripped
+`session.set_agent_hooks`: the four relocatable agent config directories
+(cursor follows `HOME`) can each be named by an absolute path in the
+environment, so they are stripped
 from every launch here and `SessionEnv.jail_agents()` re-points them
 inside the profile's root. A test that wants a session to write hook
 entries calls it, and from then on every launch asserts the jail before
@@ -487,7 +488,7 @@ class SessionEnv:
 
     # -- the agent-hooks jail ---------------------------------------------
     def jail_agents(self, **options) -> "agent_jail.Jail":
-        """Point this session's five agent config directories — and its
+        """Point this session's relocatable agent config directories — and its
         `config.conf` — inside its own root, so `session.set_agent_hooks`
         cannot reach a real dotfile (plan 046 §3.9, plan 064 §3.3).
 
