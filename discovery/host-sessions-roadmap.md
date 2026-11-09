@@ -312,7 +312,7 @@ adopted from Herdr:
   size (no SIGWINCH storm into TUI agents). Tabs created while
   detached get a configured headless default (e.g. 120×40).
   *Superseded by plan 084 /
-  [DL-31](../docs/development/vision.md#dl-31-a-tab-has-one-size-owner-2026-10-30)
+  [DL-31](../docs/development/decision-history.md#dl-31-a-tab-has-one-size-owner-2026-10-30)
   (2026-10-30): a tab has one size owner. A detach by the owner hands
   the size to another attachment at once, so it can resize; with nobody
   left the tab keeps its size and has no owner, which is where this
@@ -1051,7 +1051,7 @@ launch-time migration above is its prerequisite, now shipped — the
 remaining work is the product decision to flip and ship it, not new
 mechanism. See [`guides/host-sessions.md`](../docs/guides/host-sessions.md#switching-the-local-backend)
 for the shipped switch and
-[`development/vision.md`'s DL-27](../docs/development/vision.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14)
+[`development/decision-history.md`'s DL-27](../docs/development/decision-history.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14)
 for the decision record.
 
 ---

@@ -4,6 +4,10 @@ Status: **discovery** — not a commitment. Written 2026-08-22 as a
 companion to [`host-sessions.md`](host-sessions.md). Host sessions
 should not wait on this; this should not wait on SSH.
 
+**Update 2026-11-08:** [`agent-integration.md`](agent-integration.md)
+supersedes the "Two philosophies" table, the Codex spike step (shipped) and
+the idea that screen rules come second. Read it first.
+
 Roost already hosts agents and routes attention (OSC 133, Claude
 hooks, four-axis state, sidebar rollup, notifications). Herdr watches
 *many* agents, including ones that never grew a hook API, by reading

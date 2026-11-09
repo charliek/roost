@@ -680,8 +680,9 @@ exceptions rather than global law:
 - **No rendered output over the wire** — still true for the hot
   path (PTY bytes + a snapshot/formatter blob on attach, not cell
   frames every redraw).
-- **No multi-window** / **no split-pane** — not required for MVP;
-  the session/client split is what makes them tractable later.
+- **No multi-window** — not required for MVP. Split panes are under
+  discovery (`discovery/split-panes.md`) rather than a non-goal; the
+  session/client split is what makes both tractable later.
 
 Do not edit `docs/development/vision.md` from this discovery file.
 Revise those DLs in the implementation plan that actually builds

@@ -34,8 +34,8 @@ now. They are a candidate for removal later if few users want them (see
 [Retiring in-process local tabs](#retiring-in-process-local-tabs-later)).
 
 **Still non-goals.** These match `docs/index.md` and the project
-instructions: no browser or HTML viewer, not multi-window, no split
-panes. Also, **a full-screen TUI cannot be laid out differently for two
+instructions: no browser or HTML viewer, not multi-window. (Split panes
+left the non-goals on 2026-11-08 and are under discovery.) Also, **a full-screen TUI cannot be laid out differently for two
 screens at once**. A program sees exactly one window size per PTY, and
 tmux has the same limit. What *can* differ per machine is Roost's own
 chrome (sidebar, tab strip, font) and how a client shows a grid that
@@ -49,7 +49,7 @@ so most of the hard part has shipped.
 | Capability | Where it's pinned |
 |---|---|
 | Any number of clients can attach to one tab at once | R15 / plan 057, `docs/development/host-sessions.md` "Known limitations" |
-| Any client can type. No ownership, no "steal" step | DL-25, DL-26 in `docs/development/vision.md` |
+| Any client can type. No ownership, no "steal" step | DL-25, DL-26 in `docs/development/decision-history.md` |
 | Notifications go to every client; the one viewing the tab acknowledges for everyone | #474, `docs/guides/host-sessions.md` "Several windows on one session" |
 | Which tab you're viewing, and per-project tab memory, are per-client and never sent to the session | `docs/guides/host-sessions.md` (troubleshooting, last row) |
 | OSC 52 clipboard writes land only on clients viewing that tab | `docs/development/host-sessions.md` "Effects fan out" |
@@ -179,7 +179,7 @@ this context doesn't look at."
 
 **Status: merged: #663 (plan 084).** The
 [decision above](#decided-2026-10-28-protocol-7-release) and
-[DL-31](../docs/development/vision.md#dl-31-a-tab-has-one-size-owner-2026-10-30)
+[DL-31](../docs/development/decision-history.md#dl-31-a-tab-has-one-size-owner-2026-10-30)
 are what shipped; how it came out is in
 [protocol-7-release.md](protocol-7-release.md) § M3. What follows is the
 pre-decision analysis, kept as written: "Today's rule" is the rule before
