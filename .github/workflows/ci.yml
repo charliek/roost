@@ -2305,11 +2305,8 @@ jobs:
   # inject_pointer.py) through tools/input/linux/iced_wayland_clipboard_check.py,
   # whose checks include `_wayland_tab_reorder` — a real compositor-seat tab drag.
   #
-  # NON-BLOCKING (continue-on-error + absent from ci-success). Its retired gtk
-  # predecessor (e2e-gtk-wayland-drag) failed 3 of 21 sampled `main` runs with
-  # "window_metrics returned no window size" — harness-shaped (the injector never
-  # got a window geometry back), not product-shaped. Gather signal on this lane
-  # before promoting it to required; see #328.
+  # Required (in ci-success) since #336: after PR #694 fixed its two harness
+  # bugs it passed every run that reached the step, on main and on branches.
   #
   # ROOST_REQUIRE_REAL_INPUT=1 is LOAD-BEARING: without it the script exits 0
   # with a SKIP line whenever cage, /dev/uinput, or the binary is missing, and
@@ -2379,7 +2376,6 @@ jobs:
           echo "LIBSEAT_BACKEND=seatd" >> "$GITHUB_ENV"
 
       - name: Iced Wayland clipboard + pointer-drag guard (cage + uinput)
-        continue-on-error: true
         timeout-minutes: 15
         env:
           ROOST_TEST_MODE: "1"
@@ -2395,8 +2391,7 @@ jobs:
         # the ONLY durable record — tee it to a file and upload it below.
         # `shell: bash` already implies `-eo pipefail`; the explicit `set` keeps
         # the script's exit status (not tee's) as the step result even if that
-        # shell line is ever dropped, so continue-on-error still records a real
-        # `outcome: failure`.
+        # shell line is ever dropped.
         shell: bash
         run: |
           set -o pipefail
@@ -2726,11 +2721,9 @@ jobs:
   # Single required check. Always runs; passes iff no gated job failed (skipped
   # jobs are fine — that's the path-filter doing its job).
   ci-success:
-    # Every job but e2e-iced-wayland-drag, which is deliberately NOT here:
-    # it is a non-blocking signal lane (see its job comment).
-    # tools/roosttest_unit/test_ci_contract.py fails if any other job is
+    # Every job. tools/roosttest_unit/test_ci_contract.py fails if one is
     # missing, so adding a job is this one line.
-    needs: [changes, rust-lint, harness-unit, scripts, rust-build, iced-build-e2e, iced-release, session-e2e, mobile, mobile-android]
+    needs: [changes, rust-lint, harness-unit, scripts, rust-build, iced-build-e2e, iced-release, session-e2e, e2e-iced-wayland-drag, mobile, mobile-android]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
