@@ -1,18 +1,34 @@
-# Agent Hooks
+# Agent integration
 
-Roost drives the tab dot, the sidebar rollup, and the desktop banner for
-five coding agents — Claude Code, Codex, OpenCode, grok (and its fork
-gx), and cursor-agent — by wiring one hook entry per lifecycle event into
-each agent's own configuration file. A sixth, craze, needs no wiring at
-all: it reports its own state over the socket, which any agent can do
-([Reporting directly, without a hook](#reporting-directly-without-a-hook)).
-Agents that speak OSC 7501 also report through the terminal itself, with
-nothing to wire ([Program status](#program-status-osc-7501)). Roost **asks before it wires
-anything**: the first time the UI starts with no answer on file and at
-least one supported agent installed, a consent dialog opens naming
-what it found, and nothing is written into any agent's config until you
-choose. It works the same way on a remote host session, with one
-difference — see [Remote hosts](#remote-hosts).
+Roost drives the tab dot, the sidebar rollup, the Agents panel and the
+desktop banner for the coding agents you run in its tabs. **It connects
+them without editing their settings files**:
+
+- **Claude Code and OpenCode** get Roost's hooks from the tab's
+  environment. Every Roost tab names a plugin folder Roost owns in
+  `CLAUDE_CODE_PLUGIN_DIRS` and an OpenCode plugin in
+  `OPENCODE_CONFIG_CONTENT`, added to any value you set yourself. Nothing
+  is written under `~/.claude` or `~/.config/opencode`.
+- **Codex and Grok** report their own status to the terminal over [OSC
+  7501](#program-status-osc-7501). Roost installs nothing for them. So do
+  crush and pi.
+- **Cursor** (cursor-agent) reads its turn-end hook only from its own
+  `~/.cursor/hooks.json`, so it is the one agent Roost connects by
+  writing a file. That is an opt-in, off until you turn it on.
+
+All of these are on by default except Cursor, with no question asked.
+Roost shows a card at startup only when it has something to ask: Cursor
+is installed and you have not answered yet ([The Agent Integration
+card](#the-agent-integration-card)). Each agent has an off switch.
+
+Upgrading from a release that wrote hook entries into the agents' files
+removes those entries once, automatically, keeping a backup, and only
+the ones Roost can prove it wrote ([Upgrading: the retire](#upgrading-the-retire)).
+
+A sixth agent, craze, reports its own state over the socket, which any
+agent can do ([Reporting directly, without a hook](#reporting-directly-without-a-hook)).
+Remote hosts follow the same rules on their own `roost-session`; see
+[Remote hosts](#remote-hosts).
 
 ## Supported agents
 
@@ -21,18 +37,19 @@ lifecycle, attention, and free-form metadata — over one wire op
 (`tab.agent_report`, [`ipc.md`](../reference/ipc.md#tabagent_report)).
 What differs is where each signal comes from:
 
-| Agent | `source` | Config file Roost writes into | Blocked signal | Turn-end signal | Interrupt signal |
+| Agent | `source` | How Roost connects it | Blocked signal | Turn-end signal | Interrupt signal |
 |---|---|---|---|---|---|
-| Claude Code | `claude` | `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`) — merged in beside your own hooks | `PermissionRequest` (immediate); the `Notification` types `agent_needs_input` and `elicitation_dialog` also set it, unconditionally | `Stop` | none — the post-turn `idle_prompt` notification is the only later signal, guarded so it can't overwrite a real `waiting`/`failed` |
-| Codex | `codex` | `~/.codex/hooks.json` + `[hooks.state]` in `config.toml` (or `$CODEX_HOME`) | `PermissionRequest` | `Stop` | `Interrupt` |
-| grok / gx | `grok` | `$GROK_HOME/hooks/roost.json` (default `~/.grok`) — a file Roost owns outright | `Notification` `notificationType: permission_prompt` | `Stop` on its first fire; a fire with `stopHookActive: true` (a blocking Stop gate already continued the turn) keeps `working` instead, and the `idle_prompt` Notification settles it | `StopCancelled` |
-| cursor-agent | `cursor` | `~/.cursor/hooks.json` (or `$CURSOR_CONFIG_DIR`) — merged in beside your own hooks | none — an accepted gap, see [Per-agent caveats](#per-agent-caveats) | `stop` | `stop` (same event as turn-end; see caveats) |
-| OpenCode | `opencode` | `~/.config/opencode/plugins/roost-agent-state.js` (or `$OPENCODE_CONFIG_DIR`) — a plugin Roost owns outright, not a command hook | `permission.asked` / `question.asked` | `session.idle` | `session.error` |
+| Claude Code | `claude` | the `roost` plugin folder named in `CLAUDE_CODE_PLUGIN_DIRS`; nothing written to `~/.claude` (needs Claude Code 2.1.280 or newer) | `PermissionRequest` (immediate); the `Notification` types `agent_needs_input` and `elicitation_dialog` also set it, unconditionally | `Stop` | none — the post-turn `idle_prompt` notification is the only later signal, guarded so it can't overwrite a real `waiting`/`failed` |
+| Codex | `codex` | OSC 7501, built in; nothing installed. Older releases wrote `~/.codex/hooks.json` + `[hooks.state]` in `config.toml` | `PermissionRequest` | `Stop` | `Interrupt` |
+| Grok | `grok` | OSC 7501, built in; nothing installed. Older releases wrote `$GROK_HOME/hooks/roost.json` | `Notification` `notificationType: permission_prompt` | `Stop` on its first fire; a fire with `stopHookActive: true` (a blocking Stop gate already continued the turn) keeps `working` instead, and the `idle_prompt` Notification settles it | `StopCancelled` |
+| cursor-agent | `cursor` | opt-in: Roost's entries merged into `~/.cursor/hooks.json` (or `$CURSOR_CONFIG_DIR`) beside your own hooks | none — an accepted gap, see [Per-agent caveats](#per-agent-caveats) | `stop` | `stop` (same event as turn-end; see caveats) |
+| OpenCode | `opencode` | a plugin named in `OPENCODE_CONFIG_CONTENT`; nothing written to `~/.config/opencode` | `permission.asked` / `question.asked` | `session.idle` | `session.error` |
 | craze | `craze` | none — craze reports directly, no hook install | a permission, question or plan card is open | turn end → `finished`, banner body "Turn complete" | Esc → `finished` with attention cleared |
 
-grok/gx's `StopFailure` maps to `failed`, its banner body carrying gx's
-`errorDetails` (or `error_details`) verbatim rather than just the
-classified error name.
+The Codex and Grok columns describe the hook events an older release's
+file entries delivered; today both report over OSC 7501 instead. A
+`StopFailure` from such an entry maps to `failed`, its banner body
+carrying the agent's `errorDetails` (or `error_details`) verbatim.
 
 Claude and cursor also load hooks from `~/.claude/settings.json`
 themselves (grok can be configured to, and cursor always does via its
@@ -208,150 +225,189 @@ The rules you see:
 `roostctl tab list --json` carries the summary as `program_status` on
 each tab ([`ipc.md`](../reference/ipc.md#tabprogram_status-osc-7501)).
 
-## Roost asks once
+## The Agent Integration card
 
-Roost never writes into an agent's config file before you've said yes.
-`agent-hooks` in `config.conf` has three states — a list of agent names,
-`off`, or **absent**, which means nobody has answered yet:
+Which agents Roost connects is one `config.conf` key,
+[`agent-integration`](../reference/config.md#agent-integration). Absent
+means the defaults: every agent on except Cursor. So a fresh install
+connects Claude Code, OpenCode, Codex and Grok without asking, because
+none of them needs a file changed.
 
-- **Absent (a fresh install).** The first time the UI starts with no
-  answer on file *and* at least one of the five agents installed, a
-  consent dialog opens — the **Agent Hooks…** card — naming which agents it found and letting you
-  pick which to wire, or none. Nothing is written before you answer it.
-  It reopens on demand from the command palette (or, on Mac, the View
-  menu) as the same **Agent Hooks…** row, bound to the default-unbound
-  `agent_hooks` keybind action, so you can revisit the choice later.
-- **A list.** At startup — the UI and (on connect)
-  a host session — Roost runs the equivalent of `roostctl agent ensure`:
-  for every agent the list names whose config directory exists on that
-  machine, it makes sure Roost's hook entry is present and current,
-  merging in beside whatever else is already in that agent's config.
-- **`off`.** Nothing is wired at startup. See [How to opt
-  out](#how-to-opt-out) for what this does and doesn't remove.
+**The startup card appears only when it has something to ask**: Cursor
+is installed and nobody has answered yet. It carries one row, Cursor,
+unchecked, and names the installed agents that are already connected.
+"Continue" records your answer (the defaults, plus Cursor if you checked
+it), and the card never comes back. "Decide later" writes nothing, so
+the card returns at the next launch. Without Cursor installed there is no
+card at all; install Cursor later and the card appears at the next launch.
 
-The UI shows a one-line toast the first time any agent is
-*newly* wired on a machine, naming which ones and how to undo it; after
-that, refreshes on upgrade are silent. A machine wired only through
-`roostctl` stays unannounced until the UI runs there too, or you check
-by hand.
-`roostctl agent status` and `roostctl doctor`'s `Agents` section are the
-durable way to see what's wired without waiting for a toast.
+**Preferences.** **Agent Integration…** in the command palette (and, on
+Mac, the View menu; the keybind action is `agent_hooks`, unbound by
+default) opens the same card with a switch for every agent and a status
+line for each:
 
-If the startup wiring can't set up an agent that the list names and
-that is installed, the iced UI says so in the same toast, for example
-`Agent hooks: couldn't set up claude — run roostctl agent status`.
-This happens when the agent's config file doesn't parse, isn't the shape
-the agent documents, or is a file Roost owns by name but didn't write,
-or when the file can't be read or written at all. The toast
-comes back on every launch while the problem lasts. To silence it, fix
-the file (`roostctl agent status` names it), or drop the agent from the
-`agent-hooks` key. An agent Roost couldn't wire is never announced as
-wired, so its one-time announcement still comes once the file is fixed.
+- `Connected · nothing written`: Claude Code or OpenCode, through the
+  tab environment.
+- `Built in`: Codex or Grok, which report over OSC 7501.
+- `Off`: switched off.
+- `Skipped: blocked by your organization's Claude policy`: see [Claude's
+  plugin policy](#claudes-plugin-policy).
+- `wired v3` (or `found, not wired`, `wired v2, out of date`, …): Cursor's
+  file entry.
+- Any of these followed by what the retire left behind, or an old entry
+  that came back.
 
-Every entry Roost installs invokes `roostctl` (or `roost-session` on a
-host) indirectly, through the `$ROOST_AGENT_HOOK` environment variable
-every Roost tab is given — never a baked-in absolute path — so the exact
-same command string works after a relocated install, on a second
-machine, or over a host session; see [How
-`ROOST_AGENT_HOOK` works](../reference/cli.md#environment).
+"Apply" writes `agent-integration`. Switching Claude Code or OpenCode off
+reaches the next tab you open; tabs already running keep their
+environment. Switching Cursor on writes its entry into
+`~/.cursor/hooks.json`; switching it off takes the entry out.
 
-## How to opt out
+The switches for Codex and Grok are recorded but have no effect yet:
+both report over OSC 7501 on their own, and Roost does not yet ignore an
+agent you switched off.
 
-One `config.conf` key, read by both UIs and by `roostctl agent ensure`:
+### Toasts
+
+Each is shown once, never as a dialog:
+
+- After an upgrade that removed old entries: which agents now connect
+  without their settings files, where the backup is, and how many entries
+  Roost left in place.
+- After an upgrade from `agent-hooks = off`: Claude Code and OpenCode
+  can now connect without editing their settings files, and they stay
+  off.
+- While Claude's plugin policy blocks Roost's plugin: that Claude Code
+  isn't connected. It is said again only if the policy lifts and returns.
+- When Roost wires Cursor's file: that it did, and where to change it.
+- If Cursor's file cannot be wired (it doesn't parse, for example): a
+  line that comes back on every launch until the file is fixed or Cursor
+  is switched off.
+
+`roostctl agent status` and `roostctl doctor`'s `Agents` section say the
+same things durably.
+
+### Claude's plugin policy
+
+An organization can set `disableSideloadFlags` in Claude Code's managed
+settings. Claude then refuses to start with `CLAUDE_CODE_PLUGIN_DIRS`
+set. Roost checks before it hands Claude the variable: a managed-settings
+file under `/etc/claude-code` (`/Library/Application Support/ClaudeCode`
+on macOS), Claude's cached server settings, and `claude plugin list
+--json` run once in the background with the variable set. If the policy
+is there, Roost leaves Claude's variable out, so Claude starts normally,
+and its status still shows over OSC 7501. Doctor names the policy and
+where it was found; switch Claude Code off under Agent Integration… to
+silence the line. Roost never works around the policy, for example with
+`--settings`.
+
+## Upgrading: the retire
+
+Releases before this one wrote hook entries into each agent's own
+settings: `~/.claude/settings.json`, `~/.codex/hooks.json` and
+`config.toml`, `$GROK_HOME/hooks/roost.json`, and
+`~/.config/opencode/plugins/roost-agent-state.js`. With the agents
+connected another way, those entries would report every event twice.
+So the first launch of this release **retires** them, once per machine,
+for every agent Roost no longer connects by file. Cursor's entries stay
+while Cursor is on, and while its question is unanswered.
+
+**Only what Roost can prove it wrote is removed:**
+
+- a handler whose command is exactly one an earlier release wrote, with
+  exactly the keys and values that release wrote, in a group with
+  nothing else in it;
+- Grok's `roost.json` when it holds only Roost's entries;
+- the OpenCode plugin file when it is byte for byte the one an earlier
+  release wrote;
+- a Codex trust key with Roost's own hash, and `[features] hooks` put
+  back as it was, but only when no other hooks remain.
+
+Anything else is **left in place and reported**: an entry you edited
+(`edited`), one in a group with a `matcher` or another key (`annotated`),
+a second copy (`duplicate`), a Codex entry something follows (`shifted`),
+a file Roost's printer would reformat (`would_reformat`), a file that
+doesn't parse (`unreadable`, retried at each launch), a `roost.json`
+with someone else's entries in it (`foreign`), or a file that kept
+changing under the retire (`changed_underneath`). A leftover still runs,
+so that agent's events arrive twice until you remove it by hand;
+`roostctl agent status` and doctor name the file and event.
+
+**Backups.** Every file the retire changes or deletes is copied first to
+`~/.config/roost/agent-backups/v4/<agent>/`, with an `index.json` naming
+each original. The first backup of each file is always kept, plus the
+newest ones, three in all. To roll a file back, copy its backup over it;
+there is no restore command, because a restore would overwrite whatever
+you or the agent changed since.
+
+**Once, never chased.** The retire runs once per agent at this version.
+If an old entry comes back afterwards (a synced dotfile, an older Roost
+on another machine), `agent status` and the card report it as
+`came_back` and it is not removed again; `roostctl agent uninstall
+<agent>` takes it out.
+
+**The keys.** An earlier answer carries over: `agent-hooks = off`
+becomes `agent-integration = off`, and a list becomes the same choice in
+`agent-integration`. `agent-hooks` is then narrowed to the agents Roost
+still connects by file (`cursor`, or `off`). An older Roost on the same
+machine reads only that key, so it does not put Claude's entries back.
+
+**A local `roost-session`.** When your local tabs run on a
+`roost-session`, the UI leaves the retire to that session's own start,
+because an older session's tabs still need the file entries. Restart the
+session (the UI offers this after an upgrade) and it retires them.
+
+## How to turn an agent off
 
 ```conf
-agent-hooks = claude, codex   # a list, off, or absent (nobody has answered yet)
+agent-integration = -opencode          # every default but OpenCode
+agent-integration = cursor             # the defaults, plus Cursor
+agent-integration = off                # nothing
 ```
 
-The value is a comma list of any of `claude`, `codex`, `grok`, `cursor`,
-`opencode` — normalised trimmed, lowercased, de-duplicated, and
-reordered into that same canonical order — or the literal `off`. A name
-the parser doesn't recognize is dropped with a warning rather than
-failing the whole value; the retired `auto`/`on`/`true`/`yes` spellings,
-and anything mixing one of those reserved words with a real name, now
-parse back as **absent** (unanswered) with a warning, not as "wire
-everything". See [`config.md`](../reference/config.md#agent-hooks) for
-the full parsing rules.
+The value records **departures from the defaults**, so an agent a later
+release adds takes its own default rather than being switched off by a
+list written before it existed. `-name` turns an agent off, a bare name
+turns it on, and `off` turns everything off (`off, cursor` is only
+Cursor). See [`config.md`](../reference/config.md#agent-integration).
 
-**`off` means two different things, deliberately.** On the machine
-whose `config.conf` says `off`, the UI does nothing at all — it never
-opens an agent's config file, at startup or ever. That is the whole of
-what the key does locally, and it is worth being exact about the part
-that surprises people: **restarting the UI removes nothing.** Entries
-already on disk stay exactly where they are until you run one of the two
-commands that take them out, or reopen the consent dialog and choose
-`off`/fewer agents there:
+The card's Apply and `roostctl agent set` write a full list, which reads
+the same way. `agent-hooks`, the older key, is only read once, to carry
+an answer over; see [`config.md`](../reference/config.md#agent-hooks).
+
+A switch changes what the **next** tab gets. Tabs already running keep
+the environment they started with, and a Claude or OpenCode already
+running keeps the plugin it loaded.
+
+## Commands
 
 ```bash
-roostctl agent uninstall --all   # or a single agent name
-roostctl agent ensure            # reads the same key; on `off`, unwires
+roostctl agent status [--json]              # per agent: delivery, switch, policy, leftovers
+roostctl agent set claude,codex,cursor      # via the running UI: the switches here, raise every connected host
+roostctl agent set off --local              # write the switches here directly, with nothing running
+roostctl agent ensure [--json] [--startup]  # run the retire if due, then reconcile Cursor's file
+roostctl agent install <agent>|--all        # explicit: write an agent's file entries anyway
+roostctl agent uninstall <agent>|--all      # remove any entry whose command is Roost's
 ```
 
-`agent ensure` is the same verb the UIs run at startup with `--startup`
-(never removing); run bare, by hand, while the key says `off` (or names
-fewer agents than are wired), it removes Roost's entries from whatever
-the key does not allow. Nothing else does — a launch never undoes a hook
-someone added by hand, and never reacts to a key that changed while the
-app was closed. See [Remote hosts](#remote-hosts) for how a host session
-handles the same key differently — it can only ever be **raised**, never
-lowered, by a connecting client.
+`agent status --json` reports, per agent, `on`, `delivery` (`env`,
+`7501`, `file`, or `none` when switched off or blocked by Claude's
+policy), `policy` for Claude, `retired` (version, time, backups,
+leftovers with their reasons) and `came_back`. Every verb but bare `set`
+works with nothing running. See
+[`cli.md`](../reference/cli.md#agent-subcommands).
 
-## How to override
+`agent install` still writes any agent's file entries when you ask for
+it by name, for an agent outside Roost tabs, say. Inside a Roost tab
+Claude Code then gets its hooks twice, from the file and from the
+plugin. `agent uninstall` removes any handler whose command is Roost's,
+the looser rule an explicit request may use.
 
-**Wire one agent regardless of the config key** — explicit always wins
-over `agent-hooks = off`:
+`roostctl claude install` remains a bare alias of `agent install claude`.
 
-```bash
-roostctl agent install codex
-```
-
-**Hand-edit beside Roost's entries.** Because ownership is exact string
-match (see [Ownership](#ownership) below), anything you add next to
-Roost's hook group — another handler on the same event, a `matcher`, a
-comment in a TOML file — is untouched by `agent ensure`, `agent
-install`, or `agent uninstall`. Editing Roost's *own* entry (say,
-changing its timeout) makes it stop being recognized as Roost's; the
-next `ensure` treats the agent as needing a refresh, and doctor calls it
-out as a modified entry rather than silently overwriting your edit or
-silently leaving it be.
-
-## Install
-
-`roostctl agent ensure --startup` is exactly what the UIs run at
-startup — wire and refresh what the key names, remove nothing. The
-other verbs are the manual controls doctor points at, including the one
-that answers the consent question from a terminal:
-
-```bash
-roostctl agent status                       # per agent: present, wired@vN, up to date
-roostctl agent ensure [--json] [--startup]  # reconcile to `agent-hooks`; --startup never removes
-roostctl agent set claude,codex             # via the running UI: set the key here, raise every connected host
-roostctl agent set claude,codex --local     # set `agent-hooks` here directly, with nothing running
-roostctl agent install <agent>|--all
-roostctl agent uninstall <agent>|--all
-```
-
-Every verb but bare `set` reads and writes dotfiles directly, so it
-works with nothing running, which is exactly when a new machine needs
-it; `agent status` reports each agent's file-level wiring — not the
-state record, which only supplies the integration version — so deleting
-`<config dir>/roost/agent-hooks.json` by hand doesn't make a correctly
-wired agent lie about itself. See [`cli.md`](../reference/cli.md#agent-subcommands)
-for `set`'s full behavior, including what it does over a running UI.
-
-`roostctl claude install` remains a bare alias of `agent install claude`
-(exit 0 when already wired). It no longer writes
-`~/.config/roost/claude-settings.json` or prints a shell alias — see
-[Legacy Claude settings](#legacy-claude-settings) if you're migrating off
-that older mechanism.
-
-Every write goes through one advisory lock per agent config directory,
-so the UI, `roostctl`, and a remote connect can all
-run `ensure` at the same time without racing each other; a plan
-re-checks the file's content immediately before writing and skips
-(reporting `changed-underneath`) rather than clobbering a file that
-moved in between — Claude rewrites its own `settings.json` on its own
-schedule, so this is a real race, not a theoretical one.
+Every write goes through one advisory lock per config file, so the UI,
+`roostctl` and a host session never race; a plan re-checks the file
+immediately before writing and skips it (`changed-underneath`) rather
+than overwriting a file that moved in between.
 
 ## Ownership
 
@@ -601,11 +657,25 @@ first time someone notices the extra process per tool call.
 
 ## Remote hosts
 
+A host's `roost-session` connects agents the same way for the tabs it
+serves: it puts the plugin variables into each tab's environment from
+**its own** `agent-integration`, so Claude Code and OpenCode on a host
+need nothing written there either, and Codex and Grok report over OSC
+7501 through the ssh session. A v4 `roost-session` also runs the retire
+at its own start, so a host comes clean of an older release's entries
+even before an upgraded client connects; the backups are on the host.
+
+What a connecting client still sends is the file half: its own
+`agent-hooks` key, which now names only the agents Roost connects by
+file (Cursor). The rest of this section is about that key.
+
 **Every machine, including a host, has exactly one `agent-hooks`
 setting: the key in its own `config.conf`.** There is no separate host
 stance. What plan 064 changed is what a *connecting client* may do to
 that key — and the answer, stated plainly because it's the contentious
-part, is: **raise it, never lower it.**
+part, is: **raise it, never lower it.** A raise naming an agent Roost no
+longer connects by file is recorded and reported back as skipped (`no
+file needed`); nothing is written for it.
 
 Right after connecting, a client whose own `agent-hooks` names at least
 one agent sends that list to the host as the `session.set_agent_hooks`
@@ -688,6 +758,11 @@ already run arbitrary commands there via `tab.open`. The third does
 widen the surface, on purpose, and the opt-out is the answer to it.
 
 ## gx
+
+Roost no longer installs anything for gx: Grok is connected over OSC
+7501 only, and gx does not speak it. What follows describes what a gx
+run reports through an entry an older release wrote, until the retire
+removes it.
 
 gx is a fork of grok that shares grok's config file and reports through
 the same adapter — it shows up as `source: "grok"`, same as stock grok;
@@ -895,9 +970,14 @@ what you'd otherwise have to guess at, per agent:
 
 - `agent.hook_binary` — is `$ROOST_AGENT_HOOK` set and does it resolve
   to something executable, from inside a tab.
-- `agent.<name>.wired` — is Roost's entry present, and at which
-  integration version (a stale version means the next `ensure` still
-  has something to do, not that anything is broken).
+- `agent.<name>.wired` — how that agent is connected. For Claude Code
+  and OpenCode, "connected through the tab environment"; for Codex and
+  Grok, "reports over OSC 7501"; either one switched off, or Claude
+  skipped by its organization's plugin policy (with where the policy
+  was found). It also names an old Roost entry still in the agent's
+  file — a retire leftover, or one that came back — as the cause of
+  doubled events, and the backup the retire made. For Cursor: is Roost's
+  entry present, and at which integration version.
 - `agent.<name>.owning` — does that source currently own a tab on this
   UI (not a durable "ever observed" record — just right now).
 - `agent.codex.trust` — does the trust hash on disk match what codex
@@ -909,6 +989,13 @@ what you'd otherwise have to guess at, per agent:
 `-v` breaks the section out per agent; the plain summary line names
 whichever fact is most actionable. Every `warn`/`fail` links back to the
 exact section above that explains it.
+
+If Claude Code or OpenCode never reports, check that the tab has the
+variables: `CLAUDE_CODE_PLUGIN_DIRS` should end with a folder under
+Roost's `agent-integration` cache directory, and `OPENCODE_CONFIG_CONTENT`
+should name Roost's plugin. A tab opened before you switched the agent
+on does not have them; open a new one. Claude Code older than 2.1.280
+ignores the variable.
 
 If a hook genuinely never fires, check first whether something strips
 the tab's environment before the agent sees it — a wrapper using `env

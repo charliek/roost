@@ -2619,7 +2619,7 @@ real UI over this socket and nothing else, so without a seam onto the
 host dialog family (`HostDialog::{Add, ConfirmStop, ConfirmRestart,
 Bootstrap}` — [Host sessions (development)](../development/host-sessions.md#bootstrap-installupgrade-over-ssh))
 the consent card the SSH bootstrap flow (plan 039) gates on — and the
-agent-hooks consent card (plan 064) — could not
+agent-integration card (plan 064) — could not
 be exercised at all. Unlike the upgrade prompt, whose button composes
 ops a test can already send directly, the bootstrap job is
 deliberately UI-only and has no such back door.
@@ -2660,48 +2660,57 @@ same value `host.connect` takes — not its label, even though the
 rendered `title` and `body` above interpolate the label. Absent when
 the dialog is not about a saved host.
 
-Two fields belong to the agent-hooks consent card (plan 064) and are
+Two fields belong to the agent-integration card (plan 064, reshaped
+when Roost stopped writing most agents' config files) and are
 absent/empty for every other dialog. `mode` is
 `"first_run" | "preferences"` — which card this is, not what it would
-do, which is why it isn't folded into `variant`. `rows` is one entry
-per agent, in the install engine's `ALL_AGENTS` order (the order the
-card draws them):
+do, which is why it isn't folded into `variant`. `rows` is one entry per
+agent the card shows, in the install engine's `ALL_AGENTS` order: every
+agent in preferences, and on first run only the installed agents Roost
+connects by writing a file (today only Cursor):
 
 ```json
 {
   "dialog": "agent_hooks",
   "mode": "preferences",
-  "title": "Agent hooks",
-  "body": "Roost adds a hook to each agent you switch on so its tabs show status and send notifications. …",
+  "title": "Agent integration",
+  "body": "Roost shows what your coding agents are doing in the sidebar, the Agents panel and notifications. …",
   "buttons": ["Cancel", "Apply"],
   "rows": [
     {
       "agent": "claude",
       "on": true,
       "found": true,
-      "status": "wired v3",
-      "files": ["/home/u/.claude/settings.json"]
+      "delivery": "env",
+      "status": "Connected · nothing written",
+      "files": []
     },
     {
-      "agent": "codex",
+      "agent": "cursor",
       "on": false,
       "found": true,
-      "status": "found, not wired",
-      "files": ["/home/u/.codex/hooks.json", "/home/u/.codex/config.toml"]
+      "delivery": "file",
+      "status": "Off",
+      "files": ["/home/u/.cursor/hooks.json"]
     }
   ]
 }
 ```
 
-`agent` is the canonical name the `agent-hooks` key uses. `on` is what
-Apply would write — prefilled from the **key**, not from what is wired,
-so an agent whose entries are on disk but which the key doesn't name
-starts off. `found` says whether that agent is installed on this
-machine. `status` is the row's status line — `"wired v3"`,
-`"wired v2, out of date"`, `"found, not wired"`, `"wired, not allowed"`,
-`"not found"` — and is `null` on the first-run card, which doesn't
-render one. `files` are the files that agent's install owns or merges
-into (two for codex).
+`agent` is the canonical agent name. `on` is what Apply (or Continue)
+would record — prefilled from `agent-integration` in preferences, and
+off for the file opt-in on first run. `found` says whether that agent is
+installed on this machine. `delivery` is how this build connects it:
+`"env"` (a plugin named in the tab environment), `"7501"` (the agent's
+own OSC 7501 reports) or `"file"` (Roost's entries in the agent's own
+config); absent from an older build. `status` is the row's status line
+— `"Connected · nothing written"`, `"Built in"`, `"Off"`, `"not
+found"`, `"Skipped: blocked by your organization's Claude policy"`, or
+for a file agent `"wired v3"`, `"wired v2, out of date"`, `"found, not
+wired"`, `"wired, not allowed"`, followed by what the retire left behind
+if anything — and is `null` on the first-run card, which doesn't render
+one. `files` are the files Roost would write, which only a file agent
+has.
 
 `app.dialog_answer` presses the visible modal's primary button, or
 dismisses it — through the same production handlers a real click or
@@ -2712,8 +2721,9 @@ here too.
 Request: `{"params": {"action": "confirm"}}` (or `"cancel"`). Response:
 `{}`.
 
-`"toggle:<agent>"` is the third action, and only the agent-hooks card
-takes it: it flips that row's switch, the same route a click on the
+`"toggle:<agent>"` is the third action, and only the agent-integration
+card takes it: it flips that row's switch (an agent with no row on the
+card is an error), the same route a click on the
 switch or Space on the focused one takes. `toggle:claude`,
 `toggle:codex`, `toggle:grok`, `toggle:cursor`, `toggle:opencode`. The
 switches are that card's answer, so a harness that can only `confirm`
@@ -2858,10 +2868,13 @@ the native popup, which no test op opens, so the op answers
 
 ### `agent.set_hooks`
 
-Set *this* machine's own `agent-hooks` key — the consent dialog's Apply
-and `roostctl agent set`'s wire path — and raise every connected
-non-localhost host to at least the same allow-list in the same call
-(plan 064 §3.4). UI-socket, like `app.*`: a session socket answers
+Set *this* machine's agent switches — the Agent Integration card's
+Continue and Apply, and `roostctl agent set`'s wire path — and raise
+every connected non-localhost host to at least the same allow-list in
+the same call (plan 064 §3.4). The list is every agent that is on: it is
+written to `agent-integration`, `agent-hooks` is narrowed to the agents
+Roost connects by file, and Cursor's file is wired or unwired to match;
+no file is written for any other agent. UI-socket, like `app.*`: a session socket answers
 `unknown-op`. Unlike [`session.set_agent_hooks`](#sessionset_agent_hooks)
 this op can *lower* the key as well as raise it — it is the path behind
 a user directly at this machine's own keyboard, where
@@ -2870,7 +2883,7 @@ is at the far end's.
 
 Request:
 ```json
-{"id": "21", "op": "agent.set_hooks", "params": {"agents": ["claude", "codex"]}}
+{"id": "21", "op": "agent.set_hooks", "params": {"agents": ["claude", "codex", "cursor"]}}
 ```
 or, to switch every agent off:
 ```json
@@ -2881,11 +2894,11 @@ Response:
 ```json
 {
   "config_path": "/home/charlie/.config/roost/config.conf",
-  "local": {"wired": ["claude", "codex"], "refreshed": [], "removed": [],
-            "skipped": [{"agent": "cursor", "reason": "not allowed"}],
+  "local": {"wired": ["cursor"], "refreshed": [], "removed": [],
+            "skipped": [],
             "errors": []},
   "hosts": [
-    {"host": "mac-mini", "result": {"wired": ["claude"], "refreshed": [],
+    {"host": "mac-mini", "result": {"wired": ["cursor"], "refreshed": [],
                                      "removed": [], "skipped": [], "errors": []}},
     {"host": "build-box", "error": "connection refused"}
   ]

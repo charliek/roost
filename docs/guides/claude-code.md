@@ -1,18 +1,21 @@
 # Claude Code Hooks
 
-Claude Code is one of five agents the [Agent Hooks](agents.md) guide
-covers — that page is the mechanism (how wiring works, how to opt out,
-the guarantee about what a merge does and doesn't touch, the
+Claude Code is one of the agents the [Agent integration](agents.md)
+guide covers — that page is the mechanism (how Roost connects each
+agent, how to switch one off, the upgrade from file entries, the
 `roostctl agent` verbs), the remote behavior, and the troubleshooting
-path shared by all five. This page is what's specific to Claude: three
-notes worth knowing plus the day-one verification walk.
+path shared by all of them. This page is what's specific to Claude:
+three notes worth knowing plus the day-one verification walk.
 
-Nothing to install by hand: once you say yes in the consent dialog Roost
-raises on first launch (or set `agent-hooks = claude` yourself in
-`config.conf`), Roost wires Claude's hooks itself. See [Agent Hooks →
-Roost asks once](agents.md#roost-asks-once) for the dialog, [Agent Hooks
-→ Install](agents.md#install) to wire it manually, and [Agent Hooks →
-How to opt out](agents.md#how-to-opt-out) to turn it off.
+Nothing to install and nothing to answer: inside a Roost tab Claude Code
+(2.1.280 or newer) loads Roost's hooks from the `roost` plugin folder
+named in `CLAUDE_CODE_PLUGIN_DIRS`, and nothing is written to
+`~/.claude`. See [Agent integration → The Agent Integration
+card](agents.md#the-agent-integration-card) for the switch, [Claude's
+plugin policy](agents.md#claudes-plugin-policy) for organizations that
+block plugin folders, and [Upgrading: the
+retire](agents.md#upgrading-the-retire) for what happens to the entries
+an older release wrote into `settings.json`.
 
 ## Three things specific to Claude
 
@@ -83,7 +86,7 @@ If a project has multiple tabs running Claude, the project's sidebar row picks u
 
 Run `roostctl doctor` first. It's read-only, covers most of the cases
 below in one pass, and names exactly which check is unhappy instead of
-you guessing from the symptom — see [Agent Hooks →
+you guessing from the symptom — see [Agent integration →
 Troubleshooting](agents.md#troubleshooting) for the full per-agent
 `Agents` section.
 
@@ -98,4 +101,4 @@ Troubleshooting](agents.md#troubleshooting) for the full per-agent
 - **OSC 9 banners still appear from inside Claude** — that means the `SessionStart` hook didn't reach Roost (no ownership claimed, so raw OSC isn't suppressed). Doctor's `tab.raw_osc` check reports whether suppression is currently active on the tab; check `roostctl identify` and re-source your rc if it isn't.
 - **The dot stopped moving after Claude errored out mid-session** — if Claude was killed or crashed without a `SessionEnd`, an OSC 133 prompt mark from the shell (reaching a fresh prompt) automatically releases the stale lifecycle and falls back to shell state; typing a command and pressing enter should clear it. See [Notifications → Hook-session OSC suppression](notifications.md#hook-session-osc-suppression) for the mechanism.
 
-See [Agent Hooks](agents.md) for the mechanism every agent shares, and [Notifications](notifications.md) for the full pipeline architecture.
+See [Agent integration](agents.md) for the mechanism every agent shares, and [Notifications](notifications.md) for the full pipeline architecture.

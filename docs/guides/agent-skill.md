@@ -4,8 +4,8 @@ Roost ships a skill — `skills/roost/SKILL.md` in the repo — that
 teaches a coding agent to drive a *running* Roost through `roostctl`:
 open a project tab running a command, send it input, read its screen,
 wait on its state, watch events, and notify the user. It's the
-outbound half of driving Roost from an agent; see [Relation to Agent
-Hooks](#relation-to-agent-hooks) below for the other half.
+outbound half of driving Roost from an agent; see [Relation to agent
+integration](#relation-to-agent-integration) below for the other half.
 
 ## Scope
 
@@ -20,25 +20,37 @@ starting Roost or guessing a socket path.
 
 ## Install
 
-Two routes install the same skill. `roostctl skill` prints the copy
-built into your `roostctl`, which matches that release; an install
-route fetches the repository's current copy, so after upgrading Roost,
-update the installed skill too.
+**Inside a Roost tab, Claude Code already has it.** Roost hands Claude
+Code its `roost` plugin through the tab environment
+(`CLAUDE_CODE_PLUGIN_DIRS`), and that plugin carries this skill beside
+Roost's hooks, as `roost:roost`. There is nothing to install and nothing
+is written to `~/.claude`. The copy is the one built into this Roost, so
+it always matches the `roostctl` it drives. See [Agent
+integration](agents.md).
 
-**The general route** ([`skills`](https://skills.sh)) installs into
-Claude Code, GitHub Copilot, OpenCode, and other agents:
+**Outside Roost tabs, or for another agent**, two routes install the
+same skill. They fetch the repository's current copy, so after
+upgrading Roost, update the installed skill too.
+
+The general route ([`skills`](https://skills.sh)) installs into Claude
+Code, GitHub Copilot, OpenCode, and other agents:
 
 ```bash
 npx skills add charliek/roost
 ```
 
-**For Claude Code specifically**, a native plugin is also available —
-it namespaces the skill as `roost:roost`:
+For Claude Code, a native plugin is also available — it namespaces the
+skill as `roost:roost`:
 
 ```text
 /plugin marketplace add charliek/roost
 /plugin install roost@roost
 ```
+
+The marketplace plugin and the plugin Roost hands its tabs share the
+name `roost`, so inside a Roost tab Claude loads only one of them, and
+`claude plugin list` showing both `roost@roost` and `roost@inline` is
+normal. The two carry the same `SKILL.md`.
 
 Either way, install Roost itself first (see the [repo
 README](https://github.com/charliek/roost#install)) — the skill is
@@ -46,7 +58,7 @@ inert without a Roost to drive.
 
 ## `roostctl skill`
 
-Prints the same `SKILL.md` the two routes above install, byte for
+Prints the same `SKILL.md` the routes above install, byte for
 byte — useful for reading it without a package manager, or for an
 agent that wants to fetch it directly rather than through a plugin
 system:
@@ -70,20 +82,21 @@ CLI it drives: the skill states the *rules* (which verb for which
 task, the target policy, the exit-code table, the recipes), and the
 installed `roostctl` states the *syntax*.
 
-## Relation to Agent Hooks
+## Relation to agent integration
 
-The skill and [Agent Hooks](agents.md) are the two directions of the
-same relationship, and neither depends on the other:
+The skill and [agent integration](agents.md) are the two directions of
+the same relationship:
 
-- **Agent Hooks are inbound.** An agent running *inside* a Roost tab —
-  Claude Code, Codex, and the others Agent Hooks covers — reports its
-  own state to Roost, so the tab dot, the sidebar rollup, and desktop
-  banners reflect what that agent is doing.
+- **Agent integration is inbound.** An agent running *inside* a Roost
+  tab — Claude Code, Codex, and the others that guide covers — reports
+  its own state to Roost, so the tab dot, the sidebar rollup, the Agents
+  panel and desktop banners reflect what that agent is doing.
 - **The skill is outbound.** An agent — the same one, or a different
   one, running anywhere it can reach the socket — drives Roost: opens
   tabs, sends input, reads output, waits on state, gets notified.
 
-A Claude Code instance running inside a Roost tab typically has both:
-its own turns show up on the tab dot through Agent Hooks, while the
-skill lets it open *other* tabs and orchestrate them. Neither
-Agent Hooks nor the skill requires the other to be installed.
+A Claude Code instance running inside a Roost tab has both from the same
+plugin: its own turns show up on the tab dot, and the skill lets it open
+*other* tabs and orchestrate them. Switching Claude Code off under
+**Agent Integration…** removes both from new tabs. Anywhere else, the
+skill installs on its own and needs no hooks.
