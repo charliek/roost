@@ -2510,6 +2510,32 @@ mod tests {
         );
     }
 
+    /// A resize away and back to the handshake grid while Requesting
+    /// leaves nothing withheld, so FINISH sends no stale away grid (#570).
+    #[tokio::test]
+    async fn a_resize_away_and_back_while_requesting_sends_nothing() {
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        assert!(matches!(attach.phase, Phase::Requesting));
+        attach.note_resize(
+            Geometry {
+                cols: 100,
+                rows: 30,
+                ..GEOMETRY
+            },
+            false,
+        );
+        attach.note_resize(GEOMETRY, false);
+        attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
+        hydrate_fully(
+            &mut attach,
+            &mut tab,
+            &feed_tx,
+            &mut feed_rx,
+            snapshot_with("x"),
+        );
+        assert_eq!(attach.test_drain_input(), vec![]);
+    }
+
     /// The withhold ends at the 2 s deadline: the RESIZE goes to the
     /// session while the payload is still hydrating, and nothing here
     /// resizes the decoder to this window's grid — a `GRID` back is what
