@@ -457,6 +457,18 @@ fn run(profile: &BundleProfile, bundle_id: Option<&str>) -> anyhow::Result<()> {
     );
     forced_test_panic();
 
+    // Before the locks and the bootstrap: without a display iced cannot
+    // make its event loop and panics only after the bootstrap has bound
+    // the socket and dialled the session (issue #712), most often when
+    // `roost` was typed over ssh in place of `roostctl`.
+    if !HOST_MACOS && !has_display(|name| std::env::var_os(name)) {
+        anyhow::bail!(
+            "no display: DISPLAY, WAYLAND_DISPLAY and WAYLAND_SOCKET are all unset. \
+             Start Roost from a desktop session; to drive a running Roost from here, \
+             use `roostctl`."
+        );
+    }
+
     // Single-instance via flock-on-pidfile, one lock per resource: the
     // socket/bind lock (taken first) and the state lock. Both are fatal
     // if they fail for any reason other than contention — starting
@@ -530,6 +542,14 @@ fn forced_test_panic() {
         }
         _ => {}
     }
+}
+
+/// Whether a Linux desktop is reachable: any of the variables winit
+/// dials an X11 or Wayland server through is set to a non-empty value.
+fn has_display(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"]
+        .into_iter()
+        .any(|name| var(name).is_some_and(|value| !value.is_empty()))
 }
 
 /// macOS `titlebar_transparent` drops the standard titlebar material so the
@@ -1433,6 +1453,18 @@ impl UiTask for app::UiTask {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+
+    #[test]
+    fn a_display_is_any_non_empty_x11_or_wayland_variable() {
+        let only = |set: &'static str, value: &'static str| {
+            move |name: &str| (name == set).then(|| value.into())
+        };
+        assert!(!has_display(|_| None));
+        assert!(!has_display(only("DISPLAY", "")));
+        assert!(has_display(only("DISPLAY", ":0")));
+        assert!(has_display(only("WAYLAND_DISPLAY", "wayland-1")));
+        assert!(has_display(only("WAYLAND_SOCKET", "3")));
+    }
     use std::hash::Hasher as _;
 
     use super::*;
