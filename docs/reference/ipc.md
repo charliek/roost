@@ -2946,7 +2946,7 @@ follow-up `palette.state`:
 `open` is false when no palette is up (the other fields are then
 empty/default). When open, `frame` is the current frame id — `commands` |
 `launcher` | `custom` | `themes` | `fonts` | `notifications` | `present` |
-`agents` (a provider drill-in sub-frame gets a generated
+`agents` | `host_targets` (a provider drill-in sub-frame gets a generated
 `provider:items:<n>` id instead) — and `items` are the filtered rows in
 display order (`subtitle` present on rows that have one).
 
@@ -2981,7 +2981,7 @@ collapsed); the empty-state row
 
 | Op | Request params | Notes |
 |---|---|---|
-| `palette.open` | `{"kind": "commands"}` | `kind`: `""`/`commands` → command palette; `launcher` → custom-command launcher; `custom` → the script-backed provider palette; `agents` → the agent-jump palette. Other values → `invalid-param`. |
+| `palette.open` | `{"kind": "commands"}` | `kind`: `""`/`commands` → command palette; `launcher` → custom-command launcher; `custom` → the script-backed provider palette; `agents` → the agent-jump palette; `notifications` → the notification inbox; `host_targets` → the host picker. Other values → `invalid-param`. |
 | `palette.state` | `{}` | Read the current state. |
 | `palette.query` | `{"query": "theme"}` | Set the current frame's filter (resets selection to the top match). |
 | `palette.activate` | `{"id": "new_tab"}` | Confirm the visible row with this id — runs its command or drills into its sub-frame. `not-found` if no palette is open or no row matches. |

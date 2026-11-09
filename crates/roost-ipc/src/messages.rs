@@ -613,8 +613,11 @@ pub struct TabDumpResult {
 // `PaletteStateResult`, so a driver asserts without a second round-trip.
 
 /// `palette.open` params: which root frame to present. Empty or
-/// `"commands"` opens the command palette; `"launcher"` opens the
-/// custom-command launcher. An unknown kind is rejected `invalid-param`.
+/// `"commands"` opens the command palette, `"launcher"` the
+/// custom-command launcher, `"custom"` the script-backed provider
+/// palette, `"agents"` the agent-jump palette, `"notifications"` the
+/// notification inbox and `"host_targets"` the host picker. An unknown
+/// kind is rejected `invalid-param`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PaletteOpenParams {
@@ -709,9 +712,11 @@ pub struct PaletteAgentRow {
 /// Snapshot of the palette after an op. `open` is false when no palette
 /// is up (the remaining fields are then default/empty). When open,
 /// `frame` is the current frame id (`"commands"` | `"launcher"` |
-/// `"themes"` | `"notifications"`), `query`/`selection` are the live
-/// filter + highlight, and `items` are the filtered rows in display
-/// order. Permissive on the wire for forward-compatible fields.
+/// `"custom"` | `"agents"` | `"notifications"` | `"host_targets"` |
+/// `"themes"` | `"fonts"` | `"present"`, or `"provider:items:<n>"` for a
+/// provider drill-in), `query`/`selection` are the live filter +
+/// highlight, and `items` are the filtered rows in display order.
+/// Permissive on the wire for forward-compatible fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PaletteStateResult {
     pub open: bool,
