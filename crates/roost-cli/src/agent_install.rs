@@ -30,8 +30,8 @@
 use clap::Subcommand;
 use roost_agent::Agent;
 use roost_agent_install::{
-    ensure, install, reconcile, resolve_names, set_hooks, status, uninstall, AgentSkip, Guard,
-    Home, Mode, Outcome, Status, ALL_AGENTS,
+    ensure, install, reconcile_file_agents, resolve_names, retire, set_hooks, status, uninstall,
+    AgentSkip, Guard, Home, Mode, Outcome, RetireOutcome, Status, ALL_AGENTS,
 };
 use roost_ipc::messages::{
     ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksHostOutcome, AgentSetHooksParams,
@@ -113,30 +113,18 @@ pub fn run(cmd: &AgentCmd, json: bool) -> Result<i32, CliError> {
     let guard = Guard::from_env();
 
     match cmd {
-        AgentCmd::Ensure { startup } => match configured() {
-            // `--startup` passes no mode: `ensure` re-reads the key
-            // inside the lock. This read decides only whether there is
-            // an answer to act on at all — the key can be answered
-            // between its read and this process's write.
-            Some(_) if *startup => report(ensure(&home, BY, guard), json),
-            Some(mode) => report(reconcile(&home, &mode, BY, guard), json),
-            None => {
-                // `--json` is a machine contract, so the unconfigured
-                // path answers in the shape an ensure would (an empty
-                // outcome) and puts its one human sentence on stderr,
-                // rather than breaking a script's decode with prose.
-                let note = "agent-hooks is not configured; nothing was wired. Choose agents \
-                            in Roost (Agent Hooks… in the command palette) or run `roostctl \
-                            agent set <list|off> --local`.";
-                if json {
-                    println!("{}", outcome_json(&Outcome::default()));
-                    eprintln!("{note}");
-                } else {
-                    println!("{note}");
-                }
-                Ok(0)
+        AgentCmd::Ensure { startup } => {
+            // The retire first: it narrows `agent-hooks` to the agents
+            // still delivered by file, which is what the ensure below
+            // reads. It is the strict, once-per-version removal; the
+            // reconcile after it touches only the file agents.
+            let retired =
+                retire(&home, guard, false).map_err(|e| CliError::Failed(format!("agent: {e}")))?;
+            if !json {
+                print_retire(&retired);
             }
-        },
+            ensure_after_retire(&home, guard, *startup, &retired, json)
+        }
         // Unreachable through `main`, which sends this shape to
         // [`run_over_ipc`]. Refused rather than written: the one thing a
         // misroute must never do is quietly set the local key when the
@@ -193,6 +181,109 @@ pub fn run(cmd: &AgentCmd, json: bool) -> Result<i32, CliError> {
             print_status(&rows, key.unknown(), json);
             Ok(0)
         }
+    }
+}
+
+/// `agent ensure` after its retire: the file agents' ensure or
+/// reconcile, with the retire folded into the JSON outcome.
+fn ensure_after_retire(
+    home: &Home,
+    guard: Guard,
+    startup: bool,
+    retired: &RetireOutcome,
+    json: bool,
+) -> Result<i32, CliError> {
+    let outcome = match configured() {
+        // `--startup` passes no mode: `ensure` re-reads the key inside
+        // the lock. This read decides only whether there is an answer to
+        // act on at all — the key can be answered between its read and
+        // this process's write.
+        Some(_) if startup => ensure(home, BY, guard),
+        Some(mode) => reconcile_file_agents(home, &mode, BY, guard),
+        None => {
+            // `--json` is a machine contract, so the unconfigured path
+            // answers in the shape an ensure would (an empty outcome)
+            // and puts its one human sentence on stderr, rather than
+            // breaking a script's decode with prose.
+            let note = "agent-hooks is not configured; nothing was wired. Choose agents \
+                        in Roost (Agent Hooks… in the command palette) or run `roostctl \
+                        agent set <list|off> --local`.";
+            if json {
+                let mut body = outcome_json(&Outcome::default());
+                body["retire"] = retire_json(retired);
+                println!("{body}");
+                eprintln!("{note}");
+            } else {
+                println!("{note}");
+            }
+            return Ok(i32::from(!retired.errors.is_empty()));
+        }
+    };
+    let outcome = outcome.map_err(|e| CliError::Failed(format!("agent: {e}")))?;
+    if json {
+        let mut body = outcome_json(&outcome);
+        body["retire"] = retire_json(retired);
+        println!("{body}");
+    } else {
+        print_outcome(&outcome);
+    }
+    Ok(i32::from(!outcome.is_clean() || !retired.errors.is_empty()))
+}
+
+fn leftover_json(
+    agent: Agent,
+    leftover: &roost_agent_install::retire::Leftover,
+) -> serde_json::Value {
+    serde_json::json!({
+        "agent": agent.source(),
+        "file": leftover.file,
+        "event": leftover.event,
+        "reason": leftover.reason.to_string(),
+    })
+}
+
+fn retire_json(retired: &RetireOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "deferred": retired.deferred,
+        "retired": names(&retired.retired),
+        "leftovers": retired.leftovers.iter()
+            .map(|(agent, leftover)| leftover_json(*agent, leftover))
+            .collect::<Vec<_>>(),
+        "errors": retired.errors.iter()
+            .map(|e| serde_json::json!({
+                "agent": e.agent.source(),
+                "error": e.error.to_string(),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn print_retire(retired: &RetireOutcome) {
+    if retired.deferred {
+        println!("retire: waiting for an older roost-session on this machine");
+    }
+    if !retired.retired.is_empty() {
+        println!(
+            "retired file entries (backup in ~/.config/roost/agent-backups): {}",
+            names(&retired.retired).join(", ")
+        );
+    }
+    for (agent, leftover) in &retired.leftovers {
+        println!(
+            "left in place: {} {}",
+            agent.source(),
+            leftover_line(leftover)
+        );
+    }
+    for error in &retired.errors {
+        println!("retire error: {}: {}", error.agent.source(), error.error);
+    }
+}
+
+fn leftover_line(leftover: &roost_agent_install::retire::Leftover) -> String {
+    match &leftover.event {
+        Some(event) => format!("{} ({event}): {}", leftover.file, leftover.reason),
+        None => format!("{}: {}", leftover.file, leftover.reason),
     }
 }
 
@@ -500,6 +591,17 @@ fn print_status(rows: &[Status], unknown: &[String], json: bool) {
                     "files": row.files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                     "skipped": row.skipped.as_ref().map(ToString::to_string),
                     "warnings": row.warnings.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "delivery": delivery(row.agent),
+                    "retired": row.retired.as_ref().map(|r| serde_json::json!({
+                        "version": r.version,
+                        "at": r.at,
+                        "complete": r.complete,
+                        "backups": r.backups,
+                        "leftovers": r.leftovers.iter()
+                            .map(|l| leftover_json(row.agent, l))
+                            .collect::<Vec<_>>(),
+                    })),
+                    "came_back": row.came_back,
                 })
             })
             .chain(
@@ -522,9 +624,44 @@ fn print_status(rows: &[Status], unknown: &[String], json: bool) {
         for warning in &row.warnings {
             println!("          warning: {warning}");
         }
+        if let Some(retired) = &row.retired {
+            if !retired.changed.is_empty() {
+                println!(
+                    "          retired v{} at {}; backups: {}",
+                    retired.version,
+                    retired.at,
+                    retired.backups.join(", ")
+                );
+            }
+            for leftover in &retired.leftovers {
+                println!(
+                    "          left in place: {}; `roostctl agent uninstall {}` removes it",
+                    leftover_line(leftover),
+                    row.agent.source()
+                );
+            }
+        }
+        if row.came_back {
+            println!(
+                "          an entry came back after the retire (synced from an older Roost?); \
+                 `roostctl agent uninstall {}` removes it",
+                row.agent.source()
+            );
+        }
     }
     for name in unknown {
         println!("{name:<9} unknown to this build");
+    }
+}
+
+/// How this build connects `agent`: a user file for the file agents,
+/// the tab environment for Claude and opencode, the agent's own OSC
+/// 7501 for the rest.
+fn delivery(agent: Agent) -> &'static str {
+    match agent {
+        Agent::Cursor => "file",
+        Agent::Claude | Agent::Opencode => "env",
+        Agent::Codex | Agent::Grok => "7501",
     }
 }
 
@@ -682,6 +819,8 @@ mod tests {
             files: vec!["/home/u/.codex/hooks.json".into()],
             skipped: None,
             warnings: Vec::new(),
+            retired: None,
+            came_back: false,
         }
     }
 

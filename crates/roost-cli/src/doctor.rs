@@ -3343,6 +3343,10 @@ fn agent_wired_check(inputs: &Inputs, agent: Agent) -> Check {
     if !row.present {
         return check(id, title, Status::Skipped, "not installed");
     }
+    if !roost_agent_install::FILE_AGENTS.contains(&agent) {
+        let (status, detail) = no_file_detail(row);
+        return check(id, title, status, detail);
+    }
     let suffix = agent_warnings_suffix(&row.warnings);
     if let Some(reason) = &row.skipped {
         return check(
@@ -3400,6 +3404,69 @@ fn agent_wired_check(inputs: &Inputs, agent: Agent) -> Check {
         status
     };
     check(id, title, status, format!("{detail}{suffix}"))
+}
+
+/// An agent this build connects without a user file: what the retire of
+/// its old file entries did, and what it left. Any Roost entry still in
+/// the agent's file runs beside the env plugin, so every event arrives
+/// twice; that is the cause doctor names.
+fn no_file_detail(row: &AgentInstallStatus) -> (Status, String) {
+    let agent = row.agent.source();
+    let delivery = match row.agent {
+        Agent::Claude | Agent::Opencode => "connected through the tab environment",
+        _ => "reports over OSC 7501",
+    };
+    let uninstall = format!("`roostctl agent uninstall {agent}` removes it");
+    if row.came_back {
+        return (
+            Status::Warn,
+            format!(
+                "{delivery}; a Roost entry came back to its config after the retire (synced \
+                 from an older Roost?) and doubles every event — {uninstall}"
+            ),
+        );
+    }
+    if let Some(left) = row.retired.as_ref().and_then(|r| r.leftovers.first()) {
+        let count = row.retired.as_ref().map_or(0, |r| r.leftovers.len());
+        let event = left
+            .event
+            .as_deref()
+            .map(|e| format!(" ({e})"))
+            .unwrap_or_default();
+        return (
+            Status::Warn,
+            format!(
+                "{delivery}; {count} old Roost entr{} left in {}{event}: {} — Roost can't be \
+                 sure it added {}, and while {} it doubles every event; {uninstall}",
+                if count == 1 { "y" } else { "ies" },
+                redact(&left.file),
+                left.reason,
+                if count == 1 { "it" } else { "them" },
+                if count == 1 { "it stays" } else { "they stay" },
+            ),
+        );
+    }
+    if row.entries_on_disk {
+        return (
+            Status::Warn,
+            format!(
+                "{delivery}; Roost's old file entries are still in place and double every \
+                 event — they are retired at the next launch, or by `roostctl agent ensure` \
+                 (an older roost-session serving this machine defers it)"
+            ),
+        );
+    }
+    match row.retired.as_ref().filter(|r| !r.backups.is_empty()) {
+        Some(retired) => (
+            Status::Ok,
+            format!(
+                "{delivery}; nothing written · old entries retired (v{}) · backup {}",
+                retired.version,
+                redact(&retired.backups[retired.backups.len() - 1])
+            ),
+        ),
+        None => (Status::Ok, format!("{delivery}; nothing written")),
+    }
 }
 
 /// `ROOST_AGENT_HOOK` resolvable and executable from *this* tab's
@@ -6202,14 +6269,20 @@ mod tests {
                 .map(|agent| AgentInstallStatus {
                     agent: *agent,
                     present: true,
-                    entries_on_disk: true,
-                    wired: Some(roost_agent_install::INTEGRATION_VERSION),
+                    // Only the file agents carry entries now; any other
+                    // agent's is a leftover that doubles its events.
+                    entries_on_disk: roost_agent_install::FILE_AGENTS.contains(agent),
+                    wired: roost_agent_install::FILE_AGENTS
+                        .contains(agent)
+                        .then_some(roost_agent_install::INTEGRATION_VERSION),
                     up_to_date: true,
                     noticed: true,
                     allowed: true,
                     files: Vec::new(),
                     skipped: None,
                     warnings: Vec::new(),
+                    retired: None,
+                    came_back: false,
                 })
                 .collect(),
             agent_codex_trust: vec![TrustEntry {
@@ -7464,6 +7537,8 @@ mod tests {
             files: Vec::new(),
             skipped,
             warnings,
+            retired: None,
+            came_back: false,
         }
     }
 
@@ -7508,9 +7583,9 @@ mod tests {
     #[test]
     fn agent_wired_check_covers_every_status() {
         // Not probed at all (the fixture never populated `agent_status`).
-        assert_status(&evaluate(&healthy()), "agent.claude.wired", Status::Skipped);
+        assert_status(&evaluate(&healthy()), "agent.cursor.wired", Status::Skipped);
         assert_eq!(
-            find(&evaluate(&healthy()), "agent.claude.wired").detail,
+            find(&evaluate(&healthy()), "agent.cursor.wired").detail,
             "not probed"
         );
 
@@ -7519,14 +7594,14 @@ mod tests {
             agent_status_error: Some("no home directory".into()),
             ..healthy()
         };
-        let c = find(&evaluate(&probe_failed), "agent.claude.wired").clone();
+        let c = find(&evaluate(&probe_failed), "agent.cursor.wired").clone();
         assert_eq!(c.status, Some(Status::Fail));
         assert!(c.detail.contains("could not probe"), "{}", c.detail);
 
         // Not installed.
         let not_present = Inputs {
             agent_status: vec![make_agent_status(
-                Agent::Claude,
+                Agent::Cursor,
                 false,
                 false,
                 None,
@@ -7538,18 +7613,18 @@ mod tests {
         };
         assert_status(
             &evaluate(&not_present),
-            "agent.claude.wired",
+            "agent.cursor.wired",
             Status::Skipped,
         );
         assert_eq!(
-            find(&evaluate(&not_present), "agent.claude.wired").detail,
+            find(&evaluate(&not_present), "agent.cursor.wired").detail,
             "not installed"
         );
 
         // Present, never wired.
         let unwired = Inputs {
             agent_status: vec![make_agent_status(
-                Agent::Claude,
+                Agent::Cursor,
                 true,
                 false,
                 None,
@@ -7559,14 +7634,14 @@ mod tests {
             )],
             ..healthy()
         };
-        let c = find(&evaluate(&unwired), "agent.claude.wired").clone();
+        let c = find(&evaluate(&unwired), "agent.cursor.wired").clone();
         assert_eq!(c.status, Some(Status::Warn));
         assert!(c.detail.contains("not wired"), "{}", c.detail);
 
         // Wired, stale integration version.
         let stale = Inputs {
             agent_status: vec![make_agent_status(
-                Agent::Claude,
+                Agent::Cursor,
                 true,
                 true,
                 Some(1),
@@ -7576,14 +7651,14 @@ mod tests {
             )],
             ..healthy()
         };
-        let c = find(&evaluate(&stale), "agent.claude.wired").clone();
+        let c = find(&evaluate(&stale), "agent.cursor.wired").clone();
         assert_eq!(c.status, Some(Status::Warn));
         assert!(c.detail.contains("out of date"), "{}", c.detail);
 
         // Wired and current.
         let current = Inputs {
             agent_status: vec![make_agent_status(
-                Agent::Claude,
+                Agent::Cursor,
                 true,
                 true,
                 Some(roost_agent_install::INTEGRATION_VERSION),
@@ -7593,7 +7668,7 @@ mod tests {
             )],
             ..healthy()
         };
-        let c = find(&evaluate(&current), "agent.claude.wired").clone();
+        let c = find(&evaluate(&current), "agent.cursor.wired").clone();
         assert_eq!(c.status, Some(Status::Ok));
         assert_eq!(
             c.detail,
@@ -7605,7 +7680,7 @@ mod tests {
         // not wired" that sends the user to reinstall.
         let record_lost = Inputs {
             agent_status: vec![make_agent_status(
-                Agent::Claude,
+                Agent::Cursor,
                 true,
                 true,
                 None,
@@ -7615,7 +7690,7 @@ mod tests {
             )],
             ..healthy()
         };
-        let c = find(&evaluate(&record_lost), "agent.claude.wired").clone();
+        let c = find(&evaluate(&record_lost), "agent.cursor.wired").clone();
         assert_eq!(c.status, Some(Status::Warn));
         assert!(
             c.detail.contains("state record has no entry"),
@@ -7630,7 +7705,7 @@ mod tests {
 
         let record_only = Inputs {
             agent_status: vec![make_agent_status(
-                Agent::Claude,
+                Agent::Cursor,
                 true,
                 false,
                 Some(roost_agent_install::INTEGRATION_VERSION),
@@ -7640,7 +7715,7 @@ mod tests {
             )],
             ..healthy()
         };
-        let c = find(&evaluate(&record_only), "agent.claude.wired").clone();
+        let c = find(&evaluate(&record_only), "agent.cursor.wired").clone();
         assert_eq!(c.status, Some(Status::Warn));
         assert!(c.detail.contains("no Roost entry is in"), "{}", c.detail);
 
@@ -7649,7 +7724,7 @@ mod tests {
         // happens to remember.
         let stale_record = Inputs {
             agent_status: vec![make_agent_status(
-                Agent::Claude,
+                Agent::Cursor,
                 true,
                 true,
                 Some(1),
@@ -7659,7 +7734,7 @@ mod tests {
             )],
             ..healthy()
         };
-        let c = find(&evaluate(&stale_record), "agent.claude.wired").clone();
+        let c = find(&evaluate(&stale_record), "agent.cursor.wired").clone();
         assert_eq!(c.status, Some(Status::Warn), "{}", c.detail);
         assert!(c.detail.contains("still says v1"), "{}", c.detail);
 
@@ -7667,7 +7742,7 @@ mod tests {
         // file, …) is a doctor-visible Fail, not a silent no-op.
         let skip = Inputs {
             agent_status: vec![make_agent_status(
-                Agent::Claude,
+                Agent::Cursor,
                 true,
                 false,
                 None,
@@ -7679,7 +7754,7 @@ mod tests {
             )],
             ..healthy()
         };
-        let c = find(&evaluate(&skip), "agent.claude.wired").clone();
+        let c = find(&evaluate(&skip), "agent.cursor.wired").clone();
         assert_eq!(c.status, Some(Status::Fail));
         assert!(c.detail.contains("not written by Roost"), "{}", c.detail);
 
@@ -7687,7 +7762,7 @@ mod tests {
         // wiring from ok to warn, and the warning text is readable.
         let modified = Inputs {
             agent_status: vec![make_agent_status(
-                Agent::Claude,
+                Agent::Cursor,
                 true,
                 true,
                 Some(roost_agent_install::INTEGRATION_VERSION),
@@ -7700,7 +7775,7 @@ mod tests {
             )],
             ..healthy()
         };
-        let c = find(&evaluate(&modified), "agent.claude.wired").clone();
+        let c = find(&evaluate(&modified), "agent.cursor.wired").clone();
         assert_eq!(c.status, Some(Status::Warn), "{}", c.detail);
         assert!(
             c.detail.contains(&format!(
@@ -7711,6 +7786,66 @@ mod tests {
             c.detail
         );
         assert!(c.detail.contains("modified Roost entry"), "{}", c.detail);
+    }
+
+    /// An agent connected without a file: doctor names its delivery,
+    /// and any Roost entry still in its file as the cause of doubled
+    /// events, never "present, not wired".
+    #[test]
+    fn an_env_agent_reports_delivery_and_leftovers() {
+        let row = |entries_on_disk, retired, came_back| Inputs {
+            agent_status: vec![AgentInstallStatus {
+                entries_on_disk,
+                retired,
+                came_back,
+                ..make_agent_status(Agent::Claude, true, false, None, false, None, vec![])
+            }],
+            ..healthy()
+        };
+        let detail = |inputs: &Inputs| find(&evaluate(inputs), "agent.claude.wired").clone();
+
+        let clean = detail(&row(false, None, false));
+        assert_eq!(clean.status, Some(Status::Ok));
+        assert!(clean.detail.contains("nothing written"), "{}", clean.detail);
+
+        let pending = detail(&row(true, None, false));
+        assert_eq!(pending.status, Some(Status::Warn));
+        assert!(
+            pending.detail.contains("double every event"),
+            "{}",
+            pending.detail
+        );
+
+        let left = roost_agent_install::retire::Retired {
+            version: roost_agent_install::RETIRE_VERSION,
+            at: 1,
+            complete: true,
+            misses: 0,
+            changed: Vec::new(),
+            backups: Vec::new(),
+            leftovers: vec![roost_agent_install::retire::Leftover {
+                file: "/home/u/.claude/settings.json".into(),
+                event: Some("Stop".into()),
+                reason: roost_agent_install::retire::LeftoverReason::Annotated,
+            }],
+            noticed: false,
+        };
+        let leftover = detail(&row(true, Some(left), false));
+        assert_eq!(leftover.status, Some(Status::Warn));
+        assert!(
+            leftover.detail.contains("(Stop): annotated"),
+            "{}",
+            leftover.detail
+        );
+        assert!(
+            leftover.detail.contains("agent uninstall claude"),
+            "{}",
+            leftover.detail
+        );
+
+        let back = detail(&row(true, None, true));
+        assert_eq!(back.status, Some(Status::Warn));
+        assert!(back.detail.contains("came back"), "{}", back.detail);
     }
 
     #[test]

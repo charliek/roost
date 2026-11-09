@@ -177,6 +177,7 @@ pub fn start(
         };
 
     install_agent_env(profile);
+    crate::agent_hooks::spawn_retire();
     let config = SessionConfig::from_profile(profile, first_project, exe_path);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -256,6 +256,10 @@ pub struct Status {
     pub files: Vec<std::path::PathBuf>,
     pub skipped: Option<SkipReason>,
     pub warnings: Vec<crate::error::Warning>,
+    /// What the retire did for this agent, with the entries it left.
+    pub retired: Option<crate::retire::Retired>,
+    /// The retire finished, and an exact Roost entry is back on disk.
+    pub came_back: bool,
 }
 
 /// An uninstall reads the state record as well as the disk: it is what
@@ -352,7 +356,25 @@ pub fn reconcile(
 ) -> Result<Outcome, InstallError> {
     guard.check()?;
     let lock = home.config_lock()?;
-    reconcile_locked(home, mode, by, guard, &lock)
+    reconcile_locked(home, mode, by, guard, &ALL_AGENTS, &lock)
+}
+
+/// The agents this build still delivers by file. Every other agent's
+/// entries are the retire's to take out, by its strict rule
+/// ([`crate::retire`]), never [`reconcile`]'s looser one.
+pub const FILE_AGENTS: [Agent; 1] = [Agent::Cursor];
+
+/// [`reconcile`] for [`FILE_AGENTS`] only: what `roostctl agent ensure`
+/// runs after the retire.
+pub fn reconcile_file_agents(
+    home: &Home,
+    mode: &Mode,
+    by: &str,
+    guard: Guard,
+) -> Result<Outcome, InstallError> {
+    guard.check()?;
+    let lock = home.config_lock()?;
+    reconcile_locked(home, mode, by, guard, &FILE_AGENTS, &lock)
 }
 
 /// Union `agents` into this home's `agent-hooks` key — never removing —
@@ -410,7 +432,7 @@ pub fn set_hooks(
     // raise — the user is looking at the list they just chose.
     let desired = mode.to_config();
     let wrote = write_hooks(home, &read_hooks(home)?, &desired, &lock)?;
-    let mut outcome = reconcile_locked(home, mode, by, guard, &lock)
+    let mut outcome = reconcile_locked(home, mode, by, guard, &ALL_AGENTS, &lock)
         .map_err(|source| after_key(&desired, source))?;
     outcome.wrote |= wrote;
     Ok(outcome)
@@ -457,11 +479,12 @@ fn reconcile_locked(
     mode: &Mode,
     by: &str,
     guard: Guard,
+    only: &[Agent],
     lock: &ConfigLock,
 ) -> Result<Outcome, InstallError> {
     let (mut record, mut outcome) = start(home)?;
     let targets = unwire_targets(home, &record);
-    for agent in ALL_AGENTS {
+    for agent in only.iter().copied() {
         if mode.allows(agent) {
             wire_one(home, agent, by, guard, &mut record, &mut outcome);
         } else if targets.contains(&agent) {
@@ -579,6 +602,7 @@ pub fn uninstall(home: &Home, agents: &[Agent], guard: Guard) -> Result<Outcome,
 /// Read-only: what `roostctl agent status` and doctor render.
 pub fn status(home: &Home, mode: &Mode) -> Result<Vec<Status>, InstallError> {
     let (record, _) = state::load(home)?;
+    let tombstones = crate::retire::load(home)?;
     ALL_AGENTS
         .into_iter()
         .map(|agent| {
@@ -610,6 +634,8 @@ pub fn status(home: &Home, mode: &Mode) -> Result<Vec<Status>, InstallError> {
                     None => Some(SkipReason::NotPresent),
                 },
                 warnings: plan.map(|p| p.warnings).unwrap_or_default(),
+                retired: tombstones.get(agent.source()).cloned(),
+                came_back: present && crate::retire::came_back(home, agent, &tombstones),
             })
         })
         .collect()
@@ -829,7 +855,7 @@ fn wire_one(
 /// otherwise cleaned by nothing — `off` would plan against the current
 /// path, find nothing, and then delete the only record of where the old
 /// install was.
-fn unwire_homes(home: &Home, agent: Agent, record: &Record) -> Vec<Home> {
+pub(crate) fn unwire_homes(home: &Home, agent: Agent, record: &Record) -> Vec<Home> {
     let mut dirs = vec![home.agent_dir(agent).to_path_buf()];
     if let Some(entry) = state::entry(record, agent) {
         for file in &entry.files {

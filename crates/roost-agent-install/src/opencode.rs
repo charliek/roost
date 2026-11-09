@@ -20,6 +20,7 @@ use crate::command::INTEGRATION_VERSION;
 use crate::error::{InstallError, SkipReason};
 use crate::home::Home;
 use crate::plan::{FileEdit, InstallPlan, Intent};
+use crate::retire::{Leftover, LeftoverReason, RetirePlan};
 use crate::write::{self, PRIVATE_MODE};
 
 const AGENT: Agent = Agent::Opencode;
@@ -132,6 +133,29 @@ pub fn plan_uninstall(home: &Home) -> Result<InstallPlan, InstallError> {
         warnings: Vec::new(),
         files: Vec::new(),
     })
+}
+
+/// The strict half: the file goes only when it is byte for byte the
+/// one a release wrote. Every release wrote the same bytes ([`desired`],
+/// pinned by `the_written_file_is_the_one_v0_1_0_wrote`), so that one
+/// image is the whole frozen table. A marked file with other bytes was
+/// edited, or came from a development build, and stays.
+pub fn plan_retire(home: &Home) -> Result<RetirePlan, InstallError> {
+    let path = plugin_path(home);
+    let image = write::read_image(&path, PRIVATE_MODE)?;
+    let mut plan = RetirePlan::default();
+    match image.bytes.as_deref() {
+        Some(bytes) if bytes == desired().as_slice() => {
+            plan.edits.push(FileEdit { image, after: None })
+        }
+        Some(bytes) if is_ours(bytes) => plan.leftovers.push(Leftover {
+            file: path.display().to_string(),
+            event: None,
+            reason: LeftoverReason::Edited,
+        }),
+        _ => {}
+    }
+    Ok(plan)
 }
 
 #[cfg(test)]

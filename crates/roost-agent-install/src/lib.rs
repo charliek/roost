@@ -87,6 +87,7 @@ pub mod error;
 pub mod home;
 pub mod json;
 pub mod plan;
+pub mod retire;
 pub mod state;
 pub mod tab_env;
 pub mod write;
@@ -105,12 +106,13 @@ mod acceptance;
 pub use codex::{trust_entries, TrustEntry};
 pub use command::{installed_command, is_roost_command, owned_commands, INTEGRATION_VERSION};
 pub use ensure::{
-    agent_names, ensure, install, plan, raise, reconcile, resolve_names, set_hooks, status, Mode,
-    Outcome, Status,
+    agent_names, ensure, install, plan, raise, reconcile, reconcile_file_agents, resolve_names,
+    set_hooks, status, Mode, Outcome, Status, FILE_AGENTS,
 };
 pub use error::{AgentError, AgentSkip, AgentWarning, InstallError, SkipReason, Warning};
 pub use home::Home;
 pub use plan::{apply, Applied, FileEdit, Guard, InstallPlan, Intent};
+pub use retire::{retire, RetireOutcome, RETIRE_VERSION};
 pub use roost_agent::ALL_AGENTS;
 pub use state::mark_noticed;
 

@@ -16,6 +16,7 @@ use crate::home::Home;
 use crate::json::Json;
 use crate::jsonedit::{self, Opened};
 use crate::plan::{InstallPlan, Intent};
+use crate::retire::{self, RetirePlan};
 use crate::state::Prior;
 use crate::write::PRIVATE_MODE;
 
@@ -84,13 +85,8 @@ pub fn plan_uninstall(home: &Home, prior: &Prior) -> Result<InstallPlan, Install
     // hooks; dropping it lets the file itself go, which is what "before
     // Roost" looked like. A file that still has anything else in it
     // keeps its version untouched.
-    if removed
-        && file
-            .doc
-            .as_object()
-            .is_some_and(|entries| entries.len() == 1 && entries[0].0 == "version")
-    {
-        file.doc.remove("version");
+    if removed {
+        drop_lone_version(&mut file.doc);
     }
 
     Ok(InstallPlan {
@@ -104,4 +100,31 @@ pub fn plan_uninstall(home: &Home, prior: &Prior) -> Result<InstallPlan, Install
         warnings: Vec::new(),
         files: Vec::new(),
     })
+}
+fn drop_lone_version(doc: &mut Json) {
+    if doc
+        .as_object()
+        .is_some_and(|entries| entries.len() == 1 && entries[0].0 == "version")
+    {
+        doc.remove("version");
+    }
+}
+
+/// The strict half. Cursor's shape is flat, so there is no group to
+/// check; a retired Cursor is one the user switched off.
+pub fn plan_retire(home: &Home, prior: &Prior) -> Result<RetirePlan, InstallError> {
+    let path = hooks_path(home);
+    let rule = jsonedit::RetireRule {
+        grouped: false,
+        fits: &retire::fits_plain,
+        spare_followed: false,
+    };
+    let (plan, _) = retire::plan_json(
+        AGENT,
+        &path,
+        &rule,
+        prior.created(&path),
+        &drop_lone_version,
+    )?;
+    Ok(plan)
 }

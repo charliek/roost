@@ -186,6 +186,30 @@ pub fn plan_uninstall(home: &Home) -> Result<InstallPlan, InstallError> {
     })
 }
 
+/// The strict half: `roost.json` goes whole when [`is_ours`] holds,
+/// which is already the strict check (only Roost's events, groups and
+/// handler fields, every command Roost's).
+pub fn plan_retire(home: &Home) -> Result<crate::retire::RetirePlan, InstallError> {
+    use crate::retire::{Leftover, LeftoverReason, RetirePlan};
+    let plan = plan_uninstall(home)?;
+    let path = hooks_path(home);
+    Ok(match plan.skipped {
+        Some(SkipReason::ForeignFile { .. }) => RetirePlan {
+            leftovers: vec![Leftover {
+                file: path.display().to_string(),
+                event: None,
+                reason: LeftoverReason::Foreign,
+            }],
+            ..RetirePlan::default()
+        },
+        Some(_) => RetirePlan::unreadable(&path),
+        None => RetirePlan {
+            edits: plan.edits,
+            ..RetirePlan::default()
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

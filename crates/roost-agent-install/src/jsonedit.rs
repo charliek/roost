@@ -23,6 +23,7 @@ use crate::command::{is_roost_command, looks_edited};
 use crate::error::{InstallError, SkipReason, Warning};
 use crate::json::{Json, Style};
 use crate::plan::FileEdit;
+use crate::retire::LeftoverReason;
 use crate::write::{self, Image};
 
 /// A JSON config file, open for editing.
@@ -105,6 +106,17 @@ pub fn open(path: &Path, create_mode: u32) -> Result<Opened, InstallError> {
 impl JsonDoc {
     pub fn existed(&self) -> bool {
         self.image.exists()
+    }
+
+    /// Whether writing the document back unchanged reproduces the file
+    /// byte for byte. A file that does not is one any edit would
+    /// reformat, which the retire never does (see [`crate::retire`]).
+    pub fn round_trips(&self) -> bool {
+        match self.image.bytes.as_deref() {
+            None => true,
+            Some(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => true,
+            Some(bytes) => self.original.render(&self.style).as_bytes() == bytes,
+        }
     }
 
     /// The edit this document implies, or `None` when the parsed value
@@ -411,6 +423,117 @@ pub fn remove_flat(doc: &mut Json, path: &Path, agent: Agent) -> Result<bool, Sk
 
     prune_empty_hooks(doc, removed_anything);
     Ok(removed_anything)
+}
+
+/// The events an exact entry was removed from, and every Roost-looking
+/// handler left, as `(event, reason)`.
+pub type Retired = (Vec<String>, Vec<(String, LeftoverReason)>);
+
+/// What the retire may take out of a hooks object, beyond the owned
+/// command every removal requires.
+pub struct RetireRule<'a> {
+    /// Claude's and codex's `hooks.<event>[group].hooks[handler]`, or
+    /// cursor's flat `hooks.<event>[handler]`.
+    pub grouped: bool,
+    /// The handler is exactly what a release wrote for `event`.
+    pub fits: &'a dyn Fn(&str, &Json) -> bool,
+    /// Leave an exact handler that anything follows on its event. Codex
+    /// keys trust by position, so taking ours out would move the user's
+    /// handlers after it off their trusted keys.
+    pub spare_followed: bool,
+}
+
+/// Take out the one exact Roost handler per event that `rule` proves
+/// Roost wrote, and name every other Roost-looking handler with why it
+/// stays. Answers the events an entry was removed from, and the
+/// leftovers as `(event, reason)`.
+pub fn retire(
+    doc: &mut Json,
+    path: &Path,
+    agent: Agent,
+    rule: &RetireRule<'_>,
+) -> Result<Retired, SkipReason> {
+    let mut removed = Vec::new();
+    let mut left = Vec::new();
+    let Some(events) = event_names(doc, path)? else {
+        return Ok((removed, left));
+    };
+    for event in events {
+        let Some(hooks) = doc.get_mut("hooks") else {
+            break;
+        };
+        let Some(items) = hooks.get_mut(&event) else {
+            continue;
+        };
+        let Some(items) = items.as_array_mut() else {
+            return Err(shape(path, &format!("`hooks.{event}` is not an array")));
+        };
+        let take = {
+            let mut slots: Vec<(usize, Option<usize>, bool, &Json)> = Vec::new();
+            for (gi, item) in items.iter().enumerate() {
+                if !rule.grouped {
+                    slots.push((gi, None, false, item));
+                    continue;
+                }
+                let annotated = item
+                    .as_object()
+                    .is_some_and(|entries| entries.iter().any(|(key, _)| key != "hooks"));
+                let Some(handlers) = item.get("hooks").and_then(Json::as_array) else {
+                    continue;
+                };
+                for (hi, handler) in handlers.iter().enumerate() {
+                    slots.push((gi, Some(hi), annotated, handler));
+                }
+            }
+            let mut take = None;
+            for (k, (gi, hi, annotated, handler)) in slots.iter().enumerate() {
+                let Some(command) = command_of(handler) else {
+                    continue;
+                };
+                if !is_roost_command(agent, command) {
+                    if looks_edited(agent, command) {
+                        left.push((event.clone(), LeftoverReason::Edited));
+                    }
+                    continue;
+                }
+                let reason = if !(rule.fits)(&event, handler) {
+                    LeftoverReason::Edited
+                } else if *annotated {
+                    LeftoverReason::Annotated
+                } else if take.is_some() {
+                    LeftoverReason::Duplicate
+                } else if rule.spare_followed && k + 1 < slots.len() {
+                    LeftoverReason::Shifted
+                } else {
+                    take = Some((*gi, *hi));
+                    continue;
+                };
+                left.push((event.clone(), reason));
+            }
+            take
+        };
+        let Some((gi, hi)) = take else {
+            continue;
+        };
+        match hi.and_then(|hi| Some((hi, items[gi].get_mut("hooks")?.as_array_mut()?))) {
+            Some((hi, handlers)) => {
+                handlers.remove(hi);
+                if handlers.is_empty() {
+                    items.remove(gi);
+                }
+            }
+            None => {
+                items.remove(gi);
+            }
+        }
+        let emptied = items.is_empty();
+        if emptied {
+            hooks.remove(&event);
+        }
+        removed.push(event);
+    }
+    prune_empty_hooks(doc, !removed.is_empty());
+    Ok((removed, left))
 }
 
 /// Where Roost's handler for `event` ended up: `(group index, handler

@@ -1613,3 +1613,691 @@ fn status_carries_the_allow_flag_and_the_files_a_row_would_touch() {
         assert!(!row(&rows, agent).files.is_empty(), "{}", agent.source());
     }
 }
+
+/// The retire step: strict removal of the entries this build no longer
+/// delivers by file, once, with backups. One case per row of the note's
+/// "What Roost may remove" tables.
+mod retire_cases {
+    use super::*;
+    use crate::jsonedit;
+    use crate::retire::{self, Leftover, LeftoverReason, RETIRE_VERSION};
+
+    fn retire_now(home: &Home) -> crate::RetireOutcome {
+        let outcome = retire::retire(home, Guard::PERMITTED, false).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        outcome
+    }
+
+    fn user_files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        snapshot(dir)
+            .into_iter()
+            .filter(|(path, _)| !path.starts_with(".config/roost"))
+            .collect()
+    }
+
+    fn key_line(home: &Home, key: &str) -> Option<String> {
+        std::fs::read_to_string(home.config_path())
+            .unwrap_or_default()
+            .lines()
+            .find_map(|line| {
+                let (k, v) = line.split_once('=')?;
+                (k.trim() == key).then(|| v.trim().to_string())
+            })
+    }
+
+    fn reasons(outcome: &crate::RetireOutcome, agent: Agent) -> Vec<LeftoverReason> {
+        outcome
+            .leftovers
+            .iter()
+            .filter(|(a, _)| *a == agent)
+            .map(|(_, l)| l.reason)
+            .collect()
+    }
+
+    fn handler(agent: Agent, timeout: u64) -> Json {
+        jsonedit::handler(&installed_command(agent), timeout, None)
+    }
+
+    fn group(handlers: Vec<Json>) -> Json {
+        Json::Object(vec![("hooks".to_string(), Json::Array(handlers))])
+    }
+
+    /// A Claude `settings.json` holding `events`, each a list of groups,
+    /// written in the printer's layout.
+    fn write_claude(home: &Home, events: Vec<(&str, Vec<Json>)>) -> PathBuf {
+        let path = claude::settings_path(home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let hooks = Json::Object(
+            events
+                .into_iter()
+                .map(|(event, groups)| (event.to_string(), Json::Array(groups)))
+                .collect(),
+        );
+        let doc = Json::Object(vec![
+            ("model".to_string(), Json::String("opus".to_string())),
+            ("hooks".to_string(), hooks),
+        ]);
+        std::fs::write(&path, doc.render(&Style::default())).unwrap();
+        path
+    }
+
+    fn claude_text(home: &Home) -> String {
+        std::fs::read_to_string(claude::settings_path(home)).unwrap()
+    }
+
+    /// The upgrade path: a machine wired by v0.1.0 for every agent comes
+    /// back to its pre-Roost bytes for all but Cursor, which the user
+    /// opted into and which is still delivered by file.
+    #[test]
+    fn an_upgrade_restores_every_agent_but_cursor_byte_for_byte() {
+        let (dir, home) = fixture("all");
+        let before = user_files(dir.path());
+        wire_all(&home);
+        let wired = user_files(dir.path());
+        let on_before: Vec<bool> = ALL_AGENTS.iter().map(|a| agent_on(&home, *a)).collect();
+
+        let outcome = retire_now(&home);
+        assert_eq!(
+            outcome.retired,
+            vec![Agent::Claude, Agent::Codex, Agent::Grok, Agent::Opencode]
+        );
+        assert!(outcome.leftovers.is_empty(), "{:?}", outcome.leftovers);
+        assert_eq!(outcome.unnoticed, outcome.retired);
+
+        let after = user_files(dir.path());
+        for (path, bytes) in &after {
+            let want = if path.starts_with(".cursor") {
+                &wired[path]
+            } else {
+                before
+                    .get(path)
+                    .unwrap_or_else(|| panic!("{} was left", path.display()))
+            };
+            assert_eq!(
+                String::from_utf8_lossy(bytes),
+                String::from_utf8_lossy(want),
+                "{}",
+                path.display()
+            );
+        }
+        for path in before.keys() {
+            assert!(after.contains_key(path), "{} was deleted", path.display());
+        }
+
+        // The answer carries over, and the shadow keeps only Cursor, so
+        // neither this build's ensure nor an older one puts anything back.
+        assert_eq!(
+            key_line(&home, "agent-integration").as_deref(),
+            Some("claude, codex, grok, cursor, opencode")
+        );
+        assert_eq!(key_line(&home, "agent-hooks").as_deref(), Some("cursor"));
+        let again = ensure::ensure(&home, "local", Guard::PERMITTED).unwrap();
+        assert!(again.is_clean());
+        assert_eq!(user_files(dir.path()), after, "ensure re-added an entry");
+        let on_after: Vec<bool> = ALL_AGENTS.iter().map(|a| agent_on(&home, *a)).collect();
+        assert_eq!(on_after, on_before, "the carry-over switched an agent");
+    }
+
+    fn agent_on(home: &Home, agent: Agent) -> bool {
+        roost_ui_model::config::RoostConfig::parse(
+            &std::fs::read_to_string(home.config_path()).unwrap(),
+        )
+        .agent_on(agent)
+    }
+
+    /// Every changed file has a private backup, and the index names its
+    /// original.
+    #[test]
+    fn every_changed_file_is_backed_up_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, home) = fixture("all");
+        wire_all(&home);
+        let settings = std::fs::read(claude::settings_path(&home)).unwrap();
+        retire_now(&home);
+
+        let tombstones = retire::load(&home).unwrap();
+        let claude = &tombstones["claude"];
+        assert!(claude.finished());
+        assert_eq!(claude.version, RETIRE_VERSION);
+        assert_eq!(claude.backups.len(), 1);
+        let backup = Path::new(&claude.backups[0]);
+        assert_eq!(std::fs::read(backup).unwrap(), settings);
+        assert_eq!(
+            std::fs::metadata(backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let dir = backup.parent().unwrap();
+        assert_eq!(
+            std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let index: Vec<retire::BackupEntry> = serde_json::from_slice(
+            &std::fs::read(retire::backups_dir(&home).join("index.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(index.iter().any(|e| e.backup == claude.backups[0]
+            && e.original == claude::settings_path(&home).display().to_string()));
+        // Grok's and opencode's files are deleted, and backed up first.
+        assert_eq!(tombstones["grok"].backups.len(), 1);
+        assert_eq!(tombstones["opencode"].backups.len(), 1);
+    }
+
+    /// Once per version: a second run writes nothing, backs up nothing
+    /// and announces nothing new; the toast flag flips once.
+    #[test]
+    fn a_second_retire_writes_nothing() {
+        let (dir, home) = fixture("all");
+        wire_all(&home);
+        let first = retire_now(&home);
+        let after_first = snapshot(dir.path());
+
+        let second = retire_now(&home);
+        assert!(!second.wrote);
+        assert!(second.retired.is_empty());
+        assert_eq!(second.unnoticed, first.unnoticed);
+        assert_eq!(snapshot(dir.path()), after_first);
+
+        assert!(retire::mark_noticed(&home, &first.unnoticed).unwrap());
+        assert!(retire_now(&home).unnoticed.is_empty());
+    }
+
+    /// A lost record and tombstone re-run to a no-op: no backup, no
+    /// toast.
+    #[test]
+    fn a_lost_record_reruns_to_nothing() {
+        let (_dir, home) = fixture("all");
+        wire_all(&home);
+        retire_now(&home);
+        std::fs::remove_file(retire::tombstone_path(&home)).unwrap();
+        std::fs::remove_dir_all(retire::backups_dir(&home)).unwrap();
+
+        let outcome = retire_now(&home);
+        assert!(outcome.retired.is_empty());
+        assert!(outcome.unnoticed.is_empty());
+        assert!(!retire::backups_dir(&home).exists());
+    }
+
+    #[test]
+    fn a_group_with_a_matcher_is_left_as_annotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        let mut annotated = group(vec![handler(Agent::Claude, 10)]);
+        annotated.insert("matcher", Json::String("Bash".to_string()));
+        write_claude(&home, vec![("PreToolUse", vec![annotated])]);
+        let before = claude_text(&home);
+
+        let outcome = retire_now(&home);
+        assert_eq!(
+            reasons(&outcome, Agent::Claude),
+            [LeftoverReason::Annotated]
+        );
+        assert_eq!(claude_text(&home), before);
+    }
+
+    #[test]
+    fn a_changed_timeout_is_left_as_edited() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        write_claude(
+            &home,
+            vec![("Stop", vec![group(vec![handler(Agent::Claude, 30)])])],
+        );
+        let before = claude_text(&home);
+
+        let outcome = retire_now(&home);
+        assert_eq!(reasons(&outcome, Agent::Claude), [LeftoverReason::Edited]);
+        assert_eq!(claude_text(&home), before);
+        // The leftover keeps the record's facts for an explicit uninstall.
+        assert!(!retire::load(&home).unwrap()["claude"].leftovers.is_empty());
+    }
+
+    #[test]
+    fn a_second_exact_copy_is_left_as_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        write_claude(
+            &home,
+            vec![(
+                "Stop",
+                vec![
+                    group(vec![handler(Agent::Claude, 10)]),
+                    group(vec![handler(Agent::Claude, 10)]),
+                ],
+            )],
+        );
+
+        let outcome = retire_now(&home);
+        assert_eq!(
+            reasons(&outcome, Agent::Claude),
+            [LeftoverReason::Duplicate]
+        );
+        let (ours, _) = commands_on_disk(&home, Agent::Claude);
+        assert_eq!(ours.len(), 1, "exactly the first copy goes");
+    }
+
+    #[test]
+    fn a_compact_file_is_left_untouched_as_would_reformat() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        let path = claude::settings_path(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let compact = format!(
+            r#"{{"hooks":{{"Stop":[{{"hooks":[{{"type":"command","command":"{}","timeout":10}}]}}]}}}}"#,
+            escaped(&installed_command(Agent::Claude))
+        );
+        std::fs::write(&path, &compact).unwrap();
+
+        let outcome = retire_now(&home);
+        assert_eq!(
+            reasons(&outcome, Agent::Claude),
+            [LeftoverReason::WouldReformat]
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), compact);
+        assert!(!retire::backups_dir(&home).exists());
+    }
+
+    /// v1, v2 and v3 entries on three events beside a user hook come out
+    /// with only the user hook, and the bytes outside the removed spans
+    /// are what the user wrote.
+    #[test]
+    fn every_past_version_goes_and_the_user_hook_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        let owned = owned_commands(Agent::Claude);
+        let user = jsonedit::handler("my-notify --stop", 5, None);
+        let entry = |command: &str| jsonedit::handler(command, 10, None);
+        write_claude(
+            &home,
+            vec![
+                (
+                    "Stop",
+                    vec![group(vec![user.clone()]), group(vec![entry(&owned[0])])],
+                ),
+                ("SessionStart", vec![group(vec![entry(&owned[1])])]),
+                ("Notification", vec![group(vec![entry(&owned[2])])]),
+            ],
+        );
+
+        retire_now(&home);
+        let expected = Json::Object(vec![
+            ("model".to_string(), Json::String("opus".to_string())),
+            (
+                "hooks".to_string(),
+                Json::Object(vec![(
+                    "Stop".to_string(),
+                    Json::Array(vec![group(vec![user])]),
+                )]),
+            ),
+        ]);
+        assert_eq!(claude_text(&home), expected.render(&Style::default()));
+    }
+
+    #[test]
+    fn opencode_goes_only_when_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        std::fs::create_dir_all(home.agent_dir(Agent::Opencode)).unwrap();
+        ensure::install(&home, &[Agent::Opencode], "local", Guard::PERMITTED).unwrap();
+        let path = opencode::plugin_path(&home);
+        let mut edited = std::fs::read_to_string(&path).unwrap();
+        edited.push_str("// mine\n");
+        std::fs::write(&path, &edited).unwrap();
+
+        let outcome = retire_now(&home);
+        assert_eq!(reasons(&outcome, Agent::Opencode), [LeftoverReason::Edited]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        std::fs::create_dir_all(home.agent_dir(Agent::Opencode)).unwrap();
+        ensure::install(&home, &[Agent::Opencode], "local", Guard::PERMITTED).unwrap();
+        assert_eq!(retire_now(&home).retired, [Agent::Opencode]);
+        assert!(!opencode::plugin_path(&home).exists());
+    }
+
+    #[test]
+    fn grok_roost_json_goes_only_when_it_is_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        std::fs::create_dir_all(home.agent_dir(Agent::Grok)).unwrap();
+        ensure::install(&home, &[Agent::Grok], "local", Guard::PERMITTED).unwrap();
+        let path = grok::hooks_path(&home);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut doc = Json::parse(text.as_bytes()).unwrap();
+        let first_event = doc.get("hooks").unwrap().as_object().unwrap()[0].0.clone();
+        doc.get_mut("hooks")
+            .unwrap()
+            .get_mut(&first_event)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[0]
+            .insert("matcher", Json::String("Bash".to_string()));
+        let annotated = doc.render(&Style::default());
+        std::fs::write(&path, &annotated).unwrap();
+
+        let outcome = retire_now(&home);
+        assert_eq!(reasons(&outcome, Agent::Grok), [LeftoverReason::Foreign]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), annotated);
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        std::fs::create_dir_all(home.agent_dir(Agent::Grok)).unwrap();
+        ensure::install(&home, &[Agent::Grok], "local", Guard::PERMITTED).unwrap();
+        assert_eq!(retire_now(&home).retired, [Agent::Grok]);
+        assert!(!grok::hooks_path(&home).exists());
+    }
+
+    fn codex_home() -> (TempDir, Home) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        std::fs::create_dir_all(home.agent_dir(Agent::Codex)).unwrap();
+        ensure::install(&home, &[Agent::Codex], "local", Guard::PERMITTED).unwrap();
+        (dir, home)
+    }
+
+    fn state_hashes(home: &Home) -> Vec<String> {
+        let text = std::fs::read_to_string(codex::config_path(home)).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| l.trim().strip_prefix("trusted_hash = "))
+            .map(|h| h.trim_matches('"').to_string())
+            .collect()
+    }
+
+    /// A clean Codex comes back to nothing: handlers, trust keys and the
+    /// `[features] hooks` Roost turned on, from the recorded pre-image.
+    #[test]
+    fn codex_retires_across_both_files() {
+        let (dir, home) = codex_home();
+        assert!(!state_hashes(&home).is_empty());
+        let outcome = retire_now(&home);
+        assert_eq!(outcome.retired, [Agent::Codex]);
+        assert!(!codex::hooks_path(&home).exists());
+        assert!(!codex::config_path(&home).exists());
+        assert_eq!(
+            user_files(dir.path()),
+            BTreeMap::new(),
+            "something of Roost's was left"
+        );
+    }
+
+    /// An edited handler keeps the non-canonical trust key it runs
+    /// under; an orphaned canonical one goes.
+    #[test]
+    fn codex_trust_follows_the_handler() {
+        let (_dir, home) = codex_home();
+        let path = codex::hooks_path(&home);
+        let mut doc = parse_file(&path);
+        // Edit the Stop handler's timeout and re-trust it as codex would.
+        let stop = doc
+            .get_mut("hooks")
+            .unwrap()
+            .get_mut("Stop")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        stop[0].get_mut("hooks").unwrap().as_array_mut().unwrap()[0]
+            .insert("timeout", Json::Number(20u64.into()));
+        std::fs::write(&path, doc.render(&Style::default())).unwrap();
+        ensure::install(&home, &[Agent::Codex], "local", Guard::PERMITTED).ok();
+        // Re-read: the install refreshes Roost's entries to the shape it
+        // writes, so put the edit back after it and trust it by hand.
+        let mut doc = parse_file(&path);
+        doc.get_mut("hooks")
+            .unwrap()
+            .get_mut("Stop")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[0]
+            .get_mut("hooks")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[0]
+            .insert("timeout", Json::Number(20u64.into()));
+        std::fs::write(&path, doc.render(&Style::default())).unwrap();
+        let edited_hash = codex_hash::trusted_hash(
+            "Stop",
+            None,
+            &Handler {
+                command: installed_command(Agent::Codex),
+                timeout_sec: Some(20),
+                is_async: false,
+                status_message: None,
+                additional_context_limit: None,
+            },
+        )
+        .unwrap();
+        let config = std::fs::read_to_string(codex::config_path(&home)).unwrap();
+        let canonical_stop = codex_hash::trusted_hash(
+            "Stop",
+            None,
+            &Handler::roost(installed_command(Agent::Codex), HOOK_TIMEOUT_SECS),
+        )
+        .unwrap();
+        std::fs::write(
+            codex::config_path(&home),
+            config.replace(&canonical_stop, &edited_hash),
+        )
+        .unwrap();
+
+        let outcome = retire_now(&home);
+        assert_eq!(reasons(&outcome, Agent::Codex), [LeftoverReason::Edited]);
+        assert_eq!(state_hashes(&home), [edited_hash]);
+        let (ours, _) = commands_on_disk(&home, Agent::Codex);
+        assert_eq!(ours.len(), 1, "only the edited Stop handler stays");
+        // `[features] hooks` stays on while a hook remains.
+        assert!(std::fs::read_to_string(codex::config_path(&home))
+            .unwrap()
+            .contains("hooks = true"));
+    }
+
+    #[test]
+    fn an_orphaned_canonical_trust_key_goes_and_a_foreign_one_stays() {
+        let (_dir, home) = codex_home();
+        std::fs::remove_file(codex::hooks_path(&home)).unwrap();
+        let config = codex::config_path(&home);
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!(
+            "\n[hooks.state.\"{}:stop:0:1\"]\ntrusted_hash = \"sha256:{}\"\n",
+            codex::hooks_path(&home).display(),
+            "0".repeat(64)
+        ));
+        std::fs::write(&config, text).unwrap();
+
+        retire_now(&home);
+        assert_eq!(state_hashes(&home), [format!("sha256:{}", "0".repeat(64))]);
+    }
+
+    /// Codex keys trust by position, so an exact handler with the user's
+    /// own handler after it on its event stays, as `shifted`.
+    #[test]
+    fn a_codex_handler_something_follows_is_left_as_shifted() {
+        let (_dir, home) = codex_home();
+        let path = codex::hooks_path(&home);
+        let mut doc = parse_file(&path);
+        doc.get_mut("hooks")
+            .unwrap()
+            .get_mut("Stop")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(group(vec![jsonedit::handler("my-stop", 5, Some(false))]));
+        std::fs::write(&path, doc.render(&Style::default())).unwrap();
+
+        let outcome = retire_now(&home);
+        assert_eq!(reasons(&outcome, Agent::Codex), [LeftoverReason::Shifted]);
+        let (ours, theirs) = commands_on_disk(&home, Agent::Codex);
+        assert_eq!((ours.len(), theirs), (1, vec!["my-stop".to_string()]));
+        // The handler that stays keeps its canonical trust key: one left
+        // on an event with a Roost handler is never taken.
+        let canonical_stop = codex_hash::trusted_hash(
+            "Stop",
+            None,
+            &Handler::roost(installed_command(Agent::Codex), HOOK_TIMEOUT_SECS),
+        )
+        .unwrap();
+        assert_eq!(state_hashes(&home), [canonical_stop]);
+    }
+
+    fn cursor_home(key: Option<&str>) -> (TempDir, Home) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        std::fs::create_dir_all(home.agent_dir(Agent::Cursor)).unwrap();
+        std::fs::create_dir_all(home.agent_dir(Agent::Claude)).unwrap();
+        ensure::install(
+            &home,
+            &[Agent::Cursor, Agent::Claude],
+            "local",
+            Guard::PERMITTED,
+        )
+        .unwrap();
+        // `install` answered the key; put the case's own answer in place.
+        let config = home.config_path();
+        std::fs::write(config, key.map(|k| format!("{k}\n")).unwrap_or_default()).unwrap();
+        (dir, home)
+    }
+
+    /// While Cursor's opt-in is unanswered its entries stay, so a "yes"
+    /// does not churn the file; Claude's go regardless.
+    #[test]
+    fn an_unanswered_key_keeps_cursor_and_retires_the_rest() {
+        let (_dir, home) = cursor_home(None);
+        let cursor_before = std::fs::read(cursor::hooks_path(&home)).unwrap();
+        let outcome = retire_now(&home);
+        assert_eq!(outcome.retired, [Agent::Claude]);
+        assert_eq!(
+            std::fs::read(cursor::hooks_path(&home)).unwrap(),
+            cursor_before
+        );
+        assert!(!retire::load(&home).unwrap().contains_key("cursor"));
+        assert_eq!(
+            key_line(&home, "agent-integration"),
+            None,
+            "an answer was invented"
+        );
+    }
+
+    /// A Cursor the user switched off is retired like any other, flat
+    /// shape and all, and the lone `version` it leaves goes with the file.
+    #[test]
+    fn cursor_switched_off_is_retired() {
+        let (_dir, home) = cursor_home(Some("agent-integration = -claude"));
+        let outcome = retire_now(&home);
+        assert_eq!(outcome.retired, [Agent::Claude, Agent::Cursor]);
+        assert!(!cursor::hooks_path(&home).exists());
+    }
+
+    /// `agent-hooks = off` with exact entries on disk: retired, and the
+    /// answer stays off in both keys.
+    #[test]
+    fn off_with_entries_on_disk_retires_and_stays_off() {
+        let (_dir, home) = cursor_home(Some("agent-hooks = off"));
+        let outcome = retire_now(&home);
+        assert_eq!(outcome.retired, [Agent::Claude, Agent::Cursor]);
+        assert_eq!(key_line(&home, "agent-integration").as_deref(), Some("off"));
+        assert_eq!(key_line(&home, "agent-hooks").as_deref(), Some("off"));
+        assert_eq!(outcome.unnoticed, outcome.retired);
+    }
+
+    /// An older session still serves this machine: nothing moves.
+    #[test]
+    fn a_deferred_retire_touches_nothing() {
+        let (dir, home) = fixture("all");
+        wire_all(&home);
+        let before = snapshot(dir.path());
+        let outcome = retire::retire(&home, Guard::PERMITTED, true).unwrap();
+        assert!(outcome.deferred);
+        assert_eq!(snapshot(dir.path()), before);
+    }
+
+    #[test]
+    fn the_test_fence_holds_for_the_retire() {
+        let (dir, home) = fixture("all");
+        wire_all(&home);
+        let before = snapshot(dir.path());
+        let jailed = Guard {
+            test_mode: true,
+            forced: false,
+        };
+        assert!(matches!(
+            retire::retire(&home, jailed, false).unwrap_err(),
+            crate::InstallError::TestModeRefused
+        ));
+        assert_eq!(snapshot(dir.path()), before);
+    }
+
+    /// An exact entry put back after the retire (a synced dotfile) is
+    /// reported, and the retire does not chase it.
+    #[test]
+    fn an_entry_that_comes_back_is_reported_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        write_claude(
+            &home,
+            vec![("Stop", vec![group(vec![handler(Agent::Claude, 10)])])],
+        );
+        let wired = claude_text(&home);
+        retire_now(&home);
+        assert_ne!(claude_text(&home), wired);
+        let tombstones = retire::load(&home).unwrap();
+        assert!(!retire::came_back(&home, Agent::Claude, &tombstones));
+
+        std::fs::write(claude::settings_path(&home), &wired).unwrap();
+        assert!(retire::came_back(&home, Agent::Claude, &tombstones));
+        retire_now(&home);
+        assert_eq!(
+            claude_text(&home),
+            wired,
+            "the retire chased a synced entry"
+        );
+        let status = ensure::status(&home, &all()).unwrap();
+        assert!(row(&status, Agent::Claude).came_back);
+    }
+
+    /// Backups are capped per original file.
+    #[test]
+    fn backups_keep_the_last_three_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        let path = write_claude(
+            &home,
+            vec![("Stop", vec![group(vec![handler(Agent::Claude, 10)])])],
+        );
+        let wired = std::fs::read(&path).unwrap();
+        for _ in 0..5 {
+            std::fs::write(&path, &wired).unwrap();
+            std::fs::remove_file(retire::tombstone_path(&home)).ok();
+            retire_now(&home);
+        }
+        let files: Vec<_> = std::fs::read_dir(retire::backups_dir(&home).join("claude"))
+            .unwrap()
+            .collect();
+        assert_eq!(files.len(), 3);
+        let index: Vec<retire::BackupEntry> = serde_json::from_slice(
+            &std::fs::read(retire::backups_dir(&home).join("index.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(index.len(), 3);
+    }
+
+    #[test]
+    fn a_leftover_says_which_file_and_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        write_claude(
+            &home,
+            vec![("Stop", vec![group(vec![handler(Agent::Claude, 30)])])],
+        );
+        let outcome = retire_now(&home);
+        assert_eq!(
+            outcome.leftovers,
+            vec![(
+                Agent::Claude,
+                Leftover {
+                    file: claude::settings_path(&home).display().to_string(),
+                    event: Some("Stop".to_string()),
+                    reason: LeftoverReason::Edited,
+                }
+            )]
+        );
+    }
+}

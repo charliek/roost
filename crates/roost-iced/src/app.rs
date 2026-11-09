@@ -3374,6 +3374,9 @@ pub struct App {
     /// §3.7). `window_opened` also runs on every focus change, so this
     /// is what keeps a startup act from becoming a focus act.
     agent_hooks_started: bool,
+    /// The startup retire's own once-per-process latch: it runs whatever
+    /// `agent-hooks` says, where the ensure runs only for an allow-list.
+    agent_retire_started: bool,
     /// The one first-run consent card this process gets (plan 064 §3.5).
     /// Beside `agent_hooks_started` rather than folded into it: the two
     /// answer different questions about the same `window_opened`, which
@@ -3976,6 +3979,7 @@ impl App {
             log_path: profile.log_path().display().to_string(),
             durability: BTreeMap::new(),
             agent_hooks_started: false,
+            agent_retire_started: false,
             agent_hooks_card_raised: false,
             agent_hooks_survey: None,
             agent_hooks_surveys: 0,
@@ -4453,9 +4457,11 @@ impl App {
         // every focus and unfocus.
         let start = agent_hooks::spawn_ensure(
             &mut self.agent_hooks_started,
+            &mut self.agent_retire_started,
             &self.runtime_handle,
             &self.feed_tx,
             &self.config,
+            self.config.local_backend == roost_ui_model::config::LocalBackend::Session,
         );
         // Nobody has answered the key yet, so ask — once per process,
         // never under the harness fence, and only once the status walk
@@ -4518,6 +4524,39 @@ impl App {
             return;
         };
         self.pending_agent_hooks_toast = Some(toast);
+    }
+
+    /// The startup retire came back. Its one-time sentence joins the
+    /// held agent-hooks toast, so one banner says both and neither
+    /// replaces the other before a frame has drawn it.
+    fn agent_retired(&mut self, result: agent_hooks::AgentRetired) {
+        for problem in &result.problems {
+            tracing::warn!(
+                agent = problem.agent.map(roost_agent::Agent::source),
+                error = %problem.detail,
+                "agent retire"
+            );
+        }
+        tracing::info!(
+            unannounced = result.unnoticed.len(),
+            leftovers = result.leftovers,
+            deferred = result.deferred,
+            "agent retire finished"
+        );
+        let Some(line) = agent_hooks::retire_line(&result.unnoticed, result.leftovers) else {
+            return;
+        };
+        let toast =
+            self.pending_agent_hooks_toast
+                .get_or_insert_with(|| agent_hooks::AgentHooksToast {
+                    announcement: None,
+                    problem: None,
+                    noticed: Vec::new(),
+                    retire: None,
+                    retired: Vec::new(),
+                });
+        toast.retire = Some(line);
+        toast.retired = result.unnoticed;
     }
 
     /// Ask a host that has just connected to raise its agent hooks to at
@@ -4971,8 +5010,12 @@ impl App {
         if let Some(problem) = &toast.problem {
             tracing::info!(toast = problem.as_str(), "agent hooks problem toast shown");
         }
+        if let Some(retire) = &toast.retire {
+            tracing::info!(toast = retire.as_str(), "agent retire toast shown");
+        }
         self.set_status(toast.text());
         agent_hooks::spawn_mark_noticed(&self.runtime_handle, toast.noticed);
+        agent_hooks::spawn_mark_retired(&self.runtime_handle, toast.retired);
     }
 
     /// Bring [`App::pill_labels`] up to date with the active project's
@@ -15516,6 +15559,8 @@ mod tests {
                 files: roost_agent_install::owned_files(&home, agent),
                 skipped: None,
                 warnings: Vec::new(),
+                retired: None,
+                came_back: false,
             })
             .collect();
         let rows = agent_hooks_dialog::rows(

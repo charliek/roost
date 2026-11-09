@@ -54,6 +54,32 @@ use roost_engine::ipc::{AgentHooksError, AgentHooksHandle, AgentHooksRequest};
 use roost_ipc::messages::{AgentHooksFailed, AgentHooksOutcome, AgentHooksSkipped};
 use tracing::{info, warn};
 
+/// Retire the file entries this build no longer needs, once, on this
+/// host's own `$HOME`, so a host comes clean at its first v4 start even
+/// if no upgraded client connects. On a thread of its own: it takes the
+/// config lock and must never hold up serving.
+pub fn spawn_retire() {
+    let spawned = std::thread::Builder::new()
+        .name("agent-retire".into())
+        .spawn(|| {
+            let outcome = Home::from_env()
+                .and_then(|home| roost_agent_install::retire(&home, Guard::from_env(), false));
+            match outcome {
+                Ok(outcome) => info!(
+                    retired = ?outcome.retired.iter().map(|a| a.source()).collect::<Vec<_>>(),
+                    leftovers = outcome.leftovers.len(),
+                    errors = outcome.errors.len(),
+                    "agent retire finished"
+                ),
+                Err(roost_agent_install::InstallError::TestModeRefused) => {}
+                Err(error) => warn!(%error, "agent retire failed"),
+            }
+        });
+    if let Err(error) = spawned {
+        warn!(%error, "could not start the agent retire");
+    }
+}
+
 /// The callback `IpcHandler::with_agent_hooks` takes.
 ///
 /// `spawn_blocking` because the install reads and rewrites up to five

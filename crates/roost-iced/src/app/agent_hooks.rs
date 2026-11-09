@@ -153,32 +153,159 @@ pub(crate) fn claim_first_run(raised: &mut bool, start: &Start, guard: Guard) ->
 /// inside the lock. Carrying this snapshot over would let a `roostctl
 /// agent uninstall` that lands between launch and window re-appear as a
 /// re-wiring nobody asked for.
+///
+/// The retire of the file entries this build no longer needs
+/// ([`roost_agent_install::retire`]) runs first, once per process,
+/// whatever the key says: it narrows `agent-hooks` to the file agents,
+/// which is what the ensure then reads. It waits while the local tabs
+/// run on a `roost-session` (`defer_retire`): that session may be an
+/// older build whose tabs get no env delivery, and a v4 session retires
+/// at its own start.
 pub(crate) fn spawn_ensure(
     started: &mut bool,
+    retire_started: &mut bool,
     runtime: &tokio::runtime::Handle,
     feed: &EngineFeedSender,
     config: &RoostConfig,
+    defer_retire: bool,
 ) -> Start {
     let start = claim_start(started, resolve(config).as_ref());
     match &start {
-        Start::Run => {}
-        Start::Off => {
-            tracing::debug!("agent-hooks = off: not wiring agent hooks");
-            return start;
-        }
-        Start::Ask => {
-            tracing::debug!("agent-hooks is not configured; not wiring agent hooks");
-            return start;
-        }
-        Start::Already => return start,
+        Start::Run | Start::Already => {}
+        Start::Off => tracing::debug!("agent-hooks = off: not wiring agent hooks"),
+        Start::Ask => tracing::debug!("agent-hooks is not configured; not wiring agent hooks"),
+    }
+    let ensure = start == Start::Run;
+    let retire = !std::mem::replace(retire_started, true);
+    if !ensure && !retire {
+        return start;
     }
 
     let feed = feed.clone();
     let guard = Guard::from_env();
     runtime.spawn_blocking(move || {
-        feed.send(EngineFeed::AgentHooks(ensure_blocking(guard)));
+        if retire {
+            feed.send(EngineFeed::AgentRetire(retire_blocking(
+                guard,
+                defer_retire,
+            )));
+        }
+        if ensure {
+            feed.send(EngineFeed::AgentHooks(ensure_blocking(guard)));
+        }
     });
     start
+}
+
+/// What the startup retire had to say, as the UI needs it.
+#[derive(Debug, Default)]
+pub(crate) struct AgentRetired {
+    /// Agents whose retire removed entries and was never announced.
+    pub unnoticed: Vec<Agent>,
+    /// Entries left in place, which `roostctl agent status` names.
+    pub leftovers: usize,
+    pub problems: Vec<HookProblem>,
+    pub deferred: bool,
+}
+
+fn retire_blocking(guard: Guard, defer: bool) -> AgentRetired {
+    let outcome =
+        Home::from_env().and_then(|home| roost_agent_install::retire(&home, guard, defer));
+    match outcome {
+        Ok(outcome) => AgentRetired {
+            unnoticed: outcome.unnoticed,
+            leftovers: outcome.leftovers.len(),
+            problems: outcome
+                .errors
+                .into_iter()
+                .map(|failure| HookProblem {
+                    agent: Some(failure.agent),
+                    detail: failure.error.to_string(),
+                })
+                .collect(),
+            deferred: outcome.deferred,
+        },
+        // The harness fence: nothing to retire, nothing to say.
+        Err(InstallError::TestModeRefused) => AgentRetired::default(),
+        Err(error) => AgentRetired {
+            problems: vec![HookProblem {
+                agent: None,
+                detail: error.to_string(),
+            }],
+            ..AgentRetired::default()
+        },
+    }
+}
+
+/// The one-time sentence for a retire that removed entries: the agents
+/// connected through the tab environment, the ones that report on their
+/// own, and how many entries were left for `agent status` to name.
+pub(crate) fn retire_line(agents: &[Agent], leftovers: usize) -> Option<String> {
+    if agents.is_empty() {
+        return None;
+    }
+    let label = |agent: &Agent| match agent {
+        Agent::Claude => "Claude Code",
+        Agent::Codex => "Codex",
+        Agent::Grok => "Grok",
+        Agent::Cursor => "Cursor",
+        Agent::Opencode => "OpenCode",
+    };
+    let env: Vec<&str> = agents
+        .iter()
+        .filter(|a| matches!(a, Agent::Claude | Agent::Opencode))
+        .map(label)
+        .collect();
+    let own: Vec<&str> = agents
+        .iter()
+        .filter(|a| matches!(a, Agent::Codex | Agent::Grok))
+        .map(label)
+        .collect();
+    let mut clauses = Vec::new();
+    if !env.is_empty() {
+        clauses.push(format!(
+            "{} now connect to Roost without changes to their settings files",
+            env.join(" and ")
+        ));
+    }
+    if !own.is_empty() {
+        clauses.push(format!(
+            "{} report their status on their own",
+            own.join(" and ")
+        ));
+    }
+    let lead = if clauses.is_empty() {
+        "Roost no longer needs its hook entries".to_string()
+    } else {
+        clauses.join(", and ")
+    };
+    let mut line = format!(
+        "{lead}. Roost removed the entries it had added (backup in \
+         ~/.config/roost/agent-backups)"
+    );
+    if leftovers > 0 {
+        line.push_str(&format!(
+            ". Roost left {leftovers} entr{} it can't be sure it added: roostctl agent status \
+             lists {}",
+            if leftovers == 1 { "y" } else { "ies" },
+            if leftovers == 1 { "it" } else { "them" }
+        ));
+    }
+    Some(line)
+}
+
+/// Flip the retire's `noticed` for the agents the toast just named.
+pub(crate) fn spawn_mark_retired(runtime: &tokio::runtime::Handle, agents: Vec<Agent>) {
+    if agents.is_empty() {
+        return;
+    }
+    runtime.spawn_blocking(move || {
+        let result = Home::from_env()
+            .and_then(|home| roost_agent_install::retire::mark_noticed(&home, &agents).map(|_| ()));
+        if let Err(error) = result {
+            tracing::warn!(%error, "could not record that the agent retire toast was shown");
+        }
+    });
 }
 
 /// One queued `agent.set_hooks`, and the machinery that keeps two of
@@ -805,16 +932,24 @@ pub(crate) struct AgentHooksToast {
     pub problem: Option<String>,
     /// Exactly the agents `announcement` names — never a problem.
     pub noticed: Vec<Agent>,
+    /// [`retire_line`]'s sentence, when the retire removed entries.
+    pub retire: Option<String>,
+    /// The agents `retire` names, whose retire is flipped to noticed.
+    pub retired: Vec<Agent>,
 }
 
 impl AgentHooksToast {
     /// One banner line, the announcement first.
     pub(crate) fn text(&self) -> String {
-        [self.announcement.as_deref(), self.problem.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(". ")
+        [
+            self.announcement.as_deref(),
+            self.problem.as_deref(),
+            self.retire.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(". ")
     }
 }
 
@@ -836,6 +971,8 @@ pub(crate) fn toast(unnoticed: Vec<Agent>, problems: &[HookProblem]) -> Option<A
         announcement,
         problem,
         noticed,
+        retire: None,
+        retired: Vec::new(),
     })
 }
 

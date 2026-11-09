@@ -19,6 +19,7 @@ use crate::error::InstallError;
 use crate::home::Home;
 use crate::jsonedit::{self, Opened};
 use crate::plan::{InstallPlan, Intent};
+use crate::retire::{self, RetirePlan};
 use crate::state::Prior;
 use crate::write::PRIVATE_MODE;
 
@@ -86,4 +87,16 @@ pub fn plan_uninstall(home: &Home, prior: &Prior) -> Result<InstallPlan, Install
         warnings: Vec::new(),
         files: Vec::new(),
     })
+}
+
+/// The strict half: only handlers exactly as a release wrote them.
+pub fn plan_retire(home: &Home, prior: &Prior) -> Result<RetirePlan, InstallError> {
+    let path = settings_path(home);
+    let rule = jsonedit::RetireRule {
+        grouped: true,
+        fits: &retire::fits_plain,
+        spare_followed: false,
+    };
+    let (plan, _) = retire::plan_json(AGENT, &path, &rule, prior.created(&path), &|_| {})?;
+    Ok(plan)
 }
