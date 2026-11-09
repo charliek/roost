@@ -176,7 +176,7 @@ pub fn app_label(app: &str) -> Option<&'static str> {
     match app {
         "claude-code" => Some("Claude Code"),
         "codex" => Some("Codex"),
-        "grok-build" => Some("Grok"),
+        "grok" | "grok-build" => Some("Grok"),
         "opencode" => Some("OpenCode"),
         "crush" => Some("Crush"),
         "pi" => Some("Pi"),

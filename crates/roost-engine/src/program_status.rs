@@ -552,7 +552,7 @@ pub fn apply_hook_report(
     };
     if report.ownership_action == OwnershipAction::Claim
         && !deciding.app.is_empty()
-        && app_for_source(&report.source) != Some(deciding.app)
+        && !apps_for_source(&report.source).contains(&deciding.app)
     {
         return HookOutcome {
             outcome: ApplyOutcome {
@@ -599,15 +599,16 @@ fn repeats_kept_record(
         && compose(after, records).lifecycle == shown.lifecycle
 }
 
-/// The OSC 7501 `app` a hook source's agent reports (the 2026-10-28
-/// captures). gx shares the `grok` source, so it is `grok-build` too.
-pub fn app_for_source(source: &str) -> Option<&'static str> {
+/// The OSC 7501 `app`s a hook source's agent reports. grok named itself
+/// `grok-build` until 1.0.77 (the 2026-10-28 captures) and `grok` from
+/// then on (2026-11-08); gx shares the `grok` source.
+pub fn apps_for_source(source: &str) -> &'static [&'static str] {
     match source {
-        "claude" => Some("claude-code"),
-        "codex" => Some("codex"),
-        "grok" => Some("grok-build"),
-        "opencode" => Some("opencode"),
-        _ => None,
+        "claude" => &["claude-code"],
+        "codex" => &["codex"],
+        "grok" => &["grok", "grok-build"],
+        "opencode" => &["opencode"],
+        _ => &[],
     }
 }
 
@@ -1129,10 +1130,16 @@ mod tests {
         assert_eq!(tab.agent.lifecycle, L::Working);
         assert_eq!(tab.shows(), (L::Working, By::Records));
 
-        // gx shares the grok source, so it is the same app as grok-build.
-        let mut grok = Tab::default();
-        grok.feed([report(S::Working, "", "grok-build", "")], T0);
-        assert!(grok.hook(&session_start("grok")).outcome.accepted());
+        // gx shares the grok source; grok 1.0.77 reports `grok`, older
+        // builds `grok-build`.
+        for app in ["grok", "grok-build"] {
+            let mut grok = Tab::default();
+            grok.feed([report(S::Working, "", app, "")], T0);
+            assert!(
+                grok.hook(&session_start("grok")).outcome.accepted(),
+                "{app}"
+            );
+        }
     }
 
     #[test]
@@ -1860,6 +1867,7 @@ mod tests {
         for (app, label) in [
             ("claude-code", "Claude Code"),
             ("codex", "Codex"),
+            ("grok", "Grok"),
             ("grok-build", "Grok"),
             ("opencode", "OpenCode"),
             ("crush", "Crush"),
@@ -1895,15 +1903,15 @@ mod tests {
 
     #[test]
     fn the_source_to_app_table_matches_the_captures() {
-        for (source, app) in [
-            ("claude", Some("claude-code")),
-            ("codex", Some("codex")),
-            ("grok", Some("grok-build")),
-            ("opencode", Some("opencode")),
-            ("cursor", None),
-            (SOURCE_MANUAL, None),
+        for (source, apps) in [
+            ("claude", &["claude-code"][..]),
+            ("codex", &["codex"]),
+            ("grok", &["grok", "grok-build"]),
+            ("opencode", &["opencode"]),
+            ("cursor", &[]),
+            (SOURCE_MANUAL, &[]),
         ] {
-            assert_eq!(app_for_source(source), app, "{source}");
+            assert_eq!(apps_for_source(source), apps, "{source}");
         }
     }
 

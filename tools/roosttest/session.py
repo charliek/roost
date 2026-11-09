@@ -161,7 +161,7 @@ _SANITIZE = (
     # module a licence to write real dotfiles; the one case that wants it
     # sets it per launch.
     "ROOST_AGENT_HOOKS_FORCE",
-    # The five agent config directories (plan 046 §3.9). `HOME` below is
+    # The agent config directories (plan 046 §3.9). `HOME` below is
     # already inside the fixture's root, so a default `~/.claude` cannot
     # escape — but each of these can name an ABSOLUTE path outside it,
     # and `session.set_agent_hooks` is an op a client can send to any
