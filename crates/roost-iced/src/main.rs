@@ -514,9 +514,7 @@ fn run(profile: &BundleProfile, bundle_id: Option<&str>) -> anyhow::Result<()> {
 /// variables (a session's tabs get its own). After the locks, so a second
 /// launch that only raises the first probes nothing.
 fn install_agent_env(profile: &BundleProfile) {
-    if let Some(tab_env) = roost_agent_install::tab_env::TabEnv::start(profile) {
-        roost_engine::process::set_tab_env(Box::new(move |env| tab_env.apply(env)));
-    }
+    roost_engine::process::set_tab_env(roost_agent_install::tab_env::hook(profile));
 }
 
 /// Forces a panic when `ROOST_TEST_PANIC` is set, so the crash-report path

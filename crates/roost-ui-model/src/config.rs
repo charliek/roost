@@ -445,9 +445,10 @@ fn ordered_names(agents: &[Agent]) -> Vec<String> {
 /// release's new agent takes its own default instead of being switched
 /// off by a list written before it existed: `-opencode` turns opencode
 /// off, `cursor` turns Cursor on, and an agent the value does not name
-/// keeps [`agent_default_on`]. `off` as the whole value turns every
-/// agent off. A name this build does not know is kept, and allows
-/// nothing here.
+/// keeps [`agent_default_on`]. `off` turns every agent off, as the
+/// whole value or as a token: `off, cursor` is every agent off but
+/// Cursor. A name this build does not know is kept, and allows nothing
+/// here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentIntegration {
     Off,
@@ -463,7 +464,7 @@ impl AgentIntegration {
         if lower.is_empty() {
             return None;
         }
-        if matches!(lower.as_str(), "off" | "false" | "no" | "none") {
+        if is_off_word(&lower) {
             return Some(AgentIntegration::Off);
         }
         let tokens = lower
@@ -482,13 +483,19 @@ impl AgentIntegration {
     fn says(&self, agent: Agent) -> Option<bool> {
         match self {
             AgentIntegration::Off => Some(false),
-            AgentIntegration::Set(tokens) => tokens
-                .iter()
-                .rev()
-                .find(|(name, _)| Agent::parse(name) == Some(agent))
-                .map(|&(_, on)| on),
+            AgentIntegration::Set(tokens) => tokens.iter().rev().find_map(|(name, on)| {
+                if *on && is_off_word(name) {
+                    Some(false)
+                } else {
+                    (Agent::parse(name) == Some(agent)).then_some(*on)
+                }
+            }),
         }
     }
+}
+
+fn is_off_word(token: &str) -> bool {
+    matches!(token, "off" | "false" | "no" | "none")
 }
 
 /// An agent's state when nothing says otherwise: on for every agent Roost
@@ -525,6 +532,13 @@ pub struct AgentSwitches {
 }
 
 impl AgentSwitches {
+    pub fn all_off() -> AgentSwitches {
+        AgentSwitches {
+            integration: Some(AgentIntegration::Off),
+            legacy: AgentHooks::default(),
+        }
+    }
+
     pub fn read(content: &str) -> AgentSwitches {
         let mut switches = AgentSwitches::default();
         for (key, raw_value) in entries(content) {
@@ -1896,6 +1910,22 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// `off` among other tokens is every agent off at that point, so
+    /// `off, cursor` is what it reads as, never the defaults plus Cursor.
+    #[test]
+    fn agent_integration_off_as_a_token_starts_from_all_off() {
+        assert_eq!(on("agent-integration = off, cursor"), ["cursor"]);
+        assert_eq!(
+            on("agent-integration = none, claude, -claude"),
+            [] as [&str; 0]
+        );
+        assert!(on("agent-integration = cursor, off").is_empty());
+        assert_eq!(
+            on("agent-integration = -off"),
+            ["claude", "codex", "grok", "opencode"]
+        );
     }
 
     /// An upgrader's `agent-hooks` answer carries over exactly while the

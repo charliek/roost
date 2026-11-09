@@ -206,7 +206,7 @@ fn refuse(dir: &Path, why: &str) -> io::Error {
 /// uid can write, or refuse. On the Mac a `HOME`-less process falls back
 /// to a cache root under `/tmp`, which another uid could have made first
 /// and filled with a plugin Claude would run.
-fn prepare(dir: &Path) -> io::Result<()> {
+pub(crate) fn prepare(dir: &Path) -> io::Result<()> {
     let euid = roost_ipc::current_euid();
     if let Some(parent) = dir.parent() {
         fs::create_dir_all(parent)?;

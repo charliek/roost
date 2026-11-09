@@ -198,9 +198,7 @@ pub fn start(
 /// survive, and after the locks, so a session that lost them probes
 /// nothing.
 fn install_agent_env(profile: &BundleProfile) {
-    if let Some(tab_env) = roost_agent_install::tab_env::TabEnv::start(profile) {
-        roost_engine::process::set_tab_env(Box::new(move |env| tab_env.apply(env)));
-    }
+    roost_engine::process::set_tab_env(roost_agent_install::tab_env::hook(profile));
 }
 
 /// Create (or vouch for) the three directories a session writes into.

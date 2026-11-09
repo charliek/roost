@@ -21,7 +21,8 @@
 //! once, and `claude plugin list --json` run with the variable, off the
 //! UI thread and cached, catches what the files do not (MDM, a cached
 //! server policy). The last verdict is kept in [`POLICY_RECORD`] for
-//! doctor.
+//! doctor and for the next start, which holds it until its own probe
+//! answers.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -31,7 +32,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use roost_agent::Agent;
@@ -200,14 +201,36 @@ pub fn managed_block(roots: &[PathBuf]) -> Option<PathBuf> {
             else {
                 continue;
             };
-            match settings.get("disableSideloadFlags") {
-                Some(Value::Bool(true)) => blocking = Some(file),
-                Some(Value::Bool(false)) => blocking = None,
-                _ => {}
+            match sideload_ban(&settings) {
+                Some(true) => blocking = Some(file),
+                Some(false) => blocking = None,
+                None => {}
             }
         }
     }
     blocking
+}
+
+fn sideload_ban(settings: &Value) -> Option<bool> {
+    settings
+        .get("disableSideloadFlags")
+        .and_then(Value::as_bool)
+}
+
+/// Whether Claude's cached server-managed settings set
+/// `disableSideloadFlags`. The cache's layout is not documented, so the
+/// key is looked for at the top and under `settings`.
+fn remote_block(path: &Path) -> bool {
+    let Some(cached) = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return false;
+    };
+    sideload_ban(&cached) == Some(true)
+        || cached
+            .get("settings")
+            .is_some_and(|settings| sideload_ban(settings) == Some(true))
 }
 
 /// Run `claude plugin list --json` with `plugin_dir` named in the
@@ -285,19 +308,81 @@ pub fn find_claude(path: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf>
         })
 }
 
-struct Probe {
-    policy: ClaudePolicy,
-    at: Option<Instant>,
-    running: bool,
+/// How long a tab spawn may wait for the first probe of a process with
+/// no recorded verdict: about ten of Claude's answers, short enough that
+/// a slow `claude` stalls no more than this once.
+const FIRST_ANSWER_WAIT: Duration = Duration::from_secs(1);
+
+/// The shape of `roost_engine::process::TabEnvFn`, which this crate
+/// does not link.
+pub type Hook = dyn Fn(&mut BTreeMap<OsString, OsString>) + Send + Sync;
+
+/// The tab hook a serving process installs with
+/// `roost_engine::process::set_tab_env`: [`TabEnv::apply`], or, with no
+/// integration dir, [`strip`], so an outer Roost's entries still never
+/// reach a tab.
+pub fn hook(profile: &BundleProfile) -> Box<Hook> {
+    match TabEnv::start(profile) {
+        Some(tab_env) => Box::new(move |env| tab_env.apply(env)),
+        None => Box::new(strip),
+    }
 }
+
+/// Take every Roost entry out of a tab's variables and add none.
+pub fn strip(env: &mut BTreeMap<OsString, OsString>) {
+    deliver(env, None, None);
+}
+
+/// Merge `plugin_dir` and `opencode_plugin` (each `None` to add none)
+/// into a tab's variables, stripping inherited Roost entries.
+fn deliver(
+    env: &mut BTreeMap<OsString, OsString>,
+    plugin_dir: Option<&Path>,
+    opencode_plugin: Option<&Path>,
+) {
+    let merged = merge_plugin_dirs(
+        env.get(OsStr::new(CLAUDE_PLUGIN_DIRS))
+            .map(OsString::as_os_str),
+        plugin_dir,
+    );
+    set(env, CLAUDE_PLUGIN_DIRS, merged);
+    match merge_opencode_content(
+        env.get(OsStr::new(OPENCODE_CONFIG_CONTENT))
+            .map(OsString::as_os_str),
+        opencode_plugin,
+    ) {
+        Ok(merged) => set(env, OPENCODE_CONFIG_CONTENT, merged),
+        Err(why) => tracing::warn!(
+            why,
+            "OPENCODE_CONFIG_CONTENT left as inherited; opencode gets no Roost plugin"
+        ),
+    }
+}
+
+struct Probe {
+    /// Seeded from [`POLICY_RECORD`], so a policy the last run found
+    /// holds for the tabs a relaunch restores before this run's probe
+    /// answers.
+    policy: ClaudePolicy,
+    /// When this process's probe last answered.
+    at: Option<Instant>,
+    /// When the probe in flight started.
+    running: Option<Instant>,
+    /// The last `claude` found, looked up again when it is gone: a
+    /// session outlives an install.
+    claude: Option<PathBuf>,
+}
+
+type Locate = Box<dyn Fn() -> Option<PathBuf> + Send + Sync>;
 
 struct Inner {
     dir: PathBuf,
     config: Option<PathBuf>,
     managed_roots: Vec<PathBuf>,
-    claude: Option<PathBuf>,
+    locate_claude: Locate,
     remote_settings: Option<PathBuf>,
     probe: Mutex<Probe>,
+    answered: Condvar,
 }
 
 /// One serving process's agent variables. Cheap to clone.
@@ -308,16 +393,17 @@ impl TabEnv {
     /// The production instance for `profile`: files under its
     /// [`agent_integration_dir`](BundleProfile::agent_integration_dir),
     /// switches from this user's `config.conf`, the machine's
-    /// managed-settings dirs, and `claude` from this process's
-    /// environment. Starts the policy probe on a thread of its own, so
-    /// call it after any fork. `None`, logged, when the profile has no
-    /// integration dir: tabs then get no agent plugins.
+    /// managed-settings dirs, and `claude` looked up from this process's
+    /// environment. Starts the policy probe on a thread of its own when
+    /// Claude is on, so call it after any fork. `None`, logged, when the
+    /// profile has no integration dir.
     pub fn start(profile: &BundleProfile) -> Option<TabEnv> {
         let dir = profile
             .agent_integration_dir()
             .map_err(|error| tracing::warn!(%error, "no agent integration dir; tabs get no agent plugins"))
             .ok()?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
+        let path = std::env::var_os("PATH");
         let claude_config = std::env::var_os("CLAUDE_CONFIG_DIR")
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|home| home.join(".claude")));
@@ -325,10 +411,12 @@ impl TabEnv {
             dir,
             roost_ui_model::config::config_path(),
             MANAGED_SETTINGS_DIRS.iter().map(PathBuf::from).collect(),
-            find_claude(std::env::var_os("PATH").as_deref(), home.as_deref()),
+            Box::new(move || find_claude(path.as_deref(), home.as_deref())),
             claude_config.map(|dir| dir.join("remote-settings.json")),
         );
-        tab_env.refresh_if_stale();
+        if tab_env.switches().on(Agent::Claude) {
+            tab_env.refresh_if_stale();
+        }
         Some(tab_env)
     }
 
@@ -336,35 +424,56 @@ impl TabEnv {
         dir: PathBuf,
         config: Option<PathBuf>,
         managed_roots: Vec<PathBuf>,
-        claude: Option<PathBuf>,
+        locate_claude: Locate,
         remote_settings: Option<PathBuf>,
     ) -> TabEnv {
+        let policy = read_policy_record(&dir)
+            .map(|record| record.policy)
+            .unwrap_or(ClaudePolicy::Unchecked);
         TabEnv(Arc::new(Inner {
             dir,
             config,
             managed_roots,
-            claude,
+            locate_claude,
             remote_settings,
             probe: Mutex::new(Probe {
-                policy: ClaudePolicy::Unchecked,
+                policy,
                 at: None,
-                running: false,
+                running: None,
+                claude: None,
             }),
+            answered: Condvar::new(),
         }))
+    }
+
+    /// The switches as `config.conf` has them now. A missing file is the
+    /// defaults; one Roost cannot read turns every agent off, since the
+    /// user may have written `off` in it.
+    fn switches(&self) -> AgentSwitches {
+        let Some(path) = &self.0.config else {
+            return AgentSwitches::default();
+        };
+        match fs::read_to_string(path) {
+            Ok(text) => AgentSwitches::read(&text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => AgentSwitches::default(),
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "config unreadable; this tab gets no agent plugins");
+                AgentSwitches::all_off()
+            }
+        }
     }
 
     /// Merge this process's agent variables into a tab's environment.
     /// Blocking file I/O (the config, the managed settings, the
     /// integration files), all small; it runs on the engine's spawn path.
     pub fn apply(&self, env: &mut BTreeMap<OsString, OsString>) {
-        let switches = self
-            .0
-            .config
-            .as_ref()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .map(|text| AgentSwitches::read(&text))
-            .unwrap_or_default();
-        let claude = switches.on(Agent::Claude) && !self.claude_blocked();
+        let switches = self.switches();
+        let claude_on = switches.on(Agent::Claude);
+        if claude_on {
+            self.refresh_if_stale();
+            self.await_first_answer();
+        }
+        let claude = claude_on && !self.claude_blocked();
         let opencode = switches.on(Agent::Opencode);
         let assets = (claude || opencode)
             .then(|| env_delivery::materialize(&self.0.dir))
@@ -374,41 +483,52 @@ impl TabEnv {
                 })
                 .ok()
             });
-
         let plugin_dir = assets
             .as_ref()
             .filter(|_| claude)
             .map(|assets| assets.claude_plugin_dir.as_path())
             .filter(|dir| !dir.as_os_str().as_bytes().contains(&b':'));
-        let merged = merge_plugin_dirs(
-            env.get(OsStr::new(CLAUDE_PLUGIN_DIRS))
-                .map(OsString::as_os_str),
-            plugin_dir,
-        );
-        set(env, CLAUDE_PLUGIN_DIRS, merged);
-
         let plugin = assets
             .as_ref()
             .filter(|_| opencode)
             .map(|assets| assets.opencode_plugin.as_path());
-        match merge_opencode_content(
-            env.get(OsStr::new(OPENCODE_CONFIG_CONTENT))
-                .map(OsString::as_os_str),
-            plugin,
-        ) {
-            Ok(merged) => set(env, OPENCODE_CONFIG_CONTENT, merged),
-            Err(why) => tracing::warn!(
-                why,
-                "OPENCODE_CONFIG_CONTENT left as inherited; opencode gets no Roost plugin"
-            ),
-        }
-        self.refresh_if_stale();
+        deliver(env, plugin_dir, plugin);
     }
 
-    /// The probe's last verdict, or the managed-settings file's when one
-    /// sets the policy.
+    /// With no verdict yet, recorded or probed, hold a spawn until the
+    /// first probe answers, at most [`FIRST_ANSWER_WAIT`] from its start:
+    /// a relaunch's restored tabs spawn in the probe's first moments.
+    fn await_first_answer(&self) {
+        let mut probe = self.lock();
+        while probe.policy == ClaudePolicy::Unchecked {
+            let Some(left) = probe
+                .running
+                .and_then(|since| FIRST_ANSWER_WAIT.checked_sub(since.elapsed()))
+            else {
+                return;
+            };
+            probe = self
+                .0
+                .answered
+                .wait_timeout(probe, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
+
+    /// The probe's last verdict (or the recorded one until it answers),
+    /// unless a managed-settings file or Claude's cached server settings
+    /// set the policy.
     pub fn claude_policy(&self) -> ClaudePolicy {
         if let Some(file) = managed_block(&self.0.managed_roots) {
+            return ClaudePolicy::Blocked(format!("disableSideloadFlags in {}", file.display()));
+        }
+        if let Some(file) = self
+            .0
+            .remote_settings
+            .as_ref()
+            .filter(|file| remote_block(file))
+        {
             return ClaudePolicy::Blocked(format!("disableSideloadFlags in {}", file.display()));
         }
         self.lock().policy.clone()
@@ -425,15 +545,15 @@ impl TabEnv {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Start a probe on its own thread unless one is running or the last
-    /// verdict is fresh.
+    /// Start a probe on its own thread unless one is running or this
+    /// process's last verdict is fresh.
     fn refresh_if_stale(&self) {
         {
             let mut probe = self.lock();
-            if probe.running || probe.at.is_some_and(|at| at.elapsed() < PROBE_TTL) {
+            if probe.running.is_some() || probe.at.is_some_and(|at| at.elapsed() < PROBE_TTL) {
                 return;
             }
-            probe.running = true;
+            probe.running = Some(Instant::now());
         }
         let tab_env = self.clone();
         let spawned = std::thread::Builder::new()
@@ -441,17 +561,30 @@ impl TabEnv {
             .spawn(move || tab_env.probe_now());
         if let Err(error) = spawned {
             tracing::warn!(%error, "could not start the Claude policy probe");
-            self.lock().running = false;
+            self.lock().running = None;
+            self.0.answered.notify_all();
         }
     }
 
+    /// The `claude` to probe: the last one found while it is still
+    /// there, else a fresh lookup.
+    fn claude(&self) -> Option<PathBuf> {
+        let known = self.lock().claude.clone();
+        if let Some(claude) = known.filter(|claude| claude.is_file()) {
+            return Some(claude);
+        }
+        let found = (self.0.locate_claude)();
+        self.lock().claude.clone_from(&found);
+        found
+    }
+
     fn probe_now(&self) {
-        let policy = match (&self.0.claude, env_delivery::materialize(&self.0.dir)) {
-            (None, _) => ClaudePolicy::NotInstalled,
-            (Some(_), Err(error)) => ClaudePolicy::Unknown(format!("no plugin folder: {error}")),
-            (Some(claude), Ok(assets)) => {
-                probe_claude(claude, &assets.claude_plugin_dir, PROBE_TIMEOUT)
-            }
+        let policy = match self.claude() {
+            None => ClaudePolicy::NotInstalled,
+            Some(claude) => match env_delivery::materialize(&self.0.dir) {
+                Err(error) => ClaudePolicy::Unknown(format!("no plugin folder: {error}")),
+                Ok(assets) => probe_claude(&claude, &assets.claude_plugin_dir, PROBE_TIMEOUT),
+            },
         };
         match &policy {
             ClaudePolicy::Blocked(why) => {
@@ -466,12 +599,13 @@ impl TabEnv {
             let mut probe = self.lock();
             probe.policy = policy;
             probe.at = Some(Instant::now());
-            probe.running = false;
+            probe.running = None;
         }
+        self.0.answered.notify_all();
         self.record();
     }
 
-    /// Write the verdict where doctor reads it.
+    /// Write the verdict where doctor, and the next start, read it.
     fn record(&self) {
         let record = PolicyRecord {
             policy: self.claude_policy(),
@@ -485,8 +619,8 @@ impl TabEnv {
             .0
             .dir
             .join(format!(".{POLICY_RECORD}-{}", crate::write::nonce()));
-        let written = serde_json::to_vec(&record)
-            .map_err(std::io::Error::other)
+        let written = env_delivery::prepare(&self.0.dir)
+            .and_then(|()| serde_json::to_vec(&record).map_err(std::io::Error::other))
             .and_then(|bytes| fs::write(&staged, bytes))
             .and_then(|()| fs::rename(&staged, self.0.dir.join(POLICY_RECORD)));
         if let Err(error) = written {
@@ -692,27 +826,50 @@ mod tests {
     /// A [`TabEnv`] over a temp root whose probe has already answered
     /// `policy`, so no probe thread starts.
     fn world(policy: ClaudePolicy) -> World {
-        let root = tempfile::tempdir().expect("root");
-        let config = root.path().join("config.conf");
-        let managed = root.path().join("managed");
-        let tab_env = TabEnv::new(
-            root.path().join("cache/agent-integration"),
-            Some(config.clone()),
-            vec![managed.clone()],
-            None,
-            None,
-        );
+        let world = unprobed_world(|_| {}, Box::new(|| None));
         {
-            let mut probe = tab_env.lock();
+            let mut probe = world.tab_env.lock();
             probe.policy = policy;
             probe.at = Some(Instant::now());
         }
+        world
+    }
+
+    /// A [`TabEnv`] over a temp root, after `seed` has written into the
+    /// integration dir and with no probe yet, finding `claude` by
+    /// `locate`.
+    fn unprobed_world(seed: impl FnOnce(&Path), locate: Locate) -> World {
+        let root = tempfile::tempdir().expect("root");
+        let config = root.path().join("config.conf");
+        let managed = root.path().join("managed");
+        let dir = root.path().join("cache/agent-integration");
+        seed(&dir);
+        let tab_env = TabEnv::new(
+            dir,
+            Some(config.clone()),
+            vec![managed.clone()],
+            locate,
+            Some(root.path().join("claude-config/remote-settings.json")),
+        );
         World {
             _root: root,
             config,
             managed,
             tab_env,
         }
+    }
+
+    fn write_record(dir: &Path, policy: ClaudePolicy) {
+        fs::create_dir_all(dir).unwrap();
+        let record = PolicyRecord {
+            policy,
+            remote_settings_cached: false,
+        };
+        fs::write(
+            dir.join(POLICY_RECORD),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
     }
 
     impl World {
@@ -825,7 +982,7 @@ mod tests {
     #[test]
     fn the_verdict_is_recorded_for_doctor() {
         let world = world(ClaudePolicy::Unchecked);
-        world.tab_env.lock().running = true;
+        world.tab_env.lock().running = Some(Instant::now());
         world.tab_env.probe_now();
         assert_eq!(
             read_policy_record(&world.tab_env.0.dir),
@@ -833,6 +990,166 @@ mod tests {
                 policy: ClaudePolicy::NotInstalled,
                 remote_settings_cached: false
             })
+        );
+        // With no `claude` there is nothing to probe, so no plugin
+        // folder is made for one.
+        let made: Vec<_> = fs::read_dir(&world.tab_env.0.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(made, [OsString::from(POLICY_RECORD)]);
+    }
+
+    /// A relaunch's restored tabs spawn before its probe answers; the
+    /// last run's `Blocked` holds for them, and a fresh probe still runs.
+    #[test]
+    fn a_recorded_block_holds_until_this_runs_probe_answers() {
+        let world = unprobed_world(
+            |dir| write_record(dir, ClaudePolicy::Blocked("last run".into())),
+            Box::new(|| None),
+        );
+        // A probe in flight that has not answered.
+        world.tab_env.lock().running = Some(Instant::now());
+        let env = world.tab("", &[]);
+        assert_eq!(env.get(CLAUDE_PLUGIN_DIRS), None);
+        assert!(env.contains_key(OPENCODE_CONFIG_CONTENT));
+        assert_eq!(world.tab_env.lock().at, None, "stale: probed again");
+    }
+
+    #[test]
+    fn a_cached_server_policy_blocks_claude() {
+        for cached in [
+            r#"{"disableSideloadFlags":true}"#,
+            r#"{"settings":{"disableSideloadFlags":true},"signature":"s"}"#,
+        ] {
+            let world = world(ClaudePolicy::Allowed);
+            let remote = world.tab_env.0.remote_settings.clone().unwrap();
+            fs::create_dir_all(remote.parent().unwrap()).unwrap();
+            fs::write(&remote, cached).unwrap();
+            assert_eq!(world.tab("", &[]).get(CLAUDE_PLUGIN_DIRS), None, "{cached}");
+            fs::write(&remote, r#"{"settings":{"disableSideloadFlags":false}}"#).unwrap();
+            assert_eq!(roost_dirs(&world.tab("", &[])).len(), 1, "{cached}");
+        }
+    }
+
+    /// With no verdict at all, a spawn waits (boundedly) for the first
+    /// probe: an upgrader's first relaunch has restored tabs but no
+    /// record.
+    #[test]
+    fn a_spawn_waits_for_the_first_answer() {
+        let world = unprobed_world(|_| {}, Box::new(|| None));
+        world.tab_env.lock().running = Some(Instant::now());
+        let tab_env = world.tab_env.clone();
+        let answer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            tab_env.lock().policy = ClaudePolicy::Blocked("probe".into());
+            tab_env.0.answered.notify_all();
+        });
+        assert_eq!(world.tab("", &[]).get(CLAUDE_PLUGIN_DIRS), None);
+        answer.join().unwrap();
+
+        // A probe that never answers holds spawns only until the bound
+        // from its start has passed.
+        let world = unprobed_world(|_| {}, Box::new(|| None));
+        world.tab_env.lock().running = Instant::now().checked_sub(FIRST_ANSWER_WAIT);
+        let tab_env = world.tab_env.clone();
+        let (done, returned) = mpsc::channel();
+        std::thread::spawn(move || {
+            tab_env.await_first_answer();
+            let _ = done.send(());
+        });
+        assert!(returned.recv_timeout(Duration::from_secs(30)).is_ok());
+    }
+
+    /// Claude off means Roost never runs `claude`; Claude on starts a
+    /// probe.
+    #[test]
+    fn the_probe_runs_only_while_claude_is_on() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let world = unprobed_world(
+            |_| {},
+            Box::new(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            }),
+        );
+        for config in [
+            "agent-integration = off",
+            "agent-integration = -claude",
+            "agent-hooks = codex",
+        ] {
+            world.tab(config, &[]);
+            let probe = world.tab_env.lock();
+            assert!(probe.running.is_none() && probe.at.is_none(), "{config}");
+        }
+        world.tab("", &[]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while world.tab_env.lock().at.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(world.tab_env.lock().policy, ClaudePolicy::NotInstalled);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A `claude` installed after the process started is found by the
+    /// next probe, and one removed is looked up again.
+    #[test]
+    fn the_probe_looks_claude_up_again() {
+        let bin = tempfile::tempdir().expect("bin");
+        let installed = bin.path().join("claude");
+        let found = installed.clone();
+        let world = unprobed_world(
+            |_| {},
+            Box::new(move || found.exists().then(|| found.clone())),
+        );
+        world.tab_env.probe_now();
+        assert_eq!(world.tab_env.lock().policy, ClaudePolicy::NotInstalled);
+        fake_claude(bin.path(), "exit 0");
+        world.tab_env.probe_now();
+        assert_eq!(world.tab_env.lock().policy, ClaudePolicy::Allowed);
+        fs::remove_file(&installed).unwrap();
+        world.tab_env.probe_now();
+        assert_eq!(world.tab_env.lock().policy, ClaudePolicy::NotInstalled);
+    }
+
+    /// A config Roost cannot read may say `off`, so it turns both agents
+    /// off, and still strips what a tab inherited.
+    #[test]
+    fn an_unreadable_config_gets_neither() {
+        let world = world(ClaudePolicy::Allowed);
+        fs::write(&world.config, b"agent-integration = off\n\xff\n").unwrap();
+        let mut env: BTreeMap<OsString, OsString> = [(os(CLAUDE_PLUGIN_DIRS), os(OLD_ROOST_DIR))]
+            .into_iter()
+            .collect();
+        world.tab_env.apply(&mut env);
+        assert!(env.is_empty(), "{env:?}");
+        // Absent is the defaults.
+        fs::remove_file(&world.config).unwrap();
+        world.tab_env.apply(&mut env);
+        assert!(env.contains_key(OsStr::new(CLAUDE_PLUGIN_DIRS)));
+    }
+
+    #[test]
+    fn strip_takes_out_roosts_entries_and_adds_none() {
+        let mut env: BTreeMap<OsString, OsString> = [
+            (
+                os(CLAUDE_PLUGIN_DIRS),
+                os(&format!("/u/one:{OLD_ROOST_DIR}")),
+            ),
+            (
+                os(OPENCODE_CONFIG_CONTENT),
+                os(&format!(r#"{{"plugin":["{OLD_PLUGIN}"]}}"#)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        strip(&mut env);
+        assert_eq!(
+            env,
+            [(os(CLAUDE_PLUGIN_DIRS), os("/u/one"))]
+                .into_iter()
+                .collect()
         );
     }
 }
