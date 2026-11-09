@@ -3867,29 +3867,33 @@ Answers `shutting-down` once `session.stop` has latched.
 
 ### `session.set_agent_hooks`
 
-Raise the host's `agent-hooks` key to (at least) the connected client's own allow-list. Same-UID, and every connection is additive: this one writes files under the session user's `$HOME`, and any connected client may send it — the socket's UID check is the only gate.
+Raise the host's agent switches to (at least) the connected client's own allow-list. Same-UID, and every connection is additive: this one writes files under the session user's `$HOME`, and any connected client may send it — the socket's UID check is the only gate.
 
 Request:
 ```json
 {"id": "11", "op": "session.set_agent_hooks", "params": {
-  "agents": ["claude", "codex"],
+  "agents": ["claude", "cursor"],
   "client": "charlie-mbp"
 }}
 ```
 
 Response:
 ```json
-{"wired": ["claude", "codex"], "refreshed": [], "removed": [],
- "skipped": [{"agent": "cursor", "reason": "not allowed"},
-             {"agent": "grok", "reason": "not installed"}],
+{"wired": ["cursor"], "refreshed": [], "removed": [],
+ "skipped": [{"agent": "claude", "reason": "no file needed"},
+             {"agent": "codex", "reason": "not allowed"},
+             {"agent": "grok", "reason": "not allowed"},
+             {"agent": "opencode", "reason": "not allowed"}],
  "errors": []}
 ```
 
-**This op only ever raises the key, never lowers it (plan 064 §3.3).** `agents` is unioned into whatever `agent-hooks` already says on the host — `off`, unanswered, or a narrower list — and the union is what gets wired. There is no wire spelling of "off" or "narrow this" here: a client whose own `agent-hooks` is `off`, or unconfigured, has no allow-list to raise a host with, so it sends this op **not at all**. Taking a host's entries back out stays a deliberate, local act — `roostctl agent ensure`/`uninstall`, run by hand on the host itself. `removed` is therefore always empty from this op; the field stays on the reply shape because [`agent.set_hooks`](#agentset_hooks) — an explicit local set, not a raise — can populate it for the *local* machine.
+**Only a file agent is raised.** A host connects every other agent through the tab environment or the agent's own OSC 7501 reports: it is on wherever the host never answered, and an answer given on the host stands, so naming one writes nothing and comes back as `"no file needed"`. A file agent (today only Cursor) is switched on in the host's `agent-integration`, every other answer there kept, and added to its `agent-hooks` shadow, then wired. Both keys, because the host's next session start narrows the shadow to `agent-integration` and retires the file of any agent that key leaves off.
+
+**This op only ever raises the switches, never lowers them (plan 064 §3.3).** `agents` is unioned into whatever the host already says — `off`, unanswered, or a narrower list — and the union is what gets wired. There is no wire spelling of "off" or "narrow this" here: a client whose own `agent-hooks` is `off`, or unconfigured, has no allow-list to raise a host with, so it sends this op **not at all**. Taking a host's entries back out stays a deliberate, local act — `roostctl agent ensure`/`uninstall`, run by hand on the host itself. `removed` is therefore always empty from this op; the field stays on the reply shape because [`agent.set_hooks`](#agentset_hooks) — an explicit local set, not a raise — can populate it for the *local* machine.
 
 `agents` must be non-empty and carry no blank element; both are `invalid-param`. **A name the host does not recognise is not** — it comes back as `{"agent": "gemini", "reason": "unknown"}` in `skipped`, and the names the host *does* know are wired. [Protocol equality](#versioning) pins one wire generation, not one agent set: a newer Roost can ship an adapter inside the same generation, so refusing the whole raise on an unfamiliar name is what would keep a newly supported agent switched off forever. A list with **no** recognised name at all is a successful, empty run — everything `skipped`, `wired` empty, nothing written, including the key. `skipped[].reason` remains free text for the client to show or log verbatim. `client` is required — it is recorded as `by` in the host's state record, which is what makes two clients of one host tellable apart.
 
-**A name the host cannot wire still survives in its key.** The raise is a read-modify-write of `agent-hooks`, so an older host asked to widen a key a newer Roost wrote re-emits every token it could not resolve, verbatim, after the names it could: `claude, gemini` raised with `["codex"]` reads back `claude, codex, gemini`. Only an explicit local set — [`agent.set_hooks`](#agentset_hooks), `roostctl agent set` — replaces the key outright and drops them, because there the user is looking at the list they just chose. `roostctl agent status` on the host lists such a name as `unknown to this build`.
+**A name the host cannot wire still survives in its keys.** The raise is a read-modify-write, so an older host asked to widen a key a newer Roost wrote re-emits every token it could not resolve, verbatim: `agent-hooks = claude, gemini` raised with `["cursor"]` reads back `claude, cursor, gemini`, and `agent-integration` keeps `gemini` the same way. Only an explicit local set — [`agent.set_hooks`](#agentset_hooks), `roostctl agent set` — replaces the key outright and drops them, because there the user is looking at the list they just chose. `roostctl agent status` on the host lists such a name as `unknown to this build`.
 
 **`wired` is the toast list, not this call's writes.** It names the agents this host has wired and has never announced to *any* client — the session flips its record's `noticed` for exactly what it reports here, in the same locked write that recorded the wiring, so the sentence "Roost wired agent hooks on ‹host›" appears at most once per agent per host even when two clients connect at the same moment, and including for a wiring done by `roostctl agent ensure` on the host itself. A reconnect, or a second client raising an already-covered list, gets an empty `wired`. `refreshed` *is* this call's writes; two clients raising different allow-lists both win, additively.
 

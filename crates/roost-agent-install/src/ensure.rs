@@ -27,7 +27,7 @@
 //! back.
 
 use roost_agent::{Agent, ALL_AGENTS};
-use roost_ui_model::config::{AgentHooks, ConfigLock, RoostConfig};
+use roost_ui_model::config::{AgentHooks, AgentIntegration, ConfigLock, RoostConfig};
 
 use crate::command::INTEGRATION_VERSION;
 use crate::error::{AgentError, AgentSkip, AgentWarning, InstallError, SkipReason};
@@ -382,15 +382,22 @@ pub fn reconcile_file_agents(
     reconcile_locked(home, mode, by, guard, &FILE_AGENTS, &lock)
 }
 
-/// Union `agents` into this home's `agent-hooks` key — never removing —
-/// then wire what it now allows.
+/// Switch the file agents among `agents` on — never removing — then wire
+/// them.
 ///
 /// What a connecting client is allowed to do to a host (plan 064 §3.3).
-/// A raise is additive against whatever the key already says, `off` and
-/// `ask` included: both become the client's list, because a host has no
-/// screen to ask on and the client in front of the user is the only
-/// authority there is. It never removes, so a second client — or an
-/// agent somebody wired by hand — survives a raise it was not named in.
+/// A raise is additive against whatever the host already says, `off` and
+/// `ask` included, because a host has no screen to ask on and the client
+/// in front of the user is the only authority there is. It never removes,
+/// so a second client — or an agent somebody wired by hand — survives a
+/// raise it was not named in.
+///
+/// Only a file agent is raised. Every other agent is on wherever the
+/// host never answered and stays as answered where it did, so a raise of
+/// one writes nothing and is reported as needing no file. The raise of
+/// a file agent lands in `agent-integration` as well as the shadow: the
+/// next session start narrows the shadow to that key, and retires the
+/// file of an agent the key does not switch on.
 ///
 /// One thing differs from [`ensure`], and it follows from the caller
 /// being remote: the run flips `noticed` itself, in the same record
@@ -403,8 +410,19 @@ pub fn raise(
 ) -> Result<Outcome, InstallError> {
     guard.check()?;
     let lock = home.config_lock()?;
-    let (key, wrote) = widen(home, agents, &lock)?;
-    let mode = Mode::Allow(key.as_ref().map(allowed_in).unwrap_or_default());
+    let by_file: Vec<Agent> = agents
+        .iter()
+        .copied()
+        .filter(|agent| home.wires_by_file(*agent))
+        .collect();
+    let (key, wrote) = widen(home, &by_file, &lock)?;
+    let in_key = key.as_ref().map(allowed_in).unwrap_or_default();
+    let mode = Mode::Allow(
+        ALL_AGENTS
+            .into_iter()
+            .filter(|agent| in_key.contains(agent) || agents.contains(agent))
+            .collect(),
+    );
     let mut outcome =
         wire_locked(home, &mode, by, guard, Notice::Here, &lock).map_err(|source| match &key {
             Some(key) => after_key(key, source),
@@ -744,6 +762,12 @@ fn widen(
     agents: &[Agent],
     lock: &ConfigLock,
 ) -> Result<(Option<AgentHooks>, bool), InstallError> {
+    let by_file: Vec<Agent> = agents
+        .iter()
+        .copied()
+        .filter(|agent| home.wires_by_file(*agent))
+        .collect();
+    let switched = switch_on(home, &by_file, lock)?;
     let current = read_hooks(home)?;
     let widened = union(&current, agents);
     // A union that allows nothing writes nothing. Widening is the only
@@ -752,10 +776,47 @@ fn widen(
     // writing then would spell that as `off`, which is a *lowering* of
     // an unanswered key nobody requested.
     if allowed_in(&widened).is_empty() {
-        return Ok((None, false));
+        return Ok((None, switched));
     }
     let wrote = write_hooks(home, &current, &widened, lock)?;
-    Ok((Some(widened), wrote))
+    Ok((Some(widened), wrote || switched))
+}
+
+/// Switch `agents` on in `agent-integration`, keeping every other answer
+/// it gives, and every name this build cannot resolve.
+///
+/// Before the shadow is widened, because an absent `agent-integration`
+/// starts from the legacy answer, exactly as the retire's carry-over
+/// would spell it. Writes nothing when every agent is already on.
+fn switch_on(home: &Home, agents: &[Agent], lock: &ConfigLock) -> Result<bool, InstallError> {
+    let switches = crate::retire::switches(home)?;
+    if agents.iter().all(|agent| switches.on(*agent)) {
+        return Ok(false);
+    }
+    let base = match switches.integration {
+        Some(integration) => Some(integration),
+        None if crate::retire::answered(&switches) => {
+            AgentIntegration::parse(&crate::retire::integration_from(&switches.legacy))
+        }
+        None => None,
+    };
+    let mut tokens: Vec<String> = match base {
+        None => Vec::new(),
+        Some(AgentIntegration::Off) => {
+            let none = AgentHooks::Allow {
+                agents: Vec::new(),
+                unknown: Vec::new(),
+            };
+            vec![crate::retire::integration_from(&none)]
+        }
+        Some(AgentIntegration::Set(set)) => set
+            .into_iter()
+            .filter(|(name, _)| Agent::parse(name).is_none_or(|agent| !agents.contains(&agent)))
+            .map(|(name, on)| if on { name } else { format!("-{name}") })
+            .collect(),
+    };
+    tokens.extend(agents.iter().map(|agent| agent.source().to_string()));
+    write_integration(home, &tokens.join(", "), lock)
 }
 
 /// `hooks` widened by `agents`, in [`ALL_AGENTS`] order.

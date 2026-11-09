@@ -2592,9 +2592,9 @@ def assert_inside_the_jail(jail, agent: str) -> None:
 
 def test_a_client_raises_a_hosts_key_and_a_second_client_widens_it(jailed_host):
     """The remote half of plan 064: a connecting client's allow-list is
-    unioned into the host's own `agent-hooks` key, and what the union
+    unioned into the host's own agent switches, and what the union
     allows is wired — by file only for Cursor, the one agent still
-    delivered that way.
+    delivered that way, and the only one a raise records.
 
     Two scripted clients, deliberately. The op's reply is readable only
     from a scripted client — no IPC op on the UI side reports what a host
@@ -2617,15 +2617,19 @@ def test_a_client_raises_a_hosts_key_and_a_second_client_widens_it(jailed_host):
     skipped = {row["agent"]: row["reason"] for row in reply["skipped"]}
     assert skipped.get("claude") == "not allowed", reply
 
-    # The files and the key, not just the reply.
+    # The files and the keys, not just the reply. Cursor lands in
+    # `agent-integration` too, or the host's next start would narrow the
+    # shadow back to `off` and retire the file this raise just wrote.
     assert jail.read_key() == "cursor"
+    assert jail.read_integration() == "cursor"
     assert set(jail.read_record()) == {"cursor"}
     assert jail.read_record()["cursor"]["by"] == "roosttest"
     assert_inside_the_jail(jail, "cursor")
     assert "ROOST_AGENT_HOOK" in cursor_hooks.read_text()
 
-    # A client that names Claude widens the key, and writes no file:
-    # Claude takes Roost's hooks from the tab environment.
+    # A client that names Claude writes nothing at all: Claude takes
+    # Roost's hooks from the tab environment, and is already on on a host
+    # nobody answered.
     with host.client() as second:
         widened = raise_hooks(second, ["claude"], by="another-box")
 
@@ -2633,7 +2637,8 @@ def test_a_client_raises_a_hosts_key_and_a_second_client_widens_it(jailed_host):
     assert widened["removed"] == [], widened
     skipped = {row["agent"]: row["reason"] for row in widened["skipped"]}
     assert skipped.get("claude") == "no file needed", widened
-    assert jail.read_key() == "claude, cursor", "a raise replaced the key instead of widening it"
+    assert jail.read_key() == "cursor", "a raise of an env agent wrote the shadow"
+    assert jail.read_integration() == "cursor", "a raise of an env agent answered for the host"
     assert wired_agents(jail) == {"cursor"}
     assert "ROOST_AGENT_HOOK" in cursor_hooks.read_text(), (
         "the second client's raise took the first client's grant back out"
@@ -2808,19 +2813,24 @@ def test_a_session_resolves_the_config_the_ui_wrote_however_it_was_launched(sess
     through `$HOME` instead. Both must land on the same key, or a raise
     would write a file nobody reads.
 
-    The second launch reading what the first one wrote is what keeps this
-    from passing on a technicality: `claude, codex` can only appear if the
-    `$HOME`-resolved session unioned into the override-resolved session's
-    write.
+    The first launch writes the file at its start: its retire carries the
+    seeded `agent-hooks = claude` into `agent-integration` and narrows
+    `agent-hooks` to `off`, which leaves the seed nowhere but in that
+    carry-over. The second launch reading what the first one wrote is
+    what keeps this from passing on a technicality: Claude on and Codex
+    off beside the raised Cursor can only appear if the `$HOME`-resolved
+    session unioned into the override-resolved session's write.
     """
-    jail = start_jailed_session(session_env, agent_hooks="off")
+    jail = start_jailed_session(session_env, agent_hooks="claude")
     assert session_env.env["ROOST_CONFIG"] == str(jail.config), (
         "the UI-spawn shape needs the override actually set"
     )
-
-    with session_env.client() as spawned_by_the_ui:
-        raise_hooks(spawned_by_the_ui, ["claude"])
-    assert jail.read_key() == "claude"
+    carried = "claude, -codex, -grok, -opencode"
+    sessionlib.wait_until(
+        lambda: jail.read_integration() == carried and jail.read_key() == "off",
+        5.0,
+        "the override-resolved session's retire to carry the answer over",
+    )
 
     session_env.stop_over_the_wire()
     session_env.wait_socket_gone()
@@ -2830,11 +2840,12 @@ def test_a_session_resolves_the_config_the_ui_wrote_however_it_was_launched(sess
     start_session(session_env, ROOST_AGENT_HOOKS_FORCE="1")
 
     with session_env.client() as started_by_hand:
-        raise_hooks(started_by_hand, ["codex"])
-    assert jail.read_key() == "claude, codex", (
+        raise_hooks(started_by_hand, ["cursor"])
+    assert jail.read_integration() == f"{carried}, cursor", (
         "the two launch paths resolved different config files"
     )
-    assert wired_agents(jail) == {"claude", "codex"}
+    assert jail.read_key() == "cursor"
+    assert wired_agents(jail) == {"cursor"}
 
 
 # ---------------------------------------------------------------------------
@@ -2900,13 +2911,30 @@ def test_agent_set_hooks_answers_per_host_without_touching_the_local_half(
                         f"host {host['label']} to connect",
                     )
 
+                # The ordering first, while the healthy host still has
+                # nothing a push could add to: a machine that cannot
+                # record the user's answer must not propagate it. With
+                # this UI's own config directory unwritable, the local
+                # write fails, and a push would have raised the host to
+                # Cursor inside this same call.
+                ui_config_dir = ui_jail.config.parent
+                ui_config_dir.chmod(0o500)
+                try:
+                    denied = refused(client.call, "agent.set_hooks", {"agents": ["cursor"]})
+                finally:
+                    ui_config_dir.chmod(0o700)
+                assert denied.code == "internal", denied
+                assert healthy_jail.read_key() is None, (
+                    "a local write that failed still reached a host"
+                )
+
                 # A writer that is not this UI moves the key under it —
                 # `roostctl agent set --local`, or a remote client
                 # raising this machine. The connect-time send must read
                 # the file, not the snapshot it launched with (plan 064
-                # §3.4), or a host would be handed a list the user has
-                # since changed and could never lower it again.
-                ui_jail.write_config(agent_hooks="grok")
+                # §3.4): the snapshot is unanswered and sends nothing, so
+                # Cursor on the host can only come from the re-read.
+                ui_jail.write_config(agent_hooks="cursor")
                 client.call("host.disconnect", {"id": saved[0]["id"]})
                 wait_until(
                     lambda: host_status_row(client, saved[0]["id"])["state"] != "connected",
@@ -2920,14 +2948,14 @@ def test_agent_set_hooks_answers_per_host_without_touching_the_local_half(
                     "the healthy host to reconnect",
                 )
                 wait_until(
-                    lambda: healthy_jail.read_key() == "grok",
+                    lambda: healthy_jail.read_key() == "cursor",
                     60.0,
                     "the reconnect to raise the key written behind the UI's back",
                 )
                 ui_jail.write_config(agent_hooks=None)
 
                 # Cursor, the one agent Roost still connects by file, so
-                # the reply has a wiring to report on both sides.
+                # the local half has a wiring to report.
                 reply = client.call("agent.set_hooks", {"agents": ["cursor"]})
                 # `off` reaches no host at all: the wire can only ever
                 # raise, and an off client has no allow-list to raise
@@ -2935,21 +2963,6 @@ def test_agent_set_hooks_answers_per_host_without_touching_the_local_half(
                 # assertion — a push that went out would appear here
                 # whether the host accepted it or refused it.
                 switched_off = client.call("agent.set_hooks", {"agents": "off"})
-
-                # And the ordering: a machine that cannot record the
-                # user's answer must not propagate it. With this UI's own
-                # config directory unwritable, the local write fails —
-                # and the healthy host, which a successful call would
-                # have widened to `claude, codex`, must be untouched.
-                ui_config_dir = ui_jail.config.parent
-                ui_config_dir.chmod(0o500)
-                try:
-                    denied = refused(
-                        client.call, "agent.set_hooks", {"agents": ["claude", "codex"]}
-                    )
-                finally:
-                    ui_config_dir.chmod(0o700)
-                assert denied.code == "internal", denied
 
             # Read after the UI is gone: a `mark_noticed` still in flight
             # would otherwise race the record assertions below.
@@ -2963,7 +2976,9 @@ def test_agent_set_hooks_answers_per_host_without_touching_the_local_half(
         # hosts happened to answer in.
         assert [entry["host"] for entry in reply["hosts"]] == ["good", "bad"], reply
         good, bad = reply["hosts"]
-        assert good["result"]["wired"] == ["cursor"], good
+        # Empty: `wired` is the toast list, and the reconnect's raise
+        # already announced Cursor on this host.
+        assert good["result"]["wired"] == [], good
         assert good["result"]["errors"] == [], good
         assert "error" in bad and "result" not in bad, bad
 
@@ -2975,13 +2990,8 @@ def test_agent_set_hooks_answers_per_host_without_touching_the_local_half(
 
         # The local half went back off; the hosts kept what they had,
         # because nothing was sent to them.
-        assert ui_jail.read_key() == "off", "the refused call wrote the key anyway"
-        # `grok` from the re-read above, `cursor` from the Apply — a
-        # raise only ever widens. Grok reports over OSC 7501, so only
-        # Cursor has a file.
-        assert healthy_jail.read_key() == "grok, cursor", (
-            "a local write that failed still reached a host"
-        )
+        assert ui_jail.read_key() == "off"
+        assert healthy_jail.read_key() == "cursor", "an `off` reached a host"
         assert wired_agents(healthy_jail) == {"cursor"}
         assert broken_jail.read_key() is None, "the unwritable host was written anyway"
         assert not broken_jail.record.exists()
