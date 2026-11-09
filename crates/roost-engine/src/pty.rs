@@ -3170,7 +3170,7 @@ async fn wait_for_output(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
@@ -3640,7 +3640,7 @@ mod tests {
         );
     }
 
-    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+    pub(crate) struct CapturedLog(pub(crate) Arc<Mutex<Vec<u8>>>);
 
     impl Write for CapturedLog {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
