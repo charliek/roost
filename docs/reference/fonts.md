@@ -13,7 +13,8 @@ font-size = 13
 ```
 
 Keys use Ghostty-style hyphens (`font-family`, not `font_family`); a
-misspelled key is silently ignored.
+misspelled key is ignored, with a warning in the log that names the key
+and, for a slip like `font_size`, the key you likely meant.
 
 ## Available settings
 
@@ -89,7 +90,8 @@ sidebar rows, tab pill labels, palette rows — uses its own font,
   `hint_metrics`, `hint_style`, `antialias`, `adjust_cell_width`,
   `adjust_cell_height`, `adjust_font_baseline`, `font_thicken`) — those
   belonged to the retired GTK renderer and no shipping UI reads them.
-  Leaving them in your config is harmless; unknown keys are dropped.
+  Leaving them in your config is harmless: unknown keys are dropped, with
+  a warning in the log.
 - **Chrome fonts are not configurable.** See above.
 - **Family changes need a relaunch.** Only `Cmd-+` / `Cmd--` / `Cmd-0`
   (`Alt-` on Linux) rescale live, per tab.

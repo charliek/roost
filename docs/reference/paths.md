@@ -407,9 +407,9 @@ Pre-rewrite builds stored their state under lowercase `~/Library/Application Sup
 
 ## Config keys
 
-`config.conf` is a tiny `key = value` file (no sections, no nesting). Lines starting with `#` are comments. Missing file → built-in defaults; unknown keys are ignored. Keybindings use Ghostty's `keybind = trigger=action` syntax — see [Keybindings](../getting-started/keybindings.md#custom-keybindings) for the full action list. The full reference (including the `copy-on-select` semantics) lives in [`config.md`](config.md).
+`config.conf` is a tiny `key = value` file (no sections, no nesting). Lines starting with `#` are comments. Missing file → built-in defaults; unknown keys are ignored, with a warning in the log (Ghostty's own keys stay silent, so a pasted Ghostty config is fine). Keybindings use Ghostty's `keybind = trigger=action` syntax — see [Keybindings](../getting-started/keybindings.md#custom-keybindings) for the full action list. The full reference (including the `copy-on-select` semantics) lives in [`config.md`](config.md).
 
-Keys use Ghostty-style hyphens (`font-family`, not `font_family`); a misspelled key is silently ignored.
+Keys use Ghostty-style hyphens (`font-family`, not `font_family`); a misspelled key is ignored with a log warning that suggests the key you likely meant.
 
 | Key              | Default                              | Effect                                                 |
 |------------------|--------------------------------------|--------------------------------------------------------|

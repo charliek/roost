@@ -10,6 +10,7 @@ pub mod context_menu;
 pub mod custom_command;
 pub mod drop_content;
 pub mod file_transfer;
+mod ghostty_keys;
 pub mod host_sidebar;
 pub mod host_verbs;
 pub mod keybind;

@@ -527,6 +527,49 @@ fn unquote(s: &str) -> &str {
     }
 }
 
+/// Every key [`RoostConfig::parse`] reads: the "did you mean" candidates
+/// for one it does not (issue #714).
+const ROOST_KEYS: &[&str] = &[
+    "agent-hooks",
+    "agent-panel-sort",
+    "chrome-accent",
+    "clipboard-write",
+    "command",
+    "copy-on-select",
+    "font-family",
+    "font-size",
+    "keybind",
+    "link-modifier",
+    "local-backend",
+    "macos-auto-secure-input",
+    "macos-option-as-alt",
+    "macos-secure-input-indication",
+    "macos-secure-keyboard-entry",
+    "provider",
+    "show-sidebar-agents",
+    "theme",
+    "word-break-chars",
+];
+
+/// The warning for a key `parse` does not read, with a "did you mean"
+/// for the slips copied docs once made (`_` for `-`, another case), or
+/// `None` for a Ghostty key: a Ghostty config pasted in is legal.
+fn unknown_key_warning(key: &str) -> Option<String> {
+    if crate::ghostty_keys::GHOSTTY_KEYS
+        .binary_search(&key)
+        .is_ok()
+    {
+        return None;
+    }
+    let normalized = key.to_ascii_lowercase().replace('_', "-");
+    Some(
+        match ROOST_KEYS.iter().find(|known| **known == normalized) {
+            Some(known) => format!("unknown config key `{key}`, ignored; did you mean `{known}`?"),
+            None => format!("unknown config key `{key}`, ignored"),
+        },
+    )
+}
+
 impl RoostConfig {
     pub fn load_default() -> Self {
         let Some(path) = default_path() else {
@@ -549,7 +592,7 @@ impl RoostConfig {
 
     pub fn parse(content: &str) -> Self {
         let mut cfg = Self::default();
-        for raw in content.lines() {
+        for (index, raw) in content.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -765,8 +808,9 @@ impl RoostConfig {
                     }
                 }
                 _ => {
-                    // Unknown key — forward-compat with future Roost
-                    // versions or ghostty-format keys we don't need.
+                    if let Some(warning) = unknown_key_warning(key) {
+                        tracing::warn!(line = index + 1, "{warning}");
+                    }
                 }
             }
         }
@@ -2065,6 +2109,62 @@ mod tests {
                 .as_deref(),
             Some("Dracula")
         );
+    }
+
+    #[test]
+    fn an_unknown_key_warns_with_the_roost_key_it_likely_meant() {
+        assert_eq!(
+            unknown_key_warning("font_size").as_deref(),
+            Some("unknown config key `font_size`, ignored; did you mean `font-size`?")
+        );
+        assert_eq!(
+            unknown_key_warning("Font_Family").as_deref(),
+            Some("unknown config key `Font_Family`, ignored; did you mean `font-family`?")
+        );
+        assert_eq!(
+            unknown_key_warning("fontsize").as_deref(),
+            Some("unknown config key `fontsize`, ignored")
+        );
+    }
+
+    #[test]
+    fn a_ghostty_key_roost_does_not_read_is_silent() {
+        for key in [
+            "cursor-style",
+            "window-padding-x",
+            "background",
+            "font-family-bold",
+        ] {
+            assert_eq!(unknown_key_warning(key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn the_ghostty_keys_are_sorted_for_binary_search() {
+        let keys = crate::ghostty_keys::GHOSTTY_KEYS;
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    /// The suggestion list drifts from the parser silently, so pin it to
+    /// the documented settings table, which lists every key `parse` reads.
+    #[test]
+    fn the_roost_keys_are_the_documented_settings() {
+        let doc = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/config.md"),
+        )
+        .expect("docs/reference/config.md");
+        let settings = doc
+            .split_once("## Settings")
+            .and_then(|(_, rest)| rest.split_once("\n## "))
+            .map(|(table, _)| table)
+            .expect("a Settings section");
+        let mut documented: Vec<&str> = settings
+            .lines()
+            .filter_map(|row| row.strip_prefix("| `")?.split_once('`'))
+            .map(|(key, _)| key)
+            .collect();
+        documented.sort_unstable();
+        assert_eq!(documented, ROOST_KEYS);
     }
 
     #[test]
