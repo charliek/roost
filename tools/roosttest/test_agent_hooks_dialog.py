@@ -260,7 +260,9 @@ def test_an_answered_key_asks_nothing(short_root):
         # The answer carries over into `agent-integration`, and the
         # `agent-hooks` shadow narrows to the file agents (none here), so
         # Claude is on through the tab environment and no file is written.
-        wait_for_config_line(allowed.config, "agent-integration", "claude, -codex, -grok, -opencode")
+        wait_for_config_line(
+            allowed.config, "agent-integration", "agent-integration = claude, -codex, -grok, -opencode"
+        )
     assert allowed.read_key() == "off"
     settings = allowed.agent_dirs["claude"] / "settings.json"
     assert not settings.exists() or "ROOST_AGENT_HOOK" not in settings.read_text()

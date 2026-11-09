@@ -1036,7 +1036,7 @@ def test_agent_ensure_under_an_unanswered_key_is_a_quiet_no_op(tmp_path):
         "skipped": [],
         "warnings": [],
         "errors": [],
-        "retire": {"deferred": False, "retired": [], "leftovers": [], "errors": []},
+        "retire": {"deferred": False, "retired": [], "leftovers": [], "errors": [], "key_error": None},
     }, outcome
     assert not jail.record.exists(), "an unanswered key still wrote the state record"
     for agent in INSTALLABLE_AGENTS:
@@ -1062,7 +1062,9 @@ def test_ensure_retires_old_entries_once_and_reports_one_that_comes_back(tmp_pat
     assert retired.returncode == 0, retired.stdout + retired.stderr
     outcome = json.loads(retired.stdout)
     assert outcome["retire"]["retired"] == ["claude", "grok"], outcome
-    assert "ROOST_AGENT_HOOK" not in settings.read_text()
+    # Roost created settings.json here, so the retire's uninstall edit
+    # removes the file rather than leaving it emptied.
+    assert not settings.exists() or "ROOST_AGENT_HOOK" not in settings.read_text()
     for path in grok_files:
         assert not path.exists(), f"grok's roost.json survived the retire: {path}"
     assert jail.read_key() == "off", "the shadow key was not narrowed to the file agents"
@@ -1407,7 +1409,9 @@ def test_two_processes_writing_config_conf_share_one_lock(short_root):
         wait_for_jailed_window(jail, proc, log)
         # The startup retire carries the answer over to
         # `agent-integration` under the same lock; let it land first.
-        wait_for_config_line(jail.config, "agent-integration", "claude, -codex, -grok, -opencode")
+        wait_for_config_line(
+            jail.config, "agent-integration", "agent-integration = claude, -codex, -grok, -opencode"
+        )
         with Roost(str(sock), timeout=scaled_timeout(30)) as roost:
 
             def toggle() -> None:

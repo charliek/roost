@@ -1075,6 +1075,19 @@ pub(crate) struct AgentHooksToast {
 }
 
 impl AgentHooksToast {
+    /// The ensure's toast over one already `held`: the retire's result
+    /// lands first, often in the same drain, and its sentence and the
+    /// policy line must survive the ensure's.
+    pub(crate) fn after(self, held: Option<AgentHooksToast>) -> AgentHooksToast {
+        let held = held.unwrap_or_default();
+        AgentHooksToast {
+            retire: held.retire,
+            retired: held.retired,
+            policy: held.policy,
+            ..self
+        }
+    }
+
     /// One banner line, the announcement first.
     pub(crate) fn text(&self) -> String {
         [
@@ -1409,6 +1422,23 @@ mod tests {
             agent,
             detail: "settings.json: unreadable".to_string(),
         }
+    }
+
+    #[test]
+    fn the_ensures_toast_keeps_the_held_retire_line() {
+        let held = AgentHooksToast {
+            retire: Some("retired".into()),
+            retired: vec![Agent::Codex],
+            policy: Some(POLICY_LINE),
+            ..AgentHooksToast::default()
+        };
+        let shown = toast(Vec::new(), &[problem(Some(Agent::Cursor))])
+            .unwrap()
+            .after(Some(held));
+        assert!(shown.problem.is_some());
+        assert_eq!(shown.retire.as_deref(), Some("retired"));
+        assert_eq!(shown.retired, vec![Agent::Codex]);
+        assert_eq!(shown.policy, Some(POLICY_LINE));
     }
 
     #[test]

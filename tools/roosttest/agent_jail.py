@@ -275,6 +275,13 @@ def jailed_ui(jail: Jail, *, force: bool = True, extra_env: "dict | None" = None
         )
     try:
         yield proc, log
+    except BaseException:
+        # pytest shows a failing test's stdout: the jail is gone by the
+        # time anyone reads CI, so its UI log and config go there.
+        tail = log.read_text(errors="replace").splitlines()[-80:] if log.exists() else []
+        config = jail.config.read_text() if jail.config.exists() else "<absent>"
+        print(f"--- {jail.config}\n{config}--- {log} (last 80 lines)\n" + "\n".join(tail))
+        raise
     finally:
         if proc.poll() is None:
             proc.terminate()

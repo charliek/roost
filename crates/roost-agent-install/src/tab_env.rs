@@ -969,7 +969,7 @@ mod tests {
     }
 
     fn write_record(dir: &Path, policy: ClaudePolicy) {
-        fs::create_dir_all(dir).unwrap();
+        env_delivery::prepare(dir).unwrap();
         let record = PolicyRecord {
             policy,
             remote_settings_cached: false,

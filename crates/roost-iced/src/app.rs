@@ -4524,7 +4524,7 @@ impl App {
         let Some(toast) = agent_hooks::toast(result.unnoticed, &result.problems) else {
             return;
         };
-        self.pending_agent_hooks_toast = Some(toast);
+        self.pending_agent_hooks_toast = Some(toast.after(self.pending_agent_hooks_toast.take()));
     }
 
     /// The startup retire came back. Its one-time sentence joins the

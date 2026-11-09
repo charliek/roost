@@ -245,9 +245,12 @@ def opened_tab_environ(iced: Iced) -> dict[str, str]:
 
 
 def test_a_new_tab_carries_roosts_agent_plugins_after_the_users(iced: Iced):
-    """By default Claude's plugin folder is appended after the user's own
-    and opencode's plugin added to the user's list: nothing replaced."""
-    environ = opened_tab_environ(iced)
+    """With both agents on, Claude's plugin folder is appended after the
+    user's own and opencode's plugin added to the user's list: nothing
+    replaced. The harness's seed config says `agent-hooks = off`, which
+    carries over as every agent off, so the switch is set here."""
+    with config_line("agent-integration = claude, opencode"):
+        environ = opened_tab_environ(iced)
 
     dirs = environ["CLAUDE_CODE_PLUGIN_DIRS"].split(":")
     assert dirs[0] == ICED_AGENT_ENV["CLAUDE_CODE_PLUGIN_DIRS"], dirs
