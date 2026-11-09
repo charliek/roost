@@ -24,10 +24,13 @@
   ROOST_BUNDLE_SPARKLE_ED_PUBLIC_KEY (both or neither; see
   roost_insert_sparkle_feed in bundle-lib.sh). A production build
   requires them; a dev build without them is feedless and never checks.
-  SUEnableAutomaticChecks is present and false: with the updater
-  instantiated, an ABSENT key would trigger Sparkle's first-run "check
-  automatically?" permission prompt — the explicit false suppresses
-  scheduled checks and that prompt; checks stay strictly user-invoked.
+  SUEnableAutomaticChecks is present and true: an ABSENT key would
+  trigger Sparkle's first-run "check automatically?" permission prompt,
+  and an explicit value suppresses it; the answer is just yes. Sparkle
+  checks daily (SUScheduledCheckInterval) and prompts before installing:
+  SUAutomaticallyUpdate is false, so it never installs silently over
+  running tabs. A feedless dev bundle has nothing to check; the E2E
+  harness turns scheduled checks off per launch (tools/roosttest/ui.py).
 
   Device-permission purpose strings (NSMicrophone/Camera/AppleEvents
   UsageDescription): paired with the capture entitlements in
@@ -72,6 +75,10 @@
   <key>LSUIElement</key>
   <false/>
   <key>SUEnableAutomaticChecks</key>
+  <true/>
+  <key>SUScheduledCheckInterval</key>
+  <integer>86400</integer>
+  <key>SUAutomaticallyUpdate</key>
   <false/>
   <key>NSHumanReadableCopyright</key>
   <string>Copyright © 2026 Charlie Knudsen. MIT-licensed.</string>

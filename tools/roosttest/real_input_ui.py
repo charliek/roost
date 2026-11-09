@@ -304,7 +304,11 @@ class RealInputUI:
         if (rust_log := os.environ.get("RUST_LOG")) is not None:
             argv += ["--env", f"RUST_LOG={ui._floor_roost_iced_info(rust_log)}"]
         try:
-            subprocess.run([*argv, str(self.app)], check=True, timeout=scaled_timeout(30))
+            subprocess.run(
+                [*argv, str(self.app), "--args", *ui.SPARKLE_NO_SCHEDULED_CHECKS],
+                check=True,
+                timeout=scaled_timeout(30),
+            )
             self.pid = self._adopt()
             self._wait_booted()
         except BaseException:

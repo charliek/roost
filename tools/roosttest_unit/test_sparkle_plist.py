@@ -142,19 +142,20 @@ class StampPlistTests(unittest.TestCase):
                 bundle = _StampedBundle(self, identity=identity)
                 self.assertNotEqual(bundle.result.returncode, 0)
 
-    def test_template_ships_no_feed_and_an_explicit_auto_check_false(self) -> None:
-        """The 6c posture baked into the template itself: no
-        SUFeedURL/SUPublicEDKey keys (the words appear in the template's
-        comment block, so match real <key> elements, not raw text), and
-        SUEnableAutomaticChecks present WITH the value false — presence
-        alone would still pass if someone flipped it to <true/>."""
+    def test_template_ships_no_feed_and_daily_prompting_checks(self) -> None:
+        """The template's posture: no SUFeedURL/SUPublicEDKey keys (the
+        words appear in the template's comment block, so match real <key>
+        elements, not raw text), and background checks on, daily, never
+        installing silently (#134). Each key is matched WITH its value."""
         bundle = _stamped(self)
         text = bundle.plist.read_text()
         self.assertNotIn("<key>SUFeedURL</key>", text)
         self.assertNotIn("<key>SUPublicEDKey</key>", text)
+        self.assertRegex(text, r"<key>SUEnableAutomaticChecks</key>\s*<true/>")
         self.assertRegex(
-            text, r"<key>SUEnableAutomaticChecks</key>\s*<false/>"
+            text, r"<key>SUScheduledCheckInterval</key>\s*<integer>86400</integer>"
         )
+        self.assertRegex(text, r"<key>SUAutomaticallyUpdate</key>\s*<false/>")
 
 
 class InsertFeedContractTests(unittest.TestCase):
@@ -244,12 +245,12 @@ class InsertFeedInsertionTests(unittest.TestCase):
         self.assertEqual(_plistbuddy_print(bundle.plist, "SUFeedURL"), FEED_URL)
         self.assertEqual(_plistbuddy_print(bundle.plist, "SUPublicEDKey"), ED_PUBLIC_KEY)
 
-    def test_insertion_leaves_auto_checks_false_and_identity_untouched(self) -> None:
+    def test_insertion_leaves_auto_checks_and_identity_untouched(self) -> None:
         bundle = _stamped(self)
         result = bundle.insert_feed(FEED_URL, ED_PUBLIC_KEY)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            _plistbuddy_print(bundle.plist, "SUEnableAutomaticChecks"), "false"
+            _plistbuddy_print(bundle.plist, "SUEnableAutomaticChecks"), "true"
         )
         self.assertEqual(
             _plistbuddy_print(bundle.plist, "CFBundleIdentifier"),

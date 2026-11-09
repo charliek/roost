@@ -1439,12 +1439,14 @@ jobs:
           done
           echo "OK: no SUFeedURL / SUPublicEDKey"
 
-          # Present AND false — with the updater instantiated, an absent
-          # key would trigger Sparkle's first-run auto-check prompt;
-          # checks stay strictly user-invoked.
-          [ "$(plist_value "$INFO" SUEnableAutomaticChecks)" = "false" ] \
-            || { echo "FAIL: SUEnableAutomaticChecks missing or not false"; exit 1; }
-          echo "OK: SUEnableAutomaticChecks present and false"
+          # Present AND true — an absent key would trigger Sparkle's
+          # first-run auto-check prompt. Daily background checks that
+          # prompt rather than install (#134).
+          for kv in SUEnableAutomaticChecks=true SUScheduledCheckInterval=86400 SUAutomaticallyUpdate=false; do
+            [ "$(plist_value "$INFO" "${kv%%=*}")" = "${kv#*=}" ] \
+              || { echo "FAIL: ${kv%%=*} missing or not ${kv#*=}"; exit 1; }
+            echo "OK: ${kv%%=*} = ${kv#*=}"
+          done
 
           FRAMEWORK="$APP/Contents/Frameworks/Sparkle.framework"
           [ -d "$FRAMEWORK" ] \
@@ -1814,7 +1816,9 @@ jobs:
           check CFBundleDisplayName Roost
           check SUFeedURL https://charliek.github.io/roost/appcast.xml
           check SUPublicEDKey "$(tr -d '[:space:]' < mac/keys/roost-sparkle-ed-public-key.txt)"
-          check SUEnableAutomaticChecks false
+          check SUEnableAutomaticChecks true
+          check SUScheduledCheckInterval 86400
+          check SUAutomaticallyUpdate false
           check NSMicrophoneUsageDescription "A program running in Roost would like to use the microphone."
           [ -x "$APP/Contents/MacOS/Roost" ] \
             || { echo "FAIL: $APP/Contents/MacOS/Roost missing or not executable"; exit 1; }
@@ -1938,6 +1942,8 @@ jobs:
           xmllint --noout "$W/appcast.xml"
           grep -q 'Roost-ci-smoke\.dmg' "$W/appcast.xml" \
             || { echo "FAIL: the appcast entry does not carry the DMG's enclosure name"; exit 1; }
+          grep -q '<sparkle:releaseNotesLink>https://github.com/charliek/roost/releases/tag/v0.0.0-ci-smoke</sparkle:releaseNotesLink>' "$W/appcast.xml" \
+            || { echo "FAIL: the appcast entry carries no release-notes link"; exit 1; }
           echo "OK: sign_update -> update-appcast.py chain produced a valid feed entry"
 
       - name: Collect Iced diagnostics

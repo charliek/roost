@@ -63,11 +63,11 @@ use the separate `Roost-iced` paths, so they run beside an installed
 ### Updating
 
 - **macOS.** `Roost.app` checks for updates through
-  [Sparkle](https://sparkle-project.org), and checks are **user-invoked**:
-  choose **Check for Updates…** from the app menu. It does not poll in the
-  background (`SUEnableAutomaticChecks` is `false`), so you will never get
-  an unprompted update panel. The feed (`appcast.xml`) is served from this
-  documentation site.
+  [Sparkle](https://sparkle-project.org) once a day in the background, and
+  you can check any time with **Check for Updates…** in the app menu. When
+  a new version is out, Sparkle shows its release notes and asks before
+  installing; it never installs on its own. The feed (`appcast.xml`) is
+  served from this documentation site.
 - **Linux.** Updates come from apt: `sudo apt update && sudo apt upgrade`
   (or just `sudo apt install --only-upgrade roost`). The package upgrades
   in place — same socket, `state.json`, and log paths as the version it
