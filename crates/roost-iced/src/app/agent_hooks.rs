@@ -640,8 +640,10 @@ fn survey_blocking(mode: CardMode, fallback: &AgentSwitches) -> Result<AgentHook
 }
 
 /// Both agent keys **as they are on disk right now**, for
-/// [`hooks_on_disk`]'s reason. An unreadable config falls back to what
-/// this process already believes.
+/// [`hooks_on_disk`]'s reason. Absent is unanswered, which is a real
+/// state and not a failure; an unreadable config falls back to what this
+/// process already believes, because failing to read is not a reason to
+/// say something different.
 fn switches_on_disk(fallback: &AgentSwitches) -> AgentSwitches {
     let Some(path) = roost_ui_model::config::config_path() else {
         return fallback.clone();
@@ -958,19 +960,11 @@ pub(crate) fn remote_request(config: &RoostConfig) -> Option<Vec<String>> {
 /// unreadable config falls back to what this process already believes,
 /// because failing to read is not a reason to say something different.
 pub(crate) fn hooks_on_disk(fallback: &AgentHooks) -> AgentHooks {
-    let Some(path) = roost_ui_model::config::config_path() else {
-        return fallback.clone();
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => RoostConfig::parse(&text).agent_hooks,
-        // Absent is unanswered, which is a real state and not a failure:
-        // it is what a machine nobody has consented on looks like.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => AgentHooks::Ask,
-        Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "could not re-read agent-hooks");
-            fallback.clone()
-        }
-    }
+    switches_on_disk(&AgentSwitches {
+        integration: None,
+        legacy: fallback.clone(),
+    })
+    .legacy
 }
 
 /// How this client names itself in a host's state record.

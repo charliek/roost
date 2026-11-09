@@ -723,11 +723,7 @@ fn write_hooks(
 /// Write `agent-integration`, unless it already says exactly `value`.
 fn write_integration(home: &Home, value: &str, lock: &ConfigLock) -> Result<bool, InstallError> {
     let path = home.config_path();
-    let current = match std::fs::read_to_string(path) {
-        Ok(text) => RoostConfig::parse(&text).agent_integration,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(InstallError::io(path, e)),
-    };
+    let current = crate::retire::switches(home)?.integration;
     if current == roost_ui_model::config::AgentIntegration::parse(value) {
         return Ok(false);
     }

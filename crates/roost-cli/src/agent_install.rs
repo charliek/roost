@@ -29,9 +29,10 @@
 
 use clap::Subcommand;
 use roost_agent::Agent;
+use roost_agent_install::tab_env::ClaudePolicy;
 use roost_agent_install::{
     ensure, install, reconcile_file_agents, resolve_names, retire, set_hooks, status, uninstall,
-    AgentSkip, Guard, Home, Mode, Outcome, RetireOutcome, Status, ALL_AGENTS,
+    AgentSkip, Delivery, Guard, Home, Mode, Outcome, RetireOutcome, Status, ALL_AGENTS,
 };
 use roost_ipc::messages::{
     ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksHostOutcome, AgentSetHooksParams,
@@ -182,7 +183,8 @@ pub fn run(cmd: &AgentCmd, json: bool) -> Result<i32, CliError> {
             let (key, mode) = resolved_or_nothing();
             let rows =
                 status(&home, &mode).map_err(|e| CliError::Failed(format!("agent status: {e}")))?;
-            print_status(&rows, key.unknown(), json);
+            let policy = roost_agent_install::tab_env::claude_policy_here(&home);
+            print_status(&rows, key.unknown(), policy.as_ref(), json);
             Ok(0)
         }
     }
@@ -587,7 +589,8 @@ fn print_outcome(outcome: &Outcome) {
 /// act on — the key itself keeps them (a newer Roost put them there), so
 /// a status that hid them would read as if the name had been thrown
 /// away.
-fn print_status(rows: &[Status], unknown: &[String], json: bool) {
+fn print_status(rows: &[Status], unknown: &[String], policy: Option<&ClaudePolicy>, json: bool) {
+    let blocked = policy.is_some_and(ClaudePolicy::blocks);
     if json {
         let body: Vec<serde_json::Value> = rows
             .iter()
@@ -603,7 +606,11 @@ fn print_status(rows: &[Status], unknown: &[String], json: bool) {
                     "files": row.files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                     "skipped": row.skipped.as_ref().map(ToString::to_string),
                     "warnings": row.warnings.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                    "delivery": delivery(row.agent),
+                    "on": row.on,
+                    "delivery": live_delivery(row, blocked),
+                    "policy": (row.agent == Agent::Claude)
+                        .then(|| policy.map(|p| serde_json::to_value(p).unwrap_or_default()))
+                        .flatten(),
                     "retired": row.retired.as_ref().map(|r| serde_json::json!({
                         "version": r.version,
                         "at": r.at,
@@ -627,7 +634,12 @@ fn print_status(rows: &[Status], unknown: &[String], json: bool) {
     }
 
     for row in rows {
-        println!("{:<9} {}", row.agent.source(), status_line(row));
+        println!("{:<9} {}", row.agent.source(), status_line(row, blocked));
+        if let (Agent::Claude, Some(ClaudePolicy::Blocked(why) | ClaudePolicy::Unknown(why))) =
+            (row.agent, policy)
+        {
+            println!("          plugin policy: {why}");
+        }
         if let Some(reason) = &row.skipped {
             if row.present {
                 println!("          skipped: {reason}");
@@ -665,15 +677,24 @@ fn print_status(rows: &[Status], unknown: &[String], json: bool) {
     }
 }
 
-/// How this build connects `agent`: a user file for the file agents,
-/// the tab environment for Claude and opencode, the agent's own OSC
-/// 7501 for the rest.
-fn delivery(agent: Agent) -> &'static str {
-    match agent {
-        Agent::Cursor => "file",
-        Agent::Claude | Agent::Opencode => "env",
-        Agent::Codex | Agent::Grok => "7501",
+/// How an agent with no file is connected, in a sentence doctor and
+/// `agent status` share.
+pub(crate) fn delivery_phrase(delivery: Delivery) -> &'static str {
+    match delivery {
+        Delivery::Env => "connected through the tab environment",
+        Delivery::Osc7501 => "reports over OSC 7501",
+        Delivery::File => "connected by its own config file",
     }
+}
+
+/// How this build connects the agent right now: its [`Delivery`], or
+/// `none` while it is switched off or Claude's sideload policy keeps the
+/// plugin out.
+fn live_delivery(row: &Status, claude_blocked: bool) -> &'static str {
+    if !row.on || (row.agent == Agent::Claude && claude_blocked) {
+        return "none";
+    }
+    Delivery::of(row.agent).as_str()
 }
 
 /// Three independent facts per row, in the order that reads: is the
@@ -682,9 +703,23 @@ fn delivery(agent: Agent) -> &'static str {
 /// `wired` is the state record's claim and `entries_on_disk` is the
 /// agent's own files; they can disagree, and saying which is which is
 /// the difference between a status line and a guess.
-fn status_line(row: &Status) -> String {
+fn status_line(row: &Status, claude_blocked: bool) -> String {
     if !row.present {
         return "not installed".to_string();
+    }
+    let delivery = Delivery::of(row.agent);
+    if delivery != Delivery::File {
+        let mut line = if !row.on {
+            "present, switched off".to_string()
+        } else if row.agent == Agent::Claude && claude_blocked {
+            "present, skipped: your organization's Claude policy blocks plugin folders".to_string()
+        } else {
+            format!("present, {}, nothing written", delivery_phrase(delivery))
+        };
+        if row.entries_on_disk {
+            line.push_str(", old Roost file entries still in place");
+        }
+        return line;
     }
     let allowed = if row.allowed {
         "allowed"
@@ -840,33 +875,73 @@ mod tests {
     fn a_status_line_says_present_allowed_and_wired_separately() {
         let version = roost_agent_install::INTEGRATION_VERSION;
         assert_eq!(
-            status_line(&a_row(Agent::Codex, true)),
+            status_line(&a_row(Agent::Cursor, true), false),
             format!("present, allowed, wired@v{version}")
         );
         assert_eq!(
-            status_line(&Status {
-                entries_on_disk: false,
-                wired: None,
-                up_to_date: false,
-                ..a_row(Agent::Grok, false)
-            }),
+            status_line(
+                &Status {
+                    entries_on_disk: false,
+                    wired: None,
+                    up_to_date: false,
+                    ..a_row(Agent::Cursor, false)
+                },
+                false
+            ),
             "present, not allowed"
         );
         // The record-vs-disk disagreement is kept word for word.
         assert_eq!(
-            status_line(&Status {
-                entries_on_disk: false,
-                ..a_row(Agent::Claude, true)
-            }),
+            status_line(
+                &Status {
+                    entries_on_disk: false,
+                    ..a_row(Agent::Cursor, true)
+                },
+                false
+            ),
             format!("present, allowed, record says wired@v{version}, nothing wired on disk")
         );
         assert_eq!(
-            status_line(&Status {
-                present: false,
-                ..a_row(Agent::Cursor, true)
-            }),
+            status_line(
+                &Status {
+                    present: false,
+                    ..a_row(Agent::Cursor, true)
+                },
+                false
+            ),
             "not installed"
         );
+    }
+
+    /// An agent connected without a file says how, or why not.
+    #[test]
+    fn a_status_line_says_how_an_agent_without_a_file_connects() {
+        let clean = |agent| Status {
+            entries_on_disk: false,
+            ..a_row(agent, false)
+        };
+        assert_eq!(
+            status_line(&clean(Agent::Claude), false),
+            "present, connected through the tab environment, nothing written"
+        );
+        assert_eq!(
+            status_line(&clean(Agent::Grok), true),
+            "present, reports over OSC 7501, nothing written"
+        );
+        assert!(status_line(&clean(Agent::Claude), true).contains("Claude policy"));
+        let off = Status {
+            on: false,
+            ..clean(Agent::Opencode)
+        };
+        assert_eq!(status_line(&off, false), "present, switched off");
+        assert!(status_line(&a_row(Agent::Codex, true), false).ends_with("still in place"));
+
+        assert_eq!(live_delivery(&clean(Agent::Claude), false), "env");
+        assert_eq!(live_delivery(&clean(Agent::Claude), true), "none");
+        assert_eq!(live_delivery(&clean(Agent::Opencode), true), "env");
+        assert_eq!(live_delivery(&off, false), "none");
+        assert_eq!(live_delivery(&clean(Agent::Codex), false), "7501");
+        assert_eq!(live_delivery(&a_row(Agent::Cursor, true), false), "file");
     }
 
     #[test]

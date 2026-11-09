@@ -1138,16 +1138,18 @@ mod tests {
         let managed = root.path().join("managed");
         let remote = root.path().join("remote-settings.json");
 
-        let read = |records: &[PathBuf]| claude_policy_from(&[managed.clone()], &remote, records);
+        let read = |records: &[PathBuf]| {
+            claude_policy_from(std::slice::from_ref(&managed), &remote, records)
+        };
         assert_eq!(read(&[]), None);
-        assert_eq!(read(&[ui.clone()]), Some(ClaudePolicy::Allowed));
+        assert_eq!(read(std::slice::from_ref(&ui)), Some(ClaudePolicy::Allowed));
         assert_eq!(
             read(&[ui.clone(), session.clone()]),
             Some(ClaudePolicy::Blocked("probe".into()))
         );
 
         fs::write(&remote, r#"{"settings":{"disableSideloadFlags":true}}"#).unwrap();
-        assert!(read(&[ui.clone()]).is_some_and(|p| p.blocks()));
+        assert!(read(std::slice::from_ref(&ui)).is_some_and(|p| p.blocks()));
         fs::remove_file(&remote).unwrap();
 
         fs::create_dir_all(&managed).unwrap();
