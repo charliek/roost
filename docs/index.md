@@ -29,7 +29,6 @@ Building from source instead? See [Installation](getting-started/installation.md
 - Not a Ghostty replacement.
 - Not a tmux replacement.
 - Not multi-window — one window, projects in the sidebar, tabs in each project.
-- Not split-pane — one terminal per tab.
 - Not a browser host.
 - Not a Windows app — macOS and Linux only.
 
@@ -56,4 +55,4 @@ If the tab is not currently focused you'll see:
 - [Host Sessions](guides/host-sessions.md) — shells that survive closing the window, via the opt-in `roost-session` daemon.
 - [Claude Code Hooks](guides/claude-code.md) — wire `roostctl notify` into Claude.
 - [Architecture](reference/architecture.md) — how the UIs, IPC socket, and CLI fit together.
-- [Vision](development/vision.md) — the durable design decisions and migration path.
+- [Vision](development/vision.md) — what Roost is for, its principles, and the directions under discovery.

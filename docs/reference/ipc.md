@@ -2960,7 +2960,7 @@ follow-up `palette.state`:
 `open` is false when no palette is up (the other fields are then
 empty/default). When open, `frame` is the current frame id — `commands` |
 `launcher` | `custom` | `themes` | `fonts` | `notifications` | `present` |
-`agents` (a provider drill-in sub-frame gets a generated
+`agents` | `host_targets` (a provider drill-in sub-frame gets a generated
 `provider:items:<n>` id instead) — and `items` are the filtered rows in
 display order (`subtitle` present on rows that have one).
 
@@ -2995,7 +2995,7 @@ collapsed); the empty-state row
 
 | Op | Request params | Notes |
 |---|---|---|
-| `palette.open` | `{"kind": "commands"}` | `kind`: `""`/`commands` → command palette; `launcher` → custom-command launcher; `custom` → the script-backed provider palette; `agents` → the agent-jump palette. Other values → `invalid-param`. |
+| `palette.open` | `{"kind": "commands"}` | `kind`: `""`/`commands` → command palette; `launcher` → custom-command launcher; `custom` → the script-backed provider palette; `agents` → the agent-jump palette. Other values → `invalid-param` (`notifications` and `host_targets` are frame ids, not openable kinds). |
 | `palette.state` | `{}` | Read the current state. |
 | `palette.query` | `{"query": "theme"}` | Set the current frame's filter (resets selection to the top match). |
 | `palette.activate` | `{"id": "new_tab"}` | Confirm the visible row with this id — runs its command or drills into its sub-frame. `not-found` if no palette is open or no row matches. |
@@ -3276,7 +3276,7 @@ ever enters the ring, so **no resumed stream ever receives one from its
 gap, for any subscriber**:
 
 - [`tab.effect`](#events) (bells, OSC 52 clipboard writes —
-  [DL-18](../development/vision.md#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29)),
+  [DL-26](../development/decision-history.md#dl-26-there-is-no-lease-2026-09-12)),
   because replaying a clipboard write from thirty seconds ago is wrong
   regardless of who resumes into it;
 - [`workspace.durability_changed`](#events), because the standing value
@@ -3609,7 +3609,7 @@ there is no window to measure a size from — a UI socket keeps its usual
 `80x24` default. On start, a session **hydrates** its saved
 `state.json` layout headlessly: it re-opens each tab's saved `{title,
 cwd}` as a fresh shell (same "layout, not live state" contract as a UI —
-[DL-7](../development/vision.md#dl-7-tabs-persist-as-layout-not-live-state-revised-2026-05-24))
+[DL-7](../development/decision-history.md#dl-7-tabs-persist-as-layout-not-live-state-revised-2026-05-24))
 and attaches a per-tab OSC drain to each one so title/cwd/notification
 facts keep flowing with no terminal or renderer present. `SIGTERM` and
 `SIGINT` converge on the same shutdown path as an IPC-driven

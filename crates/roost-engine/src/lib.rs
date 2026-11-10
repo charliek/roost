@@ -19,6 +19,7 @@ pub mod git_metrics;
 #[cfg(feature = "vt")]
 pub mod images;
 pub mod ipc;
+mod locale;
 #[cfg(feature = "vt")]
 pub mod memory;
 pub mod opener;
@@ -43,6 +44,8 @@ pub mod size_owner;
 // build keeps the default reader → broadcast flow (plan 036 D1).
 #[cfg(feature = "server-vt")]
 pub mod tab_task;
+#[cfg(test)]
+pub(crate) mod test_log;
 pub mod workspace;
 
 /// Where a project with no directory of its own is placed.

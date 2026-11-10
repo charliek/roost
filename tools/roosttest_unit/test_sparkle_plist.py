@@ -8,8 +8,9 @@ test_socket_paths.py. No cargo build, no network. Pinned here: `dev` and
 `production` are the only identities, and production requires both Sparkle
 values; the stamp fills the id and name everywhere the template asks and
 leaves no placeholder; both feed values set inserts SUFeedURL +
-SUPublicEDKey into the stamped plist, exactly one set is a hard error,
-neither set leaves the plist byte-identical (a feedless dev bundle).
+SUPublicEDKey into the stamped plist and turns scheduled checks on,
+exactly one set is a hard error, neither set leaves the plist
+byte-identical (a feedless dev bundle).
 
 The insertion-verification tests read the keys back with PlistBuddy and
 therefore run only on macOS (harness-unit CI is ubuntu); the stamping
@@ -142,19 +143,21 @@ class StampPlistTests(unittest.TestCase):
                 bundle = _StampedBundle(self, identity=identity)
                 self.assertNotEqual(bundle.result.returncode, 0)
 
-    def test_template_ships_no_feed_and_an_explicit_auto_check_false(self) -> None:
-        """The 6c posture baked into the template itself: no
-        SUFeedURL/SUPublicEDKey keys (the words appear in the template's
-        comment block, so match real <key> elements, not raw text), and
-        SUEnableAutomaticChecks present WITH the value false — presence
-        alone would still pass if someone flipped it to <true/>."""
+    def test_template_ships_no_feed_and_no_scheduled_checks(self) -> None:
+        """The template's posture: no SUFeedURL/SUPublicEDKey keys (the
+        words appear in the template's comment block, so match real <key>
+        elements, not raw text), and scheduled checks present but off
+        until the feed is inserted, daily, never installing silently
+        (#134). Each key is matched WITH its value."""
         bundle = _stamped(self)
         text = bundle.plist.read_text()
         self.assertNotIn("<key>SUFeedURL</key>", text)
         self.assertNotIn("<key>SUPublicEDKey</key>", text)
+        self.assertRegex(text, r"<key>SUEnableAutomaticChecks</key>\s*<false/>")
         self.assertRegex(
-            text, r"<key>SUEnableAutomaticChecks</key>\s*<false/>"
+            text, r"<key>SUScheduledCheckInterval</key>\s*<integer>86400</integer>"
         )
+        self.assertRegex(text, r"<key>SUAutomaticallyUpdate</key>\s*<false/>")
 
 
 class InsertFeedContractTests(unittest.TestCase):
@@ -244,12 +247,12 @@ class InsertFeedInsertionTests(unittest.TestCase):
         self.assertEqual(_plistbuddy_print(bundle.plist, "SUFeedURL"), FEED_URL)
         self.assertEqual(_plistbuddy_print(bundle.plist, "SUPublicEDKey"), ED_PUBLIC_KEY)
 
-    def test_insertion_leaves_auto_checks_false_and_identity_untouched(self) -> None:
+    def test_insertion_turns_auto_checks_on_and_leaves_identity_untouched(self) -> None:
         bundle = _stamped(self)
         result = bundle.insert_feed(FEED_URL, ED_PUBLIC_KEY)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            _plistbuddy_print(bundle.plist, "SUEnableAutomaticChecks"), "false"
+            _plistbuddy_print(bundle.plist, "SUEnableAutomaticChecks"), "true"
         )
         self.assertEqual(
             _plistbuddy_print(bundle.plist, "CFBundleIdentifier"),

@@ -86,8 +86,7 @@ These amend the table above and the sections below.
 - Embedding the app's terminal in shed-mobile. That may come later, and
   the [crate layout](#crates) keeps it possible.
 
-The project-wide non-goals still hold: no split panes, and no browser
-host.
+The project-wide non-goals still hold: no browser host.
 
 ## What the spike proved
 

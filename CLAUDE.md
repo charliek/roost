@@ -2,36 +2,51 @@
 
 ## Direction (read first)
 
-Roost is a cross-platform (Mac + Linux) desktop terminal multiplexer
-built around libghostty-vt. It ships **one desktop UI**, Rust + iced,
-on both platforms; it embeds the workspace + PTY supervisor in-process
-and serves a JSON IPC socket for external tooling (`roostctl`, Claude
-hooks). No daemon by default, except a fresh install, which starts its
-local tabs on a `roost-session` it manages. The other opt-in exception
-is `roost-session` (`crates/roost-session/`), a headless daemon for
-host-sessions, started with `roostctl session start`. The Swift + AppKit
-Mac app was retired in v0.1.0 (DL-33).
+Roost is the place to run and supervise coding agents across your
+machines: a Mac + Linux desktop terminal multiplexer built around
+libghostty-vt, with hosts reached over SSH and a mobile companion. Keep
+it simple; new work should make running agents better, not make Roost
+bigger. It ships **one desktop UI**, Rust + iced, on both platforms
+(the Swift app was retired in v0.1.0, DL-33), and serves a JSON IPC
+socket for external tooling (`roostctl`, agent hooks, the agent skill).
+A tab's shell runs either in-process or in `roost-session`
+(`crates/roost-session/`), the same engine as a headless daemon that the
+desktop app is a client of. A fresh install starts its local tabs on a
+`roost-session` it manages, an existing setup keeps the backend it has
+(DL-27), and `roostctl session start` starts one by hand. The same
+daemon on another machine, reached over SSH, is a host in the sidebar.
+Roost mobile, a Flutter + Rust Android client of `roost-session`
+(`mobile/`), shipped as a prototype in v0.1.0 (DL-34).
 
 * Desktop UI: Rust + iced, `crates/roost-iced/` — packaged as `/usr/bin/roost` on Linux and
   as `Roost.app` on macOS (bundle id `ai.stridelabs.Roost`; scripts and resources in `mac/`).
   Dev macOS builds are `Roost-Iced.app` (`ai.stridelabs.Roost.iced`).
 * CLI: `crates/roost-cli/` (binary `roostctl`).
 * IPC + path resolution: `crates/roost-ipc/`.
+* Toolkit-neutral engine (workspace, PTY runtime, persistence, events, IPC dispatch): `crates/roost-engine/`;
+  configuration + presentation models: `crates/roost-ui-model/`.
+* Headless session daemon: `crates/roost-session/`.
 * Host-session client core: `crates/roost-client/` (state machine, mirror, reconnect, op queue, uploads; `roost-iced` is its consumer).
-* libghostty-vt FFI + OSC: `crates/roost-vt/`, `crates/roost-osc/`.
+* Agent adapters (hook JSON in, `tab.agent_report` out): `crates/roost-agent/`; hook install into agents' own configs: `crates/roost-agent-install/`.
+* Mobile: the Flutter app in `mobile/`, its Rust core `crates/roost-mobile/`, and the in-process SSH dialer `crates/roost-ssh/`.
+* libghostty-vt FFI + OSC: `crates/roost-vt/`, `crates/roost-osc/`; shared URL detection: `crates/roost-url/`.
 
-**North star.** Every surface — UI clicks, hotkeys, `roostctl`, and Lua
-scripts — routes through **one core: the workspace operation set**; the
-UI is a *reaction* to the core's events, never its own source of truth.
-One contract (`roost-ipc`'s op set), one desktop implementation (Rust +
-iced on macOS and Linux); a mobile client of `roost-session` is planned.
-Optimize for **testability,
-programmability, clean architecture**: adding a capability is "add an op
-+ thin adapters", not per-surface logic. When in doubt, ask: *does this
-route through the one op set and keep the UI reactive?*
+**North star.** Every surface — UI clicks, hotkeys, `roostctl`, agent
+hooks, agents driving Roost through the skill, and any future scripting
+surface (Lua is not implemented, DL-12) — routes through **one core: the
+workspace operation set**; the UI is a *reaction* to the core's events,
+never its own source of truth. One contract (`roost-ipc`'s op set), one
+desktop implementation (Rust + iced on macOS and Linux); Roost mobile is
+a second client of the same contract, through `roost-session`. Optimize
+for **testability, programmability, clean architecture**: adding a
+capability is "add an op + thin adapters", not per-surface logic. When
+in doubt, ask: *does this route through the one op set and keep the UI
+reactive?*
 
-See [docs/development/vision.md](docs/development/vision.md) for the full
-architecture, principles, and decision log;
+See [docs/development/vision.md](docs/development/vision.md) for what
+Roost is for, the principles, the directions under discovery and the
+decision index; [docs/development/decision-history.md](docs/development/decision-history.md)
+for the full text of each decision (DL-N); and
 [docs/reference/ipc.md](docs/reference/ipc.md) for the JSON IPC wire
 format.
 
@@ -53,12 +68,12 @@ branch and is **frozen** at `00b3d10`. Do not start new work on it.
 
 ## What this is
 
-Sidebar of projects, tabs per project, one terminal per tab. The
+Sidebar of projects, tabs per project, each tab a terminal. The
 differentiator is multi-project workspace with notification routing
 for AI coding agents (Claude Code, Codex, etc.). Inspiration: cmux.
 Constraint: smaller scope than cmux.
 
-See `docs/development/vision.md` for the design rationale and
+See `docs/development/vision.md` for the direction and principles, and
 `docs/reference/architecture.md` for diagrams.
 
 ## Architecture
@@ -211,12 +226,12 @@ wrapper small.
   live COSMIC session owns input, so the cage+uinput real-input tier
   can't run locally — use CI/shed), workspace isolation, and where logs
   live.
-- **Visual smoke (screenshots)**: `tools/screenshot/` drives either UI
-  through `roostctl` (`launch.sh`/`quit.sh`/`smoke.sh <mac|iced>`),
+- **Visual smoke (screenshots)**: `tools/screenshot/` drives a dev
+  `roost-iced` build through `roostctl` (`launch.sh`/`quit.sh`/`smoke.sh iced`),
   captures labeled screenshots + a `manifest.md` of per-shot
   expectations, and includes `pngtool.py` (stdlib PNG inspect/crop —
-  cross-platform) for programmatic pixel assertions. One harness covers
-  both UIs. See [`tools/screenshot/README.md`](tools/screenshot/README.md).
+  cross-platform) for programmatic pixel assertions. The same harness
+  runs on macOS and Linux. See [`tools/screenshot/README.md`](tools/screenshot/README.md).
 - **Real-input injection (Linux)**: [`tools/input/linux/`](tools/input/linux/README.md)
   exercises the actual key-encoder + mouse-gesture + clipboard path on
   Linux (COSMIC/Wayland) with no image libraries — `/dev/uinput`
@@ -324,19 +339,23 @@ edit did what you meant; and the `pymdownx.emoji` callables live in the
 - Not a tmux replacement.
 - Not multi-window. One window, projects in sidebar, tabs in
   projects.
-- Not split-pane. One terminal per tab, period.
 - Not a browser host.
 - Not Windows. Mac + Linux only.
-- Not git-aware in MVP. Sidebar is `{name, cwd}` only.
-- No task tabs in MVP. The schema reserves the column; the UI
-  doesn't expose it yet.
+- Not git-aware in MVP. The sidebar shows no git state.
+- No task tabs in MVP.
 
 ## Useful references checked out next door
 
-- `../ghostling/main.c` — single-file C reference for libghostty-vt
+Reference projects live in `../thirdparty/`. Check a project's LICENSE
+before borrowing from it: a copyleft project is a design reference only,
+and none of its code is quoted or paraphrased here.
+
+- `../thirdparty/ghostling/main.c` — single-file C reference for libghostty-vt
   embedding. Direct template for the spike.
-- `../ghostty/include/ghostty.h` — the C API.
-- `../ghostty/src/lib_vt.zig` — exhaustive list of exported C
+- `../thirdparty/ghostty/include/ghostty.h` — the C API.
+- `../thirdparty/ghostty/src/lib_vt.zig` — exhaustive list of exported C
   symbols.
-- `../cmux/` — Swift/AppKit reference (another project); data model and CLI protocol
-  patterns.
+- `../thirdparty/herdr/` — the session substrate the host-session
+  decisions are measured against (Apache-2.0).
+- `../thirdparty/cmux/` — Swift/AppKit reference (another project); data model and CLI protocol
+  patterns. GPL-3.0-or-later, so design-level only: no code.

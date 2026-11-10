@@ -14,17 +14,17 @@ history preserves them.
 
 The short version — the decision-log entries are the canonical form:
 
-- **[DL-15](vision.md#dl-15-linux-ships-iced-gtk4-rs-is-retired-and-removed-2026-08-25)**
+- **[DL-15](decision-history.md#dl-15-linux-ships-iced-gtk4-rs-is-retired-and-removed-2026-08-25)**
   — the renderer was always ours (we walk libghostty-vt's render state
   and draw cell-aligned rects + text either way), so Cairo + Pango
   bought the terminal grid nothing that iced + wgpu doesn't buy on the
   GPU; iced runs on Linux *and* macOS, so one Rust codebase covers both
   host OSes; and both Rust UIs already sat on the toolkit-neutral
   `roost-engine`, so retiring an adapter cost the core nothing.
-- **[DL-16](vision.md#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25)**
+- **[DL-16](decision-history.md#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25)**
   — the macOS build existed to test the convergence hypothesis (one
   codebase, both platforms) against the Swift app in daily use. The
-  hypothesis held; [DL-33](vision.md#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)
+  hypothesis held; [DL-33](decision-history.md#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03)
   retires the Swift app.
 
 ## What shipped, by milestone
@@ -117,9 +117,8 @@ was deleted ([#286](https://github.com/charliek/roost/issues/286)).
   crate whose premise is replacing Swift.
 - **Sparkle, menu bar, notifications** (plans 028, 030) — user-invoked
   update checks against `docs/appcast-iced.xml` with its own signing key
-  (`SUEnableAutomaticChecks` is `false`; the app does not self-update;
-  that feed is frozen since v0.1.0, and `Roost.app` updates from
-  `docs/appcast.xml`),
+  (that feed is frozen since v0.1.0, and `Roost.app` updates from
+  `docs/appcast.xml`, with daily background checks since #134),
   a real `NSMenu`, a Dock badge, and `UNUserNotificationCenter` banners
   that focus the originating tab on click.
 - **Developer-ID signed and notarized**, published as the fourth release

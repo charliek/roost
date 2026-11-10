@@ -24,6 +24,9 @@ released DMG:
 
     sparkle:edSignature="<base64>" length="<bytes>"
 
+Each item carries a <sparkle:releaseNotesLink> to the tag's GitHub release,
+which Sparkle's "Update available" panel shows inline.
+
 A prerelease tag (one containing "-", e.g. v0.0.4-beta1 — mirroring
 release.yml's `case "$tag" in *-*)`) gets a <sparkle:channel>beta</sparkle:channel>
 so it reaches only beta-channel subscribers, not stable users.
@@ -117,6 +120,9 @@ def main():
     ET.SubElement(item, qname("version")).text = version
     ET.SubElement(item, qname("shortVersionString")).text = version
     ET.SubElement(item, qname("minimumSystemVersion")).text = min_macos
+    ET.SubElement(item, qname("releaseNotesLink")).text = (
+        f"https://github.com/{repo}/releases/tag/{tag}"
+    )
     if is_prerelease:
         ET.SubElement(item, qname("channel")).text = "beta"
     enclosure = ET.SubElement(item, "enclosure")

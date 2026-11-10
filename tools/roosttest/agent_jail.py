@@ -35,13 +35,12 @@ from util import REPO_ROOT, config_value
 
 
 # Agent name → the environment variable that relocates its config dir.
-# MIRRORS `roost_agent_install::home::config_dir_env`; the five are what
-# make the jail complete.
+# MIRRORS `roost_agent_install::home::config_dir_env`, where cursor has
+# none; these four plus `HOME` make the jail complete.
 AGENT_CONFIG_DIR_ENV = {
     "claude": "CLAUDE_CONFIG_DIR",
     "codex": "CODEX_HOME",
     "grok": "GROK_HOME",
-    "cursor": "CURSOR_CONFIG_DIR",
     "opencode": "OPENCODE_CONFIG_DIR",
 }
 
@@ -107,6 +106,7 @@ class Jail:
         # would be.
         self.session_socket_dir = self.root / "sock"
         self.agent_dirs = {name: self.root / "agents" / name for name in AGENT_CONFIG_DIR_ENV}
+        self.agent_dirs["cursor"] = self.home / ".cursor"
         # Distinct log file per launch, so a relaunch's boot output does
         # not overwrite the evidence of the launch before it.
         self.launches = 0
@@ -125,10 +125,7 @@ class Jail:
             # a different rule than the one the jail asserts on would
             # write somewhere `assert_jailed` never looked.
             "ROOST_CONFIG": str(self.config),
-            **{
-                AGENT_CONFIG_DIR_ENV[name]: str(path)
-                for name, path in self.agent_dirs.items()
-            },
+            **{env: str(self.agent_dirs[name]) for name, env in AGENT_CONFIG_DIR_ENV.items()},
         }
 
     def write_config(self, *, agent_hooks: "str | None") -> None:

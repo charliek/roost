@@ -58,8 +58,6 @@ the rest cheaper.
 These come up naturally but are out of scope by design. Restating them
 here so they don't drift into the backlog:
 
-- **Split panes** — one terminal per tab. Notification routing gets
-  weaker the more places output can land.
 - **Multi-window** — one window, projects in sidebar, tabs in projects.
 - **Embedded browser / webview shell.**
 - **Git worktree management** (cmux feature, intentionally out of MVP).

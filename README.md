@@ -90,7 +90,7 @@ The full site lives under `docs/` and builds with [Zensical](https://zensical.or
 - [Claude Code Hooks](docs/guides/claude-code.md) — copy-paste `settings.json`
 - [Host Sessions](docs/guides/host-sessions.md) — the opt-in `roost-session` daemon: shells that survive closing the window
 - [Architecture](docs/reference/architecture.md) — package layout + threading contract
-- [Vision & Principles](docs/development/vision.md) — direction, decision log, and the single-implementation architecture
+- [Vision & Principles](docs/development/vision.md) — what Roost is for, the north star, principles, directions under discovery, and the decision index ([full decision history](docs/development/decision-history.md))
 - [IPC Reference](docs/reference/ipc.md) — the JSON wire format `roostctl` and Claude hooks speak
 
 `CLAUDE.md` at the repo root captures the project conventions enforced by review.

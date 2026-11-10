@@ -725,7 +725,7 @@ deviation is the client-notification step of Stop, noted inline.
   spawn-if-missing, and launch auto-reconnect. What HS-4b did *not*
   lift is the far side: connecting *to* a Mac over ssh is still
   refused (HS-4c). See
-  [`docs/development/vision.md` → DL-19](../docs/development/vision.md#dl-19-macos-ships-roost-session-too-the-mac-gate-lifts-2026-09-01).
+  [`docs/development/decision-history.md` → DL-19](../docs/development/decision-history.md#dl-19-macos-ships-roost-session-too-the-mac-gate-lifts-2026-09-01).
 - Reconnect/backoff: on connection loss, host marked disconnected
   with a retry affordance; automatic retry only for localhost.
   **Superseded by HS-4 slice 1 (plan 040, shipped):** a saved SSH host
@@ -992,6 +992,6 @@ the same rule one level out from connection state.
   52 *read* is unchanged — still parser-level default-deny everywhere.
   Cost: `SESSION_PROTOCOL_VERSION` 2 → 3. See
   [ipc.md's `session.put_file`](../docs/reference/ipc.md#sessionput_file)
-  and [DL-22](../docs/development/vision.md).
+  and [DL-22](../docs/development/decision-history.md#dl-22-files-cross-a-host-boundary-as-bytes-through-the-op-set-pasted-as-bare-host-paths-the-client-has-validated-2026-09-06).
 - Mac `roost-session` packaging (post-HS-3; code is portable
   already).

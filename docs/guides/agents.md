@@ -42,7 +42,7 @@ What differs is where each signal comes from:
 | Claude Code | `claude` | the `roost` plugin folder named in `CLAUDE_CODE_PLUGIN_DIRS`; nothing written to `~/.claude` (needs Claude Code 2.1.280 or newer) | `PermissionRequest` (immediate); the `Notification` types `agent_needs_input` and `elicitation_dialog` also set it, unconditionally | `Stop` | none — the post-turn `idle_prompt` notification is the only later signal, guarded so it can't overwrite a real `waiting`/`failed` |
 | Codex | `codex` | OSC 7501, built in; nothing installed. Older releases wrote `~/.codex/hooks.json` + `[hooks.state]` in `config.toml` | `PermissionRequest` | `Stop` | `Interrupt` |
 | Grok | `grok` | OSC 7501, built in; nothing installed. Older releases wrote `$GROK_HOME/hooks/roost.json` | `Notification` `notificationType: permission_prompt` | `Stop` on its first fire; a fire with `stopHookActive: true` (a blocking Stop gate already continued the turn) keeps `working` instead, and the `idle_prompt` Notification settles it | `StopCancelled` |
-| cursor-agent | `cursor` | opt-in: Roost's entries merged into `~/.cursor/hooks.json` (or `$CURSOR_CONFIG_DIR`) beside your own hooks | none — an accepted gap, see [Per-agent caveats](#per-agent-caveats) | `stop` | `stop` (same event as turn-end; see caveats) |
+| cursor-agent | `cursor` | opt-in: Roost's entries merged into `~/.cursor/hooks.json` beside your own hooks (cursor-agent reads user hooks only there, so `$CURSOR_CONFIG_DIR` does not move it) | none — an accepted gap, see [Per-agent caveats](#per-agent-caveats) | `stop` | `stop` (same event as turn-end; see caveats) |
 | OpenCode | `opencode` | a plugin named in `OPENCODE_CONFIG_CONTENT`; nothing written to `~/.config/opencode` | `permission.asked` / `question.asked` | `session.idle` | `session.error` |
 | craze | `craze` | none — craze reports directly, no hook install | a permission, question or plan card is open | turn end → `finished`, banner body "Turn complete" | Esc → `finished` with attention cleared |
 
@@ -179,7 +179,7 @@ an agent that speaks it is heard the moment it starts.
 |---|---|---|
 | Claude Code | yes | `claude-code` |
 | Codex | yes | `codex` |
-| Grok CLI (1.0.70 or later) | yes | `grok-build` |
+| Grok CLI (1.0.70 or later) | yes | `grok` (1.0.77 or later), `grok-build` before |
 | crush | yes | `crush` |
 | pi | yes | `pi` |
 | gx, cursor-agent, OpenCode (1.19) | no — hooks only | |

@@ -64,7 +64,8 @@ nav = [
     { "Legacy protocol" = "archive/ipc-legacy-proto.md" },
   ] },
   { "Development" = [
-    { "Architecture & principles" = "development/vision.md" },
+    { "Vision & principles" = "development/vision.md" },
+    { "Decision history" = "development/decision-history.md" },
     { "Iced migration" = "development/iced-migration.md" },
     { "Host sessions" = "development/host-sessions.md" },
     { "Shared Rust engine" = "development/shared-rust-engine.md" },

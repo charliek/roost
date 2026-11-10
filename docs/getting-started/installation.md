@@ -5,10 +5,14 @@
 Most people want a released build, not a source checkout.
 
 Linux (Ubuntu Noble / Pop!\_OS 24.04+) — add the `apt.stridelabs.ai`
-apt repo once, then:
+apt repo once, then install:
 
 ```bash
-sudo apt install roost
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://apt.stridelabs.ai/pubkey.gpg | sudo tee /etc/apt/keyrings/apt-charliek.gpg > /dev/null
+echo 'deb [signed-by=/etc/apt/keyrings/apt-charliek.gpg] https://apt.stridelabs.ai noble main' | sudo tee /etc/apt/sources.list.d/apt-charliek.list
+sudo apt update
+sudo apt install roost          # installs the `roost` UI + the `roostctl` CLI
 ```
 
 For a one-off install without adding the repo, grab the `.deb` from
@@ -63,11 +67,12 @@ use the separate `Roost-iced` paths, so they run beside an installed
 ### Updating
 
 - **macOS.** `Roost.app` checks for updates through
-  [Sparkle](https://sparkle-project.org), and checks are **user-invoked**:
-  choose **Check for Updates…** from the app menu. It does not poll in the
-  background (`SUEnableAutomaticChecks` is `false`), so you will never get
-  an unprompted update panel. The feed (`appcast.xml`) is served from this
-  documentation site.
+  [Sparkle](https://sparkle-project.org) once a day in the background, and
+  you can check any time with **Check for Updates…** in the app menu. When
+  a new version is out, Sparkle shows its release notes and asks before
+  installing. It installs without asking only if you opt in to automatic
+  installs in that update alert. The feed (`appcast.xml`) is
+  served from this documentation site.
 - **Linux.** Updates come from apt: `sudo apt update && sudo apt upgrade`
   (or just `sudo apt install --only-upgrade roost`). The package upgrades
   in place — same socket, `state.json`, and log paths as the version it

@@ -2285,14 +2285,17 @@ impl App {
         agent_palette::agent_frame_across(&self.agent_sources(&local), agent_palette::now_unix())
     }
 
-    pub(super) fn refresh_agent_palette(&mut self) {
-        let has_agents = self.palette.as_ref().is_some_and(|state| {
+    pub(super) fn agent_palette_open(&self) -> bool {
+        self.palette.as_ref().is_some_and(|state| {
             state
                 .frames()
                 .iter()
                 .any(|frame| frame.id == agent_palette::FRAME_ID)
-        });
-        if !has_agents {
+        })
+    }
+
+    pub(super) fn refresh_agent_palette(&mut self) {
+        if !self.agent_palette_open() {
             return;
         }
         let before_layout = self.palette_layout_signature();

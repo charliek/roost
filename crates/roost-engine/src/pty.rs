@@ -2586,8 +2586,9 @@ fn roost_resources_dir() -> Option<&'static std::path::Path> {
 /// A tab's environment before Roost's own variables (plan 085 D1): the
 /// starter's minus the whole opener set, `runtime_dir` as its
 /// `XDG_RUNTIME_DIR` when one derived ([`user_runtime_dir`]), then the
-/// variables `opener` brings, then what the serving process's `extend`
-/// adds ([`crate::process::set_tab_env`]). Neither kind of opener
+/// variables `opener` brings, `system_lang`'s `LANG` when the tab has no
+/// locale ([`crate::locale::fill_lang`]), then what the serving process's
+/// `extend` adds ([`crate::process::set_tab_env`]). Neither kind of opener
 /// inherits the starter's: a local tab gets its opener's display, a
 /// remote one its opener's SSH identity.
 fn tab_environment(
@@ -2595,6 +2596,7 @@ fn tab_environment(
     opener: &TabOpener,
     runtime_dir: Option<PathBuf>,
     extend: Option<&crate::process::TabEnvFn>,
+    system_lang: impl FnOnce() -> Option<&'static str>,
 ) -> Vec<(OsString, OsString)> {
     let mut env: BTreeMap<OsString, OsString> = starter
         .filter(|(name, _)| !OPENER_SET.iter().any(|opened| name == opened))
@@ -2605,6 +2607,7 @@ fn tab_environment(
     for (name, value) in opener.vars() {
         env.insert(name.into(), value.into());
     }
+    crate::locale::fill_lang(&mut env, system_lang);
     if let Some(extend) = extend {
         extend(&mut env);
     }
@@ -2700,6 +2703,7 @@ fn build_command(
             opener,
             user_runtime_dir(),
             crate::process::tab_env(),
+            crate::locale::system_lang,
         ),
     );
     // Advertise the terminal Roost provides — force TERM rather than
@@ -3334,7 +3338,13 @@ mod tests {
 
     #[test]
     fn the_baseline_drops_every_opener_variable_and_keeps_the_rest() {
-        let env = tab_environment(crowded_starter().into_iter(), &TabOpener::None, None, None);
+        let env = tab_environment(
+            crowded_starter().into_iter(),
+            &TabOpener::None,
+            None,
+            None,
+            || None,
+        );
         assert_eq!(openers(&env), BTreeMap::new());
         assert_eq!(get(&env, "PATH"), Some("/usr/bin:/bin"));
         assert_eq!(get(&env, "HOME"), Some("/home/u"));
@@ -3348,7 +3358,7 @@ mod tests {
     #[test]
     fn a_local_opener_adds_exactly_its_values_empty_ones_included() {
         let local = TabOpener::Local(values(&[("DISPLAY", ":7"), ("SSH_AUTH_SOCK", "")]));
-        let env = tab_environment(crowded_starter().into_iter(), &local, None, None);
+        let env = tab_environment(crowded_starter().into_iter(), &local, None, None, || None);
         assert_eq!(
             openers(&env),
             values(&[("DISPLAY", ":7"), ("SSH_AUTH_SOCK", "")])
@@ -3361,7 +3371,7 @@ mod tests {
             ssh_connection: Some("3.3.3.3 3 4.4.4.4 22".into()),
             ssh_client: Some("3.3.3.3 3 22".into()),
         };
-        let env = tab_environment(crowded_starter().into_iter(), &remote, None, None);
+        let env = tab_environment(crowded_starter().into_iter(), &remote, None, None, || None);
         assert_eq!(
             openers(&env),
             values(&[
@@ -3378,6 +3388,7 @@ mod tests {
             &TabOpener::None,
             Some(PathBuf::from("/run/user/4242")),
             None,
+            || None,
         );
         assert_eq!(get(&env, "XDG_RUNTIME_DIR"), Some("/run/user/4242"));
         let bare = tab_environment(
@@ -3385,6 +3396,7 @@ mod tests {
             &TabOpener::None,
             Some(PathBuf::from("/run/user/4242")),
             None,
+            || None,
         );
         assert_eq!(get(&bare, "XDG_RUNTIME_DIR"), Some("/run/user/4242"));
     }
@@ -3399,9 +3411,36 @@ mod tests {
             env.insert("PATH".into(), "/extended".into());
             env.remove(OsStr::new("HOME"));
         };
-        let env = tab_environment(crowded_starter().into_iter(), &local, None, Some(&extend));
+        let env = tab_environment(
+            crowded_starter().into_iter(),
+            &local,
+            None,
+            Some(&extend),
+            || None,
+        );
         assert_eq!(get(&env, "PATH"), Some("/extended"));
         assert_eq!(get(&env, "HOME"), None);
+    }
+
+    #[test]
+    fn a_tab_with_no_locale_gets_the_system_lang_and_a_named_one_is_kept() {
+        let system = || Some("sv_SE.UTF-8");
+        let bare = tab_environment(
+            crowded_starter().into_iter(),
+            &TabOpener::None,
+            None,
+            None,
+            system,
+        );
+        assert_eq!(get(&bare, "LANG"), Some("sv_SE.UTF-8"));
+        let named = tab_environment(
+            os_env(&[("LC_ALL", "C")]).into_iter(),
+            &TabOpener::None,
+            None,
+            None,
+            system,
+        );
+        assert_eq!(get(&named, "LANG"), None);
     }
 
     #[test]
@@ -3642,14 +3681,7 @@ mod tests {
         let not_a_tty = Arc::new(OwnedFd::from(File::open("/dev/null").expect("/dev/null")));
         set_line_discipline(&slave, true, false);
 
-        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let writer = Arc::clone(&captured);
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .with_writer(move || CapturedLog(Arc::clone(&writer)))
-            .finish();
-        let seen = tracing::subscriber::with_default(subscriber, || {
+        let (seen, log) = crate::test_log::capture(tracing::Level::DEBUG, || {
             let mut sampler = PasswordSampler::default();
             let mut seen = reports(sampler.tick(&[probe(3, 1, &master)]));
             for _ in 0..3 {
@@ -3659,25 +3691,11 @@ mod tests {
         });
 
         assert_eq!(seen, [(3, 1, true), (3, 1, false)]);
-        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
         assert_eq!(
             log.matches("tcgetattr on the pty master failed").count(),
             1,
             "{log}"
         );
-    }
-
-    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for CapturedLog {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
 
     /// A tab id respawned under a raised flag: the replacement's first

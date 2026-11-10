@@ -26,6 +26,8 @@
 //! startup [`ensure`] could wire what an `uninstall` had just taken
 //! back.
 
+use std::path::PathBuf;
+
 use roost_agent::{Agent, ALL_AGENTS};
 use roost_ui_model::config::{AgentHooks, AgentIntegration, ConfigLock, RoostConfig};
 
@@ -961,8 +963,10 @@ fn wire_one(
     }
     // Read off the plan before it is applied: afterwards the files
     // exist and `config.toml` says whatever Roost put there.
+    let mut files = plan.files.clone();
+    files.extend(still_wired_elsewhere(home, agent, record, &plan.files));
     let wired = state::Wired {
-        files: plan.files.clone(),
+        files,
         created: plan
             .edits
             .iter()
@@ -989,6 +993,41 @@ fn wire_one(
     } else {
         outcome.wired.push(agent);
     }
+}
+
+/// The recorded files outside this agent's current directory that still
+/// hold Roost's entry. A refresh after the directory moved (a changed
+/// `CODEX_HOME`, or cursor leaving `CURSOR_CONFIG_DIR` in #717) has to
+/// keep naming them: the record is all [`unwire_homes`] has to find them
+/// by. A file is dropped only once its entry is gone; one that cannot be
+/// read is kept.
+fn still_wired_elsewhere(
+    home: &Home,
+    agent: Agent,
+    record: &Record,
+    current: &[PathBuf],
+) -> Vec<PathBuf> {
+    let Some(entry) = state::entry(record, agent) else {
+        return Vec::new();
+    };
+    entry
+        .files
+        .iter()
+        .map(PathBuf::from)
+        .filter(|file| !current.contains(file))
+        .filter(|file| {
+            let Some(dir) = crate::agent_dir_of(agent, file) else {
+                return false;
+            };
+            if dir == home.agent_dir(agent) {
+                return false;
+            }
+            match plan_for(agent, &home.with_agent_dir(agent, dir), Intent::Uninstall) {
+                Ok(plan) => plan.skipped.is_some() || !plan.is_noop(),
+                Err(_) => true,
+            }
+        })
+        .collect()
 }
 
 /// Every place this agent's entries could be: where it lives now, plus

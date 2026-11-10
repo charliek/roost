@@ -2,7 +2,7 @@
 
 Host sessions (HS-1a/HS-1b/HS-2 in the [roadmap](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md)) let a `roost-session` daemon own a workspace + PTY supervisor that outlives any UI attached to it, and let the iced UI attach to one as a client. This page is the shipped architecture: the component topology, the attach sequence, and how multiple clients share one session. [`reference/ipc.md`](../reference/ipc.md#session-sockets) is the **normative wire spec** — this page explains the shape, that page is the contract. The design rationale and the full decision history live in [`discovery/host-sessions-architecture.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md) and [`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md).
 
-Scope: the iced UI (`crates/roost-iced`); the server crate (`crates/roost-session`) builds and ships for both Linux and macOS. See [DL-17](vision.md#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28) and [DL-18](vision.md#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29) in the decision log for why the shape is what it is, and the [user guide](../guides/host-sessions.md) for how it looks from the outside.
+Scope: the iced UI (`crates/roost-iced`); the server crate (`crates/roost-session`) builds and ships for both Linux and macOS. See [DL-17](decision-history.md#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28) and [DL-18](decision-history.md#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29) in the decision log for why the shape is what it is, and the [user guide](../guides/host-sessions.md) for how it looks from the outside.
 
 ## Component topology
 
@@ -76,7 +76,7 @@ A session has no owner. R1 (plan 049) opened reads; R15 (plan 057,
 what remained after both was "the foreground" — an interactive lease
 that decided whose event stream got `tab.effect`, whose focus muted
 notifications, and which connection the session-wide settings ops would
-accept. Plan 061 retired it (protocol `5`, [DL-26](vision.md#dl-26-there-is-no-lease-2026-09-12)):
+accept. Plan 061 retired it (protocol `5`, [DL-26](decision-history.md#dl-26-there-is-no-lease-2026-09-12)):
 there is no `session.connect`, no `lease` field on any op, and no
 `session.driver_changed` event. Every same-UID connection is symmetric,
 and reconnecting is just a reconnect — never a claim on anything
@@ -139,9 +139,9 @@ answered `cleared: false` and changes nothing.
 ### Who sizes a tab
 
 A tab has at most one **size owner**, an attachment, and the owner's grid
-is the PTY's ([DL-31](vision.md#dl-31-a-tab-has-one-size-owner-2026-10-30),
+is the PTY's ([DL-31](decision-history.md#dl-31-a-tab-has-one-size-owner-2026-10-30),
 plan 084; it replaced the last-interactor rule of
-[DL-25](vision.md#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)
+[DL-25](decision-history.md#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)
 and the roadmap's "detach never resizes back"). Deliberate interaction
 takes it; watching never does. The wire is in
 [`ipc.md`](../reference/ipc.md#size-ownership) and the user-facing view in
