@@ -117,9 +117,8 @@ was deleted ([#286](https://github.com/charliek/roost/issues/286)).
   crate whose premise is replacing Swift.
 - **Sparkle, menu bar, notifications** (plans 028, 030) — user-invoked
   update checks against `docs/appcast-iced.xml` with its own signing key
-  (`SUEnableAutomaticChecks` is `false`; the app does not self-update;
-  that feed is frozen since v0.1.0, and `Roost.app` updates from
-  `docs/appcast.xml`),
+  (that feed is frozen since v0.1.0, and `Roost.app` updates from
+  `docs/appcast.xml`, with daily background checks since #134),
   a real `NSMenu`, a Dock badge, and `UNUserNotificationCenter` banners
   that focus the originating tab on click.
 - **Developer-ID signed and notarized**, published as the fourth release

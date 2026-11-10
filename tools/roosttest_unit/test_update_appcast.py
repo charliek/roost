@@ -116,6 +116,10 @@ class UpdateAppcastTests(unittest.TestCase):
         self.assertTrue(enclosure.get("url").endswith("Roost-0.0.2.dmg"))
         self.assertEqual(enclosure.get(qname("edSignature")), "NEWSIG-abc123")
         self.assertEqual(enclosure.get("length"), "9999")
+        self.assertEqual(
+            new_item.findtext(qname("releaseNotesLink")),
+            "https://github.com/charliek/roost/releases/tag/v0.0.2",
+        )
 
     def test_iced_dmg_name_override_changes_only_the_enclosure_name(self) -> None:
         appcast = self._write_appcast(APPCAST_WITH_ONE_ITEM)

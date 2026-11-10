@@ -1213,6 +1213,13 @@ def _forward_env(argv: list[str], name: str) -> None:
         argv += ["--env", f"{name}={os.environ[name]}"]
 
 
+# NSUserDefaults' argument domain beats Info.plist, so a launched bundle
+# never runs the scheduled Sparkle check the shipped plist enables (#134):
+# a feed offering a newer version would open an update panel mid-test.
+# User-invoked checks (`app.update_check`) are unaffected.
+SPARKLE_NO_SCHEDULED_CHECKS = ("-SUEnableAutomaticChecks", "NO")
+
+
 def _launch_iced_bundle(bundle: IcedBundle, *, state_dir: Path | None = None) -> None:
     """Launch an assembled iced bundle via LaunchServices (`open`).
 
@@ -1274,7 +1281,7 @@ def _launch_iced_bundle(bundle: IcedBundle, *, state_dir: Path | None = None) ->
     rust_log = os.environ.get("RUST_LOG")
     if rust_log is not None:
         argv += ["--env", f"RUST_LOG={_floor_roost_iced_info(rust_log)}"]
-    argv += [str(app)]
+    argv += [str(app), "--args", *SPARKLE_NO_SCHEDULED_CHECKS]
     subprocess.run(argv, check=True)
 
     # Everything from here on can fail after a real process is already up.

@@ -527,6 +527,49 @@ fn unquote(s: &str) -> &str {
     }
 }
 
+/// Every key [`RoostConfig::parse`] reads: the "did you mean" candidates
+/// for one it does not (issue #714).
+const ROOST_KEYS: &[&str] = &[
+    "agent-hooks",
+    "agent-panel-sort",
+    "chrome-accent",
+    "clipboard-write",
+    "command",
+    "copy-on-select",
+    "font-family",
+    "font-size",
+    "keybind",
+    "link-modifier",
+    "local-backend",
+    "macos-auto-secure-input",
+    "macos-option-as-alt",
+    "macos-secure-input-indication",
+    "macos-secure-keyboard-entry",
+    "provider",
+    "show-sidebar-agents",
+    "theme",
+    "word-break-chars",
+];
+
+/// The warning for a key `parse` does not read, with a "did you mean"
+/// for the slips copied docs once made (`_` for `-`, another case), or
+/// `None` for a Ghostty key: a Ghostty config pasted in is legal.
+fn unknown_key_warning(key: &str) -> Option<String> {
+    if crate::ghostty_keys::GHOSTTY_KEYS
+        .binary_search(&key)
+        .is_ok()
+    {
+        return None;
+    }
+    let normalized = key.to_ascii_lowercase().replace('_', "-");
+    Some(
+        match ROOST_KEYS.iter().find(|known| **known == normalized) {
+            Some(known) => format!("unknown config key `{key}`, ignored; did you mean `{known}`?"),
+            None => format!("unknown config key `{key}`, ignored"),
+        },
+    )
+}
+
 impl RoostConfig {
     pub fn load_default() -> Self {
         let Some(path) = default_path() else {
@@ -537,7 +580,9 @@ impl RoostConfig {
 
     pub fn load_from(path: &Path) -> Self {
         let mut cfg = match fs::read_to_string(path) {
-            Ok(content) => Self::parse(&content),
+            Ok(content) => Self::parse_reporting(&content, |line, warning| {
+                tracing::warn!(line, "{warning}");
+            }),
             Err(_) => Self::default(),
         };
         // Discovered providers append after any `provider =` config
@@ -547,9 +592,18 @@ impl RoostConfig {
         cfg
     }
 
+    /// Parse without the unknown-key warnings: only [`Self::load_from`]
+    /// reports those, so a reader that re-parses for one key (the
+    /// agent-hooks check on every host connect) does not repeat them.
     pub fn parse(content: &str) -> Self {
+        Self::parse_reporting(content, |_, _| {})
+    }
+
+    /// [`Self::parse`], handing each unknown key's 1-based line and
+    /// warning to `unknown`.
+    fn parse_reporting(content: &str, mut unknown: impl FnMut(usize, &str)) -> Self {
         let mut cfg = Self::default();
-        for raw in content.lines() {
+        for (index, raw) in content.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -765,8 +819,9 @@ impl RoostConfig {
                     }
                 }
                 _ => {
-                    // Unknown key — forward-compat with future Roost
-                    // versions or ghostty-format keys we don't need.
+                    if let Some(warning) = unknown_key_warning(key) {
+                        unknown(index + 1, &warning);
+                    }
                 }
             }
         }
@@ -2065,6 +2120,85 @@ mod tests {
                 .as_deref(),
             Some("Dracula")
         );
+    }
+
+    #[test]
+    fn an_unknown_key_warns_with_the_roost_key_it_likely_meant() {
+        assert_eq!(
+            unknown_key_warning("font_size").as_deref(),
+            Some("unknown config key `font_size`, ignored; did you mean `font-size`?")
+        );
+        assert_eq!(
+            unknown_key_warning("Font_Family").as_deref(),
+            Some("unknown config key `Font_Family`, ignored; did you mean `font-family`?")
+        );
+        assert_eq!(
+            unknown_key_warning("fontsize").as_deref(),
+            Some("unknown config key `fontsize`, ignored")
+        );
+    }
+
+    #[test]
+    fn parse_reporting_names_each_unknown_key_by_its_line() {
+        let mut reported = Vec::new();
+        let cfg = RoostConfig::parse_reporting(
+            "# comment\nfont_size = 15\nscrollback-limit = 100\nfont-size = 12\nbogus = 1\n",
+            |line, warning| reported.push((line, warning.to_string())),
+        );
+        assert_eq!(cfg.font_size, Some(12.0));
+        assert_eq!(
+            reported,
+            [
+                (
+                    2,
+                    "unknown config key `font_size`, ignored; did you mean `font-size`?"
+                        .to_string()
+                ),
+                (5, "unknown config key `bogus`, ignored".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_ghostty_key_roost_does_not_read_is_silent() {
+        for key in [
+            "cursor-style",
+            "window-padding-x",
+            "background",
+            "font-family-bold",
+            "scrollback-limit",
+            "bold-is-bright",
+        ] {
+            assert_eq!(unknown_key_warning(key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn the_ghostty_keys_are_sorted_for_binary_search() {
+        let keys = crate::ghostty_keys::GHOSTTY_KEYS;
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    /// The suggestion list drifts from the parser silently, so pin it to
+    /// the documented settings table, which lists every key `parse` reads.
+    #[test]
+    fn the_roost_keys_are_the_documented_settings() {
+        let doc = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/config.md"),
+        )
+        .expect("docs/reference/config.md");
+        let settings = doc
+            .split_once("## Settings")
+            .and_then(|(_, rest)| rest.split_once("\n## "))
+            .map(|(table, _)| table)
+            .expect("a Settings section");
+        let mut documented: Vec<&str> = settings
+            .lines()
+            .filter_map(|row| row.strip_prefix("| `")?.split_once('`'))
+            .map(|(key, _)| key)
+            .collect();
+        documented.sort_unstable();
+        assert_eq!(documented, ROOST_KEYS);
     }
 
     #[test]

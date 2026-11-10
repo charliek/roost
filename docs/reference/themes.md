@@ -1,13 +1,13 @@
 # Themes
 
-Roost ships with a small set of bundled color themes. Pick one with `theme = NAME` in `config.conf`. Themes control colors only; font choice stays on `font_family` / `font_size`.
+Roost ships with a small set of bundled color themes. Pick one with `theme = NAME` in `config.conf`. Themes control colors only; font choice stays on `font-family` / `font-size`.
 
 ```conf
 # ~/.config/roost/config.conf
 theme = Dracula+
 ```
 
-The setting takes effect on the next launch (themes are not hot-reloaded today). Unknown names fall back to `roost-dark` with a warning logged at startup.
+To switch while Roost runs, use **Select Theme…** in the command palette: it previews each theme live as you move through the list, applies the one you pick to every tab, and writes it back to `theme` in `config.conf`. A hand edit of `config.conf` takes effect on the next launch. Unknown names fall back to `roost-dark` with a warning logged at startup.
 
 ## Bundled themes
 
@@ -77,7 +77,7 @@ selection-foreground = #545454
 ## Limitations
 
 - **No user override directory.** Only the bundled themes are loadable. To use a theme that isn't bundled, add the file to the bundled set and rebuild (see below) — themes are embedded into the binary at compile time.
-- **No hot-reload.** Theme is loaded once when each tab is created. To switch, edit `config.conf` and restart roost.
+- **No reload of a hand-edited `config.conf`.** Roost reads `theme` at launch; **Select Theme…** in the command palette is the live path.
 - **Indices 16–255 of the palette are not customizable** — they're filled by the standard xterm formula. Bundled themes only set indices 0–15, matching every Ghostty theme.
 
 ## Trying a Ghostty theme that isn't bundled

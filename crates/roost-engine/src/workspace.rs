@@ -1914,7 +1914,7 @@ impl Workspace {
             .tabs
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        if row.user_titled {
+        if row.user_titled || row.title == title {
             return Ok(());
         }
         row.title = title.to_string();
@@ -1937,6 +1937,9 @@ impl Workspace {
             .tabs
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
+        if row.cwd == cwd {
+            return Ok(());
+        }
         let title_follows = !row.user_titled;
         let cwd_owned = cwd.to_string();
         row.cwd = cwd_owned.clone();
@@ -4660,26 +4663,30 @@ mod tests {
         assert_eq!(ws.tab(tid).unwrap().title, "manual");
     }
 
-    /// `cd .` (cwd unchanged in basename) doesn't churn a redundant
-    /// TabTitleChanged. Guards against per-prompt event spam from a
-    /// shell that re-emits the same OSC 7 every prompt.
+    /// Shells re-send OSC 7 and OSC 0 every prompt (#711): a repeat of
+    /// the stored cwd or title commits nothing.
     #[test]
-    fn set_tab_cwd_skips_title_event_when_basename_unchanged() {
-        let ws = Workspace::new();
+    fn a_repeated_cwd_or_title_bumps_no_revision_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Workspace::open(path.clone());
         let pid = ws.create_project("p", "").unwrap().id;
         let tid = ws
             .open_tab(pid, "/tmp", "", true, TabOpener::None)
             .unwrap()
             .id;
+        ws.set_tab_title_from_osc(tid, "~/tmp").unwrap();
+        let revision = ws.revision();
+        let on_disk = std::fs::read(&path).unwrap();
         let mut rx = ws.subscribe();
+
         ws.set_tab_cwd(tid, "/tmp").unwrap();
-        // Cwd event fires (same string but the model writes through);
-        // title event suppressed since basename didn't change.
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(WorkspaceEvent::TabCwdChanged { .. })
-        ));
-        assert!(rx.try_recv().is_err());
+        ws.set_tab_title_from_osc(tid, "~/tmp").unwrap();
+
+        assert!(rx.try_recv().is_err(), "no event");
+        assert_eq!(ws.revision(), revision, "no revision bump");
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk, "no write");
+        assert_eq!(ws.tab(tid).unwrap().title, "~/tmp");
     }
 
     /// CLI / IPC `tab.open` callers can pass an explicit placeholder
@@ -7723,8 +7730,6 @@ mod tests {
 
     /// Plan 082 B4: program status (OSC 7501) wired into the workspace.
     mod program_status {
-        use std::sync::Arc;
-
         use super::*;
         use roost_ipc::program_status::{
             DecidedBy, ProgramStatusKind, ProgramStatusReport, ProgramStatusState as S, PromptMark,
@@ -8203,18 +8208,10 @@ mod tests {
                 .collect();
             assert_eq!(children.len(), 257);
 
-            let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
-            let writer = Arc::clone(&captured);
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .with_writer(move || CapturedLog(Arc::clone(&writer)))
-                .finish();
-            tracing::subscriber::with_default(subscriber, || {
+            let ((), log) = crate::test_log::capture(tracing::Level::WARN, || {
                 ws.apply_program_status(tid, children, LATE).unwrap();
             });
 
-            let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
             assert_eq!(
                 log.matches("the tab is at its child-record cap").count(),
                 1,
@@ -8222,19 +8219,6 @@ mod tests {
             );
             assert!(log.contains(&format!("tab_id={tid}")), "{log}");
             assert!(log.contains("id=\"c255\""), "{log}");
-        }
-
-        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for CapturedLog {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
         }
 
         /// A claim from an agent other than the deciding record's is a

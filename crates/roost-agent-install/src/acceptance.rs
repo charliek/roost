@@ -829,6 +829,60 @@ fn off_cleans_a_recorded_file_at_a_config_dir_that_has_since_moved() {
     assert!(state::load(&now).unwrap().0.is_empty());
 }
 
+/// A refresh at a new directory keeps naming the old one while it still
+/// holds Roost's entry. Cursor's hooks moved from `CURSOR_CONFIG_DIR` to
+/// `$HOME/.cursor` (#717): the first install after that refreshes the
+/// record at the new path, and `off` must still take the entry out of
+/// the old file.
+#[test]
+fn a_refresh_after_the_config_dir_moved_keeps_the_old_file_for_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("cursor-config-dir");
+    std::fs::create_dir_all(&old).unwrap();
+    let then = Home::rooted(dir.path()).with_agent_dir(Agent::Cursor, &old);
+    ensure::install(&then, &[Agent::Cursor], "local", Guard::PERMITTED).unwrap();
+    let stale = cursor::hooks_path(&then);
+    assert!(stale.exists());
+
+    let now = Home::rooted(dir.path());
+    std::fs::create_dir_all(now.agent_dir(Agent::Cursor)).unwrap();
+    let refreshed = ensure::install(&now, &[Agent::Cursor], "local", Guard::PERMITTED).unwrap();
+    assert_eq!(refreshed.refreshed, vec![Agent::Cursor]);
+    assert!(cursor::hooks_path(&now).exists());
+
+    ensure::uninstall(&now, &[Agent::Cursor], Guard::PERMITTED).unwrap();
+    assert!(
+        !stale.exists(),
+        "the old file kept Roost's entry: {}",
+        stale.display()
+    );
+    assert!(!cursor::hooks_path(&now).exists());
+    assert!(state::load(&now).unwrap().0.is_empty());
+}
+
+/// Once the old file no longer holds Roost's entry, a refresh stops
+/// naming it.
+#[test]
+fn a_refresh_drops_an_old_file_that_no_longer_holds_roosts_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("cursor-config-dir");
+    std::fs::create_dir_all(&old).unwrap();
+    let then = Home::rooted(dir.path()).with_agent_dir(Agent::Cursor, &old);
+    ensure::install(&then, &[Agent::Cursor], "local", Guard::PERMITTED).unwrap();
+    std::fs::remove_file(cursor::hooks_path(&then)).unwrap();
+
+    let now = Home::rooted(dir.path());
+    std::fs::create_dir_all(now.agent_dir(Agent::Cursor)).unwrap();
+    ensure::install(&now, &[Agent::Cursor], "local", Guard::PERMITTED).unwrap();
+
+    let (record, _) = state::load(&now).unwrap();
+    let files = &state::entry(&record, Agent::Cursor).unwrap().files;
+    assert_eq!(
+        files,
+        &[cursor::hooks_path(&now).to_string_lossy().into_owned()]
+    );
+}
+
 /// A file that is *not* already in the printer's layout still comes back
 /// with every value and every key order the user had. What it does not
 /// come back with is its original bytes, and that is the guarantee the

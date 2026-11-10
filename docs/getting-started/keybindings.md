@@ -56,11 +56,11 @@ Bare `Ctrl-C` is left as SIGINT — it's not overloaded for copy.
 
 | Shortcut         | Action                                          |
 |------------------|-------------------------------------------------|
-| `Cmd-+` / `Cmd-=` | Increase font size for the active tab          |
-| `Cmd--`          | Decrease font size for the active tab           |
-| `Cmd-0`          | Reset font size to the `font_size` from config  |
+| `Cmd-+` / `Cmd-=` | Increase the font size                          |
+| `Cmd--`          | Decrease the font size                          |
+| `Cmd-0`          | Reset the font size to the one Roost launched with |
 
-Font size adjustments are per-tab and held in memory only. They do not persist across restarts, and new tabs always start at `font_size` from `config.conf`. The size is clamped to 6 .. 72 points; out-of-range steps saturate.
+A font size change applies to every tab and is written back to `font-size` in `config.conf`, so it carries across restarts. Reset returns to the `font-size` that was in effect at launch. The size is clamped to 6 .. 72 points; out-of-range steps saturate.
 
 ## Linux
 
@@ -115,11 +115,11 @@ Bare `Ctrl-C` is left as SIGINT — it's not overloaded for copy. Copying (or si
 
 | Shortcut         | Action                                          |
 |------------------|-------------------------------------------------|
-| `Alt-+` / `Alt-=` | Increase font size for the active tab          |
-| `Alt--`          | Decrease font size for the active tab           |
-| `Alt-0`          | Reset font size to the `font_size` from config  |
+| `Alt-+` / `Alt-=` | Increase the font size                          |
+| `Alt--`          | Decrease the font size                          |
+| `Alt-0`          | Reset the font size to the one Roost launched with |
 
-Font size adjustments are per-tab and held in memory only. They do not persist across restarts, and new tabs always start at `font_size` from `config.conf`. The size is clamped to 6 .. 72 points; out-of-range steps saturate.
+A font size change applies to every tab and is written back to `font-size` in `config.conf`, so it carries across restarts. Reset returns to the `font-size` that was in effect at launch. The size is clamped to 6 .. 72 points; out-of-range steps saturate.
 
 ## Terminal keys
 

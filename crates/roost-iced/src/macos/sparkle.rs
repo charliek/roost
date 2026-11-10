@@ -307,15 +307,14 @@ pub(crate) fn can_check(_mtm: MainThreadMarker) -> bool {
 /// takes), so nothing is reported back here.
 pub(crate) fn check_for_updates(_mtm: MainThreadMarker) {
     let dispatched = with_updater(|updater| {
-        // A check dispatched while a session is in progress is a silent
-        // Sparkle no-op (SPUUpdater.h:150) — re-arming the cycle for one
-        // would let the IN-FLIGHT cycle's tail record itself as this
-        // check's outcome. Skip arming (and the call) instead.
-        if session_in_progress(updater) {
-            tracing::debug!("sparkle: interactive check requested mid-session; ignored");
-            return;
+        // Mid-session, `-checkForUpdates` starts no new check: it brings
+        // the update already on screen (a scheduled check's alert, maybe
+        // behind other windows) to the front (SPUUpdater.h:109). So it is
+        // still sent, but the cycle is not re-armed — that would let the
+        // IN-FLIGHT cycle's tail record itself as this click's outcome.
+        if !session_in_progress(updater) {
+            arm_cycle();
         }
-        arm_cycle();
         // SAFETY: `-checkForUpdates` takes no arguments and returns void
         // (SPUUpdater.h:109). Deliberately the updater's own method
         // rather than the controller's `-checkForUpdates:` IBAction —

@@ -21,7 +21,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::osc::{OscAction, OscColorSnapshot, OscColorState, OscRouter};
-use crate::{PtyOutputEvent, PtySupervisor};
+use crate::{PtyError, PtyOutputEvent, PtySupervisor};
 
 /// Shared buffer used by the `tab.capture_pty_input` test op to
 /// observe outbound PTY-input bytes. `None` in production; populated
@@ -281,7 +281,7 @@ impl TabSession {
                             .resize_with_px(tab_id, cols, rows, cell_w, cell_h)
                             .await
                         {
-                            tracing::warn!(?err, tab_id, "pty resize failed");
+                            log_resize_failure(tab_id, &err);
                         }
                     }
                 }
@@ -411,11 +411,43 @@ impl TabSession {
     }
 }
 
+/// A resize that races the tab's exit finds its PTY gone or closing;
+/// that is expected, so it is not worth a warning (#713).
+fn log_resize_failure(tab_id: i64, err: &PtyError) {
+    if matches!(err, PtyError::NotFound(_) | PtyError::Closed(_)) {
+        tracing::debug!(?err, tab_id, "pty resize failed");
+    } else {
+        tracing::warn!(?err, tab_id, "pty resize failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::TabOpener;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_resize_that_races_the_exit_logs_at_debug_and_others_at_warn() {
+        let ((), log) = crate::test_log::capture(tracing::Level::DEBUG, || {
+            log_resize_failure(1, &PtyError::NotFound(1));
+            log_resize_failure(2, &PtyError::Closed(2));
+            log_resize_failure(
+                3,
+                &PtyError::Resize {
+                    tab_id: 3,
+                    message: "refused".into(),
+                },
+            );
+        });
+        let logged = |level: &str, tab: &str| {
+            log.lines()
+                .any(|line| line.contains(level) && line.contains(tab))
+        };
+        assert!(logged(" DEBUG ", "tab_id=1"), "{log}");
+        assert!(logged(" DEBUG ", "tab_id=2"), "{log}");
+        assert!(logged(" WARN ", "tab_id=3"), "{log}");
+    }
 
     /// #80 A3: rapid `send_input` calls must reach the PTY in
     /// submission order. The PTY line discipline echoes each byte we

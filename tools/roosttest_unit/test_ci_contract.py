@@ -32,7 +32,7 @@ CI = REPO / ".github" / "workflows" / "ci.yml"
 AGGREGATE = "ci-success"
 # Jobs deliberately outside the required check. The reason for each lives in
 # its job comment in ci.yml.
-NON_BLOCKING = {"e2e-iced-wayland-drag"}
+NON_BLOCKING: set[str] = set()
 
 JOB_KEY = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 NEEDS = re.compile(r"^    needs:(.*)$")

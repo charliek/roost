@@ -16,7 +16,8 @@ use roost_ui_model::agent_panel::{self, AgentPanelSort, PanelAgentRow, PanelEntr
 use super::*;
 use crate::agents_split::{AgentsSplitGrip, PanelHeight};
 
-/// How often the panel's ages are recomputed while one is counting.
+/// How often the panel's and the agent palette's ages are recomputed
+/// while one is counting.
 pub(crate) const AGENTS_CLOCK_INTERVAL: Duration = Duration::from_secs(15);
 
 const AGENTS_LABEL: &str = "AGENTS";
@@ -456,29 +457,70 @@ impl App {
         }
     }
 
-    /// Whether an age on screen is still counting: the panel is showing,
-    /// and some agent in it is working or waiting (plan 080 D11). An idle
-    /// app arms no timer.
     pub fn agents_clock_armed(&self) -> bool {
-        self.config.show_sidebar_agents
-            && !self.workspace.sidebar_collapsed()
-            && self.agent_panel_rows.iter().any(|row| {
-                matches!(
-                    row.lifecycle,
-                    AgentLifecycle::Working | AgentLifecycle::Waiting
-                )
-            })
+        clock_armed(
+            self.config.show_sidebar_agents && !self.workspace.sidebar_collapsed(),
+            &self.agent_panel_rows,
+            self.agent_palette_open(),
+        )
     }
 
     pub fn agents_clock_tick(&mut self) {
         self.refresh_sidebar_agents();
+        self.refresh_agent_palette();
     }
+}
+
+/// Whether an age on screen is still counting: the panel is showing and
+/// some agent in it is working or waiting (plan 080 D11), or the agent
+/// palette is open, where every row shows an age. An idle app arms no
+/// timer.
+fn clock_armed(panel_showing: bool, rows: &[PanelAgentRow], agent_palette_open: bool) -> bool {
+    let counting = |row: &PanelAgentRow| {
+        matches!(
+            row.lifecycle,
+            AgentLifecycle::Working | AgentLifecycle::Waiting
+        )
+    };
+    agent_palette_open || (panel_showing && rows.iter().any(counting))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agents_split::AgentsSplitDrag;
+
+    /// The panel's clock counts only a working or waiting agent while it
+    /// shows; an open agent palette shows an age on every row, so it
+    /// keeps the clock running on its own (#273).
+    #[test]
+    fn the_clock_runs_for_a_counting_panel_or_an_open_agent_palette() {
+        let row = |lifecycle| PanelAgentRow {
+            tab: TabKey::local(1),
+            project: ProjectKey::local(1),
+            panel_label: None,
+            palette_label: None,
+            project_name: "p".into(),
+            project_position: 0,
+            source_index: 0,
+            tab_position: 0,
+            tab_id: 1,
+            agent: "Claude Code".into(),
+            lifecycle,
+            name: "t".into(),
+            status_text: String::new(),
+            time_text: "2m".into(),
+            last_event_at: 0,
+            dimmed: false,
+        };
+        let working = [row(AgentLifecycle::Working)];
+        let idle = [row(AgentLifecycle::Finished)];
+        assert!(clock_armed(true, &working, false));
+        assert!(!clock_armed(false, &working, false), "a hidden panel");
+        assert!(!clock_armed(true, &idle, false), "nothing counting");
+        assert!(clock_armed(false, &idle, true), "the agent palette");
+        assert!(clock_armed(false, &[], true), "the agent palette, empty");
+    }
 
     /// The fixed slots hold the text they are sized for, so an age or a
     /// count never spills into the name beside it.

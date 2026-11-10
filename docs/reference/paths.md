@@ -407,9 +407,9 @@ Pre-rewrite builds stored their state under lowercase `~/Library/Application Sup
 
 ## Config keys
 
-`config.conf` is a tiny `key = value` file (no sections, no nesting). Lines starting with `#` are comments. Missing file → built-in defaults; unknown keys are ignored. Keybindings use Ghostty's `keybind = trigger=action` syntax — see [Keybindings](../getting-started/keybindings.md#custom-keybindings) for the full action list. The full reference (including the `copy-on-select` semantics) lives in [`config.md`](config.md).
+`config.conf` is a tiny `key = value` file (no sections, no nesting). Lines starting with `#` are comments. Missing file → built-in defaults; unknown keys are ignored, with a warning in the log (Ghostty's own keys stay silent, so a pasted Ghostty config is fine). Keybindings use Ghostty's `keybind = trigger=action` syntax — see [Keybindings](../getting-started/keybindings.md#custom-keybindings) for the full action list. The full reference (including the `copy-on-select` semantics) lives in [`config.md`](config.md).
 
-Keys use Ghostty-style hyphens (`font-family`, not `font_family`); a misspelled key is silently ignored.
+Keys use Ghostty-style hyphens (`font-family`, not `font_family`); an unknown key is ignored with a log warning. The warning names the key you likely meant only when the slip is case or `_` for `-` (`Font_Size` for `font-size`); any other misspelling, such as `font-szie`, gets the warning without a suggestion.
 
 | Key              | Default                              | Effect                                                 |
 |------------------|--------------------------------------|--------------------------------------------------------|
@@ -490,6 +490,16 @@ value alone.
 | Variable | Effect |
 |---|---|
 | `ROOST_TEST_USER_RUNTIME_DIR` | An absolute directory standing in for `/run/user/<uid>`; the same directory-and-owner check applies. Read by **debug builds, or any build with `ROOST_TEST_MODE=1`** (the release e2e lane sets it). An empty or relative value derives nothing, so the tab keeps the process's own `XDG_RUNTIME_DIR`. The harness sets it to each launched process's own runtime directory so no test tab points at the real `/run/user/<uid>`. |
+
+### `LANG` in a macOS tab
+
+An app started from Finder or the Dock inherits no locale, so on macOS a
+tab whose `LANG`, `LC_ALL` and `LC_CTYPE` are all unset or empty gets
+`LANG=<language>_<region>.UTF-8` from the system's preferred languages
+and region (the first preferred language with an installed pair wins),
+or `en_US.UTF-8` when no such pair is an installed locale. A
+locale already set, even `LC_ALL=C`, is kept. This applies to the UI's
+own tabs and `roost-session`'s; Linux tabs keep the locale they inherit.
 
 ### Terminal advertisement
 
