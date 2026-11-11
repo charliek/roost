@@ -55,6 +55,9 @@ pub(crate) enum EngineFeed {
     /// near the event-loop thread, while the toast it produces can only
     /// be set there.
     AgentHooks(crate::app::agent_hooks::AgentHooksEnsured),
+    /// The startup retire of file entries this build no longer needs
+    /// finished on the blocking pool, for [`Self::AgentHooks`]'s reason.
+    AgentRetire(crate::app::agent_hooks::AgentRetired),
     /// One host answered `session.set_agent_hooks` (plan 046 §3.4).
     ///
     /// It rides the feed rather than being awaited anywhere because the

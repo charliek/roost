@@ -29,7 +29,7 @@
 use std::path::PathBuf;
 
 use roost_agent::{Agent, ALL_AGENTS};
-use roost_ui_model::config::{AgentHooks, ConfigLock, RoostConfig};
+use roost_ui_model::config::{AgentHooks, AgentIntegration, ConfigLock, RoostConfig};
 
 use crate::command::INTEGRATION_VERSION;
 use crate::error::{AgentError, AgentSkip, AgentWarning, InstallError, SkipReason};
@@ -258,6 +258,14 @@ pub struct Status {
     pub files: Vec<std::path::PathBuf>,
     pub skipped: Option<SkipReason>,
     pub warnings: Vec<crate::error::Warning>,
+    /// Switched on in `agent-integration` (or the legacy answer while
+    /// that key is absent): what the tab environment and the settings
+    /// card go by. [`Self::allowed`] is the file shadow.
+    pub on: bool,
+    /// What the retire did for this agent, with the entries it left.
+    pub retired: Option<crate::retire::Retired>,
+    /// The retire finished, and an exact Roost entry is back on disk.
+    pub came_back: bool,
 }
 
 /// An uninstall reads the state record as well as the disk: it is what
@@ -338,9 +346,10 @@ pub fn ensure(home: &Home, by: &str, guard: Guard) -> Result<Outcome, InstallErr
 
 /// Bring this machine's files in line with `mode`, both ways.
 ///
-/// `Allow` wires and refreshes what it names and **unwires what it does
-/// not** — for every agent present on disk or named in the record, so a
-/// machine whose `~/.config/roost` was wiped still comes clean. `Off`
+/// `Allow` wires and refreshes the [`FILE_AGENTS`] it names and
+/// **unwires what it does not** — for every agent present on disk or
+/// named in the record, so a machine whose `~/.config/roost` was wiped
+/// still comes clean. `Off`
 /// unwires all of them. With nothing to remove it writes nothing.
 ///
 /// What `roostctl agent ensure` and the consent dialog's Apply run. The
@@ -354,18 +363,43 @@ pub fn reconcile(
 ) -> Result<Outcome, InstallError> {
     guard.check()?;
     let lock = home.config_lock()?;
-    reconcile_locked(home, mode, by, guard, &lock)
+    reconcile_locked(home, mode, by, guard, &ALL_AGENTS, &lock)
 }
 
-/// Union `agents` into this home's `agent-hooks` key — never removing —
-/// then wire what it now allows.
+/// The agents this build still delivers by file. Every other agent's
+/// entries are the retire's to take out, by its strict rule
+/// ([`crate::retire`]), never [`reconcile`]'s looser one.
+pub const FILE_AGENTS: [Agent; 1] = [Agent::Cursor];
+
+/// [`reconcile`] for [`FILE_AGENTS`] only: what `roostctl agent ensure`
+/// runs after the retire.
+pub fn reconcile_file_agents(
+    home: &Home,
+    mode: &Mode,
+    by: &str,
+    guard: Guard,
+) -> Result<Outcome, InstallError> {
+    guard.check()?;
+    let lock = home.config_lock()?;
+    reconcile_locked(home, mode, by, guard, &FILE_AGENTS, &lock)
+}
+
+/// Switch the file agents among `agents` on — never removing — then wire
+/// them.
 ///
 /// What a connecting client is allowed to do to a host (plan 064 §3.3).
-/// A raise is additive against whatever the key already says, `off` and
-/// `ask` included: both become the client's list, because a host has no
-/// screen to ask on and the client in front of the user is the only
-/// authority there is. It never removes, so a second client — or an
-/// agent somebody wired by hand — survives a raise it was not named in.
+/// A raise is additive against whatever the host already says, `off` and
+/// `ask` included, because a host has no screen to ask on and the client
+/// in front of the user is the only authority there is. It never removes,
+/// so a second client — or an agent somebody wired by hand — survives a
+/// raise it was not named in.
+///
+/// Only a file agent is raised. Every other agent is on wherever the
+/// host never answered and stays as answered where it did, so a raise of
+/// one writes nothing and is reported as needing no file. The raise of
+/// a file agent lands in `agent-integration` as well as the shadow: the
+/// next session start narrows the shadow to that key, and retires the
+/// file of an agent the key does not switch on.
 ///
 /// One thing differs from [`ensure`], and it follows from the caller
 /// being remote: the run flips `noticed` itself, in the same record
@@ -378,8 +412,19 @@ pub fn raise(
 ) -> Result<Outcome, InstallError> {
     guard.check()?;
     let lock = home.config_lock()?;
-    let (key, wrote) = widen(home, agents, &lock)?;
-    let mode = Mode::Allow(key.as_ref().map(allowed_in).unwrap_or_default());
+    let by_file: Vec<Agent> = agents
+        .iter()
+        .copied()
+        .filter(|agent| home.wires_by_file(*agent))
+        .collect();
+    let (key, wrote) = widen(home, &by_file, &lock)?;
+    let in_key = key.as_ref().map(allowed_in).unwrap_or_default();
+    let mode = Mode::Allow(
+        ALL_AGENTS
+            .into_iter()
+            .filter(|agent| in_key.contains(agent) || agents.contains(agent))
+            .collect(),
+    );
     let mut outcome =
         wire_locked(home, &mode, by, guard, Notice::Here, &lock).map_err(|source| match &key {
             Some(key) => after_key(key, source),
@@ -389,10 +434,30 @@ pub fn raise(
     Ok(outcome)
 }
 
-/// Set the `agent-hooks` key to exactly `mode`, then bring this
+/// What [`set_hooks`] writes for `mode`: `agent-integration` names
+/// every agent that is on, whatever its delivery, and `agent-hooks`
+/// becomes the shadow older builds and the file `ensure` read, the agents
+/// this build delivers by file (or `off`), so neither puts back an entry
+/// the retire took out.
+pub fn keys_for(home: &Home, mode: &Mode) -> (String, AgentHooks) {
+    let integration = crate::retire::integration_from(&mode.to_config());
+    let shadow = match mode {
+        Mode::Allow(agents) => Mode::Allow(
+            agents
+                .iter()
+                .copied()
+                .filter(|agent| home.wires_by_file(*agent))
+                .collect(),
+        ),
+        Mode::Off => Mode::Off,
+    };
+    (integration, shadow.to_config())
+}
+
+/// Set the agent keys to exactly `mode` ([`keys_for`]), then bring this
 /// machine's files in line with it.
 ///
-/// The key is written **first and under the same lock**: a partial
+/// The keys are written **first and under the same lock**: a partial
 /// reconcile leaves the permission durable (a later `roostctl agent
 /// ensure` retries what failed), where a key written afterwards would be
 /// lost by every failure and by any concurrent [`raise`]. A key that
@@ -410,10 +475,20 @@ pub fn set_hooks(
     // a token this build cannot name goes with the rest of the old value.
     // That is the difference between an explicit local answer and a
     // raise — the user is looking at the list they just chose.
-    let desired = mode.to_config();
-    let wrote = write_hooks(home, &read_hooks(home)?, &desired, &lock)?;
-    let mut outcome = reconcile_locked(home, mode, by, guard, &lock)
-        .map_err(|source| after_key(&desired, source))?;
+    let (integration, desired) = keys_for(home, mode);
+    let current = read_hooks(home)?;
+    let wrote = write_integration(home, &integration, &lock)?;
+    let after = || -> Result<Outcome, InstallError> {
+        let wrote = write_hooks(home, &current, &desired, &lock)?;
+        let mut outcome = reconcile_locked(home, mode, by, guard, &FILE_AGENTS, &lock)?;
+        outcome.wrote |= wrote;
+        Ok(outcome)
+    };
+    let mut outcome = after().map_err(|source| InstallError::AfterKey {
+        name: "agent-integration",
+        key: integration,
+        source: Box::new(source),
+    })?;
     outcome.wrote |= wrote;
     Ok(outcome)
 }
@@ -424,6 +499,7 @@ pub fn set_hooks(
 fn after_key(key: &AgentHooks, source: InstallError) -> InstallError {
     match key.to_config_value() {
         Some(key) => InstallError::AfterKey {
+            name: "agent-hooks",
             key,
             source: Box::new(source),
         },
@@ -443,7 +519,7 @@ fn wire_locked(
     let (mut record, mut outcome) = start(home)?;
     for agent in ALL_AGENTS {
         if mode.allows(agent) {
-            wire_one(home, agent, by, guard, &mut record, &mut outcome);
+            wire_file_agent(home, agent, by, guard, &mut record, &mut outcome);
         } else {
             outcome.skipped.push(AgentSkip {
                 agent,
@@ -459,13 +535,14 @@ fn reconcile_locked(
     mode: &Mode,
     by: &str,
     guard: Guard,
+    only: &[Agent],
     lock: &ConfigLock,
 ) -> Result<Outcome, InstallError> {
     let (mut record, mut outcome) = start(home)?;
     let targets = unwire_targets(home, &record);
-    for agent in ALL_AGENTS {
+    for agent in only.iter().copied() {
         if mode.allows(agent) {
-            wire_one(home, agent, by, guard, &mut record, &mut outcome);
+            wire_file_agent(home, agent, by, guard, &mut record, &mut outcome);
         } else if targets.contains(&agent) {
             unwire_one(home, agent, guard, &mut record, &mut outcome);
         } else {
@@ -581,6 +658,15 @@ pub fn uninstall(home: &Home, agents: &[Agent], guard: Guard) -> Result<Outcome,
 /// Read-only: what `roostctl agent status` and doctor render.
 pub fn status(home: &Home, mode: &Mode) -> Result<Vec<Status>, InstallError> {
     let (record, _) = state::load(home)?;
+    // Unreadable tombstones cost only the `retired` and `came_back`
+    // columns, as they cost the retire's deferral only its notice.
+    let tombstones = crate::retire::load(home).unwrap_or_else(|error| {
+        tracing::warn!(%error, "agent status without the retire record");
+        crate::retire::Tombstones::default()
+    });
+    // An unreadable config may say `off`, as the tab environment reads it.
+    let switches = crate::retire::switches(home)
+        .unwrap_or_else(|_| roost_ui_model::config::AgentSwitches::all_off());
     ALL_AGENTS
         .into_iter()
         .map(|agent| {
@@ -612,6 +698,9 @@ pub fn status(home: &Home, mode: &Mode) -> Result<Vec<Status>, InstallError> {
                     None => Some(SkipReason::NotPresent),
                 },
                 warnings: plan.map(|p| p.warnings).unwrap_or_default(),
+                on: switches.on(agent),
+                retired: tombstones.get(agent.source()).cloned(),
+                came_back: present && crate::retire::came_back(home, agent, &tombstones),
             })
         })
         .collect()
@@ -659,6 +748,18 @@ fn write_hooks(
     Ok(true)
 }
 
+/// Write `agent-integration`, unless it already says exactly `value`.
+fn write_integration(home: &Home, value: &str, lock: &ConfigLock) -> Result<bool, InstallError> {
+    let path = home.config_path();
+    let current = crate::retire::switches(home)?.integration;
+    if current == roost_ui_model::config::AgentIntegration::parse(value) {
+        return Ok(false);
+    }
+    roost_ui_model::config::set_key_locked(lock, path, "agent-integration", value)
+        .map_err(|e| InstallError::io(path, e))?;
+    Ok(true)
+}
+
 /// The `agent-hooks` key widened by `agents` and written back — the
 /// shared half of [`raise`] and [`install`], and the reason both are
 /// additive. Returns the key the write step settled on (`None` when
@@ -668,6 +769,12 @@ fn widen(
     agents: &[Agent],
     lock: &ConfigLock,
 ) -> Result<(Option<AgentHooks>, bool), InstallError> {
+    let by_file: Vec<Agent> = agents
+        .iter()
+        .copied()
+        .filter(|agent| home.wires_by_file(*agent))
+        .collect();
+    let switched = switch_on(home, &by_file, lock)?;
     let current = read_hooks(home)?;
     let widened = union(&current, agents);
     // A union that allows nothing writes nothing. Widening is the only
@@ -676,10 +783,47 @@ fn widen(
     // writing then would spell that as `off`, which is a *lowering* of
     // an unanswered key nobody requested.
     if allowed_in(&widened).is_empty() {
-        return Ok((None, false));
+        return Ok((None, switched));
     }
     let wrote = write_hooks(home, &current, &widened, lock)?;
-    Ok((Some(widened), wrote))
+    Ok((Some(widened), wrote || switched))
+}
+
+/// Switch `agents` on in `agent-integration`, keeping every other answer
+/// it gives, and every name this build cannot resolve.
+///
+/// Before the shadow is widened, because an absent `agent-integration`
+/// starts from the legacy answer, exactly as the retire's carry-over
+/// would spell it. Writes nothing when every agent is already on.
+fn switch_on(home: &Home, agents: &[Agent], lock: &ConfigLock) -> Result<bool, InstallError> {
+    let switches = crate::retire::switches(home)?;
+    if agents.iter().all(|agent| switches.on(*agent)) {
+        return Ok(false);
+    }
+    let base = match switches.integration {
+        Some(integration) => Some(integration),
+        None if crate::retire::answered(&switches) => {
+            AgentIntegration::parse(&crate::retire::integration_from(&switches.legacy))
+        }
+        None => None,
+    };
+    let mut tokens: Vec<String> = match base {
+        None => Vec::new(),
+        Some(AgentIntegration::Off) => {
+            let none = AgentHooks::Allow {
+                agents: Vec::new(),
+                unknown: Vec::new(),
+            };
+            vec![crate::retire::integration_from(&none)]
+        }
+        Some(AgentIntegration::Set(set)) => set
+            .into_iter()
+            .filter(|(name, _)| Agent::parse(name).is_none_or(|agent| !agents.contains(&agent)))
+            .map(|(name, on)| if on { name } else { format!("-{name}") })
+            .collect(),
+    };
+    tokens.extend(agents.iter().map(|agent| agent.source().to_string()));
+    write_integration(home, &tokens.join(", "), lock)
 }
 
 /// `hooks` widened by `agents`, in [`ALL_AGENTS`] order.
@@ -756,6 +900,32 @@ fn unwire_targets(home: &Home, record: &Record) -> Vec<Agent> {
         .into_iter()
         .filter(|agent| home.is_present(*agent) || state::entry(record, *agent).is_some())
         .collect()
+}
+
+/// [`wire_one`] for an agent this build still delivers by file, and a
+/// [`SkipReason::NoFileNeeded`] for any other, whatever the key allows.
+///
+/// The automatic paths (the startup ensure, a host raise, the consent
+/// dialog's apply) must never put back what the retire takes out: a
+/// finished retire does not run again at its version, so an entry
+/// written after it doubles that agent's events for good. Only the
+/// explicit [`install`] still writes them.
+fn wire_file_agent(
+    home: &Home,
+    agent: Agent,
+    by: &str,
+    guard: Guard,
+    record: &mut Record,
+    outcome: &mut Outcome,
+) {
+    if home.wires_by_file(agent) {
+        wire_one(home, agent, by, guard, record, outcome);
+    } else {
+        outcome.skipped.push(AgentSkip {
+            agent,
+            reason: SkipReason::NoFileNeeded,
+        });
+    }
 }
 
 fn wire_one(
@@ -868,7 +1038,7 @@ fn still_wired_elsewhere(
 /// otherwise cleaned by nothing — `off` would plan against the current
 /// path, find nothing, and then delete the only record of where the old
 /// install was.
-fn unwire_homes(home: &Home, agent: Agent, record: &Record) -> Vec<Home> {
+pub(crate) fn unwire_homes(home: &Home, agent: Agent, record: &Record) -> Vec<Home> {
     let mut dirs = vec![home.agent_dir(agent).to_path_buf()];
     if let Some(entry) = state::entry(record, agent) {
         for file in &entry.files {
@@ -973,7 +1143,7 @@ mod tests {
 
     fn a_home(root: &std::path::Path) -> Home {
         std::fs::create_dir_all(root.join(".claude")).unwrap();
-        Home::rooted(root)
+        Home::rooted(root).every_agent_by_file()
     }
 
     fn all() -> Mode {
@@ -1004,12 +1174,17 @@ mod tests {
     /// The key a failed run names, taken apart: it is the key on disk,
     /// and the rendered error carries both it and the failure itself.
     fn assert_names_the_key_on_disk(home: &Home, failed: &InstallError, record: &str) {
-        let InstallError::AfterKey { key, source } = failed else {
+        let InstallError::AfterKey { name, key, source } = failed else {
             panic!("a failure after the key write was not wrapped: {failed:?}");
         };
         assert!(source.to_string().contains(record), "{source}");
+        let text = std::fs::read_to_string(home.config_path()).unwrap();
+        let on_disk = text.lines().find_map(|line| {
+            let (k, v) = line.split_once('=')?;
+            (k.trim() == *name).then(|| v.trim().to_string())
+        });
         assert_eq!(
-            read_hooks(home).unwrap().to_config_value().as_deref(),
+            on_disk.as_deref(),
             Some(key.as_str()),
             "the key named is not the key on disk"
         );
@@ -1032,7 +1207,9 @@ mod tests {
             let failed = set_hooks(&home, &mode, "local", Guard::PERMITTED)
                 .expect_err("the record is unreadable");
             assert!(
-                failed.to_string().contains("`claude, codex`"),
+                failed
+                    .to_string()
+                    .contains("the agent-integration key `claude, codex, -grok, -opencode`"),
                 "{attempt}: {failed}"
             );
             assert_names_the_key_on_disk(&home, &failed, &record);

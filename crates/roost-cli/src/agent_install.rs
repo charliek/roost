@@ -29,15 +29,16 @@
 
 use clap::Subcommand;
 use roost_agent::Agent;
+use roost_agent_install::tab_env::ClaudePolicy;
 use roost_agent_install::{
-    ensure, install, reconcile, resolve_names, set_hooks, status, uninstall, AgentSkip, Guard,
-    Home, Mode, Outcome, Status, ALL_AGENTS,
+    ensure, install, reconcile_file_agents, resolve_names, retire, set_hooks, status, uninstall,
+    AgentSkip, Delivery, Guard, Home, Mode, Outcome, RetireOutcome, Status, ALL_AGENTS,
 };
 use roost_ipc::messages::{
     ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksHostOutcome, AgentSetHooksParams,
     AgentSetHooksResult,
 };
-use roost_ui_model::config::{AgentHooks, RoostConfig};
+use roost_ui_model::config::{AgentHooks, LocalBackend, RoostConfig};
 
 use crate::error::CliError;
 use crate::UiSocket;
@@ -113,30 +114,22 @@ pub fn run(cmd: &AgentCmd, json: bool) -> Result<i32, CliError> {
     let guard = Guard::from_env();
 
     match cmd {
-        AgentCmd::Ensure { startup } => match configured() {
-            // `--startup` passes no mode: `ensure` re-reads the key
-            // inside the lock. This read decides only whether there is
-            // an answer to act on at all — the key can be answered
-            // between its read and this process's write.
-            Some(_) if *startup => report(ensure(&home, BY, guard), json),
-            Some(mode) => report(reconcile(&home, &mode, BY, guard), json),
-            None => {
-                // `--json` is a machine contract, so the unconfigured
-                // path answers in the shape an ensure would (an empty
-                // outcome) and puts its one human sentence on stderr,
-                // rather than breaking a script's decode with prose.
-                let note = "agent-hooks is not configured; nothing was wired. Choose agents \
-                            in Roost (Agent Hooks… in the command palette) or run `roostctl \
-                            agent set <list|off> --local`.";
-                if json {
-                    println!("{}", outcome_json(&Outcome::default()));
-                    eprintln!("{note}");
-                } else {
-                    println!("{note}");
-                }
-                Ok(0)
+        AgentCmd::Ensure { startup } => {
+            // The retire first: it narrows `agent-hooks` to the agents
+            // still delivered by file, which is what the ensure below
+            // reads. It is the strict, once-per-version removal; the
+            // reconcile after it touches only the file agents. It waits,
+            // as the UI's does, while the local tabs run on a
+            // `roost-session` that may be an older build still needing
+            // the entries; a v4 session retires at its own start.
+            let defer = RoostConfig::load_default().local_backend == LocalBackend::Session;
+            let retired =
+                retire(&home, guard, defer).map_err(|e| CliError::Failed(format!("agent: {e}")))?;
+            if !json {
+                print_retire(&retired);
             }
-        },
+            ensure_after_retire(&home, guard, *startup, &retired, json)
+        }
         // Unreachable through `main`, which sends this shape to
         // [`run_over_ipc`]. Refused rather than written: the one thing a
         // misroute must never do is quietly set the local key when the
@@ -190,9 +183,131 @@ pub fn run(cmd: &AgentCmd, json: bool) -> Result<i32, CliError> {
             let (key, mode) = resolved_or_nothing();
             let rows =
                 status(&home, &mode).map_err(|e| CliError::Failed(format!("agent status: {e}")))?;
-            print_status(&rows, key.unknown(), json);
+            let policy = roost_agent_install::tab_env::claude_policy_here(&home);
+            print_status(&rows, key.unknown(), policy.as_ref(), json);
             Ok(0)
         }
+    }
+}
+
+/// `agent ensure` after its retire: the file agents' ensure or
+/// reconcile, with the retire folded into the JSON outcome.
+fn ensure_after_retire(
+    home: &Home,
+    guard: Guard,
+    startup: bool,
+    retired: &RetireOutcome,
+    json: bool,
+) -> Result<i32, CliError> {
+    let outcome = match configured() {
+        // `--startup` passes no mode: `ensure` re-reads the key inside
+        // the lock. This read decides only whether there is an answer to
+        // act on at all — the key can be answered between its read and
+        // this process's write.
+        Some(_) if startup => ensure(home, BY, guard),
+        Some(mode) => reconcile_file_agents(home, &mode, BY, guard),
+        None => {
+            // `--json` is a machine contract, so the unconfigured path
+            // answers in the shape an ensure would (an empty outcome)
+            // and puts its one human sentence on stderr, rather than
+            // breaking a script's decode with prose.
+            let note = "agent-hooks is not configured; nothing was wired. Choose agents \
+                        in Roost (Agent Integration… in the command palette) or run `roostctl \
+                        agent set <list|off> --local`.";
+            if json {
+                let mut body = outcome_json(&Outcome::default());
+                body["retire"] = retire_json(retired);
+                println!("{body}");
+                eprintln!("{note}");
+            } else {
+                println!("{note}");
+            }
+            return Ok(i32::from(retire_failed(retired)));
+        }
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // The retire has already run and may have changed files and
+            // made backups; a script still gets that record.
+            if json {
+                println!("{}", serde_json::json!({ "retire": retire_json(retired) }));
+            }
+            return Err(CliError::Failed(format!("agent: {error}")));
+        }
+    };
+    if json {
+        let mut body = outcome_json(&outcome);
+        body["retire"] = retire_json(retired);
+        println!("{body}");
+    } else {
+        print_outcome(&outcome);
+    }
+    Ok(i32::from(!outcome.is_clean() || retire_failed(retired)))
+}
+
+fn retire_failed(retired: &RetireOutcome) -> bool {
+    !retired.errors.is_empty() || retired.key_error.is_some()
+}
+
+fn leftover_json(
+    agent: Agent,
+    leftover: &roost_agent_install::retire::Leftover,
+) -> serde_json::Value {
+    serde_json::json!({
+        "agent": agent.source(),
+        "file": leftover.file,
+        "event": leftover.event,
+        "reason": leftover.reason.to_string(),
+    })
+}
+
+fn retire_json(retired: &RetireOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "deferred": retired.deferred,
+        "retired": names(&retired.retired),
+        "leftovers": retired.leftovers.iter()
+            .map(|(agent, leftover)| leftover_json(*agent, leftover))
+            .collect::<Vec<_>>(),
+        "errors": retired.errors.iter()
+            .map(|e| serde_json::json!({
+                "agent": e.agent.source(),
+                "error": e.error.to_string(),
+            }))
+            .collect::<Vec<_>>(),
+        "key_error": retired.key_error.as_ref().map(ToString::to_string),
+    })
+}
+
+fn print_retire(retired: &RetireOutcome) {
+    if retired.deferred {
+        println!("retire: waiting for an older roost-session on this machine");
+    }
+    if !retired.retired.is_empty() {
+        println!(
+            "retired file entries (backup in ~/.config/roost/agent-backups): {}",
+            names(&retired.retired).join(", ")
+        );
+    }
+    for (agent, leftover) in &retired.leftovers {
+        println!(
+            "left in place: {} {}",
+            agent.source(),
+            leftover_line(leftover)
+        );
+    }
+    for error in &retired.errors {
+        println!("retire error: {}: {}", error.agent.source(), error.error);
+    }
+    if let Some(error) = &retired.key_error {
+        println!("retire error: {error}");
+    }
+}
+
+fn leftover_line(leftover: &roost_agent_install::retire::Leftover) -> String {
+    match &leftover.event {
+        Some(event) => format!("{} ({event}): {}", leftover.file, leftover.reason),
+        None => format!("{}: {}", leftover.file, leftover.reason),
     }
 }
 
@@ -484,7 +599,8 @@ fn print_outcome(outcome: &Outcome) {
 /// act on — the key itself keeps them (a newer Roost put them there), so
 /// a status that hid them would read as if the name had been thrown
 /// away.
-fn print_status(rows: &[Status], unknown: &[String], json: bool) {
+fn print_status(rows: &[Status], unknown: &[String], policy: Option<&ClaudePolicy>, json: bool) {
+    let blocked = policy.is_some_and(ClaudePolicy::blocks);
     if json {
         let body: Vec<serde_json::Value> = rows
             .iter()
@@ -500,6 +616,21 @@ fn print_status(rows: &[Status], unknown: &[String], json: bool) {
                     "files": row.files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                     "skipped": row.skipped.as_ref().map(ToString::to_string),
                     "warnings": row.warnings.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "on": row.on,
+                    "delivery": live_delivery(row, blocked),
+                    "policy": (row.agent == Agent::Claude)
+                        .then(|| policy.map(|p| serde_json::to_value(p).unwrap_or_default()))
+                        .flatten(),
+                    "retired": row.retired.as_ref().map(|r| serde_json::json!({
+                        "version": r.version,
+                        "at": r.at,
+                        "complete": r.complete,
+                        "backups": r.backups,
+                        "leftovers": r.leftovers.iter()
+                            .map(|l| leftover_json(row.agent, l))
+                            .collect::<Vec<_>>(),
+                    })),
+                    "came_back": row.came_back,
                 })
             })
             .chain(
@@ -513,7 +644,12 @@ fn print_status(rows: &[Status], unknown: &[String], json: bool) {
     }
 
     for row in rows {
-        println!("{:<9} {}", row.agent.source(), status_line(row));
+        println!("{:<9} {}", row.agent.source(), status_line(row, blocked));
+        if let (Agent::Claude, Some(ClaudePolicy::Blocked(why) | ClaudePolicy::Unknown(why))) =
+            (row.agent, policy)
+        {
+            println!("          plugin policy: {why}");
+        }
         if let Some(reason) = &row.skipped {
             if row.present {
                 println!("          skipped: {reason}");
@@ -522,10 +658,53 @@ fn print_status(rows: &[Status], unknown: &[String], json: bool) {
         for warning in &row.warnings {
             println!("          warning: {warning}");
         }
+        if let Some(retired) = &row.retired {
+            if !retired.changed.is_empty() {
+                println!(
+                    "          retired v{} at {}; backups: {}",
+                    retired.version,
+                    retired.at,
+                    retired.backups.join(", ")
+                );
+            }
+            for leftover in &retired.leftovers {
+                println!(
+                    "          left in place: {}; remove it by hand if Roost added it",
+                    leftover_line(leftover)
+                );
+            }
+        }
+        if row.came_back {
+            println!(
+                "          an entry came back after the retire (synced from an older Roost?); \
+                 `roostctl agent uninstall {}` removes it",
+                row.agent.source()
+            );
+        }
     }
     for name in unknown {
         println!("{name:<9} unknown to this build");
     }
+}
+
+/// How an agent with no file is connected, in a sentence doctor and
+/// `agent status` share.
+pub(crate) fn delivery_phrase(delivery: Delivery) -> &'static str {
+    match delivery {
+        Delivery::Env => "connected through the tab environment",
+        Delivery::Osc7501 => "reports over OSC 7501",
+        Delivery::File => "connected by its own config file",
+    }
+}
+
+/// How this build connects the agent right now: its [`Delivery`], or
+/// `none` while it is switched off or Claude's sideload policy keeps the
+/// plugin out.
+fn live_delivery(row: &Status, claude_blocked: bool) -> &'static str {
+    if !row.on || (row.agent == Agent::Claude && claude_blocked) {
+        return "none";
+    }
+    Delivery::of(row.agent).as_str()
 }
 
 /// Three independent facts per row, in the order that reads: is the
@@ -534,9 +713,23 @@ fn print_status(rows: &[Status], unknown: &[String], json: bool) {
 /// `wired` is the state record's claim and `entries_on_disk` is the
 /// agent's own files; they can disagree, and saying which is which is
 /// the difference between a status line and a guess.
-fn status_line(row: &Status) -> String {
+fn status_line(row: &Status, claude_blocked: bool) -> String {
     if !row.present {
         return "not installed".to_string();
+    }
+    let delivery = Delivery::of(row.agent);
+    if delivery != Delivery::File {
+        let mut line = if !row.on {
+            "present, switched off".to_string()
+        } else if row.agent == Agent::Claude && claude_blocked {
+            "present, skipped: your organization's Claude policy blocks plugin folders".to_string()
+        } else {
+            format!("present, {}, nothing written", delivery_phrase(delivery))
+        };
+        if row.entries_on_disk {
+            line.push_str(", old Roost file entries still in place");
+        }
+        return line;
     }
     let allowed = if row.allowed {
         "allowed"
@@ -682,6 +875,9 @@ mod tests {
             files: vec!["/home/u/.codex/hooks.json".into()],
             skipped: None,
             warnings: Vec::new(),
+            on: true,
+            retired: None,
+            came_back: false,
         }
     }
 
@@ -689,33 +885,73 @@ mod tests {
     fn a_status_line_says_present_allowed_and_wired_separately() {
         let version = roost_agent_install::INTEGRATION_VERSION;
         assert_eq!(
-            status_line(&a_row(Agent::Codex, true)),
+            status_line(&a_row(Agent::Cursor, true), false),
             format!("present, allowed, wired@v{version}")
         );
         assert_eq!(
-            status_line(&Status {
-                entries_on_disk: false,
-                wired: None,
-                up_to_date: false,
-                ..a_row(Agent::Grok, false)
-            }),
+            status_line(
+                &Status {
+                    entries_on_disk: false,
+                    wired: None,
+                    up_to_date: false,
+                    ..a_row(Agent::Cursor, false)
+                },
+                false
+            ),
             "present, not allowed"
         );
         // The record-vs-disk disagreement is kept word for word.
         assert_eq!(
-            status_line(&Status {
-                entries_on_disk: false,
-                ..a_row(Agent::Claude, true)
-            }),
+            status_line(
+                &Status {
+                    entries_on_disk: false,
+                    ..a_row(Agent::Cursor, true)
+                },
+                false
+            ),
             format!("present, allowed, record says wired@v{version}, nothing wired on disk")
         );
         assert_eq!(
-            status_line(&Status {
-                present: false,
-                ..a_row(Agent::Cursor, true)
-            }),
+            status_line(
+                &Status {
+                    present: false,
+                    ..a_row(Agent::Cursor, true)
+                },
+                false
+            ),
             "not installed"
         );
+    }
+
+    /// An agent connected without a file says how, or why not.
+    #[test]
+    fn a_status_line_says_how_an_agent_without_a_file_connects() {
+        let clean = |agent| Status {
+            entries_on_disk: false,
+            ..a_row(agent, false)
+        };
+        assert_eq!(
+            status_line(&clean(Agent::Claude), false),
+            "present, connected through the tab environment, nothing written"
+        );
+        assert_eq!(
+            status_line(&clean(Agent::Grok), true),
+            "present, reports over OSC 7501, nothing written"
+        );
+        assert!(status_line(&clean(Agent::Claude), true).contains("Claude policy"));
+        let off = Status {
+            on: false,
+            ..clean(Agent::Opencode)
+        };
+        assert_eq!(status_line(&off, false), "present, switched off");
+        assert!(status_line(&a_row(Agent::Codex, true), false).ends_with("still in place"));
+
+        assert_eq!(live_delivery(&clean(Agent::Claude), false), "env");
+        assert_eq!(live_delivery(&clean(Agent::Claude), true), "none");
+        assert_eq!(live_delivery(&clean(Agent::Opencode), true), "env");
+        assert_eq!(live_delivery(&off, false), "none");
+        assert_eq!(live_delivery(&clean(Agent::Codex), false), "7501");
+        assert_eq!(live_delivery(&a_row(Agent::Cursor, true), false), "file");
     }
 
     #[test]

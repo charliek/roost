@@ -764,68 +764,73 @@ roostctl palette dismiss
 
 ## `agent` subcommands
 
-Wire Roost's hook entries into each supported agent's own configuration
-file, and take them back out. Every verb but one reads and writes
-dotfiles directly and works with nothing running; bare `agent set` is
-the exception — it dials the running UI, because only the UI can reach
-the hosts this machine is connected to.
+Which coding agents Roost connects, and the file entries it writes for
+the one agent it still connects by file (Cursor). Every verb but one
+reads and writes dotfiles directly and works with nothing running; bare
+`agent set` is the exception — it dials the running UI, because only the
+UI can reach the hosts this machine is connected to.
 
 ```bash
-roostctl agent status                        # per agent: installed, wired, up to date
-roostctl agent ensure [--json] [--startup]    # reconcile to `agent-hooks`; --startup never removes
-roostctl agent set claude,codex [--json]      # via the running UI: set the key here, raise every connected host
-roostctl agent set claude,codex --local       # set `agent-hooks` to exactly this list here, and wire it
-roostctl agent set off --local                # set `agent-hooks = off`, and unwire everything
-roostctl agent install claude                 # or --all; explicit wins over `agent-hooks = off`
-roostctl agent uninstall claude               # or --all
+roostctl agent status [--json]                # per agent: delivery, switch, Claude policy, retire, leftovers
+roostctl agent ensure [--json] [--startup]    # the retire if due, then reconcile Cursor's file
+roostctl agent set claude,codex,cursor [--json]  # via the running UI: the switches here, raise every connected host
+roostctl agent set claude,cursor --local      # write the switches here directly
+roostctl agent set off --local                # every agent off, and Cursor's entries out
+roostctl agent install cursor                 # or --all; writes an agent's file entries regardless
+roostctl agent uninstall cursor               # or --all
 ```
 
-`ensure` reads the `agent-hooks` key from `config.conf`
-([`config.md`](config.md#agent-hooks)) — the same value the UIs act on
-at startup, through the same parser (`roost-cli` depends on
-`roost-ui-model` for exactly this) — and reconciles this machine's files
-to match: wires what the key allows and **takes out what it does not**.
-Bare `agent ensure` is that full reconcile; `--startup` is the narrower
-shape a UI launch runs — wire and refresh what the key names, but never
-remove anything, because a launch must not undo a hook someone added by
-hand or react to a key that changed while the app was closed. An
-unanswered key (nobody has run the consent dialog or `agent set` yet) is
-a no-op for either shape: nothing is wired, and nothing already wired is
-touched.
+`status` changes nothing on disk. Per agent it says whether the agent is
+installed, whether it is switched on, how Roost connects it, and what
+the retire did. `--json` carries, per agent: `on`; `delivery` — `env`
+(Claude Code, OpenCode: a plugin in the tab environment), `7501` (Codex,
+Grok: the agent's own reports), `file` (Cursor), or `none` while the
+agent is switched off or Claude's plugin policy keeps the plugin out;
+`policy` for Claude (`{"state": "allowed" | "blocked" | "unknown" |
+"not-installed" | "unchecked", "detail": …}`, or `null` when nothing has
+been recorded); `retired` (`version`, `at`, `complete`, `backups`, and
+`leftovers` with `file`, `event` and `reason`); and `came_back`. The
+older fields (`present`, `wired`, `entries_on_disk`, `up_to_date`,
+`allowed`, `files`, `skipped`, `warnings`) describe the agent's file
+entries, which matter now only for Cursor and for leftovers.
 
-`set <list|off>` answers the consent question from a terminal: the
-argument is a comma list of agent names (`claude`, `codex`, `grok`,
-`cursor`, `opencode`) or the literal `off`, and an unrecognised name
-refuses the whole list rather than narrowing it silently.
+`ensure` first runs the [retire](../guides/agents.md#upgrading-the-retire)
+if it is due: the entries an older release wrote for agents Roost no
+longer connects by file come out, each changed file backed up first,
+and only what Roost can prove it wrote. It waits while this machine's
+tabs run on a `roost-session`, which retires at its own start. Then it
+reconciles Cursor's file to the switches: bare `ensure` wires or removes
+it; `--startup`, the shape a UI launch runs, never removes anything. The
+JSON outcome carries the retire under `retire` (`deferred`, `retired`,
+`leftovers`, `errors`, `key_error`).
+
+`set <list|off>` sets the switches from a terminal: the argument is a
+comma list of agent names (`claude`, `codex`, `grok`, `cursor`,
+`opencode`) or the literal `off`, and an unrecognised name refuses the
+whole list rather than narrowing it silently. It writes
+[`agent-integration`](config.md#agent-integration) with every agent on
+or off as listed, narrows [`agent-hooks`](config.md#agent-hooks) to the
+file agents in the list, and wires or removes Cursor's entries to match.
 
 Bare `set` puts [`agent.set_hooks`](ipc.md#agentset_hooks) to the
-running UI, which writes this machine's `agent-hooks` key, reconciles
-its files, and raises every **connected non-localhost** host to at least
-the same list in the same call — so a headless box and a desk box agree
-without either editing the other's dotfiles. It prints where the key
-landed, what changed here, and one line per host (`--json` prints the
-op's reply verbatim), and exits non-zero if anything failed here or a
-host could not be asked.
+running UI, which does the above here and raises every **connected
+non-localhost** host with the same list in the same call. It prints
+where the keys landed, what changed here, and one line per host
+(`--json` prints the op's reply verbatim), and exits non-zero if
+anything failed here or a host could not be asked. `set <list|off>
+--local` writes this machine's keys directly instead, with nothing
+running, and reaches no host at all.
 
-`set <list|off> --local` writes the key and reconciles this machine's
-files directly instead, the same way `ensure` does — with nothing
-running, and reaching no host at all, so a connected host's live session
-does not pick up the change until it reconnects.
+`agent install` and `agent uninstall` take an agent name or `--all`.
+`install` writes the named agents' file entries whatever the switches
+say — for an agent you run outside Roost tabs, say; inside a Roost tab
+Claude Code then gets its hooks twice — and unions them into
+`agent-hooks`. `uninstall` removes any handler whose command is Roost's,
+the looser rule an explicit request may use, and narrows `agent-hooks`,
+spelling the result `off` when nothing would be left.
 
-`agent install` and `agent uninstall` take an agent name or `--all`, and
-deliberately ignore `agent-hooks = off` — an explicit verb always wins.
-Both also *move* the key rather than leaving it alone: `install`
-unions the named agent(s) into it (so the next `ensure` does not treat
-what you just asked for as unconsented), and `uninstall` narrows it back
-out, spelling the result `off` when nothing would be left allowed.
-`status` changes nothing on disk; each row names the agent, whether its
-config directory is present, whether the resolved `agent-hooks` key
-allows it, whether Roost's entries are actually wired on disk, and
-whether they're at the current integration version.
-
-See the [Agent Hooks](../guides/agents.md) guide for the mechanism, the
-wire format each agent gets, and the guarantee about what a merge does
-and doesn't touch.
+See the [Agent integration](../guides/agents.md) guide for the
+mechanism, the retire, and what each agent gets.
 
 ## `agent-hook`
 
@@ -1094,8 +1099,8 @@ judge a *tab* fact unless the selected tab is doctor's own tab.
 | `shell` | process (`shell.marks_observed` is tab-scoped) | Is the shell-integration contract offered, can this shell/version emit the OSC 133 marks that drive the running dot, and has a mark actually been observed on doctor's own tab? |
 | `tab` | tab | Which tab is selected — the one check in the section, and it can fail if a `--tab`/`$ROOST_TAB_ID` no longer exists — then, for that tab, its four agent axes (shell state, agent lifecycle, attention, ownership), the state derived from them, whether raw OSC 9/99/777 is currently suppressed, and the agent reports the tab's server has dropped (how many, the latest, and a note when the latest was dropped while no agent owned the tab and that agent doesn't own it now: if it is still running, it has lost the tab). Those seven are observations, not verdicts. |
 | `session` | process | Is a session running at a socket path this build no longer uses (`session.old_path`)? A warn names each one and the `session stop --old-path` fix; skipped, saying why, where the probe may not run (an override or test mode is in effect) |
-| `claude` | process (`claude.observed` is tab-scoped) | Is `claude` on `PATH`, does `~/.claude/settings.json` parse and register every lifecycle event Roost maps, does each hook command resolve to a runnable `roostctl`, has this tab actually seen a Claude hook fire? Pre-046 checks, kept for the settings-file shape they've always covered — see the `agents` section below for the other four agents and for Claude's newer, agent-hooks-specific facts |
-| `agents` | process (the `owning` checks are tab-scoped) | Is `$ROOST_AGENT_HOOK` set and executable from this tab; per agent (claude, codex, grok, cursor, opencode), is Roost's hook entry present and at the current integration version, and does that source currently own a tab on this UI; for codex, does its `trusted_hash` on disk match what codex would compute; is a legacy `~/.config/roost/claude-settings.json` or shell alias still lying around? See the [Agent Hooks](../guides/agents.md) guide |
+| `claude` | process (`claude.observed` is tab-scoped) | Is `claude` on `PATH`, does `~/.claude/settings.json` parse, is any Roost hook command still in it (Claude connects through the tab environment, so one left there doubles every event, and doctor says how to remove it), has this tab actually seen a Claude hook fire? Doctor never asks for Roost's hooks in that file — see the `agents` section below for how each agent is connected |
+| `agents` | process (the `owning` checks are tab-scoped) | Is `$ROOST_AGENT_HOOK` set and executable from this tab; per agent (claude, codex, grok, cursor, opencode), is Roost's hook entry present and at the current integration version, and does that source currently own a tab on this UI; for codex, does its `trusted_hash` on disk match what codex would compute; is a legacy `~/.config/roost/claude-settings.json` or shell alias still lying around? See the [Agent integration](../guides/agents.md) guide |
 
 Every entry carries a stable `id` (`env.tab_id`, `ui.socket`,
 `shell.marks_capability`, `claude.hook_command`, …) and a `kind`: `check`
@@ -1191,23 +1196,23 @@ Selected tab (tab)
 Claude Code (process)
   ok      claude.binary            2.1.261 (Claude Code)
   ok      claude.settings          /Users/charliek/.claude/settings.json parses
-  ok      claude.hook_events       all 11 events registered
-  ok      claude.hook_command      all 11 events have a current Roost command
+  ok      claude.hook_events       none registered, and Roost needs none: Claude connects through the tab environment, not settings.json
+  ok      claude.hook_command      no Roost command, and none needed: Claude connects through the tab environment, not settings.json
   skipped claude.observed          the selected tab's ownership is unavailable (no tab.list from a running UI)
 
 Agents (process)
   skipped agent.hook_binary        not running inside a Roost tab
-  ok      agent.claude.wired       wired@v3
+  ok      agent.claude.wired       connected through the tab environment; nothing written · old entries retired (v4) · backup ~/.config/roost/agent-backups/…
   skipped agent.claude.owning      unavailable (no tab.list from a running UI)
   ok      agent.claude.legacy_settings no leftover ~/.config/roost/claude-settings.json or shell alias found
-  ok      agent.codex.wired        wired@v3
-  ok      agent.codex.trust        8 trusted hashes match what codex would compute
+  ok      agent.codex.wired        reports over OSC 7501; nothing written · old entries retired (v4) · backup ~/.config/roost/agent-backups/…
+  skipped agent.codex.trust        nothing wired for codex yet
   skipped agent.codex.owning       unavailable (no tab.list from a running UI)
-  ok      agent.grok.wired         wired@v3
+  ok      agent.grok.wired         reports over OSC 7501; nothing written
   skipped agent.grok.owning        unavailable (no tab.list from a running UI)
   ok      agent.cursor.wired       wired@v3
   skipped agent.cursor.owning      unavailable (no tab.list from a running UI)
-  ok      agent.opencode.wired     wired@v3
+  ok      agent.opencode.wired     connected through the tab environment; nothing written · old entries retired (v4) · backup ~/.config/roost/agent-backups/…
   skipped agent.opencode.owning    unavailable (no tab.list from a running UI)
 
 • 2 issues found — exit 1 (https://charliek.github.io/roost/reference/cli/#exit-codes):
@@ -1216,11 +1221,13 @@ Agents (process)
 ```
 
 Paths are this machine's own (`/Users/charliek/...`) — expect your own
-absolute paths, not these. The five `agent.*.wired`/`agent.codex.trust`
-`ok`s above reflect this dev checkout's own machine already having run
-`roostctl agent ensure` for real — an agent whose config directory
-doesn't exist at all shows `skipped: not installed` instead, and a
-present-but-never-wired agent shows `warn: not wired` rather than `ok`.
+absolute paths, not these. Only Cursor is wired by a file of its own, so
+only its `agent.cursor.wired` reports a `wired@v` version: the other four
+say how they connect and that nothing was written, plus "old entries
+retired" on a machine whose earlier file entries the upgrade took out.
+An agent whose config directory doesn't exist at all shows `skipped: not
+installed` instead, and Cursor present but never wired shows `warn: not
+wired` rather than `ok`.
 
 `--json` carries the same facts as JSON — a top-level `schema_version: 2`,
 an explicit `exit_code` (so a script never has to re-derive "did
@@ -1239,7 +1246,7 @@ flag.
 | `ROOST_SOCKET` | Override the UI socket the CLI dials. In a local session tab it names the session, and a verb goes to the window that owns it instead ([Inside a session tab](#inside-a-session-tab)) |
 | `ROOST_TAB_ID` | Default tab id when `--tab` is not given. A command that changes a tab refuses without one of the two ([why](#which-tab-a-command-acts-on)) |
 | `ROOST_ROOSTCTL` | Set by the UI for provider scripts: absolute path to its own `roostctl`. Best-effort — may be absent if the UI can't resolve its bundled/sibling CLI, so scripts keep the `"${ROOST_ROOSTCTL:-roostctl}"` fallback (see [Where `roostctl` lives](#where-roostctl-lives)) |
-| `ROOST_AGENT_HOOK` | Set by the UI (or `roost-session`) on every tab: absolute path of the `roostctl` (or `roost-session`) that understands `agent-hook <agent>`. Every hook entry Roost installs into an agent's config reads this indirectly through a shell fallback rather than calling `roostctl` directly, which is what keeps the installed command host-independent — see [Agent Hooks](../guides/agents.md#inert-outside-roost). Resolved the same sibling → bundled-`Resources/bin` → `PATH` ladder as `ROOST_ROOSTCTL`; omitted, like that variable, when nothing resolves |
+| `ROOST_AGENT_HOOK` | Set by the UI (or `roost-session`) on every tab: absolute path of the `roostctl` (or `roost-session`) that understands `agent-hook <agent>`. Every hook entry Roost installs into an agent's config reads this indirectly through a shell fallback rather than calling `roostctl` directly, which is what keeps the installed command host-independent — see [Agent integration](../guides/agents.md#inert-outside-roost). Resolved the same sibling → bundled-`Resources/bin` → `PATH` ladder as `ROOST_ROOSTCTL`; omitted, like that variable, when nothing resolves |
 | `ROOST_DEBUG` | If set, `claude-hook` and `agent-hook` write failure messages to stderr |
 | `ROOST_AGENT_HOOKS_FORCE` | Set to `1` to let `agent ensure`/`install`/`uninstall` write real dotfiles while `ROOST_TEST_MODE=1` is also set — without it, the agent-hooks install engine refuses to run at all under `ROOST_TEST_MODE=1`, belt and braces against a test writing into a real machine's dotfiles |
 | `ROOST_SESSION_BIN` | Overrides where `session start` looks for the `roost-session` binary (default: next to `roostctl`, then `PATH`) |

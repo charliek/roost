@@ -1,55 +1,57 @@
-//! The agent-hooks consent card (plan 064 §3.5): one dialog, two modes.
+//! The "Agent integration" card (plan 064 §3.5, reshaped by the move
+//! off config writes): one dialog, two modes.
 //!
-//! **First run** is raised once per process on the local chrome when
-//! nobody has answered the `agent-hooks` key yet; **preferences** is the
-//! same card opened deliberately from `Agent Hooks…` in the command
-//! palette. They differ in three things and nothing else: what the two
-//! buttons say, whether each row carries a status line, and who raised
-//! it. The rows, the copy and the keyboard ring are one implementation
-//! because they are one card.
+//! **First run** asks only what still needs an answer: whether Roost may
+//! write a file agent's own config (today only Cursor's `hooks.json`).
+//! It is raised once per process when neither agent key is answered and
+//! such an agent is installed. Otherwise there is nothing to ask: Claude
+//! Code and OpenCode connect through the tab environment and Codex and
+//! Grok report over OSC 7501, none of which touches a user file, so they
+//! are on by default with no card. **Preferences** is the same card
+//! opened deliberately from `Agent Integration…` in the command palette,
+//! with a switch and a status line per agent.
 //!
 //! Pure on purpose, like [`super::bootstrap`] and
 //! [`super::host_notice`]: the prefill rule, the status wording and the
 //! ring are the parts that have to be right for every combination, and
 //! a table test is the only way to say that once. `app.rs` renders what
-//! these answer and adds nothing.
-//!
-//! The strings are the plan's, verbatim, and the Mac sheet (C8) says the
-//! same words. They live here rather than at the widgets so
-//! `app.dialog_dump` and the card cannot disagree about the copy.
+//! these answer and adds nothing. The strings live here rather than at
+//! the widgets so `app.dialog_dump` and the card cannot disagree.
 
 use iced::keyboard::key::Named;
 use iced::keyboard::{self, Key};
-use roost_agent::Agent;
-use roost_agent_install::Status;
+use roost_agent::{Agent, ALL_AGENTS};
+use roost_agent_install::{Delivery, Status};
 use roost_ipc::messages::AgentSetHooksAgents;
-use roost_ui_model::config::AgentHooks;
 
-pub(crate) const TITLE: &str = "Agent hooks";
+pub(crate) const TITLE: &str = "Agent integration";
 
-pub(crate) const LEDE: &str = "Roost adds a hook to each agent you switch on so its tabs show \
-     status and send notifications. It edits the agent files named below, plus Roost's own \
-     config, and nothing else. roostctl agent uninstall --all puts the agent files back.";
+const INTRO: &str = "Roost shows what your coding agents are doing (working, needs you, done) \
+     in the sidebar, the Agents panel and notifications.";
 
-pub(crate) const FOOTER: &str = "Switching an agent on applies here and on every host this Roost \
-     connects to. Switching one off applies here only. Change it any time from Agent Hooks… in \
-     the command palette.";
+const ASK: &str = "One agent needs a change to its own settings file to report fully:";
 
-/// codex is the one agent whose install writes a second file, and the
-/// only one that would otherwise put a dialog of its own in front of the
-/// user the first time a hook fires.
-const CODEX_NOTE: &str =
-    "Also pre-trusts Roost's hooks in config.toml so codex won't show its own review dialog.";
+const PREFERENCES_LEDE: &str = "Roost shows what your coding agents are doing in the sidebar, \
+     the Agents panel and notifications. Only rows that say so change an agent's own settings.";
 
-/// OpenCode has no command hooks at all, so what Roost installs there is
-/// a plugin — a different kind of thing in a different place, and the
-/// row says so rather than letting "hook" stand for both.
-const OPENCODE_NOTE: &str = "This is a plugin that runs inside OpenCode, not a hook entry.";
+const FIRST_RUN_FOOTER: &str =
+    "Change this, or switch any agent off, from Agent Integration… in the command palette.";
+
+const PREFERENCES_FOOTER: &str = "These switches apply to this machine. Turning Cursor on \
+     also asks the hosts you connect to for its hooks.";
+
+/// The agents with no Roost row: they speak OSC 7501 and Roost has
+/// nothing to switch for them.
+pub(crate) const BUILT_IN_LINE: &str =
+    "Also built in: crush and pi report their status on their own.";
+
+const CLAUDE_BLOCKED: &str = "Skipped: blocked by your organization's Claude policy";
 
 /// Which of the two cards this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CardMode {
-    /// Nobody has answered the key yet, and the app asked unprompted.
+    /// Nobody has answered yet and a file agent is installed, so the app
+    /// asked unprompted.
     FirstRun,
     /// The user opened it from the palette.
     Preferences,
@@ -71,32 +73,29 @@ impl CardMode {
         }
     }
 
-    /// The primary button. Both modes name the count, because the button
-    /// is the last thing read before five config files are edited — and
-    /// both have a distinct spelling for zero, since "Instrument 0" and
-    /// a bare "Apply" would both hide that confirming now writes `off`.
+    /// The primary button. First run records an answer whatever the one
+    /// switch says, so it is "Continue"; preferences has its own spelling
+    /// for zero, since a bare "Apply" would hide that it writes `off`.
     fn confirm_label(self, on: usize) -> String {
         match (self, on) {
-            (Self::FirstRun, 0) => "Turn off".to_string(),
-            (Self::FirstRun, on) => format!("Instrument {on}"),
+            (Self::FirstRun, _) => "Continue".to_string(),
             (Self::Preferences, 0) => "Apply: turn off".to_string(),
             (Self::Preferences, _) => "Apply".to_string(),
         }
     }
 }
 
-/// One agent's row. All five are always drawn, present or not: an agent
-/// the user has only on a host is still something they can consent to
-/// here, and a row that vanished would make the card's list depend on
-/// what happens to be installed today.
+/// One agent's row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentHooksRow {
     pub(crate) agent: Agent,
     pub(crate) on: bool,
     pub(crate) found: bool,
+    pub(crate) delivery: Delivery,
     /// Rendered in preferences mode only, so `None` on first run — the
     /// dump reports what the card shows, not what it could have.
     pub(crate) status: Option<String>,
+    /// The files Roost would write: only a file agent has any.
     pub(crate) files: Vec<String>,
 }
 
@@ -123,42 +122,56 @@ pub(crate) fn display_name(agent: Agent) -> &'static str {
     }
 }
 
-/// The extra sentence two of the five rows carry.
-pub(crate) fn note(agent: Agent) -> Option<&'static str> {
-    match agent {
-        Agent::Codex => Some(CODEX_NOTE),
-        Agent::Opencode => Some(OPENCODE_NOTE),
-        Agent::Claude | Agent::Grok | Agent::Cursor => None,
+/// The sentence under each row: what connecting it costs, in files.
+pub(crate) fn note(agent: Agent, mode: CardMode) -> &'static str {
+    match (agent, mode) {
+        (Agent::Claude, _) => {
+            "Connected inside Roost tabs only. Nothing is written to ~/.claude. Needs Claude \
+             Code 2.1.280 or newer."
+        }
+        (Agent::Opencode, _) => {
+            "Connected inside Roost tabs only. Nothing is written to ~/.config/opencode."
+        }
+        (Agent::Codex, _) => "Built in. Codex reports its status to the terminal itself.",
+        (Agent::Grok, _) => "Built in. Grok reports its status to the terminal itself.",
+        (Agent::Cursor, CardMode::FirstRun) => {
+            "Adds Roost's entries to the file below, because Cursor reads its turn-end hook \
+             only from that file. Without it, Roost shows nothing for Cursor."
+        }
+        (Agent::Cursor, CardMode::Preferences) => {
+            "Adds Roost's entries to the file below, because Cursor reads its turn-end hook \
+             only from that file."
+        }
     }
 }
 
-/// Which switches start on.
-///
-/// **The key, never the disk.** A row that is wired but not named in the
-/// key starts off, so Apply taking its entries back out is a visible act
-/// the user chose rather than a silent narrowing of what they already
-/// had. `Ask` is the one state with no key to read: there the fallback
-/// is what is installed here, which is plan 064's D2 — an agent that
-/// exists only on a host stays off until somebody switches it on once.
-fn prefill(key: &AgentHooks, status: &Status) -> bool {
-    match key {
-        AgentHooks::Ask => status.present,
-        AgentHooks::Off | AgentHooks::Allow { .. } => status.allowed,
+/// "A", "A and B", "A, B and C".
+fn and_list(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
-/// The status line preferences mode shows under each row.
-///
-/// The order of the tests is the meaning: the record and the agent's own
-/// files are independent sources ([`Status`] keeps them apart on
-/// purpose), and "is there anything of Roost's in these files" has to be
-/// answered before any version can be. `up_to_date` alone cannot say it
-/// — an agent the mode does not name plans no edits and so looks current
-/// while carrying nothing at all.
-pub(crate) fn row_status(status: &Status) -> String {
-    if !status.present {
-        return "not found".to_string();
+/// The first-run lede, naming the installed agents already connected.
+fn first_run_lede(connected: &[Agent]) -> String {
+    if connected.is_empty() {
+        return format!("{INTRO} {ASK}");
     }
+    let names: Vec<&str> = connected.iter().map(|a| display_name(*a)).collect();
+    format!(
+        "{INTRO} {} {} already connected, with nothing written to their settings. {ASK}",
+        and_list(&names),
+        if names.len() == 1 { "is" } else { "are" }
+    )
+}
+
+/// A file agent's status line: the record and the agent's own files are
+/// independent sources ([`Status`] keeps them apart on purpose), and "is
+/// there anything of Roost's in these files" is answered before any
+/// version can be.
+fn file_status(status: &Status) -> String {
     if !status.entries_on_disk {
         return "found, not wired".to_string();
     }
@@ -176,26 +189,63 @@ pub(crate) fn row_status(status: &Status) -> String {
     }
 }
 
-/// Every row the card will draw, from one `roost_agent_install::status`
-/// walk plus the key it was resolved against.
-///
-/// `statuses` arrives in `ALL_AGENTS` order because `status` walks that
-/// list, which is also the order the card draws and the dump reports.
-pub(crate) fn rows(mode: CardMode, key: &AgentHooks, statuses: &[Status]) -> Vec<AgentHooksRow> {
-    statuses
-        .iter()
-        .map(|status| AgentHooksRow {
-            agent: status.agent,
-            on: prefill(key, status),
-            found: status.present,
-            status: matches!(mode, CardMode::Preferences).then(|| row_status(status)),
-            files: status
+/// The status line preferences mode shows under each row, then what the
+/// retire left behind or what came back after it.
+pub(crate) fn row_status(status: &Status, claude_blocked: bool) -> String {
+    let delivery = Delivery::of(status.agent);
+    let mut line = if !status.present {
+        "not found".to_string()
+    } else if !status.on {
+        "Off".to_string()
+    } else {
+        match delivery {
+            Delivery::File => file_status(status),
+            Delivery::Env if status.agent == Agent::Claude && claude_blocked => {
+                CLAUDE_BLOCKED.to_string()
+            }
+            Delivery::Env => "Connected · nothing written".to_string(),
+            Delivery::Osc7501 => "Built in".to_string(),
+        }
+    };
+    if status.came_back {
+        line.push_str(&format!(
+            " · an old Roost entry came back after Roost removed it (synced from an older \
+             Roost?): roostctl agent uninstall {} removes it",
+            status.agent.source()
+        ));
+    } else if let Some(left) = status.retired.as_ref().filter(|r| !r.leftovers.is_empty()) {
+        let count = left.leftovers.len();
+        line.push_str(&format!(
+            " · {count} old Roost entr{} left in {} that Roost can't be sure it added: \
+             roostctl agent status lists {}",
+            if count == 1 { "y" } else { "ies" },
+            left.leftovers[0].file,
+            if count == 1 { "it" } else { "them" }
+        ));
+    }
+    line
+}
+
+fn row(mode: CardMode, status: &Status, claude_blocked: bool) -> AgentHooksRow {
+    let delivery = Delivery::of(status.agent);
+    AgentHooksRow {
+        agent: status.agent,
+        // First run asks a question nobody has answered: the file agent
+        // starts off, because it is the one row that writes a user file.
+        on: mode == CardMode::Preferences && status.on,
+        found: status.present,
+        delivery,
+        status: (mode == CardMode::Preferences).then(|| row_status(status, claude_blocked)),
+        files: if delivery == Delivery::File {
+            status
                 .files
                 .iter()
                 .map(|path| path.display().to_string())
-                .collect(),
-        })
-        .collect()
+                .collect()
+        } else {
+            Vec::new()
+        },
+    }
 }
 
 /// Where the card's Tab traversal sits.
@@ -292,17 +342,73 @@ pub(crate) fn key_action(event: &keyboard::Event, at: CardFocus) -> CardKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentHooksDraft {
     mode: CardMode,
+    lede: String,
     rows: Vec<AgentHooksRow>,
+    /// Agents that are on and have no row on this card: on first run,
+    /// the defaults the answer records alongside the file agent's.
+    kept_on: Vec<Agent>,
     focus: CardFocus,
 }
 
 impl AgentHooksDraft {
-    pub(crate) fn new(mode: CardMode, rows: Vec<AgentHooksRow>) -> Self {
+    /// The card for `statuses` (one per agent, in `ALL_AGENTS` order,
+    /// from one `roost_agent_install::status` walk). First run carries
+    /// only the installed file agents; preferences carries all five.
+    pub(crate) fn new(mode: CardMode, statuses: &[Status], claude_blocked: bool) -> Self {
+        let shown = |status: &Status| match mode {
+            CardMode::FirstRun => Delivery::of(status.agent) == Delivery::File && status.present,
+            CardMode::Preferences => true,
+        };
+        let rows = statuses
+            .iter()
+            .filter(|status| shown(status))
+            .map(|status| row(mode, status, claude_blocked))
+            .collect();
+        let kept_on = statuses
+            .iter()
+            .filter(|status| !shown(status) && status.on)
+            .map(|status| status.agent)
+            .collect();
+        let lede = match mode {
+            CardMode::FirstRun => first_run_lede(
+                &statuses
+                    .iter()
+                    .filter(|s| s.present && s.on && Delivery::of(s.agent) != Delivery::File)
+                    .filter(|s| !(s.agent == Agent::Claude && claude_blocked))
+                    .map(|s| s.agent)
+                    .collect::<Vec<_>>(),
+            ),
+            CardMode::Preferences => PREFERENCES_LEDE.to_string(),
+        };
         Self {
             mode,
+            lede,
             rows,
+            kept_on,
             focus: CardFocus::Switch(0),
         }
+    }
+
+    pub(crate) fn lede(&self) -> &str {
+        &self.lede
+    }
+
+    /// Whether this card has a question on it: a first-run card with no
+    /// row is never raised.
+    pub(crate) fn asks(&self) -> bool {
+        !self.rows.is_empty()
+    }
+
+    pub(crate) fn footer(&self) -> &'static str {
+        match self.mode {
+            CardMode::FirstRun => FIRST_RUN_FOOTER,
+            CardMode::Preferences => PREFERENCES_FOOTER,
+        }
+    }
+
+    /// Preferences names the agents that need no switch at all.
+    pub(crate) fn built_in_line(&self) -> Option<&'static str> {
+        (self.mode == CardMode::Preferences).then_some(BUILT_IN_LINE)
     }
 
     pub(crate) fn mode(&self) -> CardMode {
@@ -348,18 +454,20 @@ impl AgentHooksDraft {
         self.rows.iter().filter(|row| row.on).count()
     }
 
-    /// What confirming sends to `agent.set_hooks`.
+    /// What confirming sends to `agent.set_hooks`: every agent that is
+    /// on, shown or not, in `ALL_AGENTS` order.
     ///
-    /// Every switch off is the word `off`, not an empty list: the op
+    /// Every agent off is the word `off`, not an empty list: the op
     /// refuses an empty `agents`, and `off` is the spelling that says
-    /// "the user answered, and the answer was nothing" — an empty value
-    /// would parse back as `Ask` and bring this card round again.
+    /// "the user answered, and the answer was nothing".
     pub(crate) fn wire_agents(&self) -> AgentSetHooksAgents {
-        let names: Vec<String> = self
-            .rows
-            .iter()
-            .filter(|row| row.on)
-            .map(|row| row.agent.source().to_string())
+        let names: Vec<String> = ALL_AGENTS
+            .into_iter()
+            .filter(|agent| {
+                self.kept_on.contains(agent)
+                    || self.rows.iter().any(|row| row.agent == *agent && row.on)
+            })
+            .map(|agent| agent.source().to_string())
             .collect();
         if names.is_empty() {
             AgentSetHooksAgents::Off
@@ -394,33 +502,36 @@ impl AgentHooksDraft {
 /// What a finished survey may do with its result.
 ///
 /// Pure, and separate from the `App` method that acts on it, because
-/// three of the four arms are races: the key answered by another process
-/// while this launch was asking, another dialog taken the screen in the
-/// meantime, a machine with nothing installed. None of them is
+/// three of the four arms are races: the keys answered by another
+/// process while this launch was asking, another dialog taken the screen
+/// in the meantime, a machine with nothing to ask about. None of them is
 /// reproducible from outside the process, and all of them decide whether
-/// Roost writes into somebody else's config file.
+/// Roost asks to write into somebody else's config file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SurveyVerdict {
     Raise,
-    /// Nothing is installed here, so there is nothing to consent about.
-    NoAgent,
-    /// Somebody answered the key while this launch was asking.
+    /// No file agent is installed here, so there is nothing to ask:
+    /// every other agent connects without a file and is on by default.
+    NothingToAsk,
+    /// Somebody answered while this launch was asking.
     AlreadyAnswered,
     /// The user is already answering a different question.
     ScreenTaken,
 }
 
+/// `asks` is whether the first-run card would carry a row; `answered` is
+/// whether either agent key holds an answer on disk.
 pub(crate) fn survey_verdict(
     mode: CardMode,
-    any_present: bool,
-    key: &AgentHooks,
+    asks: bool,
+    answered: bool,
     dialog_open: bool,
 ) -> SurveyVerdict {
     if mode == CardMode::FirstRun {
-        if !any_present {
-            return SurveyVerdict::NoAgent;
+        if !asks {
+            return SurveyVerdict::NothingToAsk;
         }
-        if *key != AgentHooks::Ask {
+        if answered {
             return SurveyVerdict::AlreadyAnswered;
         }
     }
@@ -433,8 +544,8 @@ pub(crate) fn survey_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roost_agent_install::{Home, ALL_AGENTS};
-    use std::path::PathBuf;
+    use roost_agent_install::retire::{Leftover, LeftoverReason, Retired};
+    use roost_agent_install::Home;
 
     fn status(agent: Agent) -> Status {
         Status {
@@ -448,6 +559,9 @@ mod tests {
             files: roost_agent_install::owned_files(&Home::rooted("/home/u"), agent),
             skipped: None,
             warnings: Vec::new(),
+            on: roost_ui_model::config::agent_default_on(agent),
+            retired: None,
+            came_back: false,
         }
     }
 
@@ -455,168 +569,230 @@ mod tests {
         ALL_AGENTS.into_iter().map(status).collect()
     }
 
-    /// The five rows, in `ALL_AGENTS` order, whatever the key says.
-    #[test]
-    fn every_agent_gets_a_row_in_the_inventory_order() {
-        let rows = rows(CardMode::FirstRun, &AgentHooks::Ask, &all());
-        assert_eq!(
-            rows.iter().map(|row| row.agent).collect::<Vec<_>>(),
-            ALL_AGENTS.to_vec()
-        );
-        assert_eq!(
-            rows.iter()
-                .map(|row| display_name(row.agent))
-                .collect::<Vec<_>>(),
-            ["Claude Code", "Codex", "Grok", "Cursor", "OpenCode"]
-        );
-        // codex is the one agent with two files, and the paths are the
-        // install engine's own rather than a second table here.
-        let codex = rows.iter().find(|row| row.agent == Agent::Codex).unwrap();
-        assert_eq!(codex.files.len(), 2, "{codex:?}");
-        assert!(rows
-            .iter()
-            .all(|row| !row.files.is_empty() && row.status.is_none()));
+    fn agents(card: &AgentHooksDraft) -> Vec<Agent> {
+        card.rows().iter().map(|row| row.agent).collect()
     }
 
-    /// Only two rows carry an extra sentence, and they are the two whose
-    /// install is not "one hook entry in one file".
+    /// First run asks only about the installed file agent, unchecked;
+    /// with none installed there is no question at all.
     #[test]
-    fn the_two_rows_with_something_more_to_say_are_codex_and_opencode() {
-        assert_eq!(note(Agent::Codex), Some(CODEX_NOTE));
-        assert_eq!(note(Agent::Opencode), Some(OPENCODE_NOTE));
-        for agent in [Agent::Claude, Agent::Grok, Agent::Cursor] {
-            assert_eq!(note(agent), None, "{}", agent.source());
-        }
-    }
+    fn first_run_carries_only_an_installed_cursor_unchecked() {
+        let card = AgentHooksDraft::new(CardMode::FirstRun, &all(), false);
+        assert_eq!(agents(&card), [Agent::Cursor]);
+        assert!(!card.rows()[0].on, "the one file-writing row starts off");
+        assert!(card.asks());
+        assert_eq!(card.rows()[0].status, None);
+        assert_eq!(
+            card.rows()[0].files,
+            ["/home/u/.cursor/hooks.json"],
+            "the row names the file it would write"
+        );
 
-    /// First run has no key, so what is installed here is the fallback —
-    /// and an agent that exists only on a host stays off (D2).
-    #[test]
-    fn an_unanswered_key_starts_the_installed_agents_on_and_the_rest_off() {
         let mut statuses = all();
-        statuses[2].present = false;
-        let rows = rows(CardMode::FirstRun, &AgentHooks::Ask, &statuses);
-        assert_eq!(
-            rows.iter().map(|row| row.on).collect::<Vec<_>>(),
-            [true, true, false, true, true]
-        );
-        assert_eq!(rows[2].chip(), "not found here");
-        assert_eq!(rows[0].chip(), "found here");
+        statuses[3].present = false;
+        let card = AgentHooksDraft::new(CardMode::FirstRun, &statuses, false);
+        assert!(!card.asks(), "nothing to ask without Cursor");
     }
 
-    /// The prefill is the key, not the disk: an agent that is wired and
-    /// not named starts OFF, so Apply removing it is something the user
-    /// can see they are doing.
+    /// Continue records the defaults with the file agent's answer, so the
+    /// next launch has an answer and no card.
     #[test]
-    fn a_wired_agent_the_key_does_not_name_starts_off() {
-        let mut statuses = all();
-        statuses[1].entries_on_disk = true;
-        statuses[1].wired = Some(3);
-        let key = AgentHooks::allow(["claude"]);
-        statuses[0].allowed = true;
-        let rows = rows(CardMode::Preferences, &key, &statuses);
-        assert!(rows[0].on, "the key names claude");
-        assert!(!rows[1].on, "codex is wired and unnamed: it starts off");
-        assert_eq!(rows[1].status.as_deref(), Some("wired, not allowed"));
-    }
-
-    /// `off` is an answer, so every switch starts off — including for an
-    /// agent whose entries are still on disk.
-    #[test]
-    fn off_starts_every_switch_off() {
-        let rows = rows(CardMode::Preferences, &AgentHooks::Off, &all());
-        assert!(rows.iter().all(|row| !row.on));
-    }
-
-    /// The five wordings, and the order they are decided in.
-    #[test]
-    fn the_status_line_reads_the_record_and_the_disk_apart() {
-        let mut absent = status(Agent::Grok);
-        absent.present = false;
-        assert_eq!(row_status(&absent), "not found");
-
-        let mut bare = status(Agent::Grok);
-        bare.allowed = true;
-        // A present agent with nothing of Roost's in its files plans no
-        // edits only when it is unwired AND unnamed; here it is named,
-        // so the honest answer is the disk's.
-        assert_eq!(row_status(&bare), "found, not wired");
-
-        let mut unnamed = status(Agent::Grok);
-        unnamed.entries_on_disk = true;
-        unnamed.up_to_date = true;
-        assert_eq!(
-            row_status(&unnamed),
-            "wired, not allowed",
-            "an unnamed agent plans no edits, which is not the same as being current"
-        );
-
-        let mut current = status(Agent::Grok);
-        current.entries_on_disk = true;
-        current.allowed = true;
-        current.up_to_date = true;
-        current.wired = Some(1);
-        assert_eq!(
-            row_status(&current),
-            format!("wired v{}", roost_agent_install::INTEGRATION_VERSION),
-            "the disk is current, whatever version the record remembers"
-        );
-
-        let mut stale = status(Agent::Grok);
-        stale.entries_on_disk = true;
-        stale.allowed = true;
-        stale.wired = Some(2);
-        assert_eq!(row_status(&stale), "wired v2, out of date");
-
-        let mut forgotten = stale.clone();
-        forgotten.wired = None;
-        assert_eq!(row_status(&forgotten), "wired, out of date");
-    }
-
-    fn draft(mode: CardMode, on: [bool; 5]) -> AgentHooksDraft {
-        let mut rows = rows(mode, &AgentHooks::Ask, &all());
-        for (row, on) in rows.iter_mut().zip(on) {
-            row.on = on;
-        }
-        AgentHooksDraft::new(mode, rows)
-    }
-
-    /// Both modes name the count on the primary, and both have their own
-    /// spelling for zero — "Instrument 0" would hide that confirming
-    /// writes `off`.
-    #[test]
-    fn the_buttons_say_what_confirming_will_do() {
-        let card = draft(CardMode::FirstRun, [true, true, false, false, false]);
-        assert_eq!(card.buttons(), ["Decide later", "Instrument 2"]);
-        let card = draft(CardMode::FirstRun, [false; 5]);
-        assert_eq!(card.buttons(), ["Decide later", "Turn off"]);
-
-        let card = draft(CardMode::Preferences, [true, false, false, false, false]);
-        assert_eq!(card.buttons(), ["Cancel", "Apply"]);
-        let card = draft(CardMode::Preferences, [false; 5]);
-        assert_eq!(card.buttons(), ["Cancel", "Apply: turn off"]);
-    }
-
-    /// Every switch off travels as the word `off`, never as an empty
-    /// list — which the op refuses, and which would parse back as `Ask`.
-    #[test]
-    fn what_confirming_sends_is_the_switches_that_are_on() {
-        let card = draft(CardMode::FirstRun, [true, false, true, false, false]);
+    fn continue_records_the_defaults_and_cursors_answer() {
+        let mut card = AgentHooksDraft::new(CardMode::FirstRun, &all(), false);
+        assert_eq!(card.buttons(), ["Decide later", "Continue"]);
         assert_eq!(
             card.wire_agents(),
-            AgentSetHooksAgents::List(vec!["claude".to_string(), "grok".to_string()])
+            AgentSetHooksAgents::List(
+                ["claude", "codex", "grok", "opencode"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+        card.toggle_named("cursor").unwrap();
+        assert_eq!(card.buttons(), ["Decide later", "Continue"]);
+        assert_eq!(
+            card.wire_agents(),
+            AgentSetHooksAgents::List(
+                ["claude", "codex", "grok", "cursor", "opencode"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+        assert!(card.toggle_named("claude").is_err(), "no row for claude");
+    }
+
+    /// The lede names only the installed agents already connected, and
+    /// never a Claude the policy keeps out.
+    #[test]
+    fn the_first_run_lede_names_what_is_already_connected() {
+        let mut statuses = all();
+        statuses[4].present = false;
+        let card = AgentHooksDraft::new(CardMode::FirstRun, &statuses, false);
+        assert!(
+            card.lede()
+                .contains("Claude Code, Codex and Grok are already connected"),
+            "{}",
+            card.lede()
+        );
+        let card = AgentHooksDraft::new(CardMode::FirstRun, &statuses, true);
+        assert!(
+            card.lede()
+                .contains(" Codex and Grok are already connected"),
+            "{}",
+            card.lede()
+        );
+        for status in &mut statuses {
+            status.present = status.agent == Agent::Cursor;
+        }
+        let card = AgentHooksDraft::new(CardMode::FirstRun, &statuses, false);
+        assert!(
+            !card.lede().contains("already connected"),
+            "{}",
+            card.lede()
+        );
+        assert!(card.lede().ends_with(ASK));
+    }
+
+    /// Preferences has every agent, prefilled from the switches, and only
+    /// the file agent names a file.
+    #[test]
+    fn preferences_has_a_switch_per_agent_from_the_switches() {
+        let mut statuses = all();
+        statuses[4].on = false;
+        let card = AgentHooksDraft::new(CardMode::Preferences, &statuses, false);
+        assert_eq!(agents(&card), ALL_AGENTS.to_vec());
+        assert_eq!(
+            card.rows().iter().map(|row| row.on).collect::<Vec<_>>(),
+            [true, true, true, false, false]
+        );
+        assert!(card
+            .rows()
+            .iter()
+            .all(|row| row.files.is_empty() == (row.agent != Agent::Cursor)));
+        assert_eq!(card.built_in_line(), Some(BUILT_IN_LINE));
+        assert_eq!(card.buttons(), ["Cancel", "Apply"]);
+        assert_eq!(
+            card.wire_agents(),
+            AgentSetHooksAgents::List(["claude", "codex", "grok"].map(String::from).to_vec())
+        );
+    }
+
+    #[test]
+    fn every_switch_off_is_the_word_off() {
+        let mut statuses = all();
+        for status in &mut statuses {
+            status.on = false;
+        }
+        let card = AgentHooksDraft::new(CardMode::Preferences, &statuses, false);
+        assert_eq!(card.buttons(), ["Cancel", "Apply: turn off"]);
+        assert_eq!(card.wire_agents(), AgentSetHooksAgents::Off);
+    }
+
+    /// The status line says how each agent is connected.
+    #[test]
+    fn the_status_line_says_the_delivery() {
+        let line = |status: &Status, blocked| row_status(status, blocked);
+        assert_eq!(
+            line(&status(Agent::Claude), false),
+            "Connected · nothing written"
+        );
+        assert_eq!(line(&status(Agent::Claude), true), CLAUDE_BLOCKED);
+        assert_eq!(
+            line(&status(Agent::Opencode), true),
+            "Connected · nothing written",
+            "the policy is Claude's alone"
+        );
+        assert_eq!(line(&status(Agent::Codex), false), "Built in");
+        let mut off = status(Agent::Grok);
+        off.on = false;
+        assert_eq!(line(&off, false), "Off");
+        let mut absent = status(Agent::Grok);
+        absent.present = false;
+        assert_eq!(line(&absent, false), "not found");
+        assert_eq!(line(&status(Agent::Cursor), false), "Off");
+    }
+
+    /// Cursor's line is still the file's: the record and the disk apart.
+    #[test]
+    fn a_file_agents_line_reads_the_record_and_the_disk_apart() {
+        let cursor = |entries_on_disk, allowed, up_to_date, wired| Status {
+            on: true,
+            entries_on_disk,
+            allowed,
+            up_to_date,
+            wired,
+            ..status(Agent::Cursor)
+        };
+        assert_eq!(
+            row_status(&cursor(false, true, false, None), false),
+            "found, not wired"
         );
         assert_eq!(
-            draft(CardMode::FirstRun, [false; 5]).wire_agents(),
-            AgentSetHooksAgents::Off
+            row_status(&cursor(true, false, true, None), false),
+            "wired, not allowed"
         );
+        assert_eq!(
+            row_status(&cursor(true, true, true, Some(1)), false),
+            format!("wired v{}", roost_agent_install::INTEGRATION_VERSION)
+        );
+        assert_eq!(
+            row_status(&cursor(true, true, false, Some(2)), false),
+            "wired v2, out of date"
+        );
+        assert_eq!(
+            row_status(&cursor(true, true, false, None), false),
+            "wired, out of date"
+        );
+    }
+
+    /// What the retire left, or what came back after it, is on the line.
+    #[test]
+    fn leftovers_and_a_comeback_are_named() {
+        let mut left = status(Agent::Claude);
+        left.retired = Some(Retired {
+            version: 4,
+            at: 0,
+            complete: true,
+            misses: 0,
+            changed: Vec::new(),
+            backups: Vec::new(),
+            leftovers: vec![Leftover {
+                file: "/home/u/.claude/settings.json".into(),
+                event: Some("Stop".into()),
+                reason: LeftoverReason::Annotated,
+            }],
+            noticed: false,
+        });
+        let line = row_status(&left, false);
+        assert!(
+            line.starts_with(
+                "Connected · nothing written · 1 old Roost entry left in \
+                 /home/u/.claude/settings.json"
+            ),
+            "{line}"
+        );
+        let mut back = status(Agent::Claude);
+        back.came_back = true;
+        assert!(
+            row_status(&back, false).contains("roostctl agent uninstall claude"),
+            "{}",
+            row_status(&back, false)
+        );
+    }
+
+    fn draft(on: [bool; 5]) -> AgentHooksDraft {
+        let mut statuses = all();
+        for (status, on) in statuses.iter_mut().zip(on) {
+            status.on = on;
+        }
+        AgentHooksDraft::new(CardMode::Preferences, &statuses, false)
     }
 
     /// A toggle by name is the harness's spelling; an agent no row
     /// carries is an error rather than a silent no-op.
     #[test]
     fn a_toggle_names_its_agent() {
-        let mut card = draft(CardMode::FirstRun, [false; 5]);
+        let mut card = draft([false; 5]);
         card.toggle_named("codex").unwrap();
         assert!(card.rows()[1].on);
         assert_eq!(
@@ -726,7 +902,7 @@ mod tests {
     /// sits on a switch.
     #[test]
     fn the_button_ring_follows_the_focus() {
-        let mut card = draft(CardMode::Preferences, [false; 5]);
+        let mut card = draft([false; 5]);
         assert_eq!(
             card.button_ring(),
             super::super::host_dialog::ButtonRing::default(),
@@ -741,33 +917,14 @@ mod tests {
         assert!(card.button_ring().cancel && !card.button_ring().confirm);
     }
 
-    /// The files come from the install engine, so a row names the same
-    /// paths an uninstall would touch.
-    #[test]
-    fn the_rows_name_the_files_the_install_engine_owns() {
-        let rows = rows(CardMode::Preferences, &AgentHooks::Ask, &all());
-        let home = Home::rooted("/home/u");
-        for row in &rows {
-            let owned: Vec<String> = roost_agent_install::owned_files(&home, row.agent)
-                .iter()
-                .map(|path: &PathBuf| path.display().to_string())
-                .collect();
-            assert_eq!(row.files, owned, "{}", row.agent.source());
-        }
-    }
-
     #[test]
     fn a_first_run_survey_stands_down_for_an_answer_given_while_it_ran() {
-        let allow = AgentHooks::allow(["claude"]);
-        for key in [AgentHooks::Off, allow] {
-            assert_eq!(
-                survey_verdict(CardMode::FirstRun, true, &key, false),
-                SurveyVerdict::AlreadyAnswered,
-                "{key:?}"
-            );
-        }
         assert_eq!(
-            survey_verdict(CardMode::FirstRun, true, &AgentHooks::Ask, false),
+            survey_verdict(CardMode::FirstRun, true, true, false),
+            SurveyVerdict::AlreadyAnswered
+        );
+        assert_eq!(
+            survey_verdict(CardMode::FirstRun, true, false, false),
             SurveyVerdict::Raise
         );
     }
@@ -775,18 +932,18 @@ mod tests {
     /// Preferences is a question the user just asked for, so an answered
     /// key is exactly what it is there to show.
     #[test]
-    fn preferences_is_raised_over_any_key() {
+    fn preferences_is_raised_over_any_answer() {
         assert_eq!(
-            survey_verdict(CardMode::Preferences, false, &AgentHooks::Off, false),
+            survey_verdict(CardMode::Preferences, true, true, false),
             SurveyVerdict::Raise
         );
     }
 
     #[test]
-    fn nothing_installed_here_asks_nothing() {
+    fn nothing_to_ask_asks_nothing() {
         assert_eq!(
-            survey_verdict(CardMode::FirstRun, false, &AgentHooks::Ask, false),
-            SurveyVerdict::NoAgent
+            survey_verdict(CardMode::FirstRun, false, false, false),
+            SurveyVerdict::NothingToAsk
         );
     }
 
@@ -796,7 +953,7 @@ mod tests {
     fn a_survey_never_takes_the_screen_from_another_dialog() {
         for mode in [CardMode::FirstRun, CardMode::Preferences] {
             assert_eq!(
-                survey_verdict(mode, true, &AgentHooks::Ask, true),
+                survey_verdict(mode, true, false, true),
                 SurveyVerdict::ScreenTaken,
                 "{mode:?}"
             );

@@ -54,6 +54,37 @@ use roost_engine::ipc::{AgentHooksError, AgentHooksHandle, AgentHooksRequest};
 use roost_ipc::messages::{AgentHooksFailed, AgentHooksOutcome, AgentHooksSkipped};
 use tracing::{info, warn};
 
+/// Retire the file entries this build no longer needs, once, on this
+/// host's own `$HOME`, so a host comes clean at its first v4 start even
+/// if no upgraded client connects. On a thread of its own: it takes the
+/// config lock and must never hold up serving.
+pub fn spawn_retire() {
+    let spawned = std::thread::Builder::new()
+        .name("agent-retire".into())
+        .spawn(|| {
+            let outcome = Home::from_env()
+                .and_then(|home| roost_agent_install::retire(&home, Guard::from_env(), false));
+            match outcome {
+                Ok(outcome) => {
+                    if let Some(error) = &outcome.key_error {
+                        warn!(%error, "agent retire could not write config.conf");
+                    }
+                    info!(
+                        retired = ?outcome.retired.iter().map(|a| a.source()).collect::<Vec<_>>(),
+                        leftovers = outcome.leftovers.len(),
+                        errors = outcome.errors.len(),
+                        "agent retire finished"
+                    )
+                }
+                Err(roost_agent_install::InstallError::TestModeRefused) => {}
+                Err(error) => warn!(%error, "agent retire failed"),
+            }
+        });
+    if let Err(error) = spawned {
+        warn!(%error, "could not start the agent retire");
+    }
+}
+
 /// The callback `IpcHandler::with_agent_hooks` takes.
 ///
 /// `spawn_blocking` because the install reads and rewrites up to five
@@ -211,8 +242,8 @@ mod tests {
     }
 
     /// A home with claude and cursor present and nothing else, so the
-    /// three answers this reply distinguishes — wired, skipped by name,
-    /// absent — all appear in one run.
+    /// answers this reply distinguishes — wired, skipped by name, no file
+    /// needed, absent — all appear in one run.
     fn a_home(root: &std::path::Path) -> Home {
         for agent in [".claude", ".cursor"] {
             std::fs::create_dir_all(root.join(agent)).unwrap();
@@ -220,17 +251,28 @@ mod tests {
         Home::rooted(root)
     }
 
+    fn wired_by_file(root: &std::path::Path, rel: &str) -> bool {
+        std::fs::read_to_string(root.join(rel)).is_ok_and(|t| t.contains("ROOST_AGENT_HOOK"))
+    }
+
+    const CURSOR_FILE: &str = ".cursor/hooks.json";
+    const CLAUDE_FILE: &str = ".claude/settings.json";
+
     /// This home's `agent-hooks` value, read off the file rather than out
     /// of an outcome: the key is the durable half of a raise, and an
     /// outcome can be right while the write is not.
     fn key_of(home: &Home) -> String {
+        value_of(home, "agent-hooks")
+    }
+
+    fn value_of(home: &Home, key: &str) -> String {
         let text = std::fs::read_to_string(home.config_path()).expect("config.conf");
         text.lines()
-            .filter_map(|line| line.trim().strip_prefix("agent-hooks"))
+            .filter_map(|line| line.trim().strip_prefix(key))
             .filter_map(|rest| rest.trim().strip_prefix('='))
             .map(|value| value.trim().to_string())
             .next_back()
-            .expect("an agent-hooks key")
+            .unwrap_or_else(|| panic!("no {key} key"))
     }
 
     #[test]
@@ -238,8 +280,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
 
-        let first = ensure_in(&home, &request(&["claude"]), Guard::PERMITTED).expect("raise");
-        assert_eq!(first.wired, vec!["claude".to_string()]);
+        let first = ensure_in(&home, &request(&["cursor"]), Guard::PERMITTED).expect("raise");
+        assert_eq!(first.wired, vec!["cursor".to_string()]);
         assert!(first.errors.is_empty(), "{first:?}");
         let reasons: Vec<(&str, &str)> = first
             .skipped
@@ -247,22 +289,43 @@ mod tests {
             .map(|s| (s.agent.as_str(), s.reason.as_str()))
             .collect();
         assert!(
-            reasons.contains(&("cursor", "not allowed")),
-            "cursor is present but never named: {reasons:?}"
+            reasons.contains(&("claude", "not allowed")),
+            "claude is present but never named: {reasons:?}"
         );
         assert!(
             reasons.iter().any(|(agent, _)| *agent == "codex"),
             "an absent agent is a skip, not an error: {reasons:?}"
         );
-        assert!(
-            std::fs::read_to_string(dir.path().join(".claude/settings.json"))
-                .unwrap()
-                .contains("ROOST_AGENT_HOOK")
-        );
+        assert!(wired_by_file(dir.path(), CURSOR_FILE));
         // `by` is what makes two clients of one host tellable apart.
         let record = std::fs::read_to_string(dir.path().join(".config/roost/agent-hooks.json"))
             .expect("state record");
         assert!(record.contains("charlie-mbp"), "{record}");
+    }
+
+    /// An older client raises Claude, which this host delivers through
+    /// the tab environment: the reply says no file was needed, and
+    /// nothing is written, the key included. Claude is on wherever the
+    /// host never answered, and an answer given here stands.
+    #[test]
+    fn a_raise_of_an_env_agent_writes_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+
+        let raised = ensure_in(&home, &request(&["claude"]), Guard::PERMITTED).expect("raise");
+        assert!(raised.wired.is_empty(), "{raised:?}");
+        assert!(
+            raised
+                .skipped
+                .iter()
+                .any(|s| s.agent == "claude" && s.reason == "no file needed"),
+            "{raised:?}"
+        );
+        assert!(!dir.path().join(CLAUDE_FILE).exists());
+        assert!(
+            !home.config_path().exists(),
+            "a raise of an env agent wrote a key"
+        );
     }
 
     /// The toast is a property of the host, not of the call: the session
@@ -277,24 +340,27 @@ mod tests {
     fn a_second_client_is_told_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
-        let ask = request(&["claude"]);
+        let ask = request(&["cursor"]);
 
         let first = ensure_in(&home, &ask, Guard::PERMITTED).expect("raise");
-        assert!(first.wired.contains(&"claude".to_string()));
+        assert!(first.wired.contains(&"cursor".to_string()));
         let second = ensure_in(&home, &ask, Guard::PERMITTED).expect("raise again");
         assert!(second.wired.is_empty(), "{second:?}");
         assert!(second.refreshed.is_empty(), "{second:?}");
     }
 
-    /// A second client that raises a *different* agent widens the host
-    /// rather than replacing the first client's grant — the additive
-    /// half of the raise rule, and the reason this op never takes
-    /// anything out.
+    /// A raise widens the host's answer rather than replacing it — the
+    /// additive half of the raise rule, and the reason this op never
+    /// takes anything out. The answer here is one given on the host
+    /// itself, which a raise of an env agent leaves exactly as it is.
     #[test]
-    fn a_second_client_widens_rather_than_replaces() {
+    fn a_raise_widens_the_hosts_answer_rather_than_replacing_it() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
+        std::fs::create_dir_all(home.config_path().parent().unwrap()).unwrap();
+        std::fs::write(home.config_path(), "agent-integration = -grok\n").unwrap();
         ensure_in(&home, &request(&["claude"]), Guard::PERMITTED).expect("first raise");
+        assert_eq!(value_of(&home, "agent-integration"), "-grok");
 
         let second =
             ensure_in(&home, &request(&["cursor"]), Guard::PERMITTED).expect("second raise");
@@ -303,13 +369,54 @@ mod tests {
             second.removed.is_empty(),
             "a raise never removes: {second:?}"
         );
-        assert_eq!(key_of(&home), "claude, cursor");
-        assert!(
-            std::fs::read_to_string(dir.path().join(".claude/settings.json"))
-                .unwrap()
-                .contains("ROOST_AGENT_HOOK"),
-            "the first client's grant survives the second's raise"
+        assert_eq!(
+            value_of(&home, "agent-integration"),
+            "-grok, cursor",
+            "the host's own answer survives the raise"
         );
+        assert_eq!(key_of(&home), "cursor");
+        assert!(!dir.path().join(CLAUDE_FILE).exists());
+    }
+
+    /// A raised file agent outlives the host's next session start, whose
+    /// retire narrows the shadow to `agent-integration` and takes out
+    /// the file of any agent that key does not switch on. Raised onto
+    /// `off` and onto a host nobody answered: the second must also leave
+    /// every env agent on.
+    #[test]
+    fn a_raised_file_agent_survives_the_next_session_start() {
+        for (seed, integration) in [
+            (
+                Some("agent-hooks = off\n"),
+                "-claude, -codex, -grok, -opencode, cursor",
+            ),
+            (None, "cursor"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = a_home(dir.path());
+            if let Some(seed) = seed {
+                std::fs::create_dir_all(home.config_path().parent().unwrap()).unwrap();
+                std::fs::write(home.config_path(), seed).unwrap();
+                roost_agent_install::retire(&home, Guard::PERMITTED, false).expect("first start");
+            }
+
+            ensure_in(&home, &request(&["cursor"]), Guard::PERMITTED).expect("raise");
+            roost_agent_install::retire(&home, Guard::PERMITTED, false).expect("next start");
+
+            assert!(wired_by_file(dir.path(), CURSOR_FILE), "{seed:?}");
+            assert_eq!(key_of(&home), "cursor", "{seed:?}");
+            assert_eq!(
+                value_of(&home, "agent-integration"),
+                integration,
+                "{seed:?}"
+            );
+            let switches = roost_agent_install::retire::switches(&home).unwrap();
+            assert_eq!(
+                switches.on(roost_agent::Agent::Claude),
+                seed.is_none(),
+                "{seed:?}"
+            );
+        }
     }
 
     /// The contentious half of §3.3: a host that said `off` is raised by
@@ -323,14 +430,10 @@ mod tests {
         std::fs::create_dir_all(home.config_path().parent().unwrap()).unwrap();
         std::fs::write(home.config_path(), "agent-hooks = off\n").unwrap();
 
-        let raised = ensure_in(&home, &request(&["claude"]), Guard::PERMITTED).expect("raise");
-        assert!(raised.wired.contains(&"claude".to_string()), "{raised:?}");
-        assert_eq!(key_of(&home), "claude");
-        assert!(
-            std::fs::read_to_string(dir.path().join(".claude/settings.json"))
-                .unwrap()
-                .contains("ROOST_AGENT_HOOK")
-        );
+        let raised = ensure_in(&home, &request(&["cursor"]), Guard::PERMITTED).expect("raise");
+        assert!(raised.wired.contains(&"cursor".to_string()), "{raised:?}");
+        assert_eq!(key_of(&home), "cursor");
+        assert!(wired_by_file(dir.path(), CURSOR_FILE));
     }
 
     fn refused(home: &Home, agents: &[&str]) -> String {
@@ -349,8 +452,8 @@ mod tests {
         let home = a_home(dir.path());
 
         let outcome =
-            ensure_in(&home, &request(&["claude", "gemini"]), Guard::PERMITTED).expect("raise");
-        assert_eq!(outcome.wired, vec!["claude".to_string()], "{outcome:?}");
+            ensure_in(&home, &request(&["cursor", "gemini"]), Guard::PERMITTED).expect("raise");
+        assert_eq!(outcome.wired, vec!["cursor".to_string()], "{outcome:?}");
         assert!(
             outcome
                 .skipped
@@ -358,12 +461,8 @@ mod tests {
                 .any(|skip| skip.agent == "gemini" && skip.reason == "unknown"),
             "{outcome:?}"
         );
-        assert!(
-            std::fs::read_to_string(dir.path().join(".claude/settings.json"))
-                .unwrap()
-                .contains("ROOST_AGENT_HOOK")
-        );
-        assert_eq!(key_of(&home), "claude");
+        assert!(wired_by_file(dir.path(), CURSOR_FILE));
+        assert_eq!(key_of(&home), "cursor");
     }
 
     /// A list with *no* known name is a successful, empty run: the
@@ -405,8 +504,9 @@ mod tests {
         std::fs::create_dir_all(home.config_path().parent().unwrap()).unwrap();
         std::fs::write(home.config_path(), "agent-hooks = claude, gemini\n").unwrap();
 
-        ensure_in(&home, &request(&["codex"]), Guard::PERMITTED).expect("raise");
-        assert_eq!(key_of(&home), "claude, codex, gemini");
+        ensure_in(&home, &request(&["cursor"]), Guard::PERMITTED).expect("raise");
+        assert_eq!(key_of(&home), "claude, cursor, gemini");
+        assert!(value_of(&home, "agent-integration").contains("gemini"));
     }
 
     /// An empty list is refused rather than absorbed as a no-op: a client
@@ -461,15 +561,15 @@ mod tests {
         // the key is written.
         std::fs::create_dir_all(home.record_path()).unwrap();
 
-        let failed = ensure_in(&home, &request(&["claude"]), Guard::PERMITTED);
+        let failed = ensure_in(&home, &request(&["cursor"]), Guard::PERMITTED);
         let Err(AgentHooksError::Failed(message)) = &failed else {
             panic!("a failed raise must answer `internal`: {failed:?}");
         };
         assert!(
-            message.contains("the agent-hooks key `claude` is already on disk"),
+            message.contains("the agent-hooks key `cursor` is already on disk"),
             "{message}"
         );
-        assert_eq!(key_of(&home), "claude");
+        assert_eq!(key_of(&home), "cursor");
     }
 
     /// A run whose lock is busy *waits* for it and then succeeds — the
@@ -491,9 +591,9 @@ mod tests {
             drop(held);
         });
 
-        let done = ensure_in(&home, &request(&["claude"]), Guard::PERMITTED)
+        let done = ensure_in(&home, &request(&["cursor"]), Guard::PERMITTED)
             .expect("the lock frees well inside the deadline");
         releasing.join().unwrap();
-        assert!(done.wired.contains(&"claude".to_string()), "{done:?}");
+        assert!(done.wired.contains(&"cursor".to_string()), "{done:?}");
     }
 }

@@ -53,19 +53,23 @@ for the full mechanics, including what a mid-switch failure does.
 An upgrade from the old Swift `Roost.app` keeps its in-process tabs: it
 already has a `state.json` on disk, so no default fires.
 
-## Agent hooks: the first-launch consent card
+## Coding agents: usually no card
 
-The first time Roost starts with no answer on file yet and at least
-one supported coding agent (Claude Code, Codex, grok/gx, cursor-agent,
-OpenCode) installed on the machine, a consent dialog opens — the
-**Agent Hooks…** card — naming what it
-found and letting you choose which agents Roost wires notifications for,
-or none. Nothing is written into any agent's config file until you
-answer it, and it reopens on demand from the command palette (or, on
-Mac, the View menu). See [Agent Hooks → Roost asks
-once](../guides/agents.md#roost-asks-once) for the full behavior,
-including what each `agent-hooks` value (a list, `off`, or absent)
-means and how a startup that leaves an agent unwired is surfaced.
+Roost connects Claude Code, OpenCode, Codex and Grok without asking and
+without writing to their settings files: Claude Code and OpenCode get a
+plugin through each tab's environment, and Codex and Grok report their
+status to the terminal themselves. So most first launches show no agent
+card at all.
+
+The one exception is Cursor (cursor-agent), which reads its turn-end hook
+only from its own `~/.cursor/hooks.json`. If Cursor is installed, the
+first launch shows the **Agent integration** card with one unchecked row
+for it: check it and press Continue to let Roost add its entries to that
+file, or press Continue as it is to leave Cursor off. "Decide later"
+writes nothing and asks again next launch. Every agent can be switched
+off later from **Agent Integration…** in the command palette (or, on
+Mac, the View menu). See [Agent integration → The Agent Integration
+card](../guides/agents.md#the-agent-integration-card).
 
 ## Persistence
 

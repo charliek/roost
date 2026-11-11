@@ -34,6 +34,7 @@ use crate::home::Home;
 use crate::json::Json;
 use crate::jsonedit::{self, Opened};
 use crate::plan::{FileEdit, InstallPlan, Intent};
+use crate::retire::{self, RetirePlan};
 use crate::state::{Prior, PriorFlag};
 use crate::write::{self, PRIVATE_MODE};
 
@@ -353,6 +354,7 @@ fn owned_state_keys(
     state: &Table,
     key_source: &str,
     on_disk: &BTreeMap<&'static str, (Option<String>, Handler)>,
+    spare: &[&str],
 ) -> Vec<String> {
     state
         .iter()
@@ -362,6 +364,9 @@ fn owned_state_keys(
                 return None;
             }
             let event = codex_hash::event_for_label(label)?;
+            if spare.contains(&event) {
+                return None;
+            }
             let present = item.get("trusted_hash")?.as_str()?;
             our_hashes(event, on_disk.get(event))
                 .iter()
@@ -497,7 +502,7 @@ fn wire_config(
     // behind, and codex would keep asking about the entry it no longer
     // matches.
     let wanted: Vec<&str> = trust.iter().map(|(key, _)| key.as_str()).collect();
-    for stale in owned_state_keys(state, key_source, on_disk) {
+    for stale in owned_state_keys(state, key_source, on_disk, &[]) {
         if !wanted.contains(&stale.as_str()) {
             state.remove(&stale);
         }
@@ -551,6 +556,7 @@ pub fn plan_uninstall(home: &Home, prior: &Prior) -> Result<InstallPlan, Install
             &on_disk,
             others_remain,
             prior.codex_features_hooks,
+            &[],
         ) {
             return Ok(InstallPlan::skip(AGENT, Intent::Uninstall, reason));
         }
@@ -586,6 +592,7 @@ fn unwire_config(
     on_disk: &BTreeMap<&'static str, (Option<String>, Handler)>,
     others_remain: bool,
     prior_flag: Option<PriorFlag>,
+    spare: &[&str],
 ) -> Result<(), SkipReason> {
     let mut removed_state = false;
     let mut hooks_emptied = false;
@@ -594,7 +601,7 @@ fn unwire_config(
         if hooks.get("state").is_some() {
             let state_emptied = {
                 let state = table_mut(hooks, "state", true, path)?;
-                for key in owned_state_keys(state, key_source, on_disk) {
+                for key in owned_state_keys(state, key_source, on_disk, spare) {
                     state.remove(&key);
                     removed_state = true;
                 }
@@ -644,6 +651,88 @@ fn unwire_config(
         config.remove("features");
     }
     Ok(())
+}
+
+/// A handler exactly as a release wrote it for `event`: `type`,
+/// `command`, `timeout` and `async: false`. The timeout is 10, or the
+/// cap codex clamps `event` to, which v3 wrote instead.
+fn fits_release(event: &str, handler: &Json) -> bool {
+    retire::has_exactly(handler, &["type", "command", "timeout", "async"])
+        && handler.get("type").and_then(Json::as_str) == Some("command")
+        && matches!(handler.get("async"), Some(Json::Bool(false)))
+        && (retire::number_is(handler.get("timeout"), HOOK_TIMEOUT_SECS)
+            || retire::number_is(handler.get("timeout"), hook_timeout_secs(event)))
+}
+
+/// The strict half, across both files. A handler goes with its trust
+/// key; a trust key goes only when its hash is Roost's canonical one and
+/// no Roost handler is left on its event, so an edited handler keeps the
+/// key the user's codex trusts it under. `[features] hooks` goes back to
+/// the recorded pre-image only when no hooks remain at all.
+pub fn plan_retire(home: &Home, prior: &Prior) -> Result<RetirePlan, InstallError> {
+    let hooks_path = hooks_path(home);
+    let config_path = config_path(home);
+
+    let rule = jsonedit::RetireRule {
+        grouped: true,
+        fits: &fits_release,
+        spare_followed: true,
+    };
+    let (mut plan, after) = retire::plan_json(
+        AGENT,
+        &hooks_path,
+        &rule,
+        prior.created(&hooks_path),
+        &|_| {},
+    )?;
+    // A `hooks.json` left alone for its own sake leaves its trust alone.
+    let Some(after) = after else {
+        return Ok(plan);
+    };
+    let config_image = write::read_image(&config_path, PRIVATE_MODE)?;
+    if !config_image.exists() {
+        return Ok(plan);
+    }
+    let mut config = match open_config(&config_image) {
+        Ok(config) => config,
+        Err(_) => {
+            plan.leftovers
+                .extend(RetirePlan::unreadable(&config_path).leftovers);
+            plan.retry = true;
+            return Ok(plan);
+        }
+    };
+    let key_source = key_source(home, allow_symlinked(&config));
+    let spare: Vec<&str> = CODEX_HOOK_EVENTS
+        .into_iter()
+        .filter(|event| jsonedit::locate_grouped(&after, AGENT, event).is_some())
+        .collect();
+    let before = config.to_string();
+    if unwire_config(
+        &mut config,
+        &config_path,
+        &key_source,
+        &BTreeMap::new(),
+        has_other_hooks(&after),
+        prior.codex_features_hooks,
+        &spare,
+    )
+    .is_err()
+    {
+        plan.leftovers
+            .extend(RetirePlan::unreadable(&config_path).leftovers);
+        plan.retry = true;
+        return Ok(plan);
+    }
+    let text = config.to_string();
+    if text != before {
+        let gone = text.trim().is_empty() && prior.created(&config_path);
+        plan.edits.push(FileEdit {
+            image: config_image,
+            after: (!gone).then(|| text.into_bytes()),
+        });
+    }
+    Ok(plan)
 }
 
 #[cfg(test)]

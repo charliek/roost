@@ -136,7 +136,7 @@ STATIC_MENUS: dict[str, list[tuple | None]] = {
         None,
         ("Toggle Sidebar", "b", ["super"], True, "toggle_sidebar"),
         ("Toggle Sidebar Agents", "a", ["shift", "super"], True, "toggle_sidebar_agents"),
-        ("Agent Hooks…", "", [], True, "agent_hooks"),
+        ("Agent Integration…", "", [], True, "agent_hooks"),
         None,
         ("Jump to Unread", "u", ["shift", "super"], True, "jump_to_unread"),
         None,
@@ -326,7 +326,7 @@ def _bottom_line_text(roost) -> str | None:
 
 
 class TestAdditions:
-    """Settings…, Agent Hooks…, Roost Help and Full Screen — each through
+    """Settings…, Agent Integration…, Roost Help and Full Screen — each through
     the real AppKit -> feed -> update-loop path. Test mode makes the two
     openers toast `Would open …` instead of launching anything."""
 
@@ -354,12 +354,12 @@ class TestAdditions:
         )
 
     def test_agent_hooks_opens_the_preferences_card(self, roost):
-        roost.app_menu_activate(["View", "Agent Hooks…"])
+        roost.app_menu_activate(["View", "Agent Integration…"])
         try:
             roost._wait(
                 lambda: roost.call("app.dialog_dump", {}).get("dialog") == "agent_hooks",
                 10.0,
-                "View -> Agent Hooks… raises the agent-hooks card",
+                "View -> Agent Integration… raises the agent-hooks card",
             )
             assert roost.call("app.dialog_dump", {})["mode"] == "preferences"
         finally:

@@ -104,9 +104,8 @@ TAB_AXIS_IDS = (
 # `test_doctor_is_read_only`.
 AGENT_AXES = ("agent_lifecycle", "ownership", "has_notification", "hook_active")
 
-# Must stay `roost_agent::claude::CLAUDE_HOOK_EVENTS`: doctor's
-# `claude.hook_events` check fails a settings file that is missing any
-# of them, so a stale list here reads as a product bug.
+# Mirrors `roost_agent::claude::CLAUDE_HOOK_EVENTS`, the events a
+# settings-file fixture registers.
 CLAUDE_EVENTS = (
     "SessionStart",
     "UserPromptSubmit",
@@ -221,13 +220,11 @@ def write_claude_settings(home: Path, events: tuple[str, ...]) -> Path:
     registering `events` with a command hook — plan 046 re-points doctor's
     `claude.*` checks at Claude's own global settings file rather than the
     retired `~/.config/roost/claude-settings.json`. The command here is
-    deliberately **not** one `agent install claude` would write (that
-    shape has nothing left to parse an event out of — see
-    `HookKind`/`resolve_hook_command` in `doctor.rs`), so this only
-    exercises `claude.hook_events` (which event *keys* are registered);
-    `claude.hook_command` needs a real install, which
-    `test_claude_section_isolated_by_home` drives (phase 3 runs
-    `roostctl claude install` into the throwaway `HOME`). The legacy
+    deliberately **not** one `agent install claude` would write, so
+    doctor reads it as the user's own hook, not Roost's; a Roost entry
+    needs a real install, which `test_claude_section_isolated_by_home`
+    drives (phase 3 runs `roostctl claude install` into the throwaway
+    `HOME`). The legacy
     file's own shape-match and removal are
     `test_legacy_claude_settings_warns_and_uninstall_cleans_it_up`.
     """
@@ -430,10 +427,13 @@ def test_claude_section_isolated_by_home(tmp_path, roost, project, target):
 
     Three phases, one throwaway `HOME` (plan §8 bullet 4):
       1. no settings file, no `claude` on PATH -> the whole section is `skipped`.
-      2. a settings file missing `StopFailure` -> `claude.hook_events` fails.
-      3. `roostctl claude install` (now a bare alias of `agent install
-         claude` — plan 046 §3.5, no `--force`: explicit always wins) into
-         that `HOME` -> it merges in the missing event and passes.
+      2. a settings file with hooks of the user's own and none of Roost's
+         -> healthy: Claude connects through the tab environment, and
+         nothing sends the user to write Roost's hooks back.
+      3. `roostctl claude install` (a bare alias of `agent install
+         claude`, an explicit request) into that `HOME` -> Roost's hooks
+         are in the file beside the env plugin, which doctor warns
+         doubles every event and says how to remove.
     """
     tab = roost.open_tab(project, cwd="/tmp")
     wait_tab_attached(roost, tab)
@@ -460,14 +460,17 @@ def test_claude_section_isolated_by_home(tmp_path, roost, project, target):
     for cid in claude_ids:
         assert checks[cid]["status"] == "skipped", (cid, checks[cid])
 
-    # 2. A settings file that omits StopFailure.
+    # 2. The user's own hooks, none of Roost's: the upgrader's state
+    # after the retire.
     write_claude_settings(home, tuple(e for e in CLAUDE_EVENTS if e != "StopFailure"))
     code, report = run_doctor([], env)
     assert code == report["exit_code"], (code, report["exit_code"])
     checks = checks_by_id(report)
-    assert checks["claude.hook_events"]["status"] == "fail", checks["claude.hook_events"]
+    for cid in ("claude.settings", "claude.hook_events", "claude.hook_command"):
+        assert checks[cid]["status"] == "ok", (cid, checks[cid])
+        assert "agent install" not in checks[cid]["detail"], (cid, checks[cid])
 
-    # 3. `claude install` fixes it — no `--force`, and no `ROOST_TEST_MODE`
+    # 3. An explicit `claude install` — no `ROOST_TEST_MODE`
     # in `env` (it isn't inherited from `os.environ` here), so the install
     # engine's own harness-jail refusal never fires.
     proc = subprocess.run(
@@ -483,7 +486,10 @@ def test_claude_section_isolated_by_home(tmp_path, roost, project, target):
     code, report = run_doctor([], env)
     assert code == report["exit_code"], (code, report["exit_code"])
     checks = checks_by_id(report)
-    assert checks["claude.hook_events"]["status"] == "ok", checks["claude.hook_events"]
+    assert checks["claude.hook_command"]["status"] == "warn", checks["claude.hook_command"]
+    assert "agent uninstall claude" in checks["claude.hook_command"]["detail"], checks[
+        "claude.hook_command"
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -628,8 +634,14 @@ def test_agents_section_reports_wiring_and_trust(tmp_path):
     is nothing legacy to warn about. Covers the C9 test obligation
     ("`roostctl doctor -v` in the e2e asserts the Agents section")."""
     jail = Jail(tmp_path)
-    wired = _run_agent(jail, "ensure", "--json")
+    # An older Roost's install, then this build's ensure: the retire
+    # takes out every agent's entries but Cursor's, which is still
+    # delivered by file.
+    wired = _run_agent(jail, "install", "--all", "--json")
     assert wired.returncode == 0, wired.stdout + wired.stderr
+    assert checks_by_id(_run_doctor_in_jail(jail))["agent.codex.trust"]["status"] == "ok"
+    retired = _run_agent(jail, "ensure", "--json")
+    assert retired.returncode == 0, retired.stdout + retired.stderr
     record = jail.read_record()
 
     report = _run_doctor_in_jail(jail)
@@ -638,14 +650,16 @@ def test_agents_section_reports_wiring_and_trust(tmp_path):
     for agent in ("claude", "codex", "grok", "cursor", "opencode"):
         wired_check = checks[f"agent.{agent}.wired"]
         assert wired_check["status"] == "ok", wired_check
-        # The version, not just the shape of it: `wired@v` matched a
-        # report that had lost track of which version was installed.
-        version = record[agent]["integration_version"]
-        assert wired_check["detail"] == f"wired@v{version}", wired_check
+        if agent == "cursor":
+            # The version, not just the shape of it: `wired@v` matched a
+            # report that had lost track of which version was installed.
+            version = record[agent]["integration_version"]
+            assert wired_check["detail"] == f"wired@v{version}", wired_check
+        else:
+            assert "nothing written" in wired_check["detail"], wired_check
+            assert "old entries retired" in wired_check["detail"], wired_check
         owning_check = checks[f"agent.{agent}.owning"]
         assert owning_check["status"] == "skipped", owning_check
-
-    assert checks["agent.codex.trust"]["status"] == "ok", checks["agent.codex.trust"]
     assert checks["agent.claude.legacy_settings"]["status"] == "ok", checks[
         "agent.claude.legacy_settings"
     ]
@@ -662,10 +676,14 @@ def test_agents_section_names_present_but_unwired_agents(tmp_path):
 
     report = _run_doctor_in_jail(jail)
     checks = checks_by_id(report)
-    for agent in ("claude", "codex", "grok", "cursor", "opencode"):
+    cursor = checks["agent.cursor.wired"]
+    assert cursor["status"] == "warn", cursor
+    assert "not wired" in cursor["detail"], cursor
+    # The rest need no file: doctor names how they connect instead.
+    for agent in ("claude", "codex", "grok", "opencode"):
         wired_check = checks[f"agent.{agent}.wired"]
-        assert wired_check["status"] == "warn", wired_check
-        assert "not wired" in wired_check["detail"], wired_check
+        assert wired_check["status"] == "ok", wired_check
+        assert "nothing written" in wired_check["detail"], wired_check
     assert checks["agent.codex.trust"]["status"] == "skipped", checks["agent.codex.trust"]
 
 
@@ -676,18 +694,23 @@ def test_wiring_is_read_off_the_agents_own_config_not_the_record(tmp_path):
     a doctor that reported "present, not wired" there would send the
     user to reinstall something already installed."""
     jail = Jail(tmp_path)
-    wired = _run_agent(jail, "ensure", "--json")
+    wired = _run_agent(jail, "install", "--all", "--json")
     assert wired.returncode == 0, wired.stdout + wired.stderr
     assert jail.record.exists()
 
     jail.record.unlink()
 
     checks = checks_by_id(_run_doctor_in_jail(jail))
-    for agent in ("claude", "codex", "grok", "cursor", "opencode"):
+    cursor = checks["agent.cursor.wired"]
+    assert cursor["status"] == "warn", cursor
+    assert "state record has no entry" in cursor["detail"], cursor
+    assert "present, not wired" not in cursor["detail"], cursor
+    # An agent delivered without a file names the entry as the cause of
+    # doubled events, record or no record.
+    for agent in ("claude", "codex", "grok", "opencode"):
         wired_check = checks[f"agent.{agent}.wired"]
         assert wired_check["status"] == "warn", wired_check
-        assert "state record has no entry" in wired_check["detail"], wired_check
-        assert "present, not wired" not in wired_check["detail"], wired_check
+        assert "double every event" in wired_check["detail"], wired_check
     # The entries really are still there, which is what makes the
     # "not wired" reading wrong rather than merely pessimistic.
     assert checks["agent.codex.trust"]["status"] == "ok", checks["agent.codex.trust"]
@@ -700,7 +723,7 @@ def test_a_hand_edited_codex_handler_is_reported_as_trust_drift(tmp_path):
     the expected hash from Roost's canonical command would report `ok`
     straight through that dialog."""
     jail = Jail(tmp_path)
-    wired = _run_agent(jail, "ensure", "--json")
+    wired = _run_agent(jail, "install", "codex", "--json")
     assert wired.returncode == 0, wired.stdout + wired.stderr
     assert checks_by_id(_run_doctor_in_jail(jail))["agent.codex.trust"]["status"] == "ok"
 
@@ -713,8 +736,8 @@ def test_a_hand_edited_codex_handler_is_reported_as_trust_drift(tmp_path):
     assert trust["status"] == "fail", trust
     assert "Stop" in trust["detail"], trust
 
-    # And `agent ensure` is the remedy the check names.
-    again = _run_agent(jail, "ensure", "--json")
+    # An explicit install refreshes the handler and its trust.
+    again = _run_agent(jail, "install", "codex", "--json")
     assert again.returncode == 0, again.stdout + again.stderr
     assert checks_by_id(_run_doctor_in_jail(jail))["agent.codex.trust"]["status"] == "ok"
 

@@ -180,7 +180,7 @@ after the prompt was sent, not whether this prompt is what did it, so
 an unrelated turn starting in the window still satisfies it. And an
 agent with no hooks reporting to Roost never reaches `running` at all,
 so the gate times out by design (exit 4 `stalled`) — `tab prompt` needs
-[Agent Hooks](agents.md) wired, or an agent reporting directly (see
+[Agent integration](agents.md) wired, or an agent reporting directly (see
 [Reporting directly, without a hook](agents.md#reporting-directly-without-a-hook)),
 not a plain shell. See [`cli.md#tab-prompt`](../reference/cli.md#tab-prompt)
 for the full flag table and exit codes, including `--until` and

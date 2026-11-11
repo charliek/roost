@@ -4026,6 +4026,7 @@ name = "roost-agent-install"
 version = "0.1.0"
 dependencies = [
  "roost-agent",
+ "roost-ipc",
  "roost-ui-model",
  "serde",
  "serde_json",
@@ -4033,6 +4034,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml_edit",
+ "tracing",
 ]
 
 [[package]]

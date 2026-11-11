@@ -233,9 +233,9 @@ impl PaletteCommands {
         // immediately after "Clear All Notifications" — plan 007 §3.7.
         ("toggle_sidebar_agents", "Toggle Sidebar Agents"),
         ("cycle_agent_panel_sort", "Cycle Agent Panel Sort"),
-        // The one surface that changes `agent-hooks` after the first
-        // launch, and the row the wiring toast points at by name.
-        ("agent_hooks", "Agent Hooks\u{2026}"),
+        // The settings card for which agents Roost connects, and the row
+        // every agent toast points at by name.
+        ("agent_hooks", "Agent Integration\u{2026}"),
         ("open_config", "Open Settings File"),
         ("open_docs", "Open Documentation"),
         ("toggle_fullscreen", "Toggle Full Screen"),

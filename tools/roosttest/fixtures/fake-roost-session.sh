@@ -10,7 +10,8 @@
 # Other tests that exec a script use it the same way: the `$SHELL`s in
 # `crates/roost-cli/src/doctor.rs` (through `fake_launcher` in
 # `crates/roost-cli/src/session.rs`) and the `$ROOST_AGENT_HOOK` stubs in
-# `crates/roost-agent-install/src/command.rs`.
+# `crates/roost-agent-install/src/command.rs`, and the stand-in `claude`s
+# (`fake_claude`) in `crates/roost-agent-install/src/tab_env.rs`.
 #
 # It has no behaviour of its own. A test symlinks this file to
 # `<dir>/roost-session` (or another name a case needs) and writes what

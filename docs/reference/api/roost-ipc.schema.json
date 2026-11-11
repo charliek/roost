@@ -427,6 +427,12 @@
         "agent": {
           "type": "string"
         },
+        "delivery": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "files": {
           "items": {
             "type": "string"

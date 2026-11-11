@@ -488,6 +488,7 @@ fn run(profile: &BundleProfile, bundle_id: Option<&str>) -> anyhow::Result<()> {
         Err(error) => return Err(anyhow::anyhow!("single-instance lock failed: {error}")),
     };
 
+    install_agent_env(profile);
     let app = App::bootstrap(profile, locks)?;
     let opening = app.window_opening();
     let initial = Arc::new(Mutex::new(Some(app)));
@@ -513,6 +514,13 @@ fn run(profile: &BundleProfile, bundle_id: Option<&str>) -> anyhow::Result<()> {
         .window(window_settings(profile, opening))
         .run()
         .context("run Iced application")
+}
+
+/// Hand every tab this UI spawns in-process the agent integration's
+/// variables (a session's tabs get its own). After the locks, so a second
+/// launch that only raises the first probes nothing.
+fn install_agent_env(profile: &BundleProfile) {
+    roost_engine::process::set_tab_env(roost_agent_install::tab_env::hook(profile));
 }
 
 /// Forces a panic when `ROOST_TEST_PANIC` is set, so the crash-report path

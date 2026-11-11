@@ -2815,6 +2815,7 @@ impl App {
                     self.exit_state.request();
                 }
                 EngineFeed::AgentHooks(result) => self.agent_hooks_ensured(result),
+                EngineFeed::AgentRetire(result) => self.agent_retired(result),
                 EngineFeed::HostAgentHooks(reply) => self.host_agent_hooks_set(*reply),
                 EngineFeed::AgentHooksSet(done) => self.agent_hooks_applied(*done),
                 EngineFeed::AgentHooksSurvey(survey) => self.agent_hooks_surveyed(*survey),

@@ -25,11 +25,27 @@
 // `OPENCODE_SERVER_PASSWORD` is set. `ROOST_OPENCODE_NO_SERVER=1` opts
 // out; `docs/guides/agents.md` states the posture.
 //
-// Roost writes this file; `roostctl agent uninstall opencode` removes
-// it again.
+// Roost delivers this file from a directory of its own, named in the
+// tab's `OPENCODE_CONFIG_CONTENT`. Older releases wrote it into
+// opencode's own `plugins/` directory instead, where
+// `roostctl agent uninstall opencode` removes it.
 
 import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
+
+// One copy of this plugin per opencode process, among the copies that
+// carry this guard. Two load when the environment names a stale Roost
+// directory inherited from a parent Roost tab beside this process's own.
+// Both would forward every event, so the first copy to start claims the
+// process and every other copy installs nothing. The claim is per
+// module, not per call: opencode calls one copy once per project
+// instance, and each of those still runs.
+//
+// A copy without the guard is out of its reach. The `plugins/` file
+// older releases wrote has none, so while one sits beside the env copy
+// both forward, and every event arrives twice until it is removed.
+const OWNER = Symbol.for("roost.opencode.agent-state");
+const THIS_COPY = Symbol("roost-agent-state");
 
 // Whitelisted so the `message.part.delta` flood — 697 of the 862
 // records in the probe — never spawns a process. Must stay in step with
@@ -179,6 +195,8 @@ export const RoostAgentState = async (input) => {
   // used plenty of places that are not one. Returning no handlers is
   // cheaper than checking on every bus event.
   if (!hookBinary || !tabId || !socket) return {};
+  globalThis[OWNER] ??= THIS_COPY;
+  if (globalThis[OWNER] !== THIS_COPY) return {};
 
   // The loopback front end, kept so `dispose` can close it.
   let server = null;

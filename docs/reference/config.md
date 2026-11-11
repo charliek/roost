@@ -45,7 +45,8 @@ the launcher with deterministic commands.
 | `macos-auto-secure-input` | bool | `true` | Turn Secure Keyboard Entry on while the active tab is at a password prompt. Read on macOS only. See [Secure Keyboard Entry](#secure-keyboard-entry). |
 | `macos-secure-input-indication` | bool | `true` | Show a lock at the right end of the tab band while Secure Keyboard Entry is on. Read on macOS only. See [Secure Keyboard Entry](#secure-keyboard-entry). |
 | `macos-secure-keyboard-entry` | bool | `false` | Keep Secure Keyboard Entry on whenever Roost is the active app. Written by the menu's **Secure Keyboard Entry** row, the palette's **Toggle Secure Keyboard Entry** and the `toggle_secure_input` action. Read on macOS only. See [Secure Keyboard Entry](#secure-keyboard-entry). |
-| `agent-hooks` | agent list \| `off` \| absent | absent (unanswered) | Which supported coding agents (Claude Code, Codex, grok/gx, cursor-agent, OpenCode) Roost wires its hook entries into, at startup. Absent means nobody has answered the consent dialog yet — Roost writes nothing until they do. See [the dedicated section below](#agent-hooks) and the [Agent Hooks](../guides/agents.md) guide. |
+| `agent-integration` | departures from the defaults \| `off` \| absent | absent (the defaults: every agent but Cursor on) | Which coding agents Roost connects: Claude Code and OpenCode through the tab environment, Codex and Grok over OSC 7501, Cursor by writing its `hooks.json`. See [the dedicated section below](#agent-integration) and the [Agent integration](../guides/agents.md) guide. |
+| `agent-hooks` | agent list \| `off` \| absent | absent | The older key, now a shadow Roost writes as the agents it connects by file (`cursor` or `off`), and reads only to carry an earlier answer over. See [below](#agent-hooks). |
 | `local-backend` | `in-process \| session` | `in-process` for an existing setup; `session` on a genuinely fresh install | Where the tabs you start in the Roost window run. See [the dedicated section below](#local-backend). |
 | `chrome-accent` | `system \| #rrggbb` | `system` | The accent color of the window chrome: the active tab and project, notification dots, focus rings. See [the dedicated section below](#chrome-accent). |
 
@@ -336,65 +337,74 @@ seen. Turn on `macos-secure-keyboard-entry` for those.
 > `toggle_secure_input` does nothing, and there is no menu row, palette
 > row or lock.
 
-## `agent-hooks`
+## `agent-integration`
 
-Which supported coding agents Roost wires its hook entries into, in
-their own config files. Both UIs read this at startup, and `roostctl
-agent ensure` (the same verb the UIs run) reads it too — see the [Agent
-Hooks](../guides/agents.md) guide for the full mechanism, what gets
-written where, and the guarantee about what a merge does and doesn't
-touch.
+Which coding agents Roost connects, whatever the way: a plugin in the
+tab environment (Claude Code, OpenCode), the agent's own OSC 7501
+reports (Codex, Grok), or entries Roost writes into the agent's file
+(Cursor). See [Agent integration](../guides/agents.md) for what each
+means. Read at every tab spawn, so a change reaches the next tab.
 
 ```conf
-agent-hooks = claude, codex   # a list, off, or absent (nobody has answered yet)
+agent-integration = -opencode   # departures from the defaults, or off
 ```
 
 | Value | Effect |
 |---|---|
-| a comma list of agent names | Every named agent gets Roost's hook entries, refreshed on launch if they're stale. Everything present and *not* named is left alone — nothing is ever removed just for being absent from the list. |
-| `off` — also accepts `false`, `no` | The UIs wire nothing at startup; an agent's config file is never opened. This does **not** remove anything already wired on its own — see below. |
-| absent, empty, or unrecognized | **Unanswered.** Nobody has run the consent dialog or `roostctl agent set` yet. Nothing is wired, and nothing already wired is touched, until they do — a fresh install starts here, and a launch raises the consent dialog once per process when at least one supported agent is installed. See [Agent Hooks → Roost asks once](../guides/agents.md#roost-asks-once). |
+| absent or empty | **The defaults**: every agent on except Cursor. A fresh install starts here, and no card is shown unless Cursor is installed (its opt-in is still unanswered). |
+| `name` | Turns that agent on (`cursor` is the only one that is off by default). |
+| `-name` | Turns that agent off. |
+| `off` (also `false`, `no`, `none`) | Every agent off, as the whole value or as a token: `off, cursor` is only Cursor. |
 
-**Names normalise.** Each token is trimmed and lowercased; duplicates
-collapse; the result is reordered into `claude, codex, grok, cursor,
-opencode` regardless of the order written. A token that names none of
-the five wires nothing and warns, and the rest of the list still
-resolves — one typo shouldn't turn into "nothing is wired and nothing
-says why." It is **kept in the key**, though, and written back
-unchanged: a newer Roost that supports more agents writes its name here,
-and an older one that erased it on the next launch would silently undo
-that answer. `roostctl agent status` lists it as `unknown to this
-build`. A value that names *no* recognised agent at all, or mixes a
-reserved word (`off`/`false`/`no`, or the retired `auto`/`on`/`true`/
-`yes`) with anything else, resolves to **unanswered** with a warning —
-the retired spellings no longer mean "wire everything"; they mean
-"nobody has said yet." A repeated key is last-wins, including when the
-repeat is empty or unparseable (it resolves to unanswered, not to
-whatever an earlier line in the file said).
+**Departures, not a list.** An agent the value doesn't name keeps its
+default, so an agent a later release adds is not switched off by a value
+written before it existed. Tokens are trimmed and lowercased, the last
+token for a name wins, and a name this build doesn't know is kept and
+changes nothing. The Agent Integration card's Apply and `roostctl agent
+set` write a full value (every default-on agent named, on or off).
 
-**`off` stops future wiring; it does not itself remove anything.** This
-split is deliberate, not an oversight: flipping the key to `off` and
-relaunching means the UI won't wire anything *new*, but entries already
-on disk stay there until something explicit takes them out —
-`roostctl agent uninstall --all`, running `roostctl agent ensure`
-yourself (which reads this same key and, seeing `off`, does perform the
-removal), or reopening the consent dialog (the **Agent Hooks…** palette
-row) and choosing `off` there. The UIs themselves never rewrite an
-agent's config file just because the key changed to `off` — they simply
-stop touching it.
+**What off means.** Claude Code or OpenCode off: the next tab gets no
+plugin variable. Cursor off: its file entries are removed. Codex or Grok
+off: recorded, but no effect yet, because both report over OSC 7501 on
+their own.
 
-**Over a connected host session the rule is different again, and
-reversed from an earlier design.** A connecting client can only ever
-**raise** a host's `agent-hooks` key — union its own allow-list into
-whatever the host's key already says, never removing — and that
-includes raising a host whose key is explicitly `off` or still
-unanswered: a host has no screen to ask on, so the connecting client is
-the only authority there is. A client whose own key is `off` or
-unanswered sends nothing and so cannot raise or lower a host either.
-**Lowering a host is done on that machine** — `roostctl agent
-ensure`/`uninstall` run there, or its own dialog — and holds until a
-more permissive client connects again. See [Agent Hooks → Remote
-hosts](../guides/agents.md#remote-hosts) for the full behavior.
+**An unreadable `config.conf`** gives new tabs no agent plugins, since
+the file might say `off`.
+
+## `agent-hooks`
+
+The older key, from releases that wrote hook entries into every agent's
+own files. It is now a **shadow**: Roost writes it as the agents it
+still connects by file (`cursor`, or `off`) and reads it only to carry
+an earlier answer over:
+
+- With no `agent-integration`, an answered `agent-hooks` decides:
+  `off` is every agent off and a list is those agents on, the rest off.
+  The first launch of this release writes the same answer into
+  `agent-integration` and narrows `agent-hooks` to the shadow. See
+  [Upgrading: the retire](../guides/agents.md#upgrading-the-retire).
+- An older Roost on the same machine reads only `agent-hooks`. Narrowed
+  to the file agents, it no longer tells that Roost to wire Claude's
+  file, so the two builds don't take turns adding and removing entries.
+
+```conf
+agent-hooks = cursor   # written by Roost; a list, off, or absent
+```
+
+The parsing rules are unchanged: names trim, lowercase, de-duplicate and
+reorder into `claude, codex, grok, cursor, opencode`; an unknown name is
+kept and warned about; `off`/`false`/`no` is off; the retired
+`auto`/`on`/`true`/`yes`, or a value naming no known agent, reads as
+unanswered with a warning.
+
+**Over a connected host session** a client still raises the host's
+`agent-hooks` key, never lowering it, and a host whose key is `off` or
+unanswered is raised anyway: a host has no screen to ask on. Since the
+key now names only Cursor, that raise is Cursor's file opt-in; a host's
+Claude Code and OpenCode follow the host's own `agent-integration`.
+Lowering a host is done on that machine (`roostctl agent set` or
+`uninstall` run there). See [Agent integration → Remote
+hosts](../guides/agents.md#remote-hosts).
 
 ## `local-backend`
 
@@ -484,18 +494,14 @@ command = label="Claude" run="claude --resume"
 # its rows on `list` and acts on the choice on `activate`:
 provider = label="Open shed" run="~/.config/roost/providers/shed.sh"
 
-# Left absent (the default), Roost asks once — a consent dialog opens
-# on first launch naming whichever of Claude Code, Codex, grok/gx,
-# cursor-agent and OpenCode it finds installed, and nothing is wired
-# until you answer it. Answering by hand instead: name the agents to
-# wire, or turn the whole thing off (which stops future wiring — it
-# doesn't by itself remove what's already there; see
-# docs/guides/agents.md).
-agent-hooks = claude, codex
+# Left absent (the default), Roost connects every agent but Cursor
+# without writing to their settings files. Record departures only:
+# here, OpenCode off and Cursor's hooks.json opt-in on.
+agent-integration = -opencode, cursor
 ```
 
 See [Extending Roost](../guides/extending.md) for the full `command =` /
 `provider =` contract (with bash / Python / TypeScript examples),
 [`paths.md`](paths.md) for where the file lives on each platform,
 [`themes.md`](themes.md) for the `theme` value enumeration, and the
-[Agent Hooks](../guides/agents.md) guide for `agent-hooks` in full.
+[Agent integration](../guides/agents.md) guide for `agent-integration` in full.

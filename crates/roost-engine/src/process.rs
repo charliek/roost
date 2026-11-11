@@ -6,7 +6,8 @@
 //! removal, cwd selection, stdin delivery, timeout, cancellation, exit-status
 //! reporting, and owned stdout.
 
-use std::ffi::OsStr;
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -254,6 +255,26 @@ pub fn set_agent_hook_binary(path: Option<String>) -> bool {
 /// it).
 pub fn agent_hook_binary() -> Option<&'static str> {
     AGENT_HOOK_BINARY.get_or_init(roostctl_path).as_deref()
+}
+
+/// What a serving process adds to every tab's environment beyond the
+/// engine's own variables: the agent integration's
+/// `CLAUDE_CODE_PLUGIN_DIRS` and `OPENCODE_CONFIG_CONTENT`. Set once, by
+/// the UI and by `roost-session`, which link the integration; the engine
+/// does not. It runs on the spawn path, after the opener's variables and
+/// before Roost's own, so it sees what the tab inherited.
+pub type TabEnvFn = dyn Fn(&mut BTreeMap<OsString, OsString>) + Send + Sync;
+
+static TAB_ENV: OnceLock<Box<TabEnvFn>> = OnceLock::new();
+
+/// Install [`TabEnvFn`] before the first tab spawns. Returns whether this
+/// call is the one that set it.
+pub fn set_tab_env(extend: Box<TabEnvFn>) -> bool {
+    TAB_ENV.set(extend).is_ok()
+}
+
+pub(crate) fn tab_env() -> Option<&'static TabEnvFn> {
+    TAB_ENV.get().map(Box::as_ref)
 }
 
 #[cfg(test)]

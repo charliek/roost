@@ -223,7 +223,7 @@ impl Staged {
 /// Not a cryptographic nonce, and it does not need to be: `O_EXCL` is
 /// what makes a collision — accidental or planted — safe, and this only
 /// has to make one unlikely enough that the retry loop below never runs.
-fn nonce() -> String {
+pub(crate) fn nonce() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()

@@ -47,7 +47,8 @@ pub enum InstallError {
         paths: Vec<PathBuf>,
     },
 
-    /// A run that failed **after** it wrote the `agent-hooks` key.
+    /// A run that failed **after** it wrote its agent key: `agent-hooks`
+    /// for a raise, `agent-integration` for a set.
     ///
     /// The key is written first so that a failed reconcile still leaves
     /// the user's answer durable — which means an `Err` from those runs
@@ -55,8 +56,9 @@ pub enum InstallError {
     /// `config.conf` now spells it: a caller holding the key in memory
     /// has to take it on this path too, and one that can only pass a
     /// message on carries it in the text.
-    #[error("{source}; the agent-hooks key `{key}` is already on disk")]
+    #[error("{source}; the {name} key `{key}` is already on disk")]
     AfterKey {
+        name: &'static str,
         key: String,
         #[source]
         source: Box<InstallError>,
@@ -140,6 +142,9 @@ pub enum SkipReason {
     UnexpectedShape { path: PathBuf, detail: String },
     /// A file Roost owns by name exists but was not written by Roost.
     ForeignFile { path: PathBuf },
+    /// This build connects the agent without a file entry (the tab
+    /// environment, or the agent's own OSC 7501), so none was written.
+    NoFileNeeded,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -157,6 +162,7 @@ impl std::fmt::Display for SkipReason {
             SkipReason::ForeignFile { path } => {
                 write!(f, "{}: not written by Roost", path.display())
             }
+            SkipReason::NoFileNeeded => f.write_str("no file needed"),
         }
     }
 }

@@ -448,7 +448,8 @@ class Roost:
         bottom_line: {text, severity, source} | None} — the rendered
         strings, ungated (plan 072 §D7b).
 
-        `bottom_line` with `source: "status"` is a five-second toast:
+        `bottom_line` with `source: "status"` is a five-second toast
+        (fifteen for Roost's one-time agent notice):
         read it right after the action that raised it, never after a
         wait. `generation` is what `notice_answer` must echo back."""
         return self.call("app.notice_dump", {})

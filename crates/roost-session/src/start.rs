@@ -176,6 +176,8 @@ pub fn start(
             Err(error) => return Err(anyhow::anyhow!("single-instance lock failed: {error}")),
         };
 
+    install_agent_env(profile);
+    crate::agent_hooks::spawn_retire();
     let config = SessionConfig::from_profile(profile, first_project, exe_path);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -190,6 +192,14 @@ pub fn start(
     runtime.shutdown_background();
     served?;
     Ok(Outcome::Served)
+}
+
+/// Hand every tab this session spawns the agent integration's
+/// variables. After the fork, which the policy probe's thread would not
+/// survive, and after the locks, so a session that lost them probes
+/// nothing.
+fn install_agent_env(profile: &BundleProfile) {
+    roost_engine::process::set_tab_env(roost_agent_install::tab_env::hook(profile));
 }
 
 /// Create (or vouch for) the three directories a session writes into.

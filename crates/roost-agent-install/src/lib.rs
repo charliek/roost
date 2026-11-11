@@ -82,11 +82,14 @@
 
 pub mod codex_hash;
 pub mod command;
+pub mod env_delivery;
 pub mod error;
 pub mod home;
 pub mod json;
 pub mod plan;
+pub mod retire;
 pub mod state;
+pub mod tab_env;
 pub mod write;
 
 mod claude;
@@ -103,12 +106,13 @@ mod acceptance;
 pub use codex::{trust_entries, TrustEntry};
 pub use command::{installed_command, is_roost_command, owned_commands, INTEGRATION_VERSION};
 pub use ensure::{
-    agent_names, ensure, install, plan, raise, reconcile, resolve_names, set_hooks, status, Mode,
-    Outcome, Status,
+    agent_names, ensure, install, keys_for, plan, raise, reconcile, reconcile_file_agents,
+    resolve_names, set_hooks, status, Mode, Outcome, Status, FILE_AGENTS,
 };
 pub use error::{AgentError, AgentSkip, AgentWarning, InstallError, SkipReason, Warning};
 pub use home::Home;
 pub use plan::{apply, Applied, FileEdit, Guard, InstallPlan, Intent};
+pub use retire::{retire, RetireOutcome, RETIRE_VERSION};
 pub use roost_agent::ALL_AGENTS;
 pub use state::mark_noticed;
 
@@ -120,6 +124,37 @@ pub use roost_ui_model::config::ConfigLock;
 /// [`install`]'s counterpart for a named set of agents. Re-exported here
 /// rather than as `ensure::uninstall` so the verbs read alike.
 pub use ensure::uninstall;
+
+/// How this build connects an agent to Roost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Roost's entries in the agent's own config file ([`FILE_AGENTS`]).
+    File,
+    /// A plugin named in the tab environment; nothing is written.
+    Env,
+    /// The agent reports its own status over OSC 7501.
+    Osc7501,
+}
+
+impl Delivery {
+    pub fn of(agent: roost_agent::Agent) -> Delivery {
+        use roost_agent::Agent;
+        match agent {
+            Agent::Cursor => Delivery::File,
+            Agent::Claude | Agent::Opencode => Delivery::Env,
+            Agent::Codex | Agent::Grok => Delivery::Osc7501,
+        }
+    }
+
+    /// What `agent status --json` and `app.dialog_dump` say.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Delivery::File => "file",
+            Delivery::Env => "env",
+            Delivery::Osc7501 => "7501",
+        }
+    }
+}
 
 /// The files Roost owns or merges into, per agent — what
 /// `agent status` prints and what an uninstall touches.
@@ -178,6 +213,19 @@ mod tests {
             assert!(!installed_command(agent).is_empty(), "{}", agent.source());
         }
         assert_eq!(ALL_AGENTS.len(), 5);
+    }
+
+    /// The file agents are exactly the agents delivered by file.
+    #[test]
+    fn delivery_by_file_is_the_file_agents() {
+        for agent in ALL_AGENTS {
+            assert_eq!(
+                Delivery::of(agent) == Delivery::File,
+                FILE_AGENTS.contains(&agent),
+                "{}",
+                agent.source()
+            );
+        }
     }
 
     /// The inventory here and the adapters' one are the same list.
