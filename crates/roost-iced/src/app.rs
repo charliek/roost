@@ -158,6 +158,9 @@ const SPAWN_GRID: (u16, u16) = (137, 43);
 pub(crate) const INITIAL_WINDOW_SIZE: Size = Size::new(1100.0, 720.0);
 pub(crate) const MIN_WINDOW_SIZE: Size = Size::new(640.0, 360.0);
 const STATUS_BANNER_DURATION: Duration = Duration::from_secs(5);
+/// Roost's one-time agent-integration notice: a few sentences, shown
+/// once per upgrade, so it stays up long enough to read.
+const AGENT_NOTICE_DURATION: Duration = Duration::from_secs(15);
 /// How often the banner's expiry is checked while one is up. Coarse
 /// against the five-second life it polices — the banner is allowed to
 /// outlive its deadline by up to one of these.
@@ -186,8 +189,18 @@ struct StatusBanner {
 
 impl StatusBanner {
     fn set_at(&mut self, message: impl Into<String>, severity: Severity, now: Instant) {
+        self.set_for(message, severity, now, STATUS_BANNER_DURATION);
+    }
+
+    fn set_for(
+        &mut self,
+        message: impl Into<String>,
+        severity: Severity,
+        now: Instant,
+        duration: Duration,
+    ) {
         self.message = Some((message.into(), severity));
-        self.expires_at = Some(now + STATUS_BANNER_DURATION);
+        self.expires_at = Some(now + duration);
     }
 
     fn clear(&mut self) {
@@ -4657,7 +4670,7 @@ impl App {
         // like the local one: there is no `noticed` flag on this side to
         // spend, so a line that gets replaced costs nothing but itself.
         tracing::info!(host = %reply.label, toast, "host agent hooks toast shown");
-        self.set_status(toast);
+        self.set_agent_notice(toast, Severity::Info);
     }
 
     /// `agent.set_hooks` — the consent dialog's Apply and `roostctl
@@ -5031,7 +5044,7 @@ impl App {
             tracing::info!(toast = policy, "agent policy toast shown");
             agent_hooks::spawn_mark_policy_noticed(&self.runtime_handle);
         }
-        self.set_status(toast.text());
+        self.set_agent_notice(toast.text(), toast.severity());
         agent_hooks::spawn_mark_noticed(&self.runtime_handle, toast.noticed);
         agent_hooks::spawn_mark_retired(&self.runtime_handle, toast.retired);
     }
@@ -5624,10 +5637,24 @@ impl App {
     }
 
     fn set_status_as(&mut self, message: impl Into<String>, severity: Severity) {
+        self.set_status_for(message, severity, STATUS_BANNER_DURATION);
+    }
+
+    fn set_agent_notice(&mut self, message: impl Into<String>, severity: Severity) {
+        self.set_status_for(message, severity, AGENT_NOTICE_DURATION);
+    }
+
+    fn set_status_for(
+        &mut self,
+        message: impl Into<String>,
+        severity: Severity,
+        duration: Duration,
+    ) {
         // A toast restructures the root widget tree, which drops the grips'
         // widget state — a live drag would never publish its end.
         self.commit_resize_drags();
-        self.status.set_at(message, severity, Instant::now());
+        self.status
+            .set_for(message, severity, Instant::now(), duration);
     }
 
     fn live_sidebar_width(&self) -> f32 {
@@ -12191,6 +12218,20 @@ mod tests {
             Some("on alpha: last save failed: disk full"),
             "the host's failure was never overwritten, only covered"
         );
+    }
+
+    #[test]
+    fn the_agent_notice_outlives_an_ordinary_toast() {
+        let now = Instant::now();
+        let mut status = StatusBanner::default();
+        status.set_for("agent notice", Severity::Info, now, AGENT_NOTICE_DURATION);
+        status.expire_at(now + STATUS_BANNER_DURATION);
+        assert!(
+            status.is_active(),
+            "still up when a plain toast would be gone"
+        );
+        status.expire_at(now + AGENT_NOTICE_DURATION);
+        assert!(!status.is_active());
     }
 
     #[test]

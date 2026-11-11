@@ -37,6 +37,7 @@ use roost_ipc::messages::{
     AgentSetHooksHostOutcome, AgentSetHooksResult,
 };
 use roost_ui_model::config::{AgentHooks, AgentIntegration, AgentSwitches, RoostConfig};
+use roost_ui_model::notice::Severity;
 
 use super::agent_hooks_dialog::{AgentHooksDraft, CardMode};
 use super::local_backend::plural;
@@ -1088,6 +1089,16 @@ impl AgentHooksToast {
         }
     }
 
+    /// An error only when something was left unwired; otherwise it is
+    /// a receipt of what Roost did, in the normal text colour.
+    pub(crate) fn severity(&self) -> Severity {
+        if self.problem.is_some() {
+            Severity::Error
+        } else {
+            Severity::Info
+        }
+    }
+
     /// One banner line, the announcement first.
     pub(crate) fn text(&self) -> String {
         [
@@ -1211,6 +1222,23 @@ mod tests {
         };
         assert!(toast.text().ends_with(POLICY_LINE), "{}", toast.text());
         assert!(toast.text().starts_with("Grok reports"), "{}", toast.text());
+    }
+
+    /// The upgrade notice is a receipt, not an error; only a toast that
+    /// reports an agent left unwired is drawn as one.
+    #[test]
+    fn the_toast_is_an_error_only_when_something_was_left_unwired() {
+        let receipt = AgentHooksToast {
+            retire: retire_line(&[Agent::Claude], 0, None),
+            policy: Some(POLICY_LINE),
+            ..AgentHooksToast::default()
+        };
+        assert_eq!(receipt.severity(), Severity::Info);
+        let failed = AgentHooksToast {
+            problem: Some("Agent hooks: couldn't set up Cursor".to_string()),
+            ..receipt
+        };
+        assert_eq!(failed.severity(), Severity::Error);
     }
 
     /// A name this client cannot parse survives as a name. The host has
