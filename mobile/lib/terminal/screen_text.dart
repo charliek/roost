@@ -1,3 +1,4 @@
+import 'frame.dart';
 import 'terminal_model.dart';
 
 /// The screen's rows as plain text, trailing blank rows dropped.
@@ -9,52 +10,66 @@ String screenText(TerminalModel model) {
   return lines.join('\n');
 }
 
-final _urlStart = RegExp(r'''(?:https?|ftp|file)://[^\s<>"'`]+''');
-final _continuation = RegExp(r'''^[^\s<>"'`]+''');
-final _scheme = RegExp(r'^[a-z][a-z0-9+.-]*://', caseSensitive: false);
+/// URL characters (RFC 3986, plus letters and marks of any script): a box
+/// border, a quote or a space ends a URL.
+final _url = RegExp(
+  r'(?:https?|ftp|file)://[\p{L}\p{N}\p{M}\-._~:/?#\[\]@!$&()*+,;=%]+',
+  unicode: true,
+);
+final _listMarker = RegExp(r'^[-*+•] ');
 const _trailing = '.,;:!?';
 
-/// The URLs on screen, in order and without repeats. A URL that ends in the
-/// last column continues at the start of the next row, so one that wrapped
-/// comes back whole: a terminal's soft wrap and Ink's hard wrap (Claude
-/// Code's login link) both fill every row of it to the edge. A row that ends
-/// short of the edge, or a next row that starts with a space or a new URL,
-/// ends it.
+/// The URLs on screen, in order and without repeats, found in the lines the
+/// rows were before they wrapped, so a wrapped URL (Claude Code's login
+/// link, which Ink hard-wraps to fill every row) comes back whole.
 List<String> screenUrls(TerminalModel model) {
-  final lines = [for (var r = 0; r < model.rows; r++) model.rowText(r)];
-
   final urls = <String>[];
-  // Characters at the start of a row already taken as a continuation.
-  final consumed = List<int>.filled(lines.length, 0);
-  for (var r = 0; r < lines.length; r++) {
-    for (final match in _urlStart.allMatches(lines[r])) {
-      if (match.start < consumed[r]) continue;
-      final url = StringBuffer(match[0]!);
-      var row = r;
-      var end = match.end;
-      while (end == lines[row].length &&
-          _endCol(model, row) >= model.cols &&
-          row + 1 < lines.length) {
-        final next = _continuation.firstMatch(lines[row + 1]);
-        if (next == null || _scheme.hasMatch(next[0]!)) break;
-        url.write(next[0]!);
-        row++;
-        end = next.end;
-        consumed[row] = end;
-      }
-      final trimmed = _trimUrl(url.toString());
-      if (trimmed.contains('://') && !urls.contains(trimmed)) {
-        urls.add(trimmed);
-      }
+  for (final line in _unwrappedLines(model)) {
+    for (final match in _url.allMatches(line)) {
+      final url = _trimUrl(match[0]!);
+      if (_url.hasMatch(url) && !urls.contains(url)) urls.add(url);
     }
   }
   return urls;
 }
 
+/// The rows joined wherever one fills to the last column and the next goes
+/// on with it. Nothing on screen tells a wrap from a line that ended exactly
+/// at the edge, so such a line runs into the next row; a next row that
+/// starts a new URL or a list item is kept apart.
+List<String> _unwrappedLines(TerminalModel model) {
+  final lines = <String>[];
+  final line = StringBuffer();
+  for (var r = 0; r < model.rows; r++) {
+    final text = model.rowText(r);
+    if (line.isNotEmpty &&
+        (_url.matchAsPrefix(text) != null || _listMarker.hasMatch(text))) {
+      line.write(' ');
+    }
+    line.write(text);
+    if (r + 1 < model.rows && _reachesEdge(model, r)) continue;
+    lines.add(line.toString());
+    line.clear();
+  }
+  return lines;
+}
+
+bool _reachesEdge(TerminalModel model, int r) {
+  final end = _endCol(model, r);
+  if (end >= model.cols) return true;
+  // A wide character that does not fit in the last cell wraps, leaving a
+  // blank cell behind it.
+  final next = model.row(r + 1)?.runs ?? const <FrameRun>[];
+  return end == model.cols - 1 &&
+      next.isNotEmpty &&
+      next.first.col == 0 &&
+      next.first.has(RunAttrs.wide);
+}
+
 /// The column after the row's last non-blank cell. Counted in cells, not
 /// characters: a wide character is one character in two cells.
 int _endCol(TerminalModel model, int r) {
-  final runs = model.row(r)?.runs ?? const [];
+  final runs = model.row(r)?.runs ?? const <FrameRun>[];
   for (final run in runs.reversed) {
     final trailingSpaces = run.text.length - run.text.trimRight().length;
     if (trailingSpaces == run.text.length) continue;

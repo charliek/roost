@@ -57,7 +57,8 @@ class _CopySheet extends StatelessWidget {
   final ValueChanged<String> onCopyUrl;
 
   /// Small enough that each terminal row stays one line, so the screen's
-  /// own line breaks are the ones the text shows.
+  /// own line breaks are the ones the text shows; a tab too wide for that
+  /// at [minTerminalFontSize] (about 90 columns on a phone) wraps.
   double _fontSizeFor(double width, double devicePixelRatio) {
     if (cols <= 0) return _sheetFontSize;
     final em =
@@ -147,17 +148,36 @@ class _CopySheet extends StatelessWidget {
                 // SelectionArea over the scroll view, not a SelectableText
                 // inside it: the scroll view then hides handles scrolled out
                 // of sight and scrolls while a handle is dragged to its edge.
+                // The band below the viewport is that edge: a dragged handle
+                // aims above the finger, so a viewport that ran to the
+                // bottom of the screen could never be dragged past.
                 return SelectionArea(
-                  child: SingleChildScrollView(
-                    padding: EdgeInsets.fromLTRB(16, 16, 16, 16 + bottomInset),
-                    child: Text(
-                      text.isEmpty ? '(the screen is empty)' : text,
-                      key: const ValueKey('copy-text'),
-                      style: TextStyle(
-                        fontFamily: monoFamily,
-                        fontSize: fontSize,
-                        height: 1.3,
-                        color: RoostColors.text,
+                  child: NotificationListener<ScrollStartNotification>(
+                    onNotification: (_) {
+                      ContextMenuController.removeAny();
+                      return false;
+                    },
+                    child: Padding(
+                      padding: EdgeInsets.only(bottom: bottomInset + 24),
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.all(16),
+                        child: Text(
+                          text.isEmpty ? '(the screen is empty)' : text,
+                          key: const ValueKey('copy-text'),
+                          textScaler: TextScaler.noScaling,
+                          style: TextStyle(
+                            fontFamily: monoFamily,
+                            fontSize: fontSize,
+                            height: 1.3,
+                            letterSpacing: 0,
+                            wordSpacing: 0,
+                            fontFeatures: const [
+                              FontFeature.disable('liga'),
+                              FontFeature.disable('calt'),
+                            ],
+                            color: RoostColors.text,
+                          ),
+                        ),
                       ),
                     ),
                   ),

@@ -77,17 +77,60 @@ void main() {
     expect(screenUrls(m), ['https://example.com/auth?code=abc123']);
   });
 
-  test('a next row that starts with a space or a bullet is not more URL', () {
+  test('a next row that starts with a space is not more URL', () {
     final m = _screen([
       'Open https://example.com/settings/tokens',
       '  and paste the token below.',
-      '- https://example.com/releases/v0.1.0',
-      '- next',
     ], cols: 40);
+    expect(screenUrls(m), ['https://example.com/settings/tokens']);
+  });
+
+  test('a list item at the edge does not take the next bullet', () {
+    final m = _screen([
+      '- https://example.com/releases/v0.1.0',
+      '- https://example.com/releases/v0.1.1',
+    ], cols: 37);
     expect(screenUrls(m), [
-      'https://example.com/settings/tokens',
       'https://example.com/releases/v0.1.0',
+      'https://example.com/releases/v0.1.1',
     ]);
+  });
+
+  test('a rule drawn after a URL at the edge is not part of it', () {
+    final m = _screen([
+      'see https://a.io/abcdefghijklmn',
+      '─' * 31,
+      '❯ ',
+    ], cols: 31);
+    expect(screenUrls(m), ['https://a.io/abcdefghijklmn']);
+  });
+
+  test('a wrap inside the scheme still finds the URL', () {
+    final m = _screen([
+      'Read the guide: http',
+      's://example.com/docs',
+    ], cols: 20);
+    expect(screenUrls(m), ['https://example.com/docs']);
+  });
+
+  test('a wrap inside a URL carried in another stays one URL', () {
+    const url = 'https://web.archive.org/web/2020/https://example.com/a';
+    final m = _screen(_wrapped(url, 34), cols: 34);
+    expect(screenUrls(m), [url]);
+  });
+
+  test('a wide character wrapped off the last cell keeps the URL whole', () {
+    final m = _model(20, [
+      [
+        _run(0, 'https://a'),
+        _wide(9, '例'),
+        _wide(11, 'え'),
+        _run(13, '.jp/'),
+        _wide(17, 'パ'),
+      ],
+      [_wide(0, 'ス'), _run(2, '/x')],
+    ]);
+    expect(screenUrls(m), ['https://a例え.jp/パス/x']);
   });
 
   test('URLs one per line at the edge stay separate', () {
