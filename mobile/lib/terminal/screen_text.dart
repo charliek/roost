@@ -10,19 +10,18 @@ String screenText(TerminalModel model) {
 }
 
 final _urlStart = RegExp(r'''(?:https?|ftp|file)://[^\s<>"'`]+''');
-final _continuation = RegExp(r'''^\s*([^\s<>"'`]+)''');
+final _continuation = RegExp(r'''^[^\s<>"'`]+''');
+final _scheme = RegExp(r'^[a-z][a-z0-9+.-]*://', caseSensitive: false);
 const _trailing = '.,;:!?';
 
-/// A row this close to the right edge may have wrapped: a program that
-/// wraps itself (Ink, under a padded box) stops a column or two short.
-const _wrapSlack = 4;
-
-/// The URLs on screen, in order and without repeats. A URL that runs to the
-/// right edge continues into the next row's first word, so one that wrapped
-/// (a login link, say) comes back whole.
+/// The URLs on screen, in order and without repeats. A URL that ends in the
+/// last column continues at the start of the next row, so one that wrapped
+/// comes back whole: a terminal's soft wrap and Ink's hard wrap (Claude
+/// Code's login link) both fill every row of it to the edge. A row that ends
+/// short of the edge, or a next row that starts with a space or a new URL,
+/// ends it.
 List<String> screenUrls(TerminalModel model) {
   final lines = [for (var r = 0; r < model.rows; r++) model.rowText(r)];
-  bool nearEdge(String line) => line.length >= model.cols - _wrapSlack;
 
   final urls = <String>[];
   // Characters at the start of a row already taken as a continuation.
@@ -34,11 +33,11 @@ List<String> screenUrls(TerminalModel model) {
       var row = r;
       var end = match.end;
       while (end == lines[row].length &&
-          nearEdge(lines[row]) &&
+          _endCol(model, row) >= model.cols &&
           row + 1 < lines.length) {
         final next = _continuation.firstMatch(lines[row + 1]);
-        if (next == null) break;
-        url.write(next[1]!);
+        if (next == null || _scheme.hasMatch(next[0]!)) break;
+        url.write(next[0]!);
         row++;
         end = next.end;
         consumed[row] = end;
@@ -50,6 +49,18 @@ List<String> screenUrls(TerminalModel model) {
     }
   }
   return urls;
+}
+
+/// The column after the row's last non-blank cell. Counted in cells, not
+/// characters: a wide character is one character in two cells.
+int _endCol(TerminalModel model, int r) {
+  final runs = model.row(r)?.runs ?? const [];
+  for (final run in runs.reversed) {
+    final trailingSpaces = run.text.length - run.text.trimRight().length;
+    if (trailingSpaces == run.text.length) continue;
+    return run.col + run.cells - trailingSpaces;
+  }
+  return 0;
 }
 
 /// Drops sentence punctuation and a closing bracket the URL never opened.
