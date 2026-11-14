@@ -269,7 +269,7 @@ class BridgeTabView {
 
 /// `TerminalEvent`, flattened: `state` and `message` for `Status`;
 /// `owner_label`, `is_me`, `cols`, `rows` for `Owner`; `exit_code` for
-/// `Exited`.
+/// `Exited`; `text` for `Clipboard`.
 class BridgeTerminalEvent {
   final BridgeTerminalEventKind kind;
   final BridgeAttachState state;
@@ -279,6 +279,7 @@ class BridgeTerminalEvent {
   final int cols;
   final int rows;
   final int exitCode;
+  final String? text;
 
   const BridgeTerminalEvent({
     required this.kind,
@@ -289,6 +290,7 @@ class BridgeTerminalEvent {
     required this.cols,
     required this.rows,
     required this.exitCode,
+    this.text,
   });
 
   @override
@@ -300,7 +302,8 @@ class BridgeTerminalEvent {
       isMe.hashCode ^
       cols.hashCode ^
       rows.hashCode ^
-      exitCode.hashCode;
+      exitCode.hashCode ^
+      text.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -314,10 +317,11 @@ class BridgeTerminalEvent {
           isMe == other.isMe &&
           cols == other.cols &&
           rows == other.rows &&
-          exitCode == other.exitCode;
+          exitCode == other.exitCode &&
+          text == other.text;
 }
 
-enum BridgeTerminalEventKind { frameReady, status, owner, exited }
+enum BridgeTerminalEventKind { frameReady, status, owner, exited, clipboard }
 
 class BridgeWorkspaceView {
   final List<BridgeProjectView> projects;

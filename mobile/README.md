@@ -32,6 +32,12 @@ shows the host key's SHA256 fingerprint to trust; it is pinned from then on,
 and a changed key refuses to connect. Opening a tab takes its size; going to the
 background hands it back.
 
+**Copying:** long-press the terminal (or **⋮ → Copy text…**) for the screen as
+selectable text, **Copy all**, and its links listed whole, a wrapped one
+(Claude Code's login link) rejoined. A program's own copy, an OSC 52 write
+such as Claude Code's **c to copy**, reaches the phone's clipboard while its
+tab is the one on screen; a copy from a tab you are not looking at is ignored.
+
 ## Dev loop
 
 ```bash

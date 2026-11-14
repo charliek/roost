@@ -166,6 +166,27 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('compose-toggle')));
     await tester.pump(const Duration(milliseconds: 300));
 
+    // A program's OSC 52 copy (Claude Code's "c to copy") reaches the
+    // device clipboard: session OSC scan, tab.effect, the core's routing
+    // to the tab on screen, the bridge, the pane.
+    await tester.tap(find.byKey(const ValueKey('compose-toggle')));
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.enterText(
+      find.byKey(const ValueKey('compose-field')),
+      r"printf '\033]52;c;%s\007' "
+      '"\$(printf %s $name-osc52 | base64)"',
+    );
+    await tester.tap(find.byKey(const ValueKey('compose-send')));
+    await _until(
+      tester,
+      'the OSC 52 write is applied',
+      () => find.text('Copied from the terminal').evaluate().isNotEmpty,
+    );
+    final copied = await Clipboard.getData(Clipboard.kTextPlain);
+    expect(copied?.text, '$name-osc52');
+    await tester.tap(find.byKey(const ValueKey('compose-toggle')));
+    await tester.pump(const Duration(milliseconds: 300));
+
     // A quick reply, on a tab marked waiting: the command line is typed,
     // the Enter chip runs it.
     await core.op(selection.hostId!, 'tab.set_state', {

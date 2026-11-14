@@ -11,7 +11,7 @@
 # ABI directory is a packaging regression and fails too. Every library counts,
 # not only ours: libflutter.so or a plugin's would fail Play's check the same.
 # An .apk is also run through `zipalign -c -P 16` when zipalign is on PATH or
-# under $ANDROID_HOME/build-tools, since an uncompressed library must sit at a
+# under an SDK's build-tools, since an uncompressed library must sit at a
 # 16 KB offset in the zip as well. A bare .so is checked as given.
 set -euo pipefail
 
@@ -23,24 +23,65 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-if command -v llvm-readelf >/dev/null 2>&1; then
-  readelf=(llvm-readelf -l -W)
-elif command -v readelf >/dev/null 2>&1; then
-  readelf=(readelf -l -W)
-else
-  echo "FAIL: neither llvm-readelf nor readelf is on PATH" >&2
+# The SDK roots tools/mobile/android-env.sh looks in, the Linux and macOS
+# defaults last.
+sdk_roots() {
+  local root
+  for root in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" \
+    "${HOME}/Android/Sdk" "${HOME}/Library/Android/sdk"; do
+    if [ -n "${root}" ] && [ -d "${root}" ]; then echo "${root}"; fi
+  done
+}
+
+# readelf from PATH, else the NDK's llvm-readelf: macOS has no readelf.
+readelf_bin() {
+  local tool ndk root found
+  for tool in llvm-readelf readelf; do
+    if command -v "${tool}" >/dev/null 2>&1; then
+      command -v "${tool}"
+      return
+    fi
+  done
+  for ndk in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}"; do
+    if [ -z "${ndk}" ] || [ ! -d "${ndk}/toolchains" ]; then continue; fi
+    found="$(find "${ndk}/toolchains" -path '*/llvm/prebuilt/*/bin/llvm-readelf' | head -n 1)"
+    if [ -n "${found}" ]; then
+      echo "${found}"
+      return
+    fi
+  done
+  while read -r root; do
+    [ -d "${root}/ndk" ] || continue
+    found="$(find "${root}/ndk" -maxdepth 7 -path '*/toolchains/llvm/prebuilt/*/bin/llvm-readelf' |
+      sort -V | tail -n 1)"
+    if [ -n "${found}" ]; then
+      echo "${found}"
+      return
+    fi
+  done < <(sdk_roots)
+}
+
+readelf_path="$(readelf_bin)"
+if [ -z "${readelf_path}" ]; then
+  echo "FAIL: no llvm-readelf or readelf on PATH or in an Android NDK" >&2
   exit 2
 fi
+readelf=("${readelf_path}" -l -W)
 
 zipalign_bin() {
-  local sdk
+  local root found
   if command -v zipalign >/dev/null 2>&1; then
     command -v zipalign
     return
   fi
-  sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-${HOME}/Android/Sdk}}"
-  [ -d "${sdk}/build-tools" ] || return 0
-  find "${sdk}/build-tools" -mindepth 2 -maxdepth 2 -name zipalign -type f | sort -V | tail -n 1
+  while read -r root; do
+    [ -d "${root}/build-tools" ] || continue
+    found="$(find "${root}/build-tools" -mindepth 2 -maxdepth 2 -name zipalign -type f | sort -V | tail -n 1)"
+    if [ -n "${found}" ]; then
+      echo "${found}"
+      return
+    fi
+  done < <(sdk_roots)
 }
 
 failed=0

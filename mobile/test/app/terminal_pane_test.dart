@@ -177,6 +177,113 @@ void main() {
     });
   });
 
+  group('copy text', () {
+    Future<List<String>> mockClipboard(WidgetTester tester) async {
+      final copied = <String>[];
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        (call) async {
+          if (call.method == 'Clipboard.setData') {
+            copied.add((call.arguments as Map)['text'] as String);
+          }
+          return null;
+        },
+      );
+      addTearDown(
+        () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          SystemChannels.platform,
+          null,
+        ),
+      );
+      return copied;
+    }
+
+    Future<void> echo(WidgetTester tester, String text) async {
+      await _focusTerminal(tester);
+      tester.testTextInput.updateEditingValue(
+        TextEditingValue(
+          text: '  echo $text',
+          selection: TextSelection.collapsed(offset: 7 + text.length),
+        ),
+      );
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('a long press lists the links on screen to copy', (
+      tester,
+    ) async {
+      final copied = await mockClipboard(tester);
+      await _openTab(tester, 13, width: 400);
+      await echo(tester, 'https://example.com/login?code=1');
+      await tester.longPress(byKey('terminal-canvas'));
+      await tester.pumpAndSettle();
+      expect(byKey('copy-sheet'), findsOneWidget);
+      await tester.tap(byKey('copy-url-0'));
+      await tester.pumpAndSettle();
+      expect(copied, ['https://example.com/login?code=1']);
+      expect(byKey('copy-sheet'), findsNothing);
+      expect(find.text('Link copied'), findsOneWidget);
+    });
+
+    testWidgets('a program in the tab copies to the clipboard (OSC 52)', (
+      tester,
+    ) async {
+      final copied = await mockClipboard(tester);
+      await _openTab(tester, 13, width: 400);
+      await _focusTerminal(tester);
+      tester.testTextInput.updateEditingValue(
+        const TextEditingValue(
+          text: '  copy https://claude.com/x?a=1',
+          selection: TextSelection.collapsed(offset: 31),
+        ),
+      );
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pumpAndSettle();
+      expect(copied, ['https://claude.com/x?a=1']);
+      expect(find.text('Copied from the terminal'), findsOneWidget);
+    });
+
+    testWidgets('a burst of copies shows one notice that leaves the bar free', (
+      tester,
+    ) async {
+      final copied = await mockClipboard(tester);
+      final core = await _openTab(tester, 13, width: 400);
+      await _focusTerminal(tester);
+      final shell = core.shellOf('devbox', 13);
+      for (var i = 0; i < 10; i++) {
+        shell.onClipboardWrite!('copy $i');
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      await tester.pump();
+      expect(copied, hasLength(10));
+      expect(find.text('Copied from the terminal'), findsOneWidget);
+      await tester.tap(byKey('extra-key-up'));
+      await tester.pump();
+      expect(lastSession(core).keys, [const KeyInput('ArrowUp')]);
+      await tester.pump(noticeDuration);
+      expect(find.text('Copied from the terminal'), findsNothing);
+    });
+
+    testWidgets('the tab menu opens it too, and copies the whole screen', (
+      tester,
+    ) async {
+      final copied = await mockClipboard(tester);
+      await _openTab(tester, 13);
+      await echo(tester, 'hello there');
+      await tester.tap(find.byTooltip('Tab actions'));
+      await tester.pumpAndSettle();
+      await tester.tap(byKey('menu-copy-text'));
+      await tester.pumpAndSettle();
+      await tester.tap(byKey('copy-all'));
+      await tester.pumpAndSettle();
+      expect(copied, hasLength(1));
+      expect(copied.single, contains('hello there'));
+    });
+  });
+
   group('size ownership', () {
     testWidgets('a foreign owner is named, and Take size takes it back', (
       tester,

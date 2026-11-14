@@ -308,4 +308,5 @@ TerminalEvent _terminalEvent(BridgeTerminalEvent e) => switch (e.kind) {
     rows: e.rows,
   ),
   BridgeTerminalEventKind.exited => Exited(e.exitCode),
+  BridgeTerminalEventKind.clipboard => ClipboardWrite(e.text ?? ''),
 };

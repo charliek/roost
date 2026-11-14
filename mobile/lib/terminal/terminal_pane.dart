@@ -15,6 +15,7 @@ import '../input/extra_keys.dart';
 import '../input/quick_replies.dart';
 import '../input/soft_keyboard.dart';
 import 'attached_tab.dart';
+import 'copy_sheet.dart';
 import 'terminal_view.dart';
 
 /// A hardware key event within this long hides the extra-keys bar.
@@ -22,6 +23,9 @@ const hardwareKeyboardWindow = Duration(minutes: 2);
 
 /// A local scroll has settled this long after its last step.
 const scrollSettle = Duration(milliseconds: 500);
+
+/// How long a "copied" notice stays after the last copy.
+const noticeDuration = Duration(milliseconds: 1500);
 
 /// One tab on screen: attaches it (taking its size) once the view knows its
 /// grid, routes every kind of input to it, and detaches when it goes away.
@@ -61,6 +65,8 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
   bool _alt = false;
   DateTime? _hardwareKeyAt;
   Timer? _scrollSettle;
+  String? _notice;
+  Timer? _noticeTimer;
 
   RoostCore get _core => ref.read(coreProvider);
 
@@ -74,6 +80,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
   void dispose() {
     _attachSeq++;
     _scrollSettle?.cancel();
+    _noticeTimer?.cancel();
     _detach();
     _focus
       ..removeListener(_onFocusChange)
@@ -130,7 +137,9 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
         unawaited(session.close());
         return;
       }
-      final tab = AttachedTab(session)..addListener(_onTabChanged);
+      final tab = AttachedTab(session)
+        ..addListener(_onTabChanged)
+        ..onClipboardWrite = _onClipboardWrite;
       setState(() {
         _tab = tab;
         _attaching = false;
@@ -197,6 +206,37 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
     final tab = _tab;
     if (text == null || text.isEmpty || tab == null) return;
     _fire(tab.session.paste(text));
+  }
+
+  /// A notice over the terminal rather than a snackbar: a snackbar would sit
+  /// on the extra-keys or quick-reply bar and take its taps, and a program
+  /// that copies on every edit would queue one per copy. A new notice
+  /// replaces the one showing.
+  void _showNotice(String text) {
+    _noticeTimer?.cancel();
+    setState(() => _notice = text);
+    _noticeTimer = Timer(noticeDuration, () {
+      if (mounted) setState(() => _notice = null);
+    });
+  }
+
+  Future<void> _onClipboardWrite(String text) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (mounted) _showNotice('Copied from the terminal');
+  }
+
+  void _openCopy() {
+    final tab = _tab;
+    if (tab == null || !tab.model.hasFrame) return;
+    unawaited(
+      showCopySheet(
+        context,
+        tab.model,
+        onCopied: (what) {
+          if (mounted) _showNotice('$what copied');
+        },
+      ),
+    );
   }
 
   void _scroll(int rows, int col, int row) {
@@ -270,6 +310,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
           composeOpen: _composeOpen,
           onKeyboard: () => _input.currentState?.showKeyboard(),
           onCompose: () => setState(() => _composeOpen = !_composeOpen),
+          onCopy: _openCopy,
           onRename: view == null
               ? null
               : () => renameTabFlow(context, ref, widget.hostId, view),
@@ -318,8 +359,10 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
                         ref.read(terminalFontSizeProvider.notifier).set(s),
                     onScroll: _scroll,
                     onTap: () => _input.currentState?.showKeyboard(),
+                    onLongPress: _openCopy,
                   ),
                 ),
+                if (_notice != null) _Notice(text: _notice!),
                 _StatusOverlay(
                   attaching: _attaching,
                   error: _attachError,
@@ -360,6 +403,7 @@ class _Toolbar extends StatelessWidget {
     required this.composeOpen,
     required this.onKeyboard,
     required this.onCompose,
+    required this.onCopy,
     required this.onRename,
     required this.onClose,
     required this.onFontSize,
@@ -372,6 +416,7 @@ class _Toolbar extends StatelessWidget {
   final bool composeOpen;
   final VoidCallback onKeyboard;
   final VoidCallback onCompose;
+  final VoidCallback onCopy;
   final VoidCallback? onRename;
   final VoidCallback? onClose;
   final ValueChanged<double> onFontSize;
@@ -433,6 +478,8 @@ class _Toolbar extends StatelessWidget {
             tooltip: 'Tab actions',
             onSelected: (action) {
               switch (action) {
+                case 'copy':
+                  onCopy();
                 case 'rename':
                   onRename?.call();
                 case 'close':
@@ -444,6 +491,11 @@ class _Toolbar extends StatelessWidget {
               }
             },
             itemBuilder: (context) => const [
+              PopupMenuItem(
+                key: ValueKey('menu-copy-text'),
+                value: 'copy',
+                child: Text('Copy text…'),
+              ),
               PopupMenuItem(value: 'rename', child: Text('Rename tab')),
               PopupMenuItem(value: 'close', child: Text('Close tab')),
               PopupMenuItem(value: 'bigger', child: Text('Larger text')),
@@ -552,6 +604,36 @@ class _StatusOverlay extends StatelessWidget {
                 if (retry)
                   TextButton(onPressed: onRetry, child: const Text('Reattach')),
               ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _Notice extends StatelessWidget {
+  const _Notice({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: Align(
+        alignment: Alignment.bottomCenter,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Material(
+            key: const ValueKey('terminal-notice'),
+            color: RoostColors.surfaceHighest,
+            shape: RoundedRectangleBorder(
+              side: const BorderSide(color: RoostColors.border),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              child: Text(text, style: Theme.of(context).textTheme.bodyMedium),
             ),
           ),
         ),

@@ -1781,6 +1781,7 @@ impl SseDecode for crate::api::types::BridgeTerminalEvent {
         let mut var_cols = <u16>::sse_decode(deserializer);
         let mut var_rows = <u16>::sse_decode(deserializer);
         let mut var_exitCode = <i32>::sse_decode(deserializer);
+        let mut var_text = <Option<String>>::sse_decode(deserializer);
         return crate::api::types::BridgeTerminalEvent {
             kind: var_kind,
             state: var_state,
@@ -1790,6 +1791,7 @@ impl SseDecode for crate::api::types::BridgeTerminalEvent {
             cols: var_cols,
             rows: var_rows,
             exit_code: var_exitCode,
+            text: var_text,
         };
     }
 }
@@ -1803,6 +1805,7 @@ impl SseDecode for crate::api::types::BridgeTerminalEventKind {
             1 => crate::api::types::BridgeTerminalEventKind::Status,
             2 => crate::api::types::BridgeTerminalEventKind::Owner,
             3 => crate::api::types::BridgeTerminalEventKind::Exited,
+            4 => crate::api::types::BridgeTerminalEventKind::Clipboard,
             _ => unreachable!("Invalid variant for BridgeTerminalEventKind: {}", inner),
         };
     }
@@ -2310,6 +2313,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::BridgeTerminalEvent {
             self.cols.into_into_dart().into_dart(),
             self.rows.into_into_dart().into_dart(),
             self.exit_code.into_into_dart().into_dart(),
+            self.text.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -2333,6 +2337,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::BridgeTerminalEventKin
             Self::Status => 1.into_dart(),
             Self::Owner => 2.into_dart(),
             Self::Exited => 3.into_dart(),
+            Self::Clipboard => 4.into_dart(),
             _ => unreachable!(),
         }
     }
@@ -2609,6 +2614,7 @@ impl SseEncode for crate::api::types::BridgeTerminalEvent {
         <u16>::sse_encode(self.cols, serializer);
         <u16>::sse_encode(self.rows, serializer);
         <i32>::sse_encode(self.exit_code, serializer);
+        <Option<String>>::sse_encode(self.text, serializer);
     }
 }
 
@@ -2621,6 +2627,7 @@ impl SseEncode for crate::api::types::BridgeTerminalEventKind {
                 crate::api::types::BridgeTerminalEventKind::Status => 1,
                 crate::api::types::BridgeTerminalEventKind::Owner => 2,
                 crate::api::types::BridgeTerminalEventKind::Exited => 3,
+                crate::api::types::BridgeTerminalEventKind::Clipboard => 4,
                 _ => {
                     unimplemented!("");
                 }

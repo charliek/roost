@@ -74,4 +74,6 @@ sparkle_ed_key
 .secrets/cert.p12
 .secrets/apple.env
 .secrets/roost-iced-sparkle-ed-private.key
+.secrets/roost-android-key.properties
+.secrets/roost-android-release.jks
 
