@@ -176,6 +176,19 @@ void main() {
     expect(screenUrls(m), ['https://a.io/x']);
   });
 
+  test('a styled blank in the last cell does not hide a wide wrap', () {
+    const ul = RunAttrs.underline;
+    final m = _model(20, [
+      [
+        _run(0, 'https://x.io/wik/', attrs: ul),
+        _run(17, '東', cells: 2, attrs: RunAttrs.wide | ul),
+        _run(19, ' ', attrs: ul),
+      ],
+      [_wide(0, '京'), _wide(2, '都')],
+    ]);
+    expect(screenUrls(m), ['https://x.io/wik/東京都']);
+  });
+
   test('a URL one cell short does not run into CJK on the next row', () {
     final m = _model(40, [
       [

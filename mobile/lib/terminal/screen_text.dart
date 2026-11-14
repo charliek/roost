@@ -61,11 +61,13 @@ bool _reachesEdge(TerminalModel model, int r) {
   // A wide character that does not fit in the last cell wraps, leaving a
   // blank cell behind it.
   // Only after a wide character: an ASCII line one cell short is just short.
-  final runs = model.row(r)?.runs ?? const <FrameRun>[];
+  final lastDrawn = (model.row(r)?.runs ?? const <FrameRun>[]).reversed
+      .where((run) => run.text.trimRight().isNotEmpty)
+      .firstOrNull;
   final next = model.row(r + 1)?.runs ?? const <FrameRun>[];
   return end == model.cols - 1 &&
-      runs.isNotEmpty &&
-      runs.last.has(RunAttrs.wide) &&
+      lastDrawn != null &&
+      lastDrawn.has(RunAttrs.wide) &&
       next.isNotEmpty &&
       next.first.col == 0 &&
       next.first.has(RunAttrs.wide);

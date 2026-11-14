@@ -124,4 +124,32 @@ void main() {
       reason: 'the selection scrolled out of sight above the text',
     );
   });
+
+  testWidgets('a selection that starts above the viewport keeps its menu', (
+    tester,
+  ) async {
+    tester.view
+      ..physicalSize = const Size(1080, 2400)
+      ..devicePixelRatio = 2.625;
+    addTearDown(tester.view.reset);
+    await _openSheet(
+      tester,
+      _fullRows([for (var i = 0; i < 120; i++) 'line$i word$i']),
+    );
+    final text = find.descendant(
+      of: find.byKey(const ValueKey('copy-text')),
+      matching: find.byType(RichText),
+    );
+    final topLeft = tester.getTopLeft(text);
+    await tester.dragFrom(
+      topLeft + const Offset(200, 400),
+      const Offset(0, -300),
+    );
+    await tester.pumpAndSettle();
+    await tester.longPressAt(topLeft + const Offset(20, 400));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Select all'));
+    await tester.pumpAndSettle();
+    expect(find.text('Copy'), findsOneWidget);
+  });
 }

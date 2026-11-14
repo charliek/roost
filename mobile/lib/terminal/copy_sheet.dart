@@ -70,30 +70,39 @@ class _CopySheetState extends State<_CopySheet> {
     super.dispose();
   }
 
-  /// The selection's menu, hidden while the text scrolls and while the
-  /// selection is out of sight, where it would be drawn over the header.
+  /// The selection's menu: hidden while the text scrolls and while no part
+  /// of the selection is in sight, and otherwise anchored inside the text so
+  /// it is never drawn over the header.
   Widget _selectionMenu(BuildContext context, SelectableRegionState region) =>
       ValueListenableBuilder<bool>(
         valueListenable: _scrolling,
         builder: (context, scrolling, _) {
           final viewport = _viewport.currentContext?.findRenderObject();
           final regionBox = region.context.findRenderObject();
-          final inSight =
-              viewport is RenderBox &&
-              regionBox is RenderBox &&
-              (viewport.localToGlobal(Offset.zero) & viewport.size)
-                  .inflate(1)
-                  .contains(
-                    TextSelectionToolbarAnchors.getSelectionRect(
-                      regionBox,
-                      region.startGlyphHeight,
-                      region.endGlyphHeight,
-                      region.selectionEndpoints,
-                    ).topCenter,
-                  );
-          if (scrolling || !inSight) return const SizedBox.shrink();
-          return AdaptiveTextSelectionToolbar.selectableRegion(
-            selectableRegionState: region,
+          if (scrolling || viewport is! RenderBox || regionBox is! RenderBox) {
+            return const SizedBox.shrink();
+          }
+          final view = viewport.localToGlobal(Offset.zero) & viewport.size;
+          final selection = TextSelectionToolbarAnchors.getSelectionRect(
+            regionBox,
+            region.startGlyphHeight,
+            region.endGlyphHeight,
+            region.selectionEndpoints,
+          );
+          if (!selection.overlaps(view)) return const SizedBox.shrink();
+          final x = selection.center.dx;
+          return AdaptiveTextSelectionToolbar.buttonItems(
+            buttonItems: region.contextMenuButtonItems,
+            anchors: TextSelectionToolbarAnchors(
+              primaryAnchor: Offset(
+                x,
+                math.max(selection.top, view.top + kToolbarHeight),
+              ),
+              secondaryAnchor: Offset(
+                x,
+                math.min(selection.bottom, view.bottom),
+              ),
+            ),
           );
         },
       );
