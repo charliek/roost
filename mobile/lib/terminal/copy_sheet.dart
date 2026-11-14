@@ -41,7 +41,7 @@ Future<void> showCopySheet(BuildContext context, TerminalModel model) {
   );
 }
 
-class _CopySheet extends StatelessWidget {
+class _CopySheet extends StatefulWidget {
   const _CopySheet({
     required this.text,
     required this.urls,
@@ -56,10 +56,53 @@ class _CopySheet extends StatelessWidget {
   final VoidCallback onCopyAll;
   final ValueChanged<String> onCopyUrl;
 
+  @override
+  State<_CopySheet> createState() => _CopySheetState();
+}
+
+class _CopySheetState extends State<_CopySheet> {
+  final _scrolling = ValueNotifier(false);
+  final _viewport = GlobalKey();
+
+  @override
+  void dispose() {
+    _scrolling.dispose();
+    super.dispose();
+  }
+
+  /// The selection's menu, hidden while the text scrolls and while the
+  /// selection is out of sight, where it would be drawn over the header.
+  Widget _selectionMenu(BuildContext context, SelectableRegionState region) =>
+      ValueListenableBuilder<bool>(
+        valueListenable: _scrolling,
+        builder: (context, scrolling, _) {
+          final viewport = _viewport.currentContext?.findRenderObject();
+          final regionBox = region.context.findRenderObject();
+          final inSight =
+              viewport is RenderBox &&
+              regionBox is RenderBox &&
+              (viewport.localToGlobal(Offset.zero) & viewport.size)
+                  .inflate(1)
+                  .contains(
+                    TextSelectionToolbarAnchors.getSelectionRect(
+                      regionBox,
+                      region.startGlyphHeight,
+                      region.endGlyphHeight,
+                      region.selectionEndpoints,
+                    ).topCenter,
+                  );
+          if (scrolling || !inSight) return const SizedBox.shrink();
+          return AdaptiveTextSelectionToolbar.selectableRegion(
+            selectableRegionState: region,
+          );
+        },
+      );
+
   /// Small enough that each terminal row stays one line, so the screen's
   /// own line breaks are the ones the text shows; a tab too wide for that
   /// at [minTerminalFontSize] (about 90 columns on a phone) wraps.
   double _fontSizeFor(double width, double devicePixelRatio) {
+    final cols = widget.cols;
     if (cols <= 0) return _sheetFontSize;
     final em =
         CellMetrics.measure(_sheetFontSize, devicePixelRatio).cellWidth /
@@ -70,6 +113,8 @@ class _CopySheet extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final text = widget.text;
+    final urls = widget.urls;
     final theme = Theme.of(context).textTheme;
     final height = MediaQuery.sizeOf(context).height * 0.85;
     // The sheet runs under the navigation bar on an edge-to-edge screen.
@@ -87,7 +132,7 @@ class _CopySheet extends StatelessWidget {
                 Expanded(child: Text('Copy text', style: theme.titleMedium)),
                 TextButton(
                   key: const ValueKey('copy-all'),
-                  onPressed: text.isEmpty ? null : onCopyAll,
+                  onPressed: text.isEmpty ? null : widget.onCopyAll,
                   child: const Text('Copy all'),
                 ),
                 const CloseButton(),
@@ -124,7 +169,7 @@ class _CopySheet extends StatelessWidget {
                         ),
                       ),
                       trailing: const Icon(Icons.copy, size: 18),
-                      onTap: () => onCopyUrl(url),
+                      onTap: () => widget.onCopyUrl(url),
                     ),
                 ],
               ),
@@ -148,18 +193,25 @@ class _CopySheet extends StatelessWidget {
                 // SelectionArea over the scroll view, not a SelectableText
                 // inside it: the scroll view then hides handles scrolled out
                 // of sight and scrolls while a handle is dragged to its edge.
-                // The band below the viewport is that edge: a dragged handle
-                // aims above the finger, so a viewport that ran to the
+                // The band below the viewport, outside the selection so a
+                // press there selects nothing hidden, is that edge: a dragged
+                // handle aims above the finger, so a viewport that ran to the
                 // bottom of the screen could never be dragged past.
-                return SelectionArea(
-                  child: NotificationListener<ScrollStartNotification>(
-                    onNotification: (_) {
-                      ContextMenuController.removeAny();
-                      return false;
-                    },
-                    child: Padding(
-                      padding: EdgeInsets.only(bottom: bottomInset + 24),
+                return Padding(
+                  padding: EdgeInsets.only(bottom: bottomInset + 40),
+                  child: SelectionArea(
+                    contextMenuBuilder: _selectionMenu,
+                    child: NotificationListener<ScrollNotification>(
+                      onNotification: (n) {
+                        if (n is ScrollStartNotification) {
+                          _scrolling.value = true;
+                        } else if (n is ScrollEndNotification) {
+                          _scrolling.value = false;
+                        }
+                        return false;
+                      },
                       child: SingleChildScrollView(
+                        key: _viewport,
                         padding: const EdgeInsets.all(16),
                         child: Text(
                           text.isEmpty ? '(the screen is empty)' : text,

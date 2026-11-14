@@ -84,4 +84,44 @@ void main() {
       expect(_lineTops(tester, _cols + 1, 2 * _cols + 1), hasLength(1));
     });
   }
+
+  testWidgets('the Copy menu hides while scrolling and when out of sight', (
+    tester,
+  ) async {
+    tester.view
+      ..physicalSize = const Size(1080, 2400)
+      ..devicePixelRatio = 2.625;
+    addTearDown(tester.view.reset);
+    await _openSheet(
+      tester,
+      _fullRows([for (var i = 0; i < 120; i++) 'line$i word$i']),
+    );
+    final row = find.descendant(
+      of: find.byKey(const ValueKey('copy-text')),
+      matching: find.byType(RichText),
+    );
+    final topLeft = tester.getTopLeft(row);
+    await tester.longPressAt(topLeft + const Offset(20, 60));
+    await tester.pumpAndSettle();
+    expect(find.text('Copy'), findsOneWidget);
+
+    final gesture = await tester.startGesture(topLeft + const Offset(200, 400));
+    await gesture.moveBy(const Offset(0, -20));
+    await tester.pump();
+    expect(find.text('Copy'), findsNothing, reason: 'hidden while scrolling');
+    await gesture.up();
+    await tester.pumpAndSettle();
+    expect(find.text('Copy'), findsOneWidget, reason: 'back once it settles');
+
+    await tester.dragFrom(
+      topLeft + const Offset(200, 400),
+      const Offset(0, -300),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Copy'),
+      findsNothing,
+      reason: 'the selection scrolled out of sight above the text',
+    );
+  });
 }

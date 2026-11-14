@@ -176,6 +176,31 @@ void main() {
     expect(screenUrls(m), ['https://a.io/x']);
   });
 
+  test('a URL one cell short does not run into CJK on the next row', () {
+    final m = _model(40, [
+      [
+        _wide(0, '詳'),
+        _wide(2, '細'),
+        _run(4, ': https://example.com/docs/setup/ab'),
+      ],
+      [_wide(0, '次'), _wide(2, 'に'), _wide(4, '設'), _wide(6, '定')],
+    ]);
+    expect(screenUrls(m), ['https://example.com/docs/setup/ab']);
+  });
+
+  test('Markdown around a URL is not part of it', () {
+    final m = _screen([
+      '[https://x.io/a](https://x.io/a)',
+      'See **https://x.io/b** now',
+      '[docs](https://x.io/c).',
+    ], cols: 40);
+    expect(screenUrls(m), [
+      'https://x.io/a',
+      'https://x.io/b',
+      'https://x.io/c',
+    ]);
+  });
+
   test('URLs are listed once, in order, without trailing punctuation', () {
     final m = _screen([
       '(https://b.io/x)',

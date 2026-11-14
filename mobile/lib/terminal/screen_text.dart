@@ -11,13 +11,14 @@ String screenText(TerminalModel model) {
 }
 
 /// URL characters (RFC 3986, plus letters and marks of any script): a box
-/// border, a quote or a space ends a URL.
+/// border, a quote or a space ends a URL, and so does the `](` between the
+/// halves of a Markdown link.
 final _url = RegExp(
-  r'(?:https?|ftp|file)://[\p{L}\p{N}\p{M}\-._~:/?#\[\]@!$&()*+,;=%]+',
+  r'(?:https?|ftp|file)://(?:(?!\]\()[\p{L}\p{N}\p{M}\-._~:/?#\[\]@!$&()*+,;=%])+',
   unicode: true,
 );
 final _listMarker = RegExp(r'^[-*+•] ');
-const _trailing = '.,;:!?';
+const _trailing = '.,;:!?*';
 
 /// The URLs on screen, in order and without repeats, found in the lines the
 /// rows were before they wrapped, so a wrapped URL (Claude Code's login
@@ -59,8 +60,12 @@ bool _reachesEdge(TerminalModel model, int r) {
   if (end >= model.cols) return true;
   // A wide character that does not fit in the last cell wraps, leaving a
   // blank cell behind it.
+  // Only after a wide character: an ASCII line one cell short is just short.
+  final runs = model.row(r)?.runs ?? const <FrameRun>[];
   final next = model.row(r + 1)?.runs ?? const <FrameRun>[];
   return end == model.cols - 1 &&
+      runs.isNotEmpty &&
+      runs.last.has(RunAttrs.wide) &&
       next.isNotEmpty &&
       next.first.col == 0 &&
       next.first.has(RunAttrs.wide);
@@ -78,7 +83,7 @@ int _endCol(TerminalModel model, int r) {
   return 0;
 }
 
-/// Drops sentence punctuation and a closing bracket the URL never opened.
+/// Drops sentence punctuation, Markdown emphasis and a closing bracket the URL never opened.
 String _trimUrl(String url) {
   var s = url;
   while (s.isNotEmpty) {
