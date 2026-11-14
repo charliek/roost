@@ -177,6 +177,73 @@ void main() {
     });
   });
 
+  group('copy text', () {
+    Future<List<String>> mockClipboard(WidgetTester tester) async {
+      final copied = <String>[];
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        (call) async {
+          if (call.method == 'Clipboard.setData') {
+            copied.add((call.arguments as Map)['text'] as String);
+          }
+          return null;
+        },
+      );
+      addTearDown(
+        () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          SystemChannels.platform,
+          null,
+        ),
+      );
+      return copied;
+    }
+
+    Future<void> echo(WidgetTester tester, String text) async {
+      await _focusTerminal(tester);
+      tester.testTextInput.updateEditingValue(
+        TextEditingValue(
+          text: '  echo $text',
+          selection: TextSelection.collapsed(offset: 7 + text.length),
+        ),
+      );
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('a long press lists the links on screen to copy', (
+      tester,
+    ) async {
+      final copied = await mockClipboard(tester);
+      await _openTab(tester, 13, width: 400);
+      await echo(tester, 'https://example.com/login?code=1');
+      await tester.longPress(byKey('terminal-canvas'));
+      await tester.pumpAndSettle();
+      expect(byKey('copy-sheet'), findsOneWidget);
+      await tester.tap(byKey('copy-url-0'));
+      await tester.pumpAndSettle();
+      expect(copied, ['https://example.com/login?code=1']);
+      expect(byKey('copy-sheet'), findsNothing);
+      expect(find.text('Link copied'), findsOneWidget);
+    });
+
+    testWidgets('the tab menu opens it too, and copies the whole screen', (
+      tester,
+    ) async {
+      final copied = await mockClipboard(tester);
+      await _openTab(tester, 13);
+      await echo(tester, 'hello there');
+      await tester.tap(find.byTooltip('Tab actions'));
+      await tester.pumpAndSettle();
+      await tester.tap(byKey('menu-copy-text'));
+      await tester.pumpAndSettle();
+      await tester.tap(byKey('copy-all'));
+      await tester.pumpAndSettle();
+      expect(copied, hasLength(1));
+      expect(copied.single, contains('hello there'));
+    });
+  });
+
   group('size ownership', () {
     testWidgets('a foreign owner is named, and Take size takes it back', (
       tester,

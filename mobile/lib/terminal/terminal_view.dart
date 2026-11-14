@@ -33,6 +33,7 @@ class TerminalView extends StatefulWidget {
     this.onFontSize,
     this.onScroll,
     this.onTap,
+    this.onLongPress,
   });
 
   final AttachedTab? tab;
@@ -50,6 +51,7 @@ class TerminalView extends StatefulWidget {
   /// under the pointer, for a program that reads the wheel.
   final void Function(int rows, int col, int row)? onScroll;
   final VoidCallback? onTap;
+  final VoidCallback? onLongPress;
 
   @override
   State<TerminalView> createState() => _TerminalViewState();
@@ -230,6 +232,7 @@ class _TerminalViewState extends State<TerminalView>
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
             onTap: widget.onTap,
+            onLongPress: widget.onLongPress,
             onScaleStart: _onScaleStart,
             onScaleUpdate: _onScaleUpdate,
             child: CustomPaint(

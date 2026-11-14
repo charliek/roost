@@ -15,6 +15,7 @@ import '../input/extra_keys.dart';
 import '../input/quick_replies.dart';
 import '../input/soft_keyboard.dart';
 import 'attached_tab.dart';
+import 'copy_sheet.dart';
 import 'terminal_view.dart';
 
 /// A hardware key event within this long hides the extra-keys bar.
@@ -199,6 +200,12 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
     _fire(tab.session.paste(text));
   }
 
+  void _openCopy() {
+    final tab = _tab;
+    if (tab == null || !tab.model.hasFrame) return;
+    unawaited(showCopySheet(context, tab.model));
+  }
+
   void _scroll(int rows, int col, int row) {
     final tab = _tab;
     if (tab == null) return;
@@ -270,6 +277,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
           composeOpen: _composeOpen,
           onKeyboard: () => _input.currentState?.showKeyboard(),
           onCompose: () => setState(() => _composeOpen = !_composeOpen),
+          onCopy: _openCopy,
           onRename: view == null
               ? null
               : () => renameTabFlow(context, ref, widget.hostId, view),
@@ -318,6 +326,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
                         ref.read(terminalFontSizeProvider.notifier).set(s),
                     onScroll: _scroll,
                     onTap: () => _input.currentState?.showKeyboard(),
+                    onLongPress: _openCopy,
                   ),
                 ),
                 _StatusOverlay(
@@ -360,6 +369,7 @@ class _Toolbar extends StatelessWidget {
     required this.composeOpen,
     required this.onKeyboard,
     required this.onCompose,
+    required this.onCopy,
     required this.onRename,
     required this.onClose,
     required this.onFontSize,
@@ -372,6 +382,7 @@ class _Toolbar extends StatelessWidget {
   final bool composeOpen;
   final VoidCallback onKeyboard;
   final VoidCallback onCompose;
+  final VoidCallback onCopy;
   final VoidCallback? onRename;
   final VoidCallback? onClose;
   final ValueChanged<double> onFontSize;
@@ -433,6 +444,8 @@ class _Toolbar extends StatelessWidget {
             tooltip: 'Tab actions',
             onSelected: (action) {
               switch (action) {
+                case 'copy':
+                  onCopy();
                 case 'rename':
                   onRename?.call();
                 case 'close':
@@ -444,6 +457,11 @@ class _Toolbar extends StatelessWidget {
               }
             },
             itemBuilder: (context) => const [
+              PopupMenuItem(
+                key: ValueKey('menu-copy-text'),
+                value: 'copy',
+                child: Text('Copy text…'),
+              ),
               PopupMenuItem(value: 'rename', child: Text('Rename tab')),
               PopupMenuItem(value: 'close', child: Text('Close tab')),
               PopupMenuItem(value: 'bigger', child: Text('Larger text')),
