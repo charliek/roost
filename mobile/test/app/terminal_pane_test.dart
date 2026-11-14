@@ -227,6 +227,25 @@ void main() {
       expect(find.text('Link copied'), findsOneWidget);
     });
 
+    testWidgets('a program in the tab copies to the clipboard (OSC 52)', (
+      tester,
+    ) async {
+      final copied = await mockClipboard(tester);
+      await _openTab(tester, 13, width: 400);
+      await _focusTerminal(tester);
+      tester.testTextInput.updateEditingValue(
+        const TextEditingValue(
+          text: '  copy https://claude.com/x?a=1',
+          selection: TextSelection.collapsed(offset: 31),
+        ),
+      );
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pumpAndSettle();
+      expect(copied, ['https://claude.com/x?a=1']);
+      expect(find.text('Copied from the terminal'), findsOneWidget);
+    });
+
     testWidgets('the tab menu opens it too, and copies the whole screen', (
       tester,
     ) async {

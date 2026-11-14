@@ -319,3 +319,11 @@ final class Exited extends TerminalEvent {
 
   final int code;
 }
+
+/// A program in the tab wrote the clipboard (OSC 52), as Claude Code's
+/// "c to copy" does. Only the tab on screen gets one.
+final class ClipboardWrite extends TerminalEvent {
+  const ClipboardWrite(this.text);
+
+  final String text;
+}

@@ -227,11 +227,12 @@ pub enum BridgeTerminalEventKind {
     Status,
     Owner,
     Exited,
+    Clipboard,
 }
 
 /// `TerminalEvent`, flattened: `state` and `message` for `Status`;
 /// `owner_label`, `is_me`, `cols`, `rows` for `Owner`; `exit_code` for
-/// `Exited`.
+/// `Exited`; `text` for `Clipboard`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeTerminalEvent {
     pub kind: BridgeTerminalEventKind,
@@ -242,6 +243,7 @@ pub struct BridgeTerminalEvent {
     pub cols: u16,
     pub rows: u16,
     pub exit_code: i32,
+    pub text: Option<String>,
 }
 
 impl From<TerminalEvent> for BridgeTerminalEvent {
@@ -255,6 +257,7 @@ impl From<TerminalEvent> for BridgeTerminalEvent {
             cols: 0,
             rows: 0,
             exit_code: 0,
+            text: None,
         };
         match event {
             TerminalEvent::FrameReady => plain(BridgeTerminalEventKind::FrameReady),
@@ -278,6 +281,10 @@ impl From<TerminalEvent> for BridgeTerminalEvent {
             TerminalEvent::Exited { code } => Self {
                 exit_code: code,
                 ..plain(BridgeTerminalEventKind::Exited)
+            },
+            TerminalEvent::Clipboard { text } => Self {
+                text: Some(text),
+                ..plain(BridgeTerminalEventKind::Clipboard)
             },
         }
     }

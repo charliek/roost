@@ -131,7 +131,9 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
         unawaited(session.close());
         return;
       }
-      final tab = AttachedTab(session)..addListener(_onTabChanged);
+      final tab = AttachedTab(session)
+        ..addListener(_onTabChanged)
+        ..onClipboardWrite = _onClipboardWrite;
       setState(() {
         _tab = tab;
         _attaching = false;
@@ -198,6 +200,14 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
     final tab = _tab;
     if (text == null || text.isEmpty || tab == null) return;
     _fire(tab.session.paste(text));
+  }
+
+  Future<void> _onClipboardWrite(String text) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!mounted) return;
+    ScaffoldMessenger.maybeOf(
+      context,
+    )?.showSnackBar(const SnackBar(content: Text('Copied from the terminal')));
   }
 
   void _openCopy() {

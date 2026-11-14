@@ -638,7 +638,9 @@ class FakeTerminalSession implements TerminalSession {
   void _start({required bool take}) {
     _events.add(const StatusChanged(AttachState.attaching));
     if (take) _takeSize();
-    _tab.shell.addListener(_onShellChanged);
+    _tab.shell
+      ..addListener(_onShellChanged)
+      ..onClipboardWrite = _clipboardWrite;
     _events.add(const StatusChanged(AttachState.live));
     _announceOwner();
     _signalFrame();
@@ -678,9 +680,16 @@ class FakeTerminalSession implements TerminalSession {
     _shutdown();
   }
 
+  void _clipboardWrite(String text) {
+    if (!closed) _events.add(ClipboardWrite(text));
+  }
+
   void _shutdown() {
     closed = true;
     _tab.shell.removeListener(_onShellChanged);
+    if (_tab.shell.onClipboardWrite == _clipboardWrite) {
+      _tab.shell.onClipboardWrite = null;
+    }
     _core.sessions.remove(this);
     unawaited(_events.close());
   }

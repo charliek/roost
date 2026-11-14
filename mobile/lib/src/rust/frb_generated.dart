@@ -1464,8 +1464,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   BridgeTerminalEvent dco_decode_bridge_terminal_event(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 8)
-      throw Exception('unexpected arr length: expect 8 but see ${arr.length}');
+    if (arr.length != 9)
+      throw Exception('unexpected arr length: expect 9 but see ${arr.length}');
     return BridgeTerminalEvent(
       kind: dco_decode_bridge_terminal_event_kind(arr[0]),
       state: dco_decode_bridge_attach_state(arr[1]),
@@ -1475,6 +1475,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       cols: dco_decode_u_16(arr[5]),
       rows: dco_decode_u_16(arr[6]),
       exitCode: dco_decode_i_32(arr[7]),
+      text: dco_decode_opt_String(arr[8]),
     );
   }
 
@@ -1871,6 +1872,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     final var_cols = sse_decode_u_16(deserializer);
     final var_rows = sse_decode_u_16(deserializer);
     final var_exitCode = sse_decode_i_32(deserializer);
+    final var_text = sse_decode_opt_String(deserializer);
     return BridgeTerminalEvent(
       kind: var_kind,
       state: var_state,
@@ -1880,6 +1882,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       cols: var_cols,
       rows: var_rows,
       exitCode: var_exitCode,
+      text: var_text,
     );
   }
 
@@ -2321,6 +2324,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_u_16(self.cols, serializer);
     sse_encode_u_16(self.rows, serializer);
     sse_encode_i_32(self.exitCode, serializer);
+    sse_encode_opt_String(self.text, serializer);
   }
 
   @protected

@@ -31,6 +31,9 @@ class AttachedTab extends ChangeNotifier {
   bool _framePending = false;
   bool _disposed = false;
 
+  /// A program in the tab wrote the clipboard.
+  ValueChanged<String>? onClipboardWrite;
+
   /// Bumped on every FrameReady: the view's ticker listens to it.
   final ValueNotifier<int> frameSignal = ValueNotifier(0);
 
@@ -55,6 +58,8 @@ class AttachedTab extends ChangeNotifier {
         exitCode = code;
         state = AttachState.ended;
         notifyListeners();
+      case ClipboardWrite(:final text):
+        onClipboardWrite?.call(text);
     }
   }
 

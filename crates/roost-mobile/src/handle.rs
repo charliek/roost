@@ -65,7 +65,7 @@ impl Attachment {
         lock(&self.stream).is_some()
     }
 
-    fn emit(&self, event: TerminalEvent) {
+    pub(crate) fn emit(&self, event: TerminalEvent) {
         let mut events = lock(&self.events);
         match &mut *events {
             Events::Buffered(buffer) => {

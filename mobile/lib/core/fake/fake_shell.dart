@@ -15,6 +15,10 @@ class FakeShell extends ChangeNotifier {
   final FakeScreen screen = FakeScreen();
   String _line = '';
 
+  /// What `copy <text>` writes, as a program's OSC 52 would: set by the
+  /// session attached to this tab.
+  ValueChanged<String>? onClipboardWrite;
+
   String get line => _line;
 
   /// The screen changed behind the shell's back (a resize by another client).
@@ -157,9 +161,11 @@ class FakeShell extends ChangeNotifier {
             attrs: RunAttrs.bold,
           )
           ..write('README.md\n');
+      case 'copy':
+        onClipboardWrite?.call(cmd.substring(4).trim());
       case 'help':
         screen.write(
-          'fake shell: echo, ls, clear, colors, help\n',
+          'fake shell: echo, ls, clear, colors, copy, help\n',
           fg: FakeColors.muted,
         );
       case 'colors':

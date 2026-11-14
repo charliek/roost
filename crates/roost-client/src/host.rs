@@ -19,8 +19,9 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use roost_ipc::client::{ClientError, EventFrame, EventStream, ServerCode};
 use roost_ipc::messages::{
-    ops, ClientHelloParams, EventBatch, NotificationFiredEvent, SessionIdentify,
-    SessionIdentifyParams, TabListResult,
+    bytes_base64, ops, ClientHelloParams, ClipboardEffectTarget, EventBatch, EventEnvelope,
+    NotificationFiredEvent, SessionIdentify, SessionIdentifyParams, TabEffect, TabEffectEvent,
+    TabListResult,
 };
 use roost_ipc::session_launch::IPC_TIMEOUT;
 use roost_ipc::IpcClient;
@@ -101,6 +102,15 @@ pub enum HostEvent {
         tab_id: i64,
         title: String,
         body: String,
+    },
+    /// A `tab.effect` clipboard write (a program's OSC 52), decoded. Every
+    /// subscriber gets every tab's; applying only the one for the tab on
+    /// screen is the client's call (`ipc.md`, `events.subscribe`). **The
+    /// text is user data: never log it.**
+    Clipboard {
+        tab_id: i64,
+        target: ClipboardEffectTarget,
+        text: String,
     },
 }
 
@@ -730,6 +740,12 @@ fn apply(mirror: &SharedMirror, batch: &EventBatch, publish: &impl Fn(HostEvent)
         publish(HostEvent::Workspace);
     }
     for envelope in &batch.events {
+        if envelope.event == ops::EVENT_TAB_EFFECT {
+            if let Some(event) = clipboard_write(envelope) {
+                publish(event);
+            }
+            continue;
+        }
         if envelope.event != ops::EVENT_NOTIFICATION_FIRED {
             continue;
         }
@@ -742,6 +758,38 @@ fn apply(mirror: &SharedMirror, batch: &EventBatch, publish: &impl Fn(HostEvent)
             Err(error) => tracing::debug!(%error, "notification.fired did not decode"),
         }
     }
+}
+
+/// A `tab.effect` envelope as [`HostEvent::Clipboard`], or `None` for any
+/// other effect (a bell, or one this build does not know) and for a write
+/// whose payload is not base64 of UTF-8 text. That is rejected rather than
+/// repaired, as the desktop does: replacement characters must not reach a
+/// clipboard.
+fn clipboard_write(envelope: &EventEnvelope) -> Option<HostEvent> {
+    let effect = match serde_json::from_value::<TabEffectEvent>(envelope.data.clone()) {
+        Ok(effect) => effect,
+        Err(error) => {
+            tracing::debug!(%error, "tab.effect did not decode");
+            return None;
+        }
+    };
+    if effect.effect.as_str() != TabEffect::CLIPBOARD_WRITE {
+        return None;
+    }
+    let tab_id = effect.tab_id;
+    let bytes = effect
+        .data
+        .as_deref()
+        .and_then(|data| bytes_base64::decode(data).ok());
+    let Some(text) = bytes.and_then(|bytes| String::from_utf8(bytes).ok()) else {
+        tracing::debug!(tab_id, "clipboard write with no UTF-8 payload; dropped");
+        return None;
+    };
+    Some(HostEvent::Clipboard {
+        tab_id,
+        target: effect.target.unwrap_or_default(),
+        text,
+    })
 }
 
 /// Run one op and answer its caller. `Err` means the connection is
@@ -809,6 +857,61 @@ mod tests {
             libghostty_build: "ghostty-a".into(),
             session_id: "s1".into(),
             ..SessionIdentify::default()
+        }
+    }
+
+    fn effect(data: serde_json::Value) -> EventEnvelope {
+        EventEnvelope {
+            event: ops::EVENT_TAB_EFFECT.into(),
+            data,
+        }
+    }
+
+    #[test]
+    fn a_clipboard_effect_becomes_its_decoded_text() {
+        let write = effect(serde_json::json!({
+            "tab_id": "7",
+            "effect": "clipboard-write",
+            "data": bytes_base64::encode("https://claude.com/x?a=1".as_bytes()),
+        }));
+        assert_eq!(
+            clipboard_write(&write),
+            Some(HostEvent::Clipboard {
+                tab_id: 7,
+                target: ClipboardEffectTarget::System,
+                text: "https://claude.com/x?a=1".into(),
+            })
+        );
+        let selection = effect(serde_json::json!({
+            "tab_id": "7",
+            "effect": "clipboard-write",
+            "data": bytes_base64::encode(b"p"),
+            "target": "selection",
+        }));
+        assert!(matches!(
+            clipboard_write(&selection),
+            Some(HostEvent::Clipboard {
+                target: ClipboardEffectTarget::Selection,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_bell_an_unknown_effect_and_a_bad_payload_are_not_clipboard_writes() {
+        for data in [
+            serde_json::json!({"tab_id": "7", "effect": "bell"}),
+            serde_json::json!({"tab_id": "7", "effect": "confetti", "data": "aGk="}),
+            serde_json::json!({"tab_id": "7", "effect": "clipboard-write"}),
+            serde_json::json!({"tab_id": "7", "effect": "clipboard-write", "data": "%%%"}),
+            serde_json::json!({
+                "tab_id": "7",
+                "effect": "clipboard-write",
+                "data": bytes_base64::encode(&[0xff, 0xfe]),
+            }),
+            serde_json::json!({"effect": "clipboard-write"}),
+        ] {
+            assert_eq!(clipboard_write(&effect(data.clone())), None, "{data}");
         }
     }
 

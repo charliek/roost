@@ -24,13 +24,14 @@ use base64::Engine;
 use roost_client::attach::{AttachRequest, AttachStream};
 use roost_client::dial::{Dialer, UnixDialer};
 use roost_client::host::{HostCallError, HostClient, HostClientConfig, HostEvent};
+use roost_ipc::messages::ClipboardEffectTarget;
 use roost_ssh::{HostKeyPolicy, TailscaleSshDialer};
 use roost_ui_model::theme::Theme;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::handle::{self, Attachment, TerminalHandle};
 use crate::live::Live;
-use crate::owner::{OwnerConfig, TerminalId, TerminalOwner};
+use crate::owner::{OwnerConfig, TerminalEvent, TerminalId, TerminalOwner};
 use crate::registry::{self, HostRecord, Target};
 use crate::terminal::Geometry;
 use crate::views::{self, HostStateView, HostView, NotificationView, WorkspaceView};
@@ -260,6 +261,15 @@ impl Inner {
     }
 
     fn host_event(&self, host_id: &str, serial: u64, event: HostEvent) {
+        if let HostEvent::Clipboard {
+            tab_id,
+            target,
+            text,
+        } = event
+        {
+            self.clipboard_write(host_id, serial, tab_id, target, text);
+            return;
+        }
         let mut notification = None;
         let workspace_moved = self
             .with_slot(host_id, |slot| {
@@ -291,6 +301,7 @@ impl Inner {
                         });
                         false
                     }
+                    HostEvent::Clipboard { .. } => false,
                 }
             })
             .unwrap_or(false);
@@ -305,6 +316,37 @@ impl Inner {
             self.emit_workspace(host_id);
         }
         self.emit_hosts();
+    }
+
+    /// A program's clipboard write lands only on a terminal of that tab that
+    /// is streaming, which is one on screen: `ipc.md` leaves it to each
+    /// client to apply only the tab it is viewing, so a write from a tab in
+    /// the background, or one this device merely mirrors, is dropped. The
+    /// phone has no selection clipboard, so a write aimed there is too.
+    fn clipboard_write(
+        &self,
+        host_id: &str,
+        serial: u64,
+        tab_id: i64,
+        target: ClipboardEffectTarget,
+        text: String,
+    ) {
+        if target != ClipboardEffectTarget::System {
+            return;
+        }
+        let current = self
+            .with_slot(host_id, |slot| slot.serial == serial && slot.conn.is_some())
+            .unwrap_or(false);
+        if !current {
+            return;
+        }
+        let viewing = self
+            .attachments_of(Some(host_id))
+            .into_iter()
+            .find(|attachment| attachment.tab_id == tab_id && attachment.streaming());
+        if let Some(attachment) = viewing {
+            attachment.emit(TerminalEvent::Clipboard { text });
+        }
     }
 
     /// A new stream for `tab_id` on `host_id`'s connection.

@@ -50,6 +50,11 @@ pub enum TerminalEvent {
     Exited {
         code: i32,
     },
+    /// A program in the tab wrote the clipboard (OSC 52). Only the tab on
+    /// screen gets this; never logged.
+    Clipboard {
+        text: String,
+    },
 }
 
 /// What a tab hands back to whoever holds its attach stream.
