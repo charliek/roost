@@ -7,8 +7,9 @@
 #
 # secrets-dir defaults to $ROOST_SECRETS_DIR, else .secrets/ in the main
 # checkout (found through git's common dir, so a worktree gets it too). The
-# properties file's storeFile must be absolute: Gradle resolves a relative one
-# against mobile/android/app/, wherever the link points.
+# properties file's storeFile is absolute, or relative to the directory the
+# properties file is in, which is what lets one file synced through envsecrets
+# serve every machine, whatever its home directory.
 #
 # Without the link, release builds are signed with the debug key
 # (mobile/android/app/build.gradle.kts).
@@ -31,7 +32,7 @@ done
 store=$(sed -n 's/^storeFile=//p' "${props}")
 case "${store}" in
   /*) ;;
-  *) fail "storeFile in ${props} is not an absolute path" ;;
+  *) store="${secrets}/${store}" ;;
 esac
 [ -f "${store}" ] || fail "the keystore ${store} does not exist"
 

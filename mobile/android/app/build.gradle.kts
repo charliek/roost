@@ -63,7 +63,11 @@ android {
     signingConfigs {
         if (releaseKey != null) {
             create("release") {
-                storeFile = file(releaseKey.required("storeFile"))
+                // A relative storeFile is beside the properties file the
+                // link points at (tools/mobile/link-signing.sh).
+                storeFile =
+                    keyPropertiesFile.toPath().toRealPath().parent
+                        .resolve(releaseKey.required("storeFile")).toFile()
                 storePassword = releaseKey.required("storePassword")
                 keyAlias = releaseKey.required("keyAlias")
                 keyPassword = releaseKey.required("keyPassword")
