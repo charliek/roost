@@ -13,11 +13,15 @@ const _sheetFontSize = 13.0;
 
 /// The terminal is a canvas, so its text cannot be selected in place: this
 /// sheet shows the screen as selectable text, with its links listed whole.
-Future<void> showCopySheet(BuildContext context, TerminalModel model) {
+/// [onCopied] names what a button copied ("Link", "Screen").
+Future<void> showCopySheet(
+  BuildContext context,
+  TerminalModel model, {
+  ValueChanged<String>? onCopied,
+}) {
   final text = screenText(model);
   final urls = screenUrls(model);
   final cols = model.cols;
-  final messenger = ScaffoldMessenger.maybeOf(context);
   return showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
@@ -27,7 +31,7 @@ Future<void> showCopySheet(BuildContext context, TerminalModel model) {
       Future<void> copy(String value, String what) async {
         await Clipboard.setData(ClipboardData(text: value));
         if (sheet.mounted) Navigator.of(sheet).pop();
-        messenger?.showSnackBar(SnackBar(content: Text('$what copied')));
+        onCopied?.call(what);
       }
 
       return _CopySheet(

@@ -246,6 +246,27 @@ void main() {
       expect(find.text('Copied from the terminal'), findsOneWidget);
     });
 
+    testWidgets('a burst of copies shows one notice that leaves the bar free', (
+      tester,
+    ) async {
+      final copied = await mockClipboard(tester);
+      final core = await _openTab(tester, 13, width: 400);
+      await _focusTerminal(tester);
+      final shell = core.shellOf('devbox', 13);
+      for (var i = 0; i < 10; i++) {
+        shell.onClipboardWrite!('copy $i');
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      await tester.pump();
+      expect(copied, hasLength(10));
+      expect(find.text('Copied from the terminal'), findsOneWidget);
+      await tester.tap(byKey('extra-key-up'));
+      await tester.pump();
+      expect(lastSession(core).keys, [const KeyInput('ArrowUp')]);
+      await tester.pump(noticeDuration);
+      expect(find.text('Copied from the terminal'), findsNothing);
+    });
+
     testWidgets('the tab menu opens it too, and copies the whole screen', (
       tester,
     ) async {

@@ -24,6 +24,9 @@ const hardwareKeyboardWindow = Duration(minutes: 2);
 /// A local scroll has settled this long after its last step.
 const scrollSettle = Duration(milliseconds: 500);
 
+/// How long a "copied" notice stays after the last copy.
+const noticeDuration = Duration(milliseconds: 1500);
+
 /// One tab on screen: attaches it (taking its size) once the view knows its
 /// grid, routes every kind of input to it, and detaches when it goes away.
 class TerminalPane extends ConsumerStatefulWidget {
@@ -62,6 +65,8 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
   bool _alt = false;
   DateTime? _hardwareKeyAt;
   Timer? _scrollSettle;
+  String? _notice;
+  Timer? _noticeTimer;
 
   RoostCore get _core => ref.read(coreProvider);
 
@@ -75,6 +80,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
   void dispose() {
     _attachSeq++;
     _scrollSettle?.cancel();
+    _noticeTimer?.cancel();
     _detach();
     _focus
       ..removeListener(_onFocusChange)
@@ -202,18 +208,35 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
     _fire(tab.session.paste(text));
   }
 
+  /// A notice over the terminal rather than a snackbar: a snackbar would sit
+  /// on the extra-keys or quick-reply bar and take its taps, and a program
+  /// that copies on every edit would queue one per copy. A new notice
+  /// replaces the one showing.
+  void _showNotice(String text) {
+    _noticeTimer?.cancel();
+    setState(() => _notice = text);
+    _noticeTimer = Timer(noticeDuration, () {
+      if (mounted) setState(() => _notice = null);
+    });
+  }
+
   Future<void> _onClipboardWrite(String text) async {
     await Clipboard.setData(ClipboardData(text: text));
-    if (!mounted) return;
-    ScaffoldMessenger.maybeOf(
-      context,
-    )?.showSnackBar(const SnackBar(content: Text('Copied from the terminal')));
+    if (mounted) _showNotice('Copied from the terminal');
   }
 
   void _openCopy() {
     final tab = _tab;
     if (tab == null || !tab.model.hasFrame) return;
-    unawaited(showCopySheet(context, tab.model));
+    unawaited(
+      showCopySheet(
+        context,
+        tab.model,
+        onCopied: (what) {
+          if (mounted) _showNotice('$what copied');
+        },
+      ),
+    );
   }
 
   void _scroll(int rows, int col, int row) {
@@ -339,6 +362,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
                     onLongPress: _openCopy,
                   ),
                 ),
+                if (_notice != null) _Notice(text: _notice!),
                 _StatusOverlay(
                   attaching: _attaching,
                   error: _attachError,
@@ -580,6 +604,36 @@ class _StatusOverlay extends StatelessWidget {
                 if (retry)
                   TextButton(onPressed: onRetry, child: const Text('Reattach')),
               ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _Notice extends StatelessWidget {
+  const _Notice({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: Align(
+        alignment: Alignment.bottomCenter,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Material(
+            key: const ValueKey('terminal-notice'),
+            color: RoostColors.surfaceHighest,
+            shape: RoundedRectangleBorder(
+              side: const BorderSide(color: RoostColors.border),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              child: Text(text, style: Theme.of(context).textTheme.bodyMedium),
             ),
           ),
         ),
