@@ -4032,7 +4032,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "toml_edit",
  "tracing",
 ]
@@ -4066,7 +4066,7 @@ dependencies = [
  "roost-ui-model",
  "roost-vt",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
 ]
@@ -4088,7 +4088,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4144,7 +4144,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
 ]
@@ -4166,7 +4166,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
 ]
@@ -4215,7 +4215,7 @@ dependencies = [
  "russh",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4250,7 +4250,7 @@ dependencies = [
  "base64",
  "bindgen",
  "png",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "tracing",
  "unicode-width",
 ]
