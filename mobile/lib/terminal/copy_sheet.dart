@@ -34,7 +34,20 @@ Future<void> showCopySheet(
       Future<void> copy(String value, String what) async {
         if (copying) return;
         copying = true;
-        await Clipboard.setData(ClipboardData(text: value));
+        try {
+          await Clipboard.setData(ClipboardData(text: value));
+        } catch (error, stack) {
+          copying = false;
+          FlutterError.reportError(
+            FlutterErrorDetails(
+              exception: error,
+              stack: stack,
+              library: 'roost',
+              context: ErrorDescription('while copying to the clipboard'),
+            ),
+          );
+          return;
+        }
         if (sheet.mounted) Navigator.of(sheet).pop();
         onCopied?.call(what);
       }

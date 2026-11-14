@@ -35,7 +35,7 @@ sdk_roots() {
 
 # readelf from PATH, else the NDK's llvm-readelf: macOS has no readelf.
 readelf_bin() {
-  local tool ndk root
+  local tool ndk root found
   for tool in llvm-readelf readelf; do
     if command -v "${tool}" >/dev/null 2>&1; then
       command -v "${tool}"
@@ -44,14 +44,20 @@ readelf_bin() {
   done
   for ndk in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}"; do
     if [ -z "${ndk}" ] || [ ! -d "${ndk}/toolchains" ]; then continue; fi
-    find "${ndk}/toolchains" -path '*/llvm/prebuilt/*/bin/llvm-readelf' | head -n 1
-    return
+    found="$(find "${ndk}/toolchains" -path '*/llvm/prebuilt/*/bin/llvm-readelf' | head -n 1)"
+    if [ -n "${found}" ]; then
+      echo "${found}"
+      return
+    fi
   done
   while read -r root; do
     [ -d "${root}/ndk" ] || continue
-    find "${root}/ndk" -maxdepth 7 -path '*/toolchains/llvm/prebuilt/*/bin/llvm-readelf' |
-      sort -V | tail -n 1
-    return
+    found="$(find "${root}/ndk" -maxdepth 7 -path '*/toolchains/llvm/prebuilt/*/bin/llvm-readelf' |
+      sort -V | tail -n 1)"
+    if [ -n "${found}" ]; then
+      echo "${found}"
+      return
+    fi
   done < <(sdk_roots)
 }
 
@@ -63,15 +69,18 @@ fi
 readelf=("${readelf_path}" -l -W)
 
 zipalign_bin() {
-  local root
+  local root found
   if command -v zipalign >/dev/null 2>&1; then
     command -v zipalign
     return
   fi
   while read -r root; do
     [ -d "${root}/build-tools" ] || continue
-    find "${root}/build-tools" -mindepth 2 -maxdepth 2 -name zipalign -type f | sort -V | tail -n 1
-    return
+    found="$(find "${root}/build-tools" -mindepth 2 -maxdepth 2 -name zipalign -type f | sort -V | tail -n 1)"
+    if [ -n "${found}" ]; then
+      echo "${found}"
+      return
+    fi
   done < <(sdk_roots)
 }
 
