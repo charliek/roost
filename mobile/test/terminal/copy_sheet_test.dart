@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:roost_mobile/app/theme.dart';
 import 'package:roost_mobile/terminal/copy_sheet.dart';
@@ -123,6 +126,67 @@ void main() {
       findsNothing,
       reason: 'the selection scrolled out of sight above the text',
     );
+  });
+
+  testWidgets('a second copy tap before the first lands copies nothing more', (
+    tester,
+  ) async {
+    final copied = <String>[];
+    // The platform's reply waits for the test, as a real round trip does.
+    final replies = <Completer<void>>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied.add((call.arguments as Map)['text'] as String);
+          final reply = Completer<void>();
+          replies.add(reply);
+          await reply.future;
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    final model = _fullRows(['see https://a.io/x']);
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: roostDarkTheme(),
+        home: Builder(
+          builder: (context) => TextButton(
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (context) => Scaffold(
+                  body: TextButton(
+                    onPressed: () => showCopySheet(context, model),
+                    child: const Text('terminal'),
+                  ),
+                ),
+              ),
+            ),
+            child: const Text('home'),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('home'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('terminal'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('copy-all')));
+    await tester.tap(find.byKey(const ValueKey('copy-url-0')));
+    for (final reply in replies) {
+      reply.complete();
+    }
+    await tester.pumpAndSettle();
+    expect(copied, ['see https://a.io/x']);
+    expect(find.byKey(const ValueKey('copy-sheet')), findsNothing);
+    expect(find.text('terminal'), findsOneWidget, reason: 'its route stays');
   });
 
   testWidgets('a selection that starts above the viewport keeps its menu', (

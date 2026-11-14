@@ -22,6 +22,9 @@ Future<void> showCopySheet(
   final text = screenText(model);
   final urls = screenUrls(model);
   final cols = model.cols;
+  // One copy per sheet: a second tap while the first write is in flight
+  // would otherwise pop the route under the closing sheet.
+  var copying = false;
   return showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
@@ -29,6 +32,8 @@ Future<void> showCopySheet(
     backgroundColor: RoostColors.surface,
     builder: (sheet) {
       Future<void> copy(String value, String what) async {
+        if (copying) return;
+        copying = true;
         await Clipboard.setData(ClipboardData(text: value));
         if (sheet.mounted) Navigator.of(sheet).pop();
         onCopied?.call(what);
