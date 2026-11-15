@@ -1,9 +1,10 @@
 # Agent state golden fixtures
 
 Canonical corpus for the agent state machine defined in plan 002 §3.2 /
-§3.3 — `crates/roost-ipc/src/agent.rs`. The loader asserts every
-expectation, so a change to the state machine surfaces here rather than
-in a user's sidebar.
+§3.3 — `crates/roost-ipc/src/agent.rs` — and for the process layer's
+decisions (#621) in `crates/roost-ipc/src/process.rs`. The loader asserts
+every expectation, so a change to the state machine surfaces here rather
+than in a user's sidebar.
 
 Loader:
 
@@ -137,7 +138,55 @@ strictly decreasing across `order_high_to_low`.
 - `A`/`B`/`D` also drop the lifecycle to `inactive` while retaining
   ownership. This is the failsafe that stops a killed agent from muting
   a tab forever, so `owner_retained: true` alongside
-  `lifecycle: "inactive"` is the point, not an oversight.
+  `lifecycle: "inactive"` is the point, not an oversight. These cases
+  are the mark **without process evidence**: what the process layer then
+  does to the owner (a release with the shell in front, a park with a
+  stamped agent stopped) is the `process` group's.
+
+### `group: "process"`
+
+The process layer's two decisions, one table each. `marks` is
+`at_mark(layer, stamp, relayed, fg)` — what an `A`/`B`/`D` mark does to a
+layer beyond its own effect; `samples` is `on_sample(stamp, liveness, fg)`
+— what a read of a stamped process does.
+
+```json
+{
+  "group": "process",
+  "marks": [
+    { "name": "…", "layer": "owner", "stamp": null, "fg": "shell", "expect": "release" }
+  ],
+  "samples": [
+    { "name": "…", "stamp": { "pid": 700, "start": [12345, 0], "pgid": 700, "sid": 500 },
+      "liveness": "gone", "fg": { "group": 900 }, "expect": "end" }
+  ]
+}
+```
+
+- `layer` ∈ `owner | records | identity` — the hook owner, the tab's
+  OSC 7501 records while they decide it, or an agent known only by its
+  process's name. An identity has nothing for a mark to set aside, so
+  its `park` is only a sample asked for.
+- `stamp` is `null` (nothing stamped) or the stamped process's
+  `{pid, start, pgid, sid}`; `start` is `[seconds_or_ticks, micros]`.
+- `relayed` (optional, default `false`): the layer has no stamp because
+  a multiplexer or a remote session (tmux, screen, zellij, ssh, mosh) led
+  the group in front when it was read for one. With a stamp it changes
+  nothing.
+- `fg` is who has the terminal: `"shell"` (the tab's shell, back in
+  front), `{"group": <pgid>}` (that group — the stamp's own, or another
+  job's), or `"unknown"`.
+- `liveness` ∈ `running | stopped | gone | unknown`.
+- `expect` for a mark ∈ `today | release | park`; for a sample ∈
+  `keep | restore | suspend | end`.
+
+The corpus covers every cell: each layer with no stamp against each
+foreground, each with a stamp against the shell, its own group, another
+job and nothing known; and every liveness against every foreground for a
+stamped layer. Three rules are the point: only `gone` with the stamp's
+group out of front ends anything, a stopped process always suspends, and
+a relayed owner is never released by a mark — a tmux detach puts the
+shell back in front while the agent lives on behind it.
 
 ### The `ownership` object
 

@@ -156,6 +156,9 @@ pub trait ServerVtWorkspace: Send + Sync + 'static {
         rows: u16,
         owner: Option<SizeOwner>,
     );
+    /// A viewer attached to the tab or detached from it: the only focus a
+    /// session sees, so the tab's process layer reads its processes.
+    fn tab_viewers_changed(&self, _tab_id: i64) {}
 }
 
 impl ServerVtWorkspace for crate::Workspace {
@@ -200,6 +203,10 @@ impl ServerVtWorkspace for crate::Workspace {
         owner: Option<SizeOwner>,
     ) {
         self.publish_tab_resized(tab_id, generation, cols, rows, owner);
+    }
+
+    fn tab_viewers_changed(&self, tab_id: i64) {
+        self.request_process_sample(tab_id);
     }
 }
 
@@ -1673,6 +1680,7 @@ impl TabTask {
                     provisional,
                     winsize,
                 });
+                self.vt.state.workspace.tab_viewers_changed(self.tab_id);
             }
             TabCmd::AttachCommitted { id } => {
                 self.decide(|sizes, _| sizes.commit(id));
@@ -1680,6 +1688,7 @@ impl TabTask {
             TabCmd::Detach { id, deliberate } => {
                 let now = self.now_ms();
                 self.decide(|sizes, sizer| sizes.detach(id, deliberate, now, sizer));
+                self.vt.state.workspace.tab_viewers_changed(self.tab_id);
             }
             TabCmd::Resize {
                 id,

@@ -63,6 +63,8 @@ struct TestWorkspace {
     pipelines: Mutex<HashMap<i64, u64>>,
     gate: Mutex<bool>,
     released: Condvar,
+    /// Every tab a viewer attached to or detached from, in call order.
+    viewed: Mutex<Vec<i64>>,
 }
 
 impl TestWorkspace {
@@ -93,6 +95,10 @@ impl TestWorkspace {
 
     fn resized(&self) -> Vec<Resized> {
         self.resized.lock().unwrap().clone()
+    }
+
+    fn viewed(&self) -> Vec<i64> {
+        self.viewed.lock().unwrap().clone()
     }
 }
 
@@ -167,6 +173,10 @@ impl ServerVtWorkspace for TestWorkspace {
             .lock()
             .unwrap()
             .push((tab_id, cols, rows, owner));
+    }
+
+    fn tab_viewers_changed(&self, tab_id: i64) {
+        self.viewed.lock().unwrap().push(tab_id);
     }
 }
 
@@ -1353,6 +1363,42 @@ async fn an_owners_cell_size_change_alone_is_announced_once() {
 
     drop(commands);
     sup.close(940);
+}
+
+/// A session knows a viewer only by its attach and its detach, so each
+/// tells the workspace, whose process layer then reads the tab (#519).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_and_a_detach_each_tell_the_workspace() {
+    let (sup, workspace) = enabled_supervisor(false);
+    let _tee = sup
+        .spawn(
+            945,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("viewers"),
+            &TabOpener::None,
+        )
+        .expect("spawn");
+    let commands = sup.tab_commands(945).expect("server-vt tab task");
+
+    attached(&commands, 945, 1, "a", true, geometry(80, 24, 8, 16)).await;
+    quiesce(&commands).await;
+    assert_eq!(workspace.viewed(), vec![945]);
+
+    commands
+        .send(TabCmd::Detach {
+            id: 1,
+            deliberate: true,
+        })
+        .await
+        .expect("tab task is alive");
+    quiesce(&commands).await;
+    assert_eq!(workspace.viewed(), vec![945, 945]);
+
+    drop(commands);
+    sup.close(945);
 }
 
 /// A same-grid handoff to a client with other cells moves the session

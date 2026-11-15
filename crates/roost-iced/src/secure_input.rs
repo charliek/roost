@@ -340,6 +340,7 @@ mod tests {
             password_input,
             dropped_reports: None,
             program_status: None,
+            process: None,
         }
     }
 

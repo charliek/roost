@@ -4116,6 +4116,49 @@ def test_a_session_tabs_record_reaches_the_mirror_survives_a_reconnect_and_clear
         )
 
 
+def test_a_session_tabs_suspended_agent_reads_suspended_through_the_mirror(host, roost):
+    """The process layer through a host (#519, plan 3a E9): the session
+    stamps and samples its own tab's processes, and the client's mirror
+    only carries `Tab.process` off the wire. A 7501 agent stopped with
+    Ctrl-Z reads Suspended on the host's Agents row — its record set
+    aside, so the row comes from `process` alone — and Working again
+    after `fg`; killed, its row goes."""
+    from test_process_layer import Lane
+
+    host.connect_and_wait()
+    with host.client() as session:
+        project = first_project(session)
+
+        def open_tab(argv: list[str]) -> int:
+            return session.open_tab(
+                project, cwd=str(host.env.launch_cwd), cols=80, rows=24, argv=argv
+            )
+
+        lane = Lane("session", session, str(host.env.socket), open_tab)
+        tab, shell = lane.bash_tab()
+        pid = int(lane.stamped_record(tab, shell)["pid"])
+        key = wait_until(
+            lambda: host_tab_key(roost, host.saved_id, tab), 30.0, "the host's band to list the tab"
+        )
+
+        def shows(status: str):
+            entry = panel_agent(roost, key)
+            if entry is None or entry["dimmed"] or entry["status_text"] != status:
+                return None
+            return entry
+
+        wait_until(lambda: shows("Working"), 30.0, "the record on the mirror")
+        session.send(tab, b"\x1a")
+        entry = wait_until(lambda: shows("Suspended"), 30.0, "the suspended agent on the mirror")
+        assert (entry["agent"], entry["lifecycle"]) == ("Codex", "inactive"), entry
+
+        session.send(tab, "fg\n")
+        wait_until(lambda: shows("Working"), 30.0, "the agent running again on the mirror")
+
+        os.kill(pid, 9)
+        wait_until(lambda: panel_agent(roost, key) is None, 30.0, "the row to leave the mirror")
+
+
 def test_the_mirror_shows_the_sessions_reading_of_a_prompt_mark(host, roost):
     """Plan 083 B-2: the client runs no hook path for a host tab; its
     mirror takes the shell axis and lifecycle off the wire, so it shows

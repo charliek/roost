@@ -592,7 +592,8 @@ live on 0.165.0):
 - A same-agent report replaces a live session only for start sources
   `clear`, `resume` and `compact`, never `startup`
   (`session_report_allows_session_replacement`, `:1385`). This is the
-  rule #623 cites.
+  rule #623 cites. Roost applies it to Claude only (#623): a Codex claim
+  under a new session id still supersedes, `startup` included.
 - `agent prompt --wait` refuses a blocked agent. Resume argv is reported
   by integrations and re-run after a server restart
   (`src/agent_resume.rs`).
@@ -722,13 +723,21 @@ side's text is dropped and counted.
 | Hook lifecycle | as today; + owner's process gone | fixes "stuck running" without marks (#519) |
 | Late hook from a dead process's session | refused until a new claim from a live process | herdr's rule |
 
-The stamp is `(pid, start time)`, taken through the pid-reuse-safe path
-`ForegroundLeader` already uses for cwd (`pty.rs:2377-2420`). A record is
-stamped with the leader at receipt, an owner with the leader at its
-claim. The process is sampled at every prompt mark, hook report and tab
-focus, and on a 1 s tick **only** for tabs with live state. That is
-evidence, not a TTL, so DL-14's no-TTL rule stands. A record over plain
-ssh is stamped `ssh` and ends when ssh exits.
+The stamp is `(pid, start time, pgid, sid)` of the **leader** of the
+group in front, taken through the pid-reuse-safe path `ForegroundLeader`
+uses for cwd (now `crates/roost-engine/src/foreground.rs`). It is taken at
+the first sample after the layer becomes live (an accepted claim, or the
+first live record), milliseconds after receipt rather than at it: the UI
+thread never reads `/proc`. Nothing is stamped when the shell's own group
+is in front, or when the leader is `tmux`, `screen`, `zellij`, `ssh` or
+`mosh`; those keep today's behaviour. For a multiplexer or remote session
+that includes the prompt mark: the owner is recorded as behind it and
+the #621 release skips it, since a tmux detach puts the shell back in
+front while the agent lives on. The process is sampled at hook
+reports, prompt marks that park, `C` marks on a stamped tab, and focus
+(attach and detach on a session), and on a 1 s tick **only** for tabs
+holding a stamp. That is evidence, not a TTL, so DL-14's no-TTL rule
+stands.
 
 ### Attribution by peer process (#623, #624)
 
@@ -782,7 +791,7 @@ doctor counter).
 | Error | R `error`; H StopFailure | failed | "Failed · <msg or class>" | "<Agent> failed" | `idle` |
 | Idle | R `idle`; H owner, inactive | none | "Idle" | none | `idle` |
 | Running, identity only | P | none | "<Agent> · running" | none | `none` or shell state |
-| Suspended | P (stopped) | none | "<Agent> · suspended" | none | `idle` |
+| Suspended | P (stopped) | none | "<Agent> · suspended" | none | `none` (decided D4: today's Ctrl-Z value, so `wait` and `tab prompt` keep their meaning) |
 | Exited | P exit | cleared | row goes | "<Agent> exited (<code>)" once, only when it held live state and the code is not 0 | shell state |
 | Children | R child records | parent's | nested rows under the agent row (top N); a blocked child lifts its kind into the parent | per child only if blocked | unchanged |
 
@@ -955,9 +964,12 @@ rule applies to Claude, Codex, Grok and cursor):
    under `/bin/sh` does exactly the same (Proven).
 
 **What changes.** Roost ends ownership, and any live state, once it sees
-in the process table that the agent is gone: the PTY's foreground process
-group is back to the shell, or the stamped pid has exited. A prompt mark
-alone is not enough. A stopped agent (Ctrl-Z) keeps ownership.
+in the process table that the agent is gone: the stamped process is gone
+(exited, a zombie, its pid reused, or out of the tab's session) **and**
+its group is no longer the PTY's foreground group. An unstamped owner is
+released at a prompt mark when the shell's own group is in front (#621).
+A prompt mark alone, with anything else in front, is not enough. A
+stopped agent (Ctrl-Z) keeps ownership.
 
 - Stale "Idle" rows disappear; a new agent can take the tab at once;
   notifications are never muted by a dead agent.
@@ -965,10 +977,11 @@ alone is not enough. A stopped agent (Ctrl-Z) keeps ownership.
   misleading row.
 - Hooked agents then behave the way 7501 rows already do in case 1.
 
-**Risk.** A wrapper that forks the real agent and exits (a `node` shim)
-could look like an exit; follow the process group, not only the leader
-pid (Phase 3's false-release risk). DL-14 and the shared state fixtures
-change.
+**Risk.** Stragglers left in the group (they never matter: the shell
+takes the terminal back when its own children exit), a launcher that
+outlives its agent and keeps the row until it exits (the leader is what
+is stamped), and stamping the wrong process (the leader is checked before
+and after its name is read). DL-14 and the shared state fixtures change.
 
 **Decided (Charlie, 2026-11-08): yes.** A small first step is #621 (release at an A/D
 mark when the foreground group is the shell), which fixes case 1. Phase
@@ -1156,8 +1169,9 @@ the composition layer).
   needs a change to its own settings file to report fully:"
 - **Cursor:** "Adds Roost's entries to ~/.cursor/hooks.json, because
   Cursor reads its turn-end hook only from that file. Without it, Roost
-  shows only that Cursor is running." (The last clause needs Phase 3a;
-  before that, "shows nothing for Cursor".)
+  shows only that Cursor is running." (The last clause needed Phase 3a's
+  fourth commit, which names an agent by its process; before that, the
+  card said "shows nothing for Cursor".)
 - **First-run footer:** "Change this, or switch any agent off, from Agent
   integration… in the command palette."
 - **First-run buttons:** "Decide later" (writes nothing; the card returns
@@ -1752,6 +1766,22 @@ pass](#third-pass-charlies-second-answers-and-phase-0-probes)):
 
 ### Phase 3: Process layer and attribution (XL as two plans; parallel with 1–2)
 
+Status (2026-11-14): 3a is planned (plan 3a, four commits on
+`feat/process-layer`); its first commit ships the readers, the owner's
+stamp and #621, its second the records' stamp, parking and the 1 s tick
+(#519). The records follow a process while they decide the tab, an
+unprompted idle root included: a Ctrl-Z most often stops an agent idle
+at its own prompt, and a killed one left idle would otherwise mute raw
+OSC and refuse other agents' claims forever in a shell with no marks.
+Its third commit sends `133;D;$?` and the exit banner. Its fourth names
+an agent by its process (a small comm and argv table), found when the
+tab gains or loses the focus, a session viewer comes or goes, or a `C`
+mark: cursor-agent with no hooks reads "Cursor · Running". Codex clears
+its own 7501 status as it stops, so the records' stamp passes to that
+identity when the shell's prompt mark has the terminal back, and a
+suspended Codex reads "Codex · Suspended". Node 24 names its main
+thread `MainThread`, which is what Linux reports as its name.
+
 - **Two plans.** 3a, the process layer (identity, stamps, end rules,
   `133;D;$?`, the DL-14 and DL-29 amendments), is L on its own. 3b, peer-pid
   attribution, is M: new socket code on two platforms (`SO_PEERCRED`'s pid
@@ -1783,8 +1813,9 @@ pass](#third-pass-charlies-second-answers-and-phase-0-probes)):
   - A nested fake `claude -p` under a fake Claude counts as nested.
   - The peer-pid tests run on macOS too (the macOS legs of CI's
     `rust-build` and `iced-build-e2e` jobs), not only Linux.
-  - A wrapper that forks the agent and exits (a `node` shim) does not end
-    the owner: the stamp follows the process group.
+  - A pipeline whose leader exits first keeps the owner while its group
+    is in front; a waiting wrapper whose agent is killed ends once the
+    wrapper exits; an exec shim keeps the stamp.
 - **Exit.** No stuck "running" after a kill, crash or `/exit` with marks
   off. Would-drop counts per reason are visible in doctor; they are not
   in `Tab.dropped_reports`, which holds only a total and the last drop.
@@ -2062,9 +2093,10 @@ backlog Plan C.
   an old `claude` on PATH.
 - **Reversing DL-14's label rule** changes the shared state fixtures. With
   Swift retired (DL-33) there is one port to keep in step.
-- **False release.** A wrapper that execs or forks and exits can look like
-  an exit. Follow the process group, not only the leader pid. herdr's tests
-  are a checklist.
+- **False release.** Only a gone stamped process whose group has left the
+  front ends anything, so a pipeline or a straggler keeps the owner and an
+  exec shim keeps its stamp. A launcher that outlives its agent keeps the
+  row until it exits. herdr's tests are a checklist.
 - **False `not_in_tab`.** A legitimate hook process outside the tab's
   session (tmux panes, an agent that runs hooks under `setsid`).
   Observe-only first.

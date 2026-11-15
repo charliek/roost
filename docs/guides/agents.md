@@ -14,7 +14,9 @@ them without editing their settings files**:
   crush and pi.
 - **Cursor** (cursor-agent) reads its turn-end hook only from its own
   `~/.cursor/hooks.json`, so it is the one agent Roost connects by
-  writing a file. That is an opt-in, off until you turn it on.
+  writing a file. That is an opt-in, off until you turn it on. Without
+  it, Roost still shows that Cursor is running ([agents known by
+  name](#agents-known-by-name)).
 
 All of these are on by default except Cursor, with no question asked.
 Roost shows a card at startup only when it has something to ask: Cursor
@@ -216,6 +218,13 @@ The rules you see:
   only in Screen Reader Mode, and they count the same way. The record
   layer and the hook layer read the same marks, in the same order, so
   [which forms count](#which-marks-count) is one rule for both.
+- **So does the agent's process.** While its records decide the tab,
+  Roost notes the agent's process, as it does for a hook claim. Once
+  that process is gone and the shell has the terminal back, its records
+  end as a prompt would end them — within about a second in a shell
+  that prints no prompt marks. A `Ctrl-Z` sets them aside instead: the
+  row reads **Suspended**, and after `fg` or `bg` they are back. See
+  [when a tab stays running](#when-a-tab-stays-running).
 - **One banner per change.** A record moving the tab into Waiting,
   Failed or Finished raises one desktop banner, titled with the
   record's title (else the agent's name) and carrying its message (else
@@ -490,21 +499,58 @@ predates Roost is written back empty rather than removed.
 
 An agent that is hard-killed — `kill -9`, a crash, a closed laptop lid
 over SSH — fires no `Stop`/`SessionEnd` hook, so its last lifecycle
-(`working`, `waiting`) stands with nothing to tell Roost otherwise, and
-the tab keeps showing the state that projects from it (`running`,
-`needs_input`).
+(`working`, `waiting`) stands with nothing from the agent to tell Roost
+otherwise.
 
 **What clears it.** Ownership is deliberately not TTL'd — Claude fires
 no periodic hook, so a long tool call would look stale and get released
-mid-turn — so the only thing that clears a stuck lifecycle is the
-shell's own OSC 133 prompt marks ([which forms
-count](#which-marks-count)). Reaching a fresh prompt (`A`/`B`) or a
-command ending (`D`) drops the lifecycle to `inactive` while *keeping*
-ownership as a label, so the tab falls through to shell-derived state
-instead of staying stuck. The marks clear the lifecycle because the
-shell has regained control of the terminal, not because the agent is
-proven gone — a suspended agent (`Ctrl-Z`) also returns the shell to a
-prompt while it's still alive in the background.
+mid-turn — so what clears a stuck tab is evidence from the tab itself:
+the shell's OSC 133 prompt marks ([which forms count](#which-marks-count))
+and the agent's own process.
+
+- **The agent's process.** When an agent claims a tab, or its OSC 7501
+  records start deciding it, the server that holds the tab notes the
+  process in front of the tab's terminal, and `roostctl tab list --json`
+  shows it as the tab's `process`. Once that process is gone and the
+  shell has the terminal back, the agent is released and its live
+  records end: its row leaves the Agents panel, the tab leaves
+  `running`, and raw notifications work again. Roost looks when the
+  shell prints its prompt mark, right after a command ends, and once a
+  second while it has a process noted — so a shell that prints no marks
+  clears within about a second too.
+- **The shell back in front.** When no process was noted because the
+  agent claimed from the background, a prompt mark with the shell itself
+  in front of the terminal releases the agent.
+- **Behind `tmux`, `screen`, `zellij`, `ssh` or `mosh`.** Roost never
+  notes the process of the client in front, and the agent outlives it:
+  detaching tmux puts the shell back in front while the agent runs on.
+  A prompt mark keeps such an agent's ownership as a label, as it always
+  did, so what it reports after you reattach still counts. If it dies
+  behind the multiplexer, its row stays until another agent claims the
+  tab or you clear it by hand.
+- **Anything else.** A prompt mark with some other program in front
+  drops the lifecycle to `inactive` and keeps ownership as a label, so
+  the tab falls through to shell-derived state instead of staying stuck.
+- **`Ctrl-Z`.** A stopped agent is still alive. It keeps the tab, its
+  `process` reads `suspended`, its Agents row reads **Suspended** (until
+  another agent you run in front of it reports or works), and
+  the tab shows what a prompt shows, so it mutes nothing while you work
+  at the prompt. After `fg` (or `bg`), what it was doing comes back,
+  OSC 7501 record included. A 7501 agent with no hooks keeps its row
+  through the suspend, named by its `process`. One that clears its own
+  status as it stops — Codex does — leaves nothing to set aside, so its
+  row comes from its process's name instead
+  ([agents known by name](#agents-known-by-name)) and reads **Suspended**
+  all the same.
+
+A process Roost can't read (another user's, say) counts as alive, and a
+pipeline whose first command exited keeps the agent while the pipeline
+still has the terminal. The rules are spelled out under
+[`tab.agent_report`](../reference/ipc.md#how-ownership-ends-without-a-report)
+and, for OSC 7501 records, under
+[`Tab.program_status`](../reference/ipc.md#how-a-record-ends-without-a-prompt).
+A command tab (`roostctl tab open -- claude`) needs none of this: when
+its program exits, the tab closes and its state goes with it.
 
 **Which shells emit those marks.** Roost's bundled integration
 (`crates/roost-engine/resources/shell-integration/`) wires them for zsh
@@ -512,9 +558,35 @@ and bash: zsh's
 `preexec`/`precmd` hooks fire the `C` and `D` marks unconditionally;
 bash's `PROMPT_COMMAND` fires `D` on every version, but the `C`
 (command-start) mark needs bash ≥ 4.4 — `PS0` is silently ignored on
-older bash, including macOS's stock `/bin/bash` 3.2. A shell with no
+older bash, including macOS's stock `/bin/bash` 3.2. Every `D` carries
+the command's exit status (`D;<status>`), on every bash and zsh
+version. A shell with no
 prompt marks at all — dash, plain `sh`, or bash/zsh with the
-integration disabled — never clears a stuck lifecycle on its own.
+integration disabled — relies on the agent's process: a noted process
+that is gone clears the tab within about a second. An agent Roost
+noted no process for (one behind `tmux` or `ssh`) can stay stuck there;
+the manual clear below is the way out.
+
+**When an agent dies mid-turn.** If Roost ends an agent this way while
+it was working or waiting on you, and the shell's `D` says it failed,
+Roost raises one notification under the agent's name:
+
+- `exited (3)` — it exited with that status (1 to 128);
+- `killed (SIGKILL)` — it died of a signal (a status above 128 is 128
+  plus the signal, named as the machine running the tab numbers it; one
+  with no name reads `killed (signal N)`).
+
+The status is the one the shell's `D` reports as it takes the terminal
+back from the agent, so a later command's status is never taken for
+the agent's. Like any notification, the banner is dropped while you are
+looking at the tab. Nothing is raised when the agent exited 0, was idle
+at its own prompt, ended with its own `SessionEnd`, or died in the
+background (`bg`) where no `D` reports it. A `Ctrl-Z` raises nothing
+either: the `D` it causes reports 128 + `SIGTSTP` (148 on Linux, 146 on
+macOS), a stop rather than an exit, and an agent killed while stopped
+(`kill -9 %1`) has no `D` of its own. A shell that sends no status —
+`sh`, dash, the integration off, or a `D` with no code — gives no
+banner: Roost can't tell a crash from a normal exit there.
 
 **Manual clear.** From any shell:
 
@@ -533,11 +605,12 @@ shell state reads `at_prompt` from the first prompt, and a tab left
 next prompt — the same as Roost's own bash integration. Older fish
 releases were not tested.
 
-There is no shell-agnostic failsafe today — the PTY's foreground
-process group is read only for a new tab's directory
-([cwd tracking](cwd-tracking.md)), never for a tab's state. A
-`tcgetpgrp`-based one, which would cover dash/`sh` too, is tracked as
-future work in [#519](https://github.com/charliek/roost/issues/519).
+Roost reads a tab's processes when something happens there — the agent
+reports, the shell prints a mark, the tab is focused, or a session tab
+gains or loses a viewer — and once a second for each tab with a process
+noted ([#519](https://github.com/charliek/roost/issues/519)), never for
+any other. The once-a-second read only gathers evidence: nothing ends
+because time passed, only because the process is gone.
 
 ### Which marks count
 
@@ -549,7 +622,7 @@ reading is the spec's:
 
 | The mark | What it does |
 |---|---|
-| `A`, `P`, `N` — a prompt starting (with `k=i` or no `k`); `B`, `I` — input starting; `D`, `D;<exit code>` — a command ending | the shell is at a prompt, and an agent's lifecycle drops to `inactive` (ownership stays as a label) |
+| `A`, `P`, `N` — a prompt starting (with `k=i` or no `k`); `B`, `I` — input starting; `D`, `D;<exit code>` — a command ending | the shell is at a prompt: an agent's lifecycle drops to `inactive` and its `working`/`blocked` records end; ownership stays as a label unless the agent is [gone](#when-a-tab-stays-running), and what a stopped or backgrounded agent had is set aside until it runs again. The exit code of the `D` that takes the terminal back from an agent decides whether its end raises a [banner](#when-a-tab-stays-running) |
 | `C`, `C;<options>` — a command starting | the shell has a foreground process; the agent's lifecycle stays |
 | `A;k=s`, `A;k=r`, `A;k=c`, and `P`/`N` with those — a secondary, right or continuation prompt | nothing |
 | a letter not followed by `;` or the end (`Axyz`, `D0`), `L`, an empty or unknown body | nothing |
@@ -557,6 +630,45 @@ reading is the spec's:
 
 A host tab's client shows what the session made of the marks; it reads
 none itself.
+
+## Agents known by name
+
+An agent that neither claims its tab with a hook nor reports over OSC
+7501 still gets an Agents row: cursor-agent without the
+[opt-in](#the-agent-integration-card), or Codex before it reports
+anything, on its sign-in screen. Roost names it from its process, once
+it looks at the tab — when you switch to the tab or away from it, when
+a session tab gains or loses a viewer, or when the shell marks a command
+starting. So start cursor-agent at a zsh or bash (4.4 or later) prompt
+with Roost's integration, and its row appears within about a second;
+anywhere else, it appears once you switch to another tab. The shell marks the command before it starts it, so the
+first look can be too early (on macOS it nearly always is); when it
+finds no agent, Roost looks once more a second later, unless the command
+has already ended.
+
+| The process in front | The row |
+|---|---|
+| `claude`, `codex`, `opencode`, `cursor-agent`, `grok`, `crush`, `pi` | that agent |
+| `node`, `bun`, `deno` or `python` running a script named like one of those (`codex.js`), or kept in a `claude-code`, `codex`, `opencode`, `opencode-ai` or `cursor-agent` directory | that agent |
+
+The row reads **Running**, or **Suspended** after `Ctrl-Z`, and never
+guesses more: no Working or Waiting, no banner, nothing muted, no owner,
+and the tab's own state is whatever its shell says. It goes once the
+process is gone and the shell has the terminal back, by the same rule as
+[any noted process](#when-a-tab-stays-running). Once the agent claims
+the tab or reports over OSC 7501, those decide the row again.
+
+Codex clears its own OSC 7501 status as it stops, so a `Ctrl-Z` would
+leave nothing to show; its process's name keeps its row, reading
+**Suspended**, and `fg` brings it back. A Codex that clears its status
+as it exits shows no row in between.
+
+The name only labels the row: nothing ends because of it. A launcher
+that runs the agent as its child rather than becoming it (`npx`) is not
+named, nor is an agent inside `tmux`, `screen`, `zellij`, `ssh` or
+`mosh`. Beyond that second look after a command starts, Roost never
+reads a tab's processes on a timer to find one, so an agent started
+with no prompt mark, in a tab you never look at again, shows no row.
 
 ## Codex trust
 

@@ -1,0 +1,23 @@
+{
+  "event": "agent_report.changed",
+  "data": {
+    "tab_id": "5",
+    "shell_state": "at_prompt",
+    "agent_lifecycle": "inactive",
+    "ownership": {
+      "source": "claude",
+      "session_id": "abc123",
+      "last_event_at": 1793158440,
+      "detail": "",
+      "metadata": {}
+    },
+    "state": "none",
+    "hook_active": true,
+    "process": {
+      "state": "suspended",
+      "agent": "claude",
+      "pid": "48213",
+      "since": 1793158470
+    }
+  }
+}

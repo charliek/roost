@@ -319,6 +319,7 @@ pub async fn serve(
         config.socket_path.clone(),
     );
     client.watch_password_input();
+    client.watch_processes();
 
     hydrate::hydrate(&client, config.first_project, config.starter.clone())
         .await

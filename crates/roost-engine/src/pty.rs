@@ -31,11 +31,15 @@ use anyhow::Context;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
 use roost_ipc::opener::OPENER_SET;
 use roost_ipc::paths::TEST_USER_RUNTIME_DIR_ENV;
+use roost_ipc::process::{Foreground, Stamp};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tracing::{debug, error, info, warn};
 
+use crate::foreground::{self as process_reads, ProcessSample};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::foreground::{cwd_of_pid, ForegroundLeader};
 use crate::opener::TabOpener;
 
 /// Depth of a tab's output fan-out. A consumer that falls this far
@@ -648,8 +652,12 @@ struct Session {
     /// hang-up the last master close sends would never end — and the
     /// reap would wait on it forever. A tick upgrades it for one
     /// `tcgetattr` at a time, so a recycled fd number can never redirect
-    /// a read.
+    /// a read. The process layer's `tcgetpgrp` reads it the same way.
     password_fd: Weak<OwnedFd>,
+    /// Whether the child is an interactive shell
+    /// ([`process_reads::runs_a_shell`]): its own group in front is then
+    /// a shell back at its prompt, not the program a command tab runs.
+    runs_a_shell: bool,
 }
 
 /// The password poller's handle on its supervisor (plan 074 §D2).
@@ -1139,6 +1147,74 @@ impl PtySupervisor {
             .unwrap_or_default()
     }
 
+    /// Who has `tab_id`'s terminal, by `tcgetpgrp` on the PTY master: a
+    /// non-blocking `ioctl`, so the UI thread may ask it at a prompt mark.
+    /// [`Foreground::Unknown`] once the tab has no PTY.
+    pub(crate) fn foreground(&self, tab_id: i64) -> Foreground {
+        let child = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions.get(&tab_id).and_then(|session| {
+                session
+                    .pid
+                    .map(|pid| (pid, Weak::clone(&session.password_fd), session.runs_a_shell))
+            })
+        };
+        let Some((child, fd, runs_a_shell)) = child else {
+            return Foreground::Unknown;
+        };
+        let pgrp = fd
+            .upgrade()
+            .and_then(|fd| process_reads::terminal_pgrp(fd.as_fd()));
+        process_reads::foreground_of(pgrp, child, runs_a_shell)
+    }
+
+    /// One read of `tab_id`'s processes for its process layer: who has the
+    /// terminal, the leader in front when `leader_wanted`, and whether each
+    /// of `stamps` still runs. `None` when the tab has no PTY, or its
+    /// child was reaped during the read.
+    ///
+    /// The reads can wait, so they run with no lock held, between two
+    /// checks of the reap latch, as [`Self::native_cwds`]'s do: the
+    /// child's pid is still the child's at both. Never on the UI thread.
+    pub(crate) fn sample_process(
+        &self,
+        tab_id: i64,
+        leader_wanted: bool,
+        stamps: &[Stamp],
+    ) -> Option<ProcessSample> {
+        let (child, latch, fd, incarnation, runs_a_shell) = {
+            let sessions = self.sessions.lock().unwrap();
+            let session = sessions.get(&tab_id)?;
+            (
+                session.pid?,
+                session.latch.clone(),
+                Weak::clone(&session.password_fd),
+                session.incarnation,
+                session.runs_a_shell,
+            )
+        };
+        latch.read(|| ())?;
+        let sample = ProcessSample::read(
+            incarnation,
+            || {
+                let pgrp = fd
+                    .upgrade()
+                    .and_then(|fd| process_reads::terminal_pgrp(fd.as_fd()))
+                    .or_else(|| process_reads::tpgid_of(child));
+                process_reads::foreground_of(pgrp, child, runs_a_shell)
+            },
+            || {
+                leader_wanted
+                    .then(|| process_reads::leader_in_front(child))
+                    .flatten()
+            },
+            process_reads::liveness,
+            stamps,
+        );
+        latch.read(|| ())?;
+        Some(sample)
+    }
+
     /// Spawn a shell for `tab_id`.
     ///
     /// Returns a `broadcast::Receiver` subscribed *before* the PTY
@@ -1360,6 +1436,7 @@ impl PtySupervisor {
         };
 
         let cmd = build_command(cwd, argv, tab_id, socket_path, opener);
+        let runs_a_shell = process_reads::runs_a_shell(cmd.get_argv());
         let mut child = pair.slave.spawn_command(cmd).context("spawn shell")?;
         // Sendable killer handle taken before the child moves into
         // the wait task — `close()` uses it to actively terminate
@@ -1518,6 +1595,7 @@ impl PtySupervisor {
             incarnation: self.next_incarnation.fetch_add(1, Ordering::Relaxed),
             cell_px: (0, 0),
             password_fd: password_watch_fd,
+            runs_a_shell,
         };
         before_promote();
         // Promote the slot from pending → sessions atomically, BEFORE
@@ -2220,112 +2298,11 @@ fn bash_bootstrap_env(
     out
 }
 
-/// Current working directory of `pid`. Linux reads `/proc/<pid>/cwd`;
-/// macOS asks libproc for `PROC_PIDVNODEPATHINFO`.
-#[cfg(target_os = "linux")]
-fn cwd_of_pid(pid: u32) -> Option<String> {
-    proc_read_starts("cwd");
-    std::fs::read_link(format!("/proc/{pid}/cwd"))
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_owned))
-}
-
-#[cfg(target_os = "macos")]
-fn cwd_of_pid(pid: u32) -> Option<String> {
-    use std::ffi::CStr;
-    use std::mem::{size_of, MaybeUninit};
-
-    proc_read_starts("cwd");
-    let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
-    let size = i32::try_from(size_of::<libc::proc_vnodepathinfo>()).ok()?;
-    // SAFETY: `info` is a writable buffer of exactly `size` bytes for the
-    // structure requested by PROC_PIDVNODEPATHINFO. We read it only when
-    // libproc reports that it initialized the complete structure. The SDK
-    // defines `vip_path` as a NUL-terminated MAXPATHLEN char array.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            i32::try_from(pid).ok()?,
-            libc::PROC_PIDVNODEPATHINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if written != size {
-        return None;
-    }
-    // SAFETY: the full structure was initialized above and `vip_path` is a
-    // fixed C string buffer supplied by libproc.
-    let path = unsafe {
-        CStr::from_ptr(
-            info.assume_init_ref()
-                .pvi_cdir
-                .vip_path
-                .as_ptr()
-                .cast::<libc::c_char>(),
-        )
-        .to_str()
-        .ok()?
-    };
-    (!path.is_empty()).then(|| path.to_string())
-}
-
-#[cfg(test)]
-type ProcReadHook = Box<dyn FnMut(&'static str)>;
-
-#[cfg(test)]
-thread_local! {
-    /// Run at the start of every native read of a process on this
-    /// thread, with what it reads, so a test can see which locks that
-    /// read runs under.
-    static PROC_READ_HOOK: std::cell::RefCell<Option<ProcReadHook>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Where every native read of a process begins. Does nothing outside
-/// tests.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn proc_read_starts(what: &'static str) {
-    #[cfg(test)]
-    PROC_READ_HOOK.with_borrow_mut(|hook| {
-        if let Some(hook) = hook {
-            hook(what);
-        }
-    });
-    #[cfg(not(test))]
-    let _ = what;
-}
-
-/// Who a process is, as far as the foreground-leader read needs it.
-/// Linux's start time has no sub-second part, so it reads
-/// `(starttime, 0)`.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProcStamp {
-    pid: i64,
-    pgrp: i64,
-    session: i64,
-    tty: i64,
-    tpgid: i64,
-    start: (u64, u64),
-}
-
-/// Whether the stamps taken before and after a leader's cwd read are one
-/// process, leading its own group, in the child's session and on the
-/// child's terminal. The start time is what tells a reused pid apart.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn same_leader(before: &ProcStamp, after: &ProcStamp, child_sid: i64, child_tty: i64) -> bool {
-    [before, after].iter().all(|stamp| {
-        stamp.pgrp == stamp.pid && stamp.session == child_sid && stamp.tty == child_tty
-    }) && before.pid == after.pid
-        && before.start == after.start
-}
-
 /// [`PtySupervisor::native_cwds`] of the child `child`, whose reap latch
 /// is `latch`: the foreground leader's cwd, then the child's.
 ///
 /// Nothing but the latch's liveness check runs under it. Every read —
-/// the child's stat, the leader's two [`ProcStamp`]s, both cwds — runs
+/// the child's stat, the leader's two stamps, both cwds — runs
 /// between two such checks, because the reaper takes the latch and any
 /// of those reads can wait: on macOS a path read waits on the filesystem
 /// holding the cwd (a hung NFS mount) and `proc_pidinfo` on a process
@@ -2358,193 +2335,6 @@ fn native_cwds_of(child: u32, latch: &ReapLatch) -> Vec<String> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn native_cwds_of(_child: u32, _latch: &ReapLatch) -> Vec<String> {
     Vec::new()
-}
-
-/// The leader of the terminal's foreground process group, when that is
-/// not the child itself — a job the shell is running, or a nested shell —
-/// with the [`ProcStamp`] taken when it was found.
-///
-/// The child's own `tpgid` names the group, with no master fd to keep:
-/// portable-pty makes every child a session leader with the pty as its
-/// controlling terminal. The leader is not our child, though, and
-/// nothing holds its pid, so its cwd counts only when [`same_leader`]
-/// matches the stamps taken before and after the read. Asking the
-/// terminal for its foreground group again would not do: a dead job's
-/// group stays the foreground one until the shell calls `tcsetpgrp`, and
-/// its pid can be reused meanwhile. A leader this user can't read
-/// (`sudo -s`) has no cwd, like any failed read.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-struct ForegroundLeader {
-    process: LeaderProc,
-    before: ProcStamp,
-    child_sid: i64,
-    child_tty: i64,
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-impl ForegroundLeader {
-    fn find(child: u32) -> Option<Self> {
-        let own = proc_stamp(child)?;
-        let pid = u32::try_from(own.tpgid)
-            .ok()
-            .filter(|&pid| pid != 0 && pid != child)?;
-        let process = LeaderProc::open(pid)?;
-        let before = process.stamp()?;
-        Some(Self {
-            process,
-            before,
-            child_sid: i64::from(child),
-            child_tty: own.tty,
-        })
-    }
-
-    fn cwd(&self) -> Option<String> {
-        self.process.cwd()
-    }
-
-    /// Whether a second stamp still matches the first, by [`same_leader`].
-    fn unchanged(&self) -> bool {
-        self.process
-            .stamp()
-            .is_some_and(|after| same_leader(&self.before, &after, self.child_sid, self.child_tty))
-    }
-}
-
-/// A `/proc/<pid>/stat` line's [`ProcStamp`]. The fields are counted
-/// after the LAST `)`: the command name before it can hold spaces and
-/// parens of its own.
-#[cfg(target_os = "linux")]
-fn parse_proc_stat(stat: &str) -> Option<ProcStamp> {
-    let (head, tail) = stat.rsplit_once(')')?;
-    let (pid, _) = head.split_once(" (")?;
-    // `tail` starts at field 3 in proc(5)'s numbering.
-    let fields: Vec<&str> = tail.split_whitespace().collect();
-    let field = |n: usize| fields.get(n - 3).copied();
-    Some(ProcStamp {
-        pid: pid.trim().parse().ok()?,
-        pgrp: field(5)?.parse().ok()?,
-        session: field(6)?.parse().ok()?,
-        tty: field(7)?.parse().ok()?,
-        tpgid: field(8)?.parse().ok()?,
-        start: (field(22)?.parse().ok()?, 0),
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn proc_stamp(pid: u32) -> Option<ProcStamp> {
-    proc_read_starts("stat");
-    parse_proc_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
-}
-
-/// A leader read through one `/proc/<pid>` directory fd — its stamps and
-/// its cwd alike — which never reaches a later process given the same
-/// pid.
-#[cfg(target_os = "linux")]
-struct LeaderProc(File);
-
-#[cfg(target_os = "linux")]
-impl LeaderProc {
-    fn open(pid: u32) -> Option<Self> {
-        proc_read_starts("open");
-        File::open(format!("/proc/{pid}")).ok().map(Self)
-    }
-
-    fn stamp(&self) -> Option<ProcStamp> {
-        use std::os::fd::FromRawFd;
-
-        proc_read_starts("stat");
-        // SAFETY: `self.0` is an open directory fd for the whole call,
-        // and the name is a NUL-terminated literal.
-        let fd = unsafe {
-            libc::openat(
-                self.0.as_raw_fd(),
-                c"stat".as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return None;
-        }
-        // SAFETY: `openat` just returned this fd, and nothing else owns it.
-        let file = unsafe { File::from_raw_fd(fd) };
-        parse_proc_stat(&std::io::read_to_string(file).ok()?)
-    }
-
-    fn cwd(&self) -> Option<String> {
-        proc_read_starts("cwd");
-        let mut buf = [0u8; libc::PATH_MAX as usize];
-        // SAFETY: `buf` is writable for its full length, `self.0` is an
-        // open directory fd, and the name is a NUL-terminated literal.
-        let len = unsafe {
-            libc::readlinkat(
-                self.0.as_raw_fd(),
-                c"cwd".as_ptr(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-            )
-        };
-        // A link that fills the buffer may have been cut short.
-        let len = usize::try_from(len).ok().filter(|&len| len < buf.len())?;
-        std::str::from_utf8(&buf[..len]).ok().map(str::to_owned)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn proc_stamp(pid: u32) -> Option<ProcStamp> {
-    use std::mem::{size_of, MaybeUninit};
-
-    proc_read_starts("stat");
-    let raw = i32::try_from(pid).ok()?;
-    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size = i32::try_from(size_of::<libc::proc_bsdinfo>()).ok()?;
-    // SAFETY: `info` is a writable buffer of exactly `size` bytes for the
-    // structure requested by PROC_PIDTBSDINFO, read only when libproc
-    // reports that it initialized all of it.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            raw,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if written != size {
-        return None;
-    }
-    // SAFETY: libproc initialized the full structure above.
-    let info = unsafe { info.assume_init() };
-    // `proc_bsdinfo` carries no session id.
-    // SAFETY: `getsid` reads nothing but the pid it is given.
-    let session = unsafe { libc::getsid(raw) };
-    (session >= 0).then(|| ProcStamp {
-        pid: i64::from(info.pbi_pid),
-        pgrp: i64::from(info.pbi_pgid),
-        session: i64::from(session),
-        tty: i64::from(info.e_tdev),
-        tpgid: i64::from(info.e_tpgid),
-        start: (info.pbi_start_tvsec, info.pbi_start_tvusec),
-    })
-}
-
-/// A leader read by pid. Nothing pins the pid; the stamps either side of
-/// its cwd read are what tell a reused one apart.
-#[cfg(target_os = "macos")]
-struct LeaderProc(u32);
-
-#[cfg(target_os = "macos")]
-impl LeaderProc {
-    fn open(pid: u32) -> Option<Self> {
-        Some(Self(pid))
-    }
-
-    fn stamp(&self) -> Option<ProcStamp> {
-        proc_stamp(self.0)
-    }
-
-    fn cwd(&self) -> Option<String> {
-        cwd_of_pid(self.0)
-    }
 }
 
 /// Shell-integration scripts, embedded at build time. The Mac copy under
@@ -4443,16 +4233,6 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn cwd_of_pid_reads_current_process() {
-        let got = cwd_of_pid(std::process::id()).expect("own cwd via platform process API");
-        assert_eq!(
-            std::path::Path::new(&got).canonicalize().unwrap(),
-            std::env::current_dir().unwrap().canonicalize().unwrap()
-        );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_foreground_cwd_is_the_foreground_jobs_not_the_shells() {
         let (shell_dir, job_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -4471,6 +4251,213 @@ mod tests {
         );
     }
 
+    /// P8, and U9 through a real terminal: the shell at its prompt reads
+    /// as the shell, a job as its own group, whose leader a wanted stamp
+    /// takes — unless it is a multiplexer — and a tab with no PTY as
+    /// unknown. The multiplexer half is Linux's: macOS names a process
+    /// after its binary, and a copied system binary may not run there.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_foreground_follows_the_shell_and_its_jobs() {
+        if !shell_present("bash") {
+            eprintln!("skipping the foreground test: bash not found on PATH");
+            return;
+        }
+        let sup = Arc::new(PtySupervisor::new());
+        let tab_id = 536;
+        let _hang_up = crate::application::HangUp(sup.clone(), vec![tab_id]);
+        let argv = ["bash", "--norc", "--noprofile", "-i"].map(String::from);
+        let mut rx = sup
+            .spawn(
+                tab_id,
+                "/tmp",
+                &argv,
+                80,
+                24,
+                std::path::Path::new("/tmp/roost-foreground-test.sock"),
+                &TabOpener::None,
+            )
+            .expect("spawn bash");
+        let mut seen = Vec::new();
+        wait_for_output(&mut rx, &mut seen, &[b"$ ", b"# "]).await;
+        let child = sup.sessions.lock().unwrap()[&tab_id].pid.unwrap();
+        assert_eq!(sup.foreground(tab_id), Foreground::Shell);
+        assert_eq!(
+            sup.sample_process(tab_id, true, &[]).map(|sample| (
+                sample.foreground,
+                sample.leader,
+                sample.relayed
+            )),
+            Some((Foreground::Shell, None, false)),
+            "the shell's own group is never stamped"
+        );
+
+        // A subshell, so the job is its own group and the shell survives
+        // it; `exec` makes the subshell the job.
+        sup.write(tab_id, b"( exec sleep 30 )\n".to_vec())
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pgid = loop {
+            match sup.foreground(tab_id) {
+                Foreground::Group(pgid) if pgid != i64::from(child) => break pgid,
+                _ => {
+                    assert!(Instant::now() < deadline, "the job never came to the front");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+        let sample = sup.sample_process(tab_id, true, &[]).expect("a sample");
+        assert_eq!(sample.foreground, Foreground::Group(pgid));
+        assert!(!sample.relayed);
+        let leader = sample.leader.expect("the job's leader is stamped");
+        assert_eq!(leader.agent, None, "sleep is no agent");
+        let stamp = leader.stamp;
+        assert_eq!(
+            (stamp.pid, stamp.pgid, stamp.sid),
+            (pgid, pgid, i64::from(child))
+        );
+        assert_eq!(
+            sup.sample_process(tab_id, false, &[stamp])
+                .and_then(|sample| sample.liveness_of(&stamp)),
+            Some(roost_ipc::process::Liveness::Running)
+        );
+
+        // Ctrl-C ends the sleep; the shell takes the terminal back.
+        sup.write(tab_id, b"\x03".to_vec()).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sup.foreground(tab_id) != Foreground::Shell {
+            assert!(Instant::now() < deadline, "the shell never came back");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let jobs = tempfile::tempdir().unwrap();
+            let tmux = crate::foreground::sleeper_named(jobs.path(), "tmux")
+                .expect("cc or a shell to make a process named tmux");
+            sup.write(
+                tab_id,
+                format!("( exec '{}' 30 )\n", tmux.display()).into_bytes(),
+            )
+            .await
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Foreground::Group(pgid) = sup.foreground(tab_id) {
+                    let leader = crate::foreground::comm_of(pgid as u32);
+                    if pgid != i64::from(child) && leader.as_deref() == Some("tmux") {
+                        break;
+                    }
+                }
+                assert!(Instant::now() < deadline, "tmux never came to the front");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                sup.sample_process(tab_id, true, &[])
+                    .map(|sample| (sample.leader, sample.relayed)),
+                Some((None, true)),
+                "a multiplexer in front is never stamped, and is read as one"
+            );
+        }
+
+        sup.close(tab_id);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sup.incarnation(tab_id).is_some() {
+            assert!(Instant::now() < deadline, "the tab never exited");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(sup.foreground(tab_id), Foreground::Unknown);
+        assert_eq!(sup.sample_process(tab_id, true, &[]), None);
+    }
+
+    /// The leader in front is named by its process: a binary called
+    /// `cursor-agent`, and `node` running a script under a `cursor-agent`
+    /// directory, read through its argv (when node is installed).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_leader_in_front_is_named_by_its_process() {
+        if !shell_present("bash") {
+            eprintln!("skipping the identity test: bash not found on PATH");
+            return;
+        }
+        let sup = Arc::new(PtySupervisor::new());
+        let tab_id = 537;
+        let _hang_up = crate::application::HangUp(sup.clone(), vec![tab_id]);
+        let argv = ["bash", "--norc", "--noprofile", "-i"].map(String::from);
+        let mut rx = sup
+            .spawn(
+                tab_id,
+                "/tmp",
+                &argv,
+                80,
+                24,
+                std::path::Path::new("/tmp/roost-identity-test.sock"),
+                &TabOpener::None,
+            )
+            .expect("spawn bash");
+        let mut seen = Vec::new();
+        wait_for_output(&mut rx, &mut seen, &[b"$ ", b"# "]).await;
+        let jobs = tempfile::tempdir().unwrap();
+        let named = |job: String| {
+            let sup = sup.clone();
+            async move {
+                sup.write(tab_id, format!("( exec {job} )\n").into_bytes())
+                    .await
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let agent = loop {
+                    if let Some(leader) = sup
+                        .sample_process(tab_id, true, &[])
+                        .and_then(|sample| sample.leader)
+                        .filter(|leader| leader.agent.is_some())
+                    {
+                        break leader.agent;
+                    }
+                    assert!(Instant::now() < deadline, "{job} was never named");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                sup.write(tab_id, b"\x03".to_vec()).await.unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while sup.foreground(tab_id) != Foreground::Shell {
+                    assert!(Instant::now() < deadline, "the shell never came back");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                agent
+            }
+        };
+
+        match crate::foreground::sleeper_named(jobs.path(), "cursor-agent") {
+            Some(agent) => assert_eq!(
+                named(format!("'{}' 30", agent.display())).await,
+                Some("cursor")
+            ),
+            None => eprintln!("skipping the native half: no cc to build a named sleeper"),
+        }
+        match which_node() {
+            Some(node) => {
+                let script = jobs.path().join("share/cursor-agent/versions/1/index.js");
+                std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+                std::fs::write(&script, "setTimeout(() => {}, 30000);\n").unwrap();
+                assert_eq!(
+                    named(format!(
+                        "'{}' --no-warnings '{}'",
+                        node.display(),
+                        script.display()
+                    ))
+                    .await,
+                    Some("cursor")
+                );
+            }
+            None => eprintln!("skipping the node half: node not found on PATH"),
+        }
+    }
+
+    fn which_node() -> Option<std::path::PathBuf> {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join("node"))
+            .find(|path| path.is_file())
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn no_process_is_read_under_the_reap_latch() {
@@ -4484,13 +4471,13 @@ mod tests {
         };
         let latch = sup.sessions.lock().unwrap()[&tab_id].latch.clone();
         let reads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        PROC_READ_HOOK.set(Some(Box::new({
+        crate::foreground::PROC_READ_HOOK.set(Some(Box::new({
             let reads = reads.clone();
             move |what| reads.borrow_mut().push((what, latch.0.try_lock().is_err()))
         })));
 
         let cwds = sup.native_cwds(tab_id);
-        PROC_READ_HOOK.set(None);
+        crate::foreground::PROC_READ_HOOK.set(None);
         assert_eq!(
             cwds,
             vec![canonical(job_dir.path()), canonical(shell_dir.path())],
@@ -4511,92 +4498,6 @@ mod tests {
         assert!(
             reads.iter().all(|&(_, latched)| !latched),
             "no read ran under the latch: {reads:?}"
-        );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn same_leader_refuses_another_start_session_or_terminal() {
-        let (child_sid, child_tty) = (500, 34816);
-        let leader = ProcStamp {
-            pid: 700,
-            pgrp: 700,
-            session: child_sid,
-            tty: child_tty,
-            tpgid: 700,
-            start: (1_700_000_000, 250),
-        };
-        assert!(
-            same_leader(&leader, &leader, child_sid, child_tty),
-            "the precondition: a leader read twice unchanged is kept"
-        );
-
-        let restarted = ProcStamp {
-            start: (1_700_000_000, 251),
-            ..leader
-        };
-        assert!(
-            !same_leader(&leader, &restarted, child_sid, child_tty),
-            "a different start time is a reused pid"
-        );
-        for (what, stamp) in [
-            (
-                "a different session",
-                ProcStamp {
-                    session: child_sid + 1,
-                    ..leader
-                },
-            ),
-            (
-                "a different terminal",
-                ProcStamp {
-                    tty: child_tty + 1,
-                    ..leader
-                },
-            ),
-            (
-                "not its group's leader",
-                ProcStamp {
-                    pgrp: 701,
-                    ..leader
-                },
-            ),
-        ] {
-            assert!(!same_leader(&stamp, &stamp, child_sid, child_tty), "{what}");
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_proc_stat_line_is_read_after_its_last_paren() {
-        let stat = "4242 (a) b (c)) S 4000 4242 4000 34817 4242 4194560 1 2 3 4 5 6 7 8 20 0 1 0 \
-                    987654 1000 200";
-        assert_eq!(
-            parse_proc_stat(stat),
-            Some(ProcStamp {
-                pid: 4242,
-                pgrp: 4242,
-                session: 4000,
-                tty: 34817,
-                tpgid: 4242,
-                start: (987_654, 0),
-            })
-        );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn this_process_stamps_as_itself() {
-        let stamp = proc_stamp(std::process::id()).expect("our own stamp");
-        // SAFETY: plain queries of this process's own ids.
-        let (pgrp, session) = unsafe { (libc::getpgrp(), libc::getsid(0)) };
-        assert_eq!(
-            (stamp.pid, stamp.pgrp, stamp.session),
-            (
-                i64::from(std::process::id()),
-                i64::from(pgrp),
-                i64::from(session)
-            )
         );
     }
 

@@ -185,6 +185,7 @@ pub(super) mod fixtures {
                     password_input: false,
                     dropped_reports: None,
                     program_status: None,
+                    process: None,
                 })
                 .collect(),
         }

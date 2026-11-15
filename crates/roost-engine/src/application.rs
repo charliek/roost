@@ -17,9 +17,10 @@ use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result};
 use roost_ipc::messages::{Project, Tab, TabOpenParams};
+use roost_ipc::process::Foreground;
 use roost_ipc::session_launch::FirstProject;
-use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, Notify};
 
 use crate::opener::{restore_opener, TabOpener};
 use crate::program_status::RawOscAuthority;
@@ -404,6 +405,119 @@ impl LocalClient {
             Arc::downgrade(&self.supervisor),
             reports,
         ));
+    }
+}
+
+impl LocalClient {
+    /// Start the process layer (#621, #519): install the probe a prompt
+    /// mark asks who has its tab's terminal, and a sampler that reads a
+    /// tab's processes whenever its layer asks — an agent's claim, records
+    /// that start deciding the tab, a hook report, a mark that parked, a
+    /// `C` on a stamped tab, a focus or a session viewer coming or going —
+    /// and once a second for every tab holding a stamp, and applies what
+    /// it read under the workspace lock.
+    ///
+    /// Call from inside a Tokio runtime. Only the call that installs the
+    /// probe starts a sampler, so it is idempotent per workspace. The
+    /// sampler reads on a blocking thread with no lock held, holds the
+    /// workspace and the supervisor weakly, and ends once either is gone.
+    pub fn watch_processes(&self) {
+        let probed = Arc::downgrade(&self.supervisor);
+        let installed = self.workspace.set_foreground_probe(Box::new(move |tab_id| {
+            probed.upgrade().map_or(Foreground::Unknown, |supervisor| {
+                supervisor.foreground(tab_id)
+            })
+        }));
+        if !installed {
+            return;
+        }
+        tokio::spawn(sample_processes(
+            Arc::downgrade(&self.workspace),
+            Arc::downgrade(&self.supervisor),
+            self.workspace.process_wake(),
+        ));
+    }
+}
+
+/// How often the sampler reads every tab that holds a stamp (#519): in a
+/// shell that prints no prompt marks, nothing else says a stamped agent
+/// died. It also takes the second look a `C` owes when its first named
+/// nothing. A tick only reads; what it finds ends something only on the
+/// evidence a mark's sample would need.
+const PROCESS_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// [`LocalClient::watch_processes`]'s sampler: every request the tabs'
+/// process layers made since it last woke, read off the lock, applied
+/// under it, and, every [`PROCESS_TICK`] while any tab holds a stamp or
+/// owes a look, every such tab. It sleeps on its wake while none does. A sample of a
+/// spawn the tab no longer has is dropped, as a stale password report is.
+async fn sample_processes(
+    workspace: Weak<Workspace>,
+    supervisor: Weak<PtySupervisor>,
+    wake: Arc<Notify>,
+) {
+    let mut next_tick: Option<tokio::time::Instant> = None;
+    loop {
+        // A wake never moves the tick: a tab whose agent reports all the
+        // time must not starve a quiet one of its reads.
+        let tick = match next_tick {
+            Some(at) => tokio::select! {
+                () = wake.notified() => false,
+                () = tokio::time::sleep_until(at) => true,
+            },
+            None => {
+                wake.notified().await;
+                false
+            }
+        };
+        let (Some(workspace), Some(supervisor)) = (workspace.upgrade(), supervisor.upgrade())
+        else {
+            return;
+        };
+        let requests = workspace.take_process_requests(tick);
+        if !requests.is_empty() {
+            sample(&workspace, &supervisor, requests).await;
+        }
+        next_tick = match next_tick {
+            _ if !workspace.wants_process_ticks() => None,
+            Some(at) if !tick => Some(at),
+            _ => Some(tokio::time::Instant::now() + PROCESS_TICK),
+        };
+    }
+}
+
+/// Read `requests` on a blocking thread with no lock held, and apply each
+/// sample under the workspace lock.
+async fn sample(
+    workspace: &Workspace,
+    supervisor: &Arc<PtySupervisor>,
+    requests: Vec<crate::process_axis::SampleRequest>,
+) {
+    let reader = Arc::clone(supervisor);
+    let read = tokio::task::spawn_blocking(move || {
+        requests
+            .into_iter()
+            .filter_map(|request| {
+                reader
+                    .sample_process(request.tab_id, request.leader_wanted, &request.stamps)
+                    .map(|sample| (request, sample))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+    let samples = match read {
+        Ok(samples) => samples,
+        Err(error) => {
+            tracing::warn!(%error, "a process-layer read failed");
+            return;
+        }
+    };
+    for (request, sample) in samples {
+        if supervisor.incarnation(request.tab_id) == Some(sample.incarnation) {
+            workspace.apply_process_sample(&request, &sample);
+        } else {
+            tracing::debug!(tab_id = request.tab_id, "dropping a stale process sample");
+        }
     }
 }
 
@@ -1068,7 +1182,13 @@ mod tests {
         // chunk's program-status batch, ahead of the chunk's OSC actions.
         let mut authority = client
             .workspace
-            .apply_program_status(tab_id, vec![StatusEvent::Prompt(PromptMark::CommandEnd)], 0)
+            .apply_program_status(
+                tab_id,
+                vec![StatusEvent::Prompt(PromptMark::CommandEnd {
+                    exit_code: None,
+                })],
+                0,
+            )
             .unwrap();
         assert!(client.workspace.tab(tab_id).unwrap().hook_active);
         client.apply_osc(tab_id, 9, "Build done", &mut authority);
@@ -1113,7 +1233,7 @@ mod tests {
             shell(&client),
             (ShellState::ForegroundProcess, TabState::Running)
         );
-        mark(PromptMark::CommandEnd);
+        mark(PromptMark::CommandEnd { exit_code: None });
         assert_eq!(shell(&client), (ShellState::AtPrompt, TabState::None));
 
         client.apply_osc(tab_id, 133, "C", &mut RawOscAuthority::default());

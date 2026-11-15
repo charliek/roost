@@ -114,13 +114,15 @@ __roost_title() {
 }
 fi
 
-# OSC 133 command marks: C before a command runs (preexec), D when it
-# ends / at the next prompt (precmd). Roost maps C -> running, D -> cleared.
+# OSC 133 command marks: C before a command runs (preexec), D;<exit status>
+# when it ends / at the next prompt (precmd). Roost maps C -> running, D ->
+# cleared. zsh gives every precmd hook the command's `$?`, whatever ran
+# before it.
 if (( ! $+functions[__roost_mark_c] )); then
 __roost_mark_c() { _roost_feature marks && printf '\033]133;C\033\\'; }
 fi
 if (( ! $+functions[__roost_mark_d] )); then
-__roost_mark_d() { _roost_feature marks && printf '\033]133;D\033\\'; }
+__roost_mark_d() { local -i s=$?; _roost_feature marks && printf '\033]133;D;%s\033\\' "$s"; }
 fi
 
 if (( ! $+functions[__roost_paths] )); then

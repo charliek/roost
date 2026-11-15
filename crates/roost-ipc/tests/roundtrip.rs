@@ -171,6 +171,7 @@ fn event_envelope_round_trip() {
                 password_input: false,
                 dropped_reports: None,
                 program_status: None,
+                process: None,
             },
         })
         .unwrap(),
@@ -840,6 +841,140 @@ fn the_program_status_vectors_decode_into_their_typed_shapes() {
     assert_eq!(data.program_status, None);
     assert_eq!(data.state, TabState::Running);
     assert_eq!(serde_json::to_value(&data).unwrap(), cleared["data"]);
+}
+
+/// `Tab.process` and `agent_report.changed`'s `process`: the stamped
+/// process behind a tab's agent state decodes into its typed shape and
+/// re-encodes byte for byte; an event without it means none is stamped.
+#[test]
+fn the_process_vectors_decode_into_their_typed_shapes() {
+    use roost_ipc::process::ProcessState;
+
+    for (name, state, since) in [
+        (
+            "tab.list.process.response.json",
+            ProcessState::Running,
+            1_793_158_441,
+        ),
+        (
+            "tab.list.process_suspended.response.json",
+            ProcessState::Suspended,
+            1_793_158_470,
+        ),
+    ] {
+        let response = vector(name);
+        let result: TabListResult = serde_json::from_value(response["result"].clone()).unwrap();
+        let process = result.projects[0].tabs[0]
+            .process
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}: process decodes"));
+        assert_eq!(
+            (
+                process.state,
+                process.agent.as_str(),
+                process.pid,
+                process.since
+            ),
+            (state, "claude", 48_213, since),
+            "{name}"
+        );
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            response["result"],
+            "{name}"
+        );
+    }
+
+    let event = vector("agent_report.changed.process.event.json");
+    let data: AgentReportChangedEvent = serde_json::from_value(event["data"].clone()).unwrap();
+    assert_eq!(
+        data.process.as_ref().map(|process| process.state),
+        Some(ProcessState::Suspended)
+    );
+    assert_eq!(data.state, TabState::None, "a suspended agent shows none");
+    assert_eq!(serde_json::to_value(&data).unwrap(), event["data"]);
+
+    let cleared = vector("agent_report.changed.process_cleared.event.json");
+    let data: AgentReportChangedEvent = serde_json::from_value(cleared["data"].clone()).unwrap();
+    assert_eq!(data.process, None);
+    assert_eq!(data.ownership, None);
+    assert_eq!(serde_json::to_value(&data).unwrap(), cleared["data"]);
+
+    let older = vector("agent_report.changed.event.json");
+    let data: AgentReportChangedEvent = serde_json::from_value(older["data"].clone()).unwrap();
+    assert_eq!(data.process, None, "an older server's event reads as none");
+}
+
+/// One-back decode (E8). v0.1.x's `Tab`, `Project`,
+/// `TabListResult` and `AgentReportChangedEvent` are today's less the
+/// `process` field, with the same attributes: none denies an unknown key.
+/// So this build meeting a key it has never heard of, in place of
+/// `process`, is what a v0.1.x client meets in these vectors — and it
+/// decodes everything else exactly as from a server with nothing stamped.
+#[test]
+fn a_decoder_that_predates_process_reads_the_process_vectors() {
+    fn renamed(mut value: serde_json::Value, pointer: &str) -> serde_json::Value {
+        let holder = value
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the object holding `process`");
+        let process = holder.remove("process").expect("a process to rename");
+        holder.insert("process_from_a_newer_build".into(), process);
+        value
+    }
+    fn dropped(mut value: serde_json::Value, pointer: &str) -> serde_json::Value {
+        value
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the object holding `process`")
+            .remove("process");
+        value
+    }
+
+    for name in [
+        "tab.list.process.response.json",
+        "tab.list.process_suspended.response.json",
+    ] {
+        let result = vector(name)["result"].clone();
+        let tab = "/projects/0/tabs/0";
+        let unknown: TabListResult = serde_json::from_value(renamed(result.clone(), tab))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let none: TabListResult = serde_json::from_value(dropped(result, tab)).unwrap();
+        assert_eq!(unknown, none, "{name}");
+        assert_eq!(unknown.projects[0].tabs[0].title, "claude", "{name}");
+    }
+
+    let data = vector("agent_report.changed.process.event.json")["data"].clone();
+    let unknown: AgentReportChangedEvent =
+        serde_json::from_value(renamed(data.clone(), "")).expect("the event decodes");
+    let none: AgentReportChangedEvent = serde_json::from_value(dropped(data, "")).unwrap();
+    assert_eq!(unknown, none);
+    assert_eq!(unknown.state, TabState::None);
+}
+
+/// `process.state` is an open value: one this build can't read reads the
+/// whole object as absent, on a tab and on the event, and never costs the
+/// client the tab or the event.
+#[test]
+fn an_unreadable_process_reads_as_absent() {
+    let response = vector("tab.list.process.response.json");
+    let event = vector("agent_report.changed.process.event.json");
+    for (pointer, junk) in [
+        ("/process/state", serde_json::json!("paused")),
+        ("/process/pid", serde_json::json!("not a pid")),
+    ] {
+        let mut tab = response["result"]["projects"][0]["tabs"][0].clone();
+        *tab.pointer_mut(pointer).unwrap() = junk.clone();
+        let decoded: Tab = serde_json::from_value(tab).expect("the tab still decodes");
+        assert_eq!(decoded.process, None, "{pointer}");
+        assert_eq!(decoded.title, "claude");
+
+        let mut data = event["data"].clone();
+        *data.pointer_mut(pointer).unwrap() = junk;
+        let decoded: AgentReportChangedEvent =
+            serde_json::from_value(data).expect("the event still decodes");
+        assert_eq!(decoded.process, None, "{pointer}");
+    }
 }
 
 /// `program_status` is an open shape with open enum values: a value this

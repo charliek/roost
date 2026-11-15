@@ -14,11 +14,14 @@ use roost_ipc::agent::{
 };
 use roost_ipc::format_chars::is_format;
 use roost_ipc::messages::TabState;
+use roost_ipc::process::Foreground;
 pub use roost_ipc::program_status::{app_label, DecidedBy};
 use roost_ipc::program_status::{
     ProgramStatusKind, ProgramStatusRecordView, ProgramStatusReport, ProgramStatusState,
     ProgramStatusSummary, PromptMark, StatusEvent,
 };
+
+use crate::process_axis::ProcessAxis;
 
 /// Child records a tab keeps beside its root. The root is always accepted.
 pub const MAX_CHILDREN: usize = 255;
@@ -66,6 +69,44 @@ pub struct ProgramStatusRecords {
     /// The cap refused a child and said so. Cleared once the children
     /// drop below the cap, so a burst of refusals costs one warning.
     cap_warned: bool,
+}
+
+/// What a prompt mark took off a tab while the program its records follow
+/// was stopped or in the background (the process layer, #519): its live
+/// records, and the root's say over the tab. [`ProgramStatusRecords::restore`]
+/// puts them back once the program runs again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParkedRecords {
+    records: Vec<(String, Record)>,
+    /// The tab's report count when they were taken: a root reported since
+    /// is someone else's, and then nothing comes back.
+    seq: u64,
+    /// No prompt mark had followed the root yet, so it decided the tab.
+    root_unprompted: bool,
+    /// The deciding record's app when they were taken.
+    pub(crate) app: String,
+}
+
+impl ParkedRecords {
+    /// Nothing to bring back: no live record, and no root that decided.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.records.is_empty() && !self.root_unprompted
+    }
+
+    /// What a `clear` of `id` leaves set aside: its subtree goes, and with
+    /// the root (an empty id, or RIS) so does the root's say.
+    pub(crate) fn clear(&mut self, id: &str) {
+        let id = clean(id, NAME_MAX_BYTES);
+        self.records.retain(|(key, _)| !in_subtree(key, &id));
+        if id == ROOT {
+            self.root_unprompted = false;
+        }
+    }
+
+    /// A `working` or `blocked` record was set aside.
+    pub(crate) fn holds_live(&self) -> bool {
+        !self.records.is_empty()
+    }
 }
 
 /// The deciding record, with the app it inherits.
@@ -274,6 +315,70 @@ impl ProgramStatusRecords {
         self.deciding().is_some()
     }
 
+    /// The deciding record's app, inherited along its id.
+    pub(crate) fn deciding_app(&self) -> Option<&str> {
+        self.deciding().map(|view| view.app)
+    }
+
+    pub(crate) fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Do to the records what a prompt mark does — drop the live ones and
+    /// end the root's say — and hand back what that took.
+    pub(crate) fn park(&mut self) -> ParkedRecords {
+        let app = self.deciding_app().unwrap_or_default().to_owned();
+        let root_unprompted = self.records.contains_key(ROOT) && !self.root_prompted;
+        let (live, kept) = std::mem::take(&mut self.records)
+            .into_iter()
+            .partition(|(_, record)| is_live(record.state));
+        self.records = kept;
+        self.root_prompted = true;
+        ParkedRecords {
+            records: live.into_iter().collect(),
+            seq: self.seq,
+            root_unprompted,
+            app,
+        }
+    }
+
+    /// Put back what [`Self::park`] took, unless the tab has moved on
+    /// since: a live record, or a root reported after the park. A record
+    /// whose id was reported since stays as reported, and a child the cap
+    /// has no room for stays out.
+    pub(crate) fn restore(&mut self, parked: ParkedRecords) {
+        let root_reported = self
+            .records
+            .get(ROOT)
+            .is_some_and(|root| root.updated_seq > parked.seq);
+        if root_reported || self.records.values().any(|record| is_live(record.state)) {
+            return;
+        }
+        for (id, record) in parked.records {
+            if id == ROOT || self.records.contains_key(&id) || self.children() < MAX_CHILDREN {
+                self.records.entry(id).or_insert(record);
+            }
+        }
+        if parked.root_unprompted && self.records.contains_key(ROOT) {
+            self.root_prompted = false;
+        }
+    }
+
+    /// End what a program that is gone left on the tab, as a prompt mark
+    /// would: its live records, and the root's say. With `upto`, only
+    /// records reported by then are its; a later one belongs to whatever
+    /// runs in front now. Answers whether it took a live record.
+    pub(crate) fn end(&mut self, upto: Option<u64>) -> bool {
+        let ours = |record: &Record| upto.is_none_or(|seq| record.updated_seq <= seq);
+        let before = self.records.len();
+        self.records
+            .retain(|_, record| !(is_live(record.state) && ours(record)));
+        if self.records.get(ROOT).is_none_or(ours) {
+            self.root_prompted = true;
+        }
+        self.records.len() != before
+    }
+
     /// Apply one ordered batch from the tab's authoritative terminal to the
     /// records and to the hook layer `agent`, whose shell marks come from
     /// the same stream (plan 083 D-B1).
@@ -289,16 +394,52 @@ impl ProgramStatusRecords {
         events: impl IntoIterator<Item = StatusEvent>,
         now_ms: i64,
     ) -> StatusApplied {
+        self.apply_with_process(
+            agent,
+            &mut ProcessAxis::default(),
+            Foreground::Unknown,
+            events,
+            now_ms,
+        )
+    }
+
+    /// [`Self::apply`] with the tab's process layer beside the hook layer:
+    /// each prompt mark also reaches `process`, read with `fg` in front,
+    /// so a mark's release or park lands at its byte like everything else.
+    /// A mark that parks takes the records it would drop aside instead,
+    /// and a `clear` reaches what it set aside. After each event `process`
+    /// learns whether the records still decide the tab.
+    pub(crate) fn apply_with_process(
+        &mut self,
+        agent: &mut AgentTabState,
+        process: &mut ProcessAxis,
+        fg: Foreground,
+        events: impl IntoIterator<Item = StatusEvent>,
+        now_ms: i64,
+    ) -> StatusApplied {
         let mut applied = StatusApplied::default();
         let mut before = compose(agent, self).lifecycle;
         for event in events {
             match event {
-                StatusEvent::Report(report) => self.report(&report, now_ms, &mut applied),
+                StatusEvent::Report(report) => {
+                    if report.state == ProgramStatusState::Clear {
+                        process.clear_parked(&report.id);
+                    }
+                    self.report(&report, now_ms, &mut applied);
+                }
                 StatusEvent::Prompt(mark) => {
-                    self.prompt(mark);
+                    if process.parks_records_at(mark, fg) {
+                        process.park_records(self.park());
+                    } else {
+                        self.prompt(mark);
+                    }
+                    let unmarked = agent.clone();
                     if let Some(next) = agent::apply_shell_mark(agent, osc133_body(mark)) {
                         *agent = next;
                     }
+                    applied
+                        .banners
+                        .extend(process.at_mark(mark, &unmarked, agent, fg));
                 }
                 StatusEvent::Notification { title, body } => {
                     applied.notifications.push(PlacedNotification {
@@ -312,6 +453,7 @@ impl ProgramStatusRecords {
             if self.children() < MAX_CHILDREN {
                 self.cap_warned = false;
             }
+            process.records_settled(self);
             before = self.announce(agent, before, now_ms, &mut applied);
         }
         applied
@@ -361,7 +503,7 @@ impl ProgramStatusRecords {
                     self.records.remove(ROOT);
                 }
             }
-            PromptMark::PromptStart | PromptMark::InputStart | PromptMark::CommandEnd => {
+            PromptMark::PromptStart | PromptMark::InputStart | PromptMark::CommandEnd { .. } => {
                 self.records.retain(|_, record| !is_live(record.state));
                 self.root_prompted = true;
             }
@@ -690,7 +832,7 @@ fn from_vt(events: Vec<roost_vt::TerminalEvent>) -> Vec<StatusEvent> {
                 VtMark::PromptStart => PromptMark::PromptStart,
                 VtMark::InputStart => PromptMark::InputStart,
                 VtMark::OutputStart => PromptMark::OutputStart,
-                VtMark::CommandEnd => PromptMark::CommandEnd,
+                VtMark::CommandEnd { exit_code } => PromptMark::CommandEnd { exit_code },
             }),
             TerminalEvent::Notification { title, body } => {
                 StatusEvent::Notification { title, body }
@@ -706,7 +848,7 @@ fn osc133_body(mark: PromptMark) -> &'static str {
         PromptMark::PromptStart => "A",
         PromptMark::InputStart => "B",
         PromptMark::OutputStart => "C",
-        PromptMark::CommandEnd => "D",
+        PromptMark::CommandEnd { .. } => "D",
     }
 }
 
@@ -804,7 +946,7 @@ mod tests {
         ("A", PromptMark::PromptStart),
         ("B", PromptMark::InputStart),
         ("C", PromptMark::OutputStart),
-        ("D", PromptMark::CommandEnd),
+        ("D", PromptMark::CommandEnd { exit_code: None }),
     ];
 
     fn mark(body: &str) -> PromptMark {
@@ -1904,9 +2046,9 @@ mod tests {
             p(PromptMark::OutputStart),
             claude(S::Done),
             claude(S::Done),
-            p(PromptMark::CommandEnd),
+            p(PromptMark::CommandEnd { exit_code: None }),
             p(PromptMark::OutputStart),
-            p(PromptMark::CommandEnd),
+            p(PromptMark::CommandEnd { exit_code: None }),
             claude(S::Idle),
             report(S::Working, "", "claude-code", "Again"),
             report(S::Blocked, "job/1", "", "job one"),
@@ -2185,7 +2327,10 @@ mod tests {
             TerminalEvent::Prompt(VtMark::PromptStart),
             TerminalEvent::Prompt(VtMark::InputStart),
             TerminalEvent::Prompt(VtMark::OutputStart),
-            TerminalEvent::Prompt(VtMark::CommandEnd),
+            TerminalEvent::Prompt(VtMark::CommandEnd { exit_code: None }),
+            TerminalEvent::Prompt(VtMark::CommandEnd {
+                exit_code: Some(137),
+            }),
             TerminalEvent::Notification {
                 title: "Build".into(),
                 body: "done".into(),
@@ -2205,7 +2350,10 @@ mod tests {
                 StatusEvent::Prompt(PromptMark::PromptStart),
                 StatusEvent::Prompt(PromptMark::InputStart),
                 StatusEvent::Prompt(PromptMark::OutputStart),
-                StatusEvent::Prompt(PromptMark::CommandEnd),
+                StatusEvent::Prompt(PromptMark::CommandEnd { exit_code: None }),
+                StatusEvent::Prompt(PromptMark::CommandEnd {
+                    exit_code: Some(137)
+                }),
                 StatusEvent::Notification {
                     title: "Build".into(),
                     body: "done".into(),

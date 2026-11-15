@@ -307,7 +307,7 @@ fn osc_133_marks_map_in_byte_order() {
             TerminalEvent::Prompt(PromptMark::PromptStart),
             TerminalEvent::Prompt(PromptMark::InputStart),
             TerminalEvent::Prompt(PromptMark::OutputStart),
-            TerminalEvent::Prompt(PromptMark::CommandEnd),
+            TerminalEvent::Prompt(PromptMark::CommandEnd { exit_code: Some(0) }),
         ]
     );
 }
@@ -341,7 +341,8 @@ const OSC_BUFFER: usize = 2048;
 /// doesn't, as the hook layer now reads them on a sink terminal.
 #[test]
 fn which_osc_133_bodies_are_marks() {
-    use PromptMark::{CommandEnd, InputStart, OutputStart, PromptStart};
+    use PromptMark::{InputStart, OutputStart, PromptStart};
+    let end = |exit_code| Some(PromptMark::CommandEnd { exit_code });
     let cmdline = |len: usize| {
         let mut body = b"C;cmdline_url=".to_vec();
         body.resize(len, b'a');
@@ -366,9 +367,14 @@ fn which_osc_133_bodies_are_marks() {
         (b"C;cmdline_url=ls%20-la".to_vec(), Some(OutputStart)),
         (cmdline(OSC_BUFFER), Some(OutputStart)),
         (cmdline(OSC_BUFFER + 1), None),
-        (b"D".to_vec(), Some(CommandEnd)),
-        (b"D;0".to_vec(), Some(CommandEnd)),
-        (b"D;127".to_vec(), Some(CommandEnd)),
+        (b"D".to_vec(), end(None)),
+        (b"D;0".to_vec(), end(Some(0))),
+        (b"D;127".to_vec(), end(Some(127))),
+        (b"D;137".to_vec(), end(Some(137))),
+        (b"D;148;aid=7".to_vec(), end(Some(148))),
+        (b"D;-1".to_vec(), end(Some(-1))),
+        (b"D;abc".to_vec(), end(None)),
+        (b"D;;err=x".to_vec(), end(None)),
         (b"Axyz".to_vec(), None),
         (b"Cxyz".to_vec(), None),
         (b"D0".to_vec(), None),
@@ -440,7 +446,7 @@ fn events_do_not_depend_on_write_boundaries() {
             ..report(ProgramStatusState::Blocked)
         }),
         TerminalEvent::Prompt(PromptMark::PromptStart),
-        TerminalEvent::Prompt(PromptMark::CommandEnd),
+        TerminalEvent::Prompt(PromptMark::CommandEnd { exit_code: None }),
         status(ProgramStatusState::Done),
     ];
 

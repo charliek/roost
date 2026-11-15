@@ -204,12 +204,16 @@ __roost_title() {
 }
 fi
 
-# OSC 133 command marks: C on command start (PS0), D when it ends (the
-# next prompt's PROMPT_COMMAND). Roost maps C -> running, D -> cleared.
+# OSC 133 command marks: C on command start (PS0), D;<exit status> when it
+# ends (the next prompt's PROMPT_COMMAND). Roost maps C -> running, D ->
+# cleared. `$?` is the command's only until another function runs, so
+# __roost_marks must stay first in PROMPT_COMMAND; it hands `$?` on.
 if ! declare -F __roost_marks >/dev/null; then
 __roost_marks() {
-  _roost_feature marks || return 0
-  printf '\033]133;D\033\\'
+  local s=$?
+  _roost_feature marks || return $s
+  printf '\033]133;D;%s\033\\' "$s"
+  return $s
 }
 fi
 # C via PS0 needs bash >= 4.4; older bash (e.g. macOS /bin/bash 3.2)
@@ -246,7 +250,7 @@ __roost_paths_once() {
 }
 
 # Prepend so the user's existing PROMPT_COMMAND still runs.
-PROMPT_COMMAND="__roost_paths_once;__roost_marks;__roost_osc7;__roost_title;${PROMPT_COMMAND:-}"
+PROMPT_COMMAND="__roost_marks;__roost_paths_once;__roost_osc7;__roost_title;${PROMPT_COMMAND:-}"
 
 # Default prompt (cwd in blue + a plain $) only when the user hasn't set
 # one — bash's stock interactive default is '\s-\v\$ ', else empty.

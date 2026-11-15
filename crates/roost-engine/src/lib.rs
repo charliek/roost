@@ -15,6 +15,7 @@ pub mod attach;
 pub mod crash;
 pub mod event_push;
 pub mod events;
+mod foreground;
 pub mod git_metrics;
 #[cfg(feature = "vt")]
 pub mod images;
@@ -27,6 +28,7 @@ pub mod osc;
 pub mod persistence;
 pub mod pointer;
 pub mod process;
+mod process_axis;
 pub mod program_status;
 pub mod pty;
 #[cfg(test)]

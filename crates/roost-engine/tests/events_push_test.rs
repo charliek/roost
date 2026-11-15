@@ -653,7 +653,12 @@ async fn a_lone_prompt_mark_reaches_a_subscriber_and_a_repeat_does_not() {
 
     for (step, prompt_mark, shell, state) in [
         (0, PromptMark::OutputStart, "foreground_process", "running"),
-        (1, PromptMark::CommandEnd, "at_prompt", "none"),
+        (
+            1,
+            PromptMark::CommandEnd { exit_code: None },
+            "at_prompt",
+            "none",
+        ),
     ] {
         mark(prompt_mark);
         title(format!("after {step}"));
@@ -911,6 +916,7 @@ fn every_workspace_event_has_a_wire_name() {
         password_input: false,
         dropped_reports: None,
         program_status: None,
+        process: None,
     };
     let project = Project {
         id: 1,
@@ -1022,6 +1028,7 @@ fn every_workspace_event_has_a_wire_name() {
                 tab_id: 5,
                 agent: agent.clone(),
                 program_status: None,
+                process: None,
             },
             ops::EVENT_AGENT_REPORT_CHANGED,
             vec![
@@ -1089,6 +1096,7 @@ fn every_workspace_event_has_a_wire_name() {
         tab_id: 5,
         agent: agent.clone(),
         program_status: None,
+        process: None,
     })
     .expect("agent_report.changed");
     assert_eq!(agent_event.data["state"], serde_json::json!("needs_input"));
@@ -1107,6 +1115,7 @@ fn every_workspace_event_has_a_wire_name() {
         tab_id: 5,
         agent,
         program_status: Some(status),
+        process: None,
     })
     .expect("agent_report.changed");
     assert_eq!(agent_event.data["state"], serde_json::json!("running"));

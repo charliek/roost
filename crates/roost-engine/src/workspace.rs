@@ -27,23 +27,26 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use roost_ipc::agent::{
     self, AgentLifecycle, AgentTabState, AttentionEffect, DropReason, DroppedReport,
     DroppedReports, OwnershipAction, TabAgentReportParams, SOURCE_LEGACY, SOURCE_MANUAL,
 };
 use roost_ipc::messages::{Project, Tab, TabState};
-use roost_ipc::program_status::{ProgramStatusSummary, StatusEvent};
+use roost_ipc::process::{Foreground, TabProcess};
+use roost_ipc::program_status::{ProgramStatusSummary, PromptMark, StatusEvent};
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tracing::warn;
 
+use crate::foreground::ProcessSample;
 use crate::opener::{PersistedOpener, TabOpener};
 use crate::persistence::{
     persist_state, read_state, HostSnapshot, HostTabMemory, ProjectSnapshot, SnapshotFile,
     WindowFrame,
 };
+use crate::process_axis::{ProcessAxis, SampleRequest};
 use crate::program_status::{self, ProgramStatusRecords, RawOscAuthority, VetoStream};
 
 /// How many events the broadcast channel buffers per subscriber.
@@ -145,6 +148,10 @@ struct TabRow {
     /// The tab's program-status (OSC 7501) records, composed with
     /// `agent` on the way out. Not persisted, like `agent`.
     program_status: ProgramStatusRecords,
+    /// Which process the hook owner is stamped with, and what a mark
+    /// parked while it was not in front (#621). Not persisted, like
+    /// `agent`.
+    process: ProcessAxis,
     /// Reports [`Workspace::agent_report`] dropped, plus program-status
     /// vetoes; see `Tab.dropped_reports`. Not persisted.
     dropped_reports: Option<DroppedReports>,
@@ -449,6 +456,8 @@ pub enum WorkspaceEvent {
         agent: AgentTabState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         program_status: Option<ProgramStatusSummary>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process: Option<TabProcess>,
     },
     /// A notification the user has not seen — the banner half. Live-only
     /// (see [`Self::is_live_only`]); the pending bit that rides beside
@@ -672,6 +681,26 @@ pub struct Workspace {
     /// Fixed at construction (`with_replay`), so it is read without the
     /// lock even though the ring it bounds lives under it.
     replay_bounds: Option<ReplayBounds>,
+    /// Woken when a tab's process layer wants a sample; the sampler
+    /// ([`crate::LocalClient::watch_processes`]) waits on it.
+    process_wake: Arc<Notify>,
+    /// Who has a tab's terminal, asked at a prompt mark before the lock
+    /// is taken. Installed by the sampler; none means
+    /// [`Foreground::Unknown`], and every mark does what it always did.
+    foreground_probe: OnceLock<ForegroundProbe>,
+}
+
+/// [`Workspace::set_foreground_probe`]'s probe. It runs on whichever
+/// thread applies a terminal's marks, the UI's included, so it may not
+/// read the process table: a `tcgetpgrp` on the PTY master is all.
+pub(crate) type ForegroundProbe = Box<dyn Fn(i64) -> Foreground + Send + Sync>;
+
+/// Wakes a sampler parked on this workspace, so it finds the workspace
+/// gone and ends.
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        self.process_wake.notify_one();
+    }
 }
 
 /// A tab [`Workspace::reserve_tab`] has numbered and
@@ -929,6 +958,8 @@ impl Workspace {
             persist_guard: Mutex::new(PersistState::default()),
             shutting_down: AtomicBool::new(false),
             replay_bounds: None,
+            process_wake: Arc::new(Notify::new()),
+            foreground_probe: OnceLock::new(),
         }
     }
 
@@ -1045,6 +1076,8 @@ impl Workspace {
             persist_guard: Mutex::new(PersistState::default()),
             shutting_down: AtomicBool::new(false),
             replay_bounds: None,
+            process_wake: Arc::new(Notify::new()),
+            foreground_probe: OnceLock::new(),
         }
     }
 
@@ -1179,7 +1212,14 @@ impl Workspace {
     ///
     /// [`raise_attention`]: Workspace::raise_attention
     pub fn set_window_focused(&self, focused: bool) {
-        self.inner.lock().unwrap().window_focused = focused;
+        let mut inner = self.inner.lock().unwrap();
+        inner.window_focused = focused;
+        let active = inner.active_tab_id;
+        let wake = focused && inner.request_process_samples(&[active]);
+        drop(inner);
+        if wake {
+            self.process_wake.notify_one();
+        }
     }
 
     /// The client's saved host sessions, in the order the sidebar lists
@@ -1757,6 +1797,7 @@ impl Workspace {
             notification_generation: 0,
             password_input: false,
             program_status: ProgramStatusRecords::default(),
+            process: ProcessAxis::default(),
             dropped_reports: None,
             logged_drop_streams: VecDeque::new(),
             vetoed_streams: VecDeque::new(),
@@ -2195,6 +2236,15 @@ impl Workspace {
         events: Vec<StatusEvent>,
         now_ms: i64,
     ) -> Result<RawOscAuthority, WorkspaceError> {
+        // Before the lock: the probe takes the supervisor's, and only a
+        // prompt mark has a use for what it reads.
+        let fg = if events.iter().any(
+            |event| matches!(event, StatusEvent::Prompt(mark) if *mark != PromptMark::OutputStart),
+        ) {
+            self.foreground(tab_id)
+        } else {
+            Foreground::Unknown
+        };
         let mut inner = self.inner.lock().unwrap();
         let watched = inner.tab_is_being_watched(tab_id);
         let row = inner
@@ -2205,8 +2255,13 @@ impl Workspace {
         // comparing the row with what it is handed.
         let mut next_agent = row.agent.clone();
         let mut records = row.program_status.clone();
-        let mut applied = records.apply(&mut next_agent, events, now_ms);
-        let mut events = replace_axes(row, next_agent, records);
+        let mut process = row.process.clone();
+        let mut applied =
+            records.apply_with_process(&mut next_agent, &mut process, fg, events, now_ms);
+        // A mark keeps the owner; only the process layer releases one here.
+        let released = row.agent.ownership.is_some() && next_agent.ownership.is_none();
+        let wake = process.is_due();
+        let mut events = replace_axes(row, next_agent, records, process);
         if !watched {
             for banner in &applied.banners {
                 let title = if banner.title.is_empty() {
@@ -2224,6 +2279,15 @@ impl Workspace {
         } else {
             // Run state isn't in the persisted snapshot — emit only.
             self.commit(inner, events, Persist::Skip);
+        }
+        if wake {
+            self.process_wake.notify_one();
+        }
+        if released {
+            tracing::info!(
+                tab_id,
+                "the shell took the terminal back from an unstamped agent; released its owner"
+            );
         }
         applied.emit_logs(tab_id);
         Ok(RawOscAuthority::new(std::mem::take(
@@ -2254,6 +2318,7 @@ impl Workspace {
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
 
         let mut next = row.agent.clone();
+        let mut process = row.process.clone();
         let mut accepted = false;
         let mut attention = AttentionEffect::Unchanged;
         let mut drop_logs = Vec::new();
@@ -2269,13 +2334,20 @@ impl Workspace {
             }
             accepted = true;
             next = outcome.state;
+            match report.ownership_action {
+                OwnershipAction::Claim | OwnershipAction::Release => process.owner_changed(&next),
+                OwnershipAction::Preserve => {
+                    process.request_sample();
+                }
+            }
             if outcome.attention != AttentionEffect::Unchanged {
                 attention = outcome.attention;
             }
         }
 
         let records = row.program_status.clone();
-        let mut events = replace_axes(row, next, records);
+        let wake = process.is_due();
+        let mut events = replace_axes(row, next, records, process);
         match attention {
             // Same watched predicate as `raise_attention`, applied here
             // rather than by delegating because the report's own
@@ -2306,10 +2378,129 @@ impl Workspace {
         let tab = wire_tab(row, is_active);
         // Run state isn't in the persisted snapshot — emit only.
         self.commit(inner, events, Persist::Skip);
+        if wake {
+            self.process_wake.notify_one();
+        }
         for log in drop_logs {
             log.emit();
         }
         Ok((accepted, tab))
+    }
+
+    /// Install the probe a prompt mark asks who has its tab's terminal.
+    /// The first one stays; answers whether this one was installed.
+    pub(crate) fn set_foreground_probe(&self, probe: ForegroundProbe) -> bool {
+        self.foreground_probe.set(probe).is_ok()
+    }
+
+    fn foreground(&self, tab_id: i64) -> Foreground {
+        self.foreground_probe
+            .get()
+            .map_or(Foreground::Unknown, |probe| probe(tab_id))
+    }
+
+    /// What wakes the sampler: a tab's process layer wants a sample.
+    pub(crate) fn process_wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.process_wake)
+    }
+
+    /// Every sample a tab's process layer is due, clearing what it asked.
+    /// On the sampler's `tick`, every tab holding a stamp is due as well.
+    pub(crate) fn take_process_requests(&self, tick: bool) -> Vec<SampleRequest> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .tabs
+            .iter_mut()
+            .filter_map(|(tab_id, row)| {
+                if tick {
+                    row.process.request_tick();
+                }
+                row.process
+                    .take_request(*tab_id, &row.program_status, &row.agent)
+            })
+            .collect()
+    }
+
+    /// Whether the sampler's tick has something to read: a tab holds a
+    /// stamp, or owes a look ([`ProcessAxis::ticks`]).
+    pub(crate) fn wants_process_ticks(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.tabs.values().any(|row| row.process.ticks())
+    }
+
+    /// Ask `tab_id`'s process layer for a sample or a look: a session's
+    /// viewer came or went, which is the only focus a session sees.
+    #[cfg(feature = "server-vt")]
+    pub(crate) fn request_process_sample(&self, tab_id: i64) {
+        let wake = self
+            .inner
+            .lock()
+            .unwrap()
+            .request_process_samples(&[tab_id]);
+        if wake {
+            self.process_wake.notify_one();
+        }
+    }
+
+    /// Apply what the sampler read for `request` to its tab's process
+    /// layer and hook owner, raising the exit banner an end owes unless
+    /// the tab is being watched. A tab that is gone is not an error: the
+    /// sample was read off the lock, and the row can close meanwhile.
+    pub(crate) fn apply_process_sample(&self, request: &SampleRequest, sample: &ProcessSample) {
+        let mut inner = self.inner.lock().unwrap();
+        let watched = inner.tab_is_being_watched(request.tab_id);
+        let Some(row) = inner.tabs.get_mut(&request.tab_id) else {
+            return;
+        };
+        let mut next_agent = row.agent.clone();
+        let mut records = row.program_status.clone();
+        let mut process = row.process.clone();
+        let mut ended =
+            process.apply_sample(request, sample, &mut next_agent, &mut records, unix_now());
+        let wake = process.is_due();
+        let mut events = replace_axes(row, next_agent, records, process);
+        if let Some(banner) = ended.banner.take().filter(|_| !watched) {
+            let title = if banner.title.is_empty() {
+                row.title.clone()
+            } else {
+                banner.title
+            };
+            events.extend(raise_notification(row, title, banner.body));
+        }
+        if events.is_empty() {
+            drop(inner);
+        } else {
+            // Run state isn't in the persisted snapshot — emit only.
+            self.commit(inner, events, Persist::Skip);
+        }
+        if ended.owner {
+            tracing::info!(
+                tab_id = request.tab_id,
+                "the agent's process is gone and its group left the terminal; released its owner"
+            );
+        }
+        if ended.records {
+            tracing::info!(
+                tab_id = request.tab_id,
+                "the program's process is gone and its group left the terminal; ended its live records"
+            );
+        }
+        if let Some(agent) = ended.named {
+            tracing::debug!(
+                tab_id = request.tab_id,
+                agent,
+                "named the agent in front by its process"
+            );
+        }
+        if ended.identity {
+            tracing::debug!(
+                tab_id = request.tab_id,
+                "the agent named by its process is gone"
+            );
+        }
+        if wake {
+            self.process_wake.notify_one();
+        }
     }
 
     /// Record whether a tab's PTY is at a password prompt.
@@ -2434,7 +2625,11 @@ impl Workspace {
                 });
             }
         }
+        let wake = inner.request_process_samples(&[prev.1, now.1]);
         self.commit(inner, events, persist);
+        if wake {
+            self.process_wake.notify_one();
+        }
         Ok(prev)
     }
 
@@ -2896,6 +3091,19 @@ impl Default for Workspace {
 type Selection = (i64, i64);
 
 impl Inner {
+    /// Someone looked at each of `tab_ids`: ask its process layer for a
+    /// sample, or a look for an agent in front to name
+    /// ([`ProcessAxis::request_look`]). Answers whether any asked.
+    fn request_process_samples(&mut self, tab_ids: &[i64]) -> bool {
+        let mut asked = false;
+        for tab_id in tab_ids {
+            if let Some(row) = self.tabs.get_mut(tab_id) {
+                asked |= row.process.request_look(&row.agent);
+            }
+        }
+        asked
+    }
+
     /// Move the active selection onto one tab, reporting where it was
     /// and where it landed. The mutation half of [`Workspace::focus_tab`].
     ///
@@ -3372,6 +3580,7 @@ fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
         password_input: row.password_input,
         dropped_reports: row.dropped_reports.clone(),
         program_status: status,
+        process: row.process.wire(&row.agent, &row.program_status),
     }
 }
 
@@ -3402,11 +3611,11 @@ fn raise_notification(row: &mut TabRow, title: String, body: String) -> Vec<Work
     ]
 }
 
-/// Swap a tab's hook record and program-status records, and return the
-/// events the swap implies.
+/// Swap a tab's hook record, program-status records and process layer,
+/// and return the events the swap implies.
 ///
-/// `AgentChanged` carries the full hook record and the program-status
-/// summary, and fires when either changed; `TabStateChanged` and
+/// `AgentChanged` carries the full hook record, the program-status
+/// summary and `Tab.process`, and fires when any of them changed; `TabStateChanged` and
 /// `HookActiveChanged` carry the composed state and the hook layer's
 /// liveness, and each fires only when its own projection moved. An
 /// unchanged hook record and summary emit nothing: repeated prompt marks
@@ -3417,16 +3626,23 @@ fn replace_axes(
     row: &mut TabRow,
     next_agent: AgentTabState,
     next_records: ProgramStatusRecords,
+    next_process: ProcessAxis,
 ) -> Vec<WorkspaceEvent> {
     let tab_id = row.id;
     let prev_status = program_status::summary(&row.agent, &row.program_status);
     let prev_state = roost_ipc::program_status::effective(&row.agent, prev_status.as_ref());
     let prev_live = agent::is_live(&row.agent);
+    let prev_process = row.process.wire(&row.agent, &row.program_status);
     let agent_changed = row.agent != next_agent;
     row.agent = next_agent;
     row.program_status = next_records;
+    row.process = next_process;
     let status = program_status::summary(&row.agent, &row.program_status);
-    if !agent_changed && same_summary(prev_status.as_ref(), status.as_ref()) {
+    let process = row.process.wire(&row.agent, &row.program_status);
+    if !agent_changed
+        && same_summary(prev_status.as_ref(), status.as_ref())
+        && prev_process == process
+    {
         return Vec::new();
     }
     let mut events = Vec::with_capacity(3);
@@ -3442,6 +3658,7 @@ fn replace_axes(
         tab_id,
         agent: row.agent.clone(),
         program_status: status,
+        process,
     });
     events
 }
@@ -4795,7 +5012,7 @@ mod tests {
         let (ws, tid) = agent_ws();
         shell_mark(&ws, tid, PromptMark::OutputStart);
         assert_eq!(ws.tab(tid).unwrap().state, TabState::Running);
-        shell_mark(&ws, tid, PromptMark::CommandEnd);
+        shell_mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
         assert_eq!(ws.tab(tid).unwrap().state, TabState::None);
     }
 
@@ -4817,7 +5034,7 @@ mod tests {
             .unwrap());
         assert!(!ws.tab(tid).unwrap().has_notification);
 
-        shell_mark(&ws, tid, PromptMark::CommandEnd);
+        shell_mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
         let tab = ws.tab(tid).unwrap();
         assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
         assert!(tab.hook_active, "ownership survives as a label");
@@ -5400,7 +5617,7 @@ mod tests {
             .unwrap());
         assert!(!ws.tab(tid).unwrap().has_notification);
 
-        shell_mark(&ws, tid, PromptMark::CommandEnd);
+        shell_mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
         assert!(ws
             .raise_attention(
                 tid,
@@ -7980,8 +8197,14 @@ mod tests {
                 .unwrap());
             ws.clear_notification(tid, None).unwrap();
 
-            ws.apply_program_status(tid, vec![StatusEvent::Prompt(PromptMark::CommandEnd)], LATE)
-                .unwrap();
+            ws.apply_program_status(
+                tid,
+                vec![StatusEvent::Prompt(PromptMark::CommandEnd {
+                    exit_code: None,
+                })],
+                LATE,
+            )
+            .unwrap();
             assert_eq!(ws.tab(tid).unwrap().program_status, None);
             assert!(ws
                 .raise_attention(
@@ -8096,7 +8319,7 @@ mod tests {
             let (ws, tid) = owned_ws(AgentLifecycle::Working);
             shell_mark(&ws, tid, PromptMark::OutputStart);
             let mut rx = ws.subscribe();
-            shell_mark(&ws, tid, PromptMark::CommandEnd);
+            shell_mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
             let events = drain(&mut rx);
             assert_eq!(state_changes(&events), vec![TabState::None], "{events:?}");
             assert_eq!(
@@ -8114,7 +8337,10 @@ mod tests {
             assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
 
             let mut versioned = ws.subscribe_versioned();
-            for mark in [PromptMark::CommandEnd, PromptMark::PromptStart] {
+            for mark in [
+                PromptMark::CommandEnd { exit_code: None },
+                PromptMark::PromptStart,
+            ] {
                 shell_mark(&ws, tid, mark);
             }
             assert!(
@@ -8152,7 +8378,7 @@ mod tests {
             for mark in [
                 PromptMark::PromptStart,
                 PromptMark::InputStart,
-                PromptMark::CommandEnd,
+                PromptMark::CommandEnd { exit_code: None },
             ] {
                 let (ws, tid) = owned_ws(AgentLifecycle::Working);
                 let mut rx = ws.subscribe();
@@ -8340,6 +8566,673 @@ mod tests {
                 ws.apply_program_status(99, vec![claude(S::Working, "")], LATE),
                 Err(WorkspaceError::TabNotFound(99))
             ));
+        }
+    }
+
+    /// The process layer (#621) through the workspace: marks see the
+    /// foreground group a probe reads before the lock, and samples arrive
+    /// as the sampler would hand them in.
+    mod process_layer {
+        use super::*;
+        use roost_ipc::process::{Liveness, ProcessState, Stamp};
+        use roost_ipc::program_status::PromptMark;
+
+        use crate::foreground::{Leader, ProcessSample};
+
+        const T: i64 = 1_793_158_450_000;
+        const AGENT: Stamp = Stamp {
+            pid: 700,
+            start: (12_345, 0),
+            pgid: 700,
+            sid: 500,
+        };
+
+        /// An unfocused tab whose probe answers whatever `fg` holds.
+        fn probed_ws() -> (Workspace, i64, Arc<Mutex<Foreground>>) {
+            let (ws, tid) = agent_ws();
+            let fg = Arc::new(Mutex::new(Foreground::Unknown));
+            let probed = Arc::clone(&fg);
+            assert!(ws.set_foreground_probe(Box::new(move |_| *probed.lock().unwrap())));
+            (ws, tid, fg)
+        }
+
+        fn mark(ws: &Workspace, tid: i64, mark: PromptMark) {
+            ws.apply_program_status(tid, vec![StatusEvent::Prompt(mark)], T)
+                .unwrap();
+        }
+
+        /// What the sampler would apply for every request now due: `leader`
+        /// for a wanted stamp, `liveness` for every stamp read.
+        fn sample(
+            ws: &Workspace,
+            foreground: Foreground,
+            leader: Option<Stamp>,
+            liveness: Liveness,
+        ) {
+            let requests = ws.take_process_requests(false);
+            assert!(!requests.is_empty(), "the precondition: a sample was due");
+            for request in requests {
+                let sample = ProcessSample {
+                    incarnation: 1,
+                    foreground,
+                    leader: leader.map(|stamp| Leader { stamp, agent: None }),
+                    relayed: false,
+                    liveness: request
+                        .stamps
+                        .iter()
+                        .map(|stamp| (*stamp, liveness))
+                        .collect(),
+                };
+                ws.apply_process_sample(&request, &sample);
+            }
+        }
+
+        fn claim(ws: &Workspace, tid: i64, session: &str, lifecycle: AgentLifecycle) -> bool {
+            ws.agent_report(&report(
+                tid,
+                "claude",
+                session,
+                OwnershipAction::Claim,
+                Some(lifecycle),
+            ))
+            .unwrap()
+            .0
+        }
+
+        /// A Claude working in front of the shell, stamped.
+        fn stamped_claude() -> (Workspace, i64, Arc<Mutex<Foreground>>) {
+            let (ws, tid, fg) = probed_ws();
+            mark(&ws, tid, PromptMark::OutputStart);
+            assert!(claim(&ws, tid, "s1", AgentLifecycle::Working));
+            sample(
+                &ws,
+                Foreground::Group(AGENT.pgid),
+                Some(AGENT),
+                Liveness::Running,
+            );
+            let process = ws.tab(tid).unwrap().process.expect("stamped");
+            assert_eq!(
+                (process.pid, process.state),
+                (AGENT.pid, ProcessState::Running)
+            );
+            (ws, tid, fg)
+        }
+
+        /// U2: #621 — an agent owner with no stamp is released when the
+        /// shell is back in front at a prompt mark; with another job in
+        /// front, or nothing known, it stays a label.
+        #[test]
+        fn a_prompt_mark_releases_an_unstamped_owner_only_with_the_shell_in_front() {
+            for (fg, released) in [
+                (Foreground::Shell, true),
+                (Foreground::Group(900), false),
+                (Foreground::Unknown, false),
+            ] {
+                let (ws, tid, probe) = probed_ws();
+                assert!(claim(&ws, tid, "s1", AgentLifecycle::Working));
+                *probe.lock().unwrap() = fg;
+                let mut rx = ws.subscribe();
+                mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
+
+                let tab = ws.tab(tid).unwrap();
+                assert_eq!(tab.ownership.is_none(), released, "{fg:?}");
+                assert_eq!(tab.hook_active, !released, "{fg:?}");
+                assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive, "{fg:?}");
+                let events = drain(&mut rx);
+                assert_eq!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        WorkspaceEvent::HookActiveChanged { active: false, .. }
+                    )),
+                    released,
+                    "{fg:?}: {events:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_manual_owner_stays_a_label_with_the_shell_in_front() {
+            let (ws, tid, probe) = probed_ws();
+            ws.set_tab_state(tid, TabState::Running).unwrap();
+            *probe.lock().unwrap() = Foreground::Shell;
+            mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
+            let owner = ws.tab(tid).unwrap().ownership.expect("kept");
+            assert_eq!(owner.source, SOURCE_MANUAL);
+            assert!(
+                ws.take_process_requests(false).is_empty(),
+                "no process to follow"
+            );
+        }
+
+        /// The probe reads the terminal only for a mark that can release
+        /// or park: a `C`, a report and a notification never ask.
+        #[test]
+        fn only_a_prompt_mark_asks_who_is_in_front() {
+            let (ws, tid) = agent_ws();
+            let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&asked);
+            ws.set_foreground_probe(Box::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Foreground::Unknown
+            }));
+            mark(&ws, tid, PromptMark::OutputStart);
+            ws.apply_program_status(
+                tid,
+                vec![StatusEvent::Notification {
+                    title: String::new(),
+                    body: "x".into(),
+                }],
+                T,
+            )
+            .unwrap();
+            assert_eq!(asked.load(Ordering::SeqCst), 0);
+            mark(&ws, tid, PromptMark::PromptStart);
+            assert_eq!(asked.load(Ordering::SeqCst), 1);
+        }
+
+        /// U3 and U4: Ctrl-Z parks the lifecycle and keeps the owner, the
+        /// sample shows the agent suspended, and `fg` brings back what it
+        /// was doing.
+        #[test]
+        fn a_suspended_agent_keeps_its_owner_and_comes_back_on_fg() {
+            let (ws, tid, probe) = stamped_claude();
+            *probe.lock().unwrap() = Foreground::Shell;
+            mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
+            let tab = ws.tab(tid).unwrap();
+            assert_eq!(
+                tab.ownership.as_ref().map(|o| o.source.as_str()),
+                Some("claude")
+            );
+            assert_eq!(
+                tab.agent_lifecycle,
+                AgentLifecycle::Inactive,
+                "today's Ctrl-Z"
+            );
+            assert_eq!(tab.state, TabState::None);
+
+            let mut rx = ws.subscribe();
+            sample(&ws, Foreground::Shell, None, Liveness::Stopped);
+            let tab = ws.tab(tid).unwrap();
+            let suspended = tab.process.clone().expect("still stamped");
+            assert_eq!(suspended.state, ProcessState::Suspended);
+            assert_eq!(suspended.agent, "claude");
+            assert_eq!(tab.state, TabState::None, "a suspended agent shows none");
+            assert!(drain(&mut rx).iter().any(|event| matches!(
+                event,
+                WorkspaceEvent::AgentChanged { process: Some(process), .. }
+                    if process.state == ProcessState::Suspended
+            )));
+
+            mark(&ws, tid, PromptMark::OutputStart);
+            sample(&ws, Foreground::Group(AGENT.pgid), None, Liveness::Running);
+            let tab = ws.tab(tid).unwrap();
+            assert_eq!(tab.agent_lifecycle, AgentLifecycle::Working, "restored");
+            assert_eq!(tab.state, TabState::Running);
+            assert_eq!(tab.process.map(|p| p.state), Some(ProcessState::Running));
+        }
+
+        /// The stamped agent killed: the shell's `D` parks, and the sample
+        /// that finds it gone with the shell in front ends the owner.
+        #[test]
+        fn a_killed_stamped_agent_is_released_by_the_sample_after_the_mark() {
+            let (ws, tid, probe) = stamped_claude();
+            *probe.lock().unwrap() = Foreground::Shell;
+            mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
+            assert!(
+                ws.tab(tid).unwrap().ownership.is_some(),
+                "parked, not released"
+            );
+
+            let mut rx = ws.subscribe();
+            sample(&ws, Foreground::Shell, None, Liveness::Gone);
+            let tab = ws.tab(tid).unwrap();
+            assert_eq!(tab.ownership, None);
+            assert_eq!(tab.process, None);
+            let events = drain(&mut rx);
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    WorkspaceEvent::AgentChanged { process: None, agent, .. }
+                        if agent.ownership.is_none()
+                )),
+                "{events:?}"
+            );
+            assert!(ws.take_process_requests(false).is_empty());
+        }
+
+        /// U5: a mark from the stamped group itself — Claude's own Screen
+        /// Reader marks — does what it always did, and parks nothing.
+        #[test]
+        fn a_mark_from_the_agents_own_group_is_todays() {
+            let (ws, tid, probe) = stamped_claude();
+            *probe.lock().unwrap() = Foreground::Group(AGENT.pgid);
+            mark(&ws, tid, PromptMark::PromptStart);
+            let tab = ws.tab(tid).unwrap();
+            assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
+            assert!(tab.ownership.is_some());
+            assert!(ws.take_process_requests(false).is_empty(), "nothing parked");
+        }
+
+        /// U12: a new Claude started beside a suspended one is its own
+        /// process, not one the suspended Claude runs: parking left the
+        /// lifecycle `inactive`, so the nested-claim rule lets it claim.
+        #[test]
+        fn a_new_claude_beside_a_suspended_one_takes_the_tab() {
+            let (ws, tid, probe) = stamped_claude();
+            *probe.lock().unwrap() = Foreground::Shell;
+            mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
+            sample(&ws, Foreground::Shell, None, Liveness::Stopped);
+            mark(&ws, tid, PromptMark::OutputStart);
+
+            let mut start = report(
+                tid,
+                "claude",
+                "s2",
+                OwnershipAction::Claim,
+                Some(AgentLifecycle::Inactive),
+            );
+            start
+                .metadata
+                .insert(agent::START_SOURCE_KEY.into(), "startup".into());
+            let (accepted, tab) = ws.agent_report(&start).unwrap();
+            assert!(accepted, "{:?}", tab.dropped_reports);
+            assert_eq!(tab.ownership.map(|o| o.session_id), Some("s2".into()));
+            assert_eq!(tab.process, None, "the new owner waits for its own stamp");
+        }
+
+        fn codex(state: roost_ipc::program_status::ProgramStatusState) -> StatusEvent {
+            StatusEvent::Report(roost_ipc::program_status::ProgramStatusReport {
+                state,
+                kind: None,
+                progress: None,
+                id: String::new(),
+                app: "codex".into(),
+                title: String::new(),
+                msg: String::new(),
+            })
+        }
+
+        fn raw_osc_raises(ws: &Workspace, tid: i64) -> bool {
+            ws.raise_attention(
+                tid,
+                "",
+                "after",
+                AttentionSource::RawOsc {
+                    suppressed_at_place: None,
+                },
+            )
+            .unwrap()
+        }
+
+        /// A Codex with no hooks working in front of a shell with no prompt
+        /// marks, its records stamped.
+        fn stamped_codex() -> (Workspace, i64, Arc<Mutex<Foreground>>) {
+            let (ws, tid, fg) = probed_ws();
+            mark(&ws, tid, PromptMark::OutputStart);
+            ws.apply_program_status(
+                tid,
+                vec![codex(
+                    roost_ipc::program_status::ProgramStatusState::Working,
+                )],
+                T,
+            )
+            .unwrap();
+            sample(
+                &ws,
+                Foreground::Group(AGENT.pgid),
+                Some(AGENT),
+                Liveness::Running,
+            );
+            (ws, tid, fg)
+        }
+
+        /// U14: the records' process rides `Tab.process` and
+        /// `AgentChanged`, under the record's app; and (#519) once the
+        /// tick finds it gone with the shell in front, its live record
+        /// ends as a prompt would end it, the tab leaves `running`, and a
+        /// raw notification is no longer muted.
+        #[test]
+        fn a_records_process_is_on_the_wire_and_its_end_unmutes_the_tab() {
+            let (ws, tid) = agent_ws();
+            ws.apply_program_status(
+                tid,
+                vec![codex(
+                    roost_ipc::program_status::ProgramStatusState::Working,
+                )],
+                T,
+            )
+            .unwrap();
+            let mut rx = ws.subscribe();
+            sample(
+                &ws,
+                Foreground::Group(AGENT.pgid),
+                Some(AGENT),
+                Liveness::Running,
+            );
+            let tab = ws.tab(tid).unwrap();
+            let process = tab.process.clone().expect("the records are stamped");
+            assert_eq!(
+                (process.agent.as_str(), process.pid, process.state),
+                ("codex", AGENT.pid, ProcessState::Running)
+            );
+            assert!(drain(&mut rx).iter().any(|event| matches!(
+                event,
+                WorkspaceEvent::AgentChanged { process: Some(process), .. }
+                    if process.agent == "codex"
+            )));
+            assert_eq!(tab.state, TabState::Running);
+            assert!(!raw_osc_raises(&ws, tid), "the precondition: muted");
+
+            let requests = ws.take_process_requests(true);
+            assert_eq!(requests.len(), 1, "the tick reads the stamped tab");
+            ws.apply_process_sample(
+                &requests[0],
+                &ProcessSample {
+                    incarnation: 1,
+                    foreground: Foreground::Shell,
+                    leader: None,
+                    relayed: false,
+                    liveness: vec![(AGENT, Liveness::Gone)],
+                },
+            );
+            let tab = ws.tab(tid).unwrap();
+            assert_eq!(tab.state, TabState::None);
+            assert_eq!(tab.program_status, None);
+            assert_eq!(tab.process, None);
+            assert!(drain(&mut rx).iter().any(|event| matches!(
+                event,
+                WorkspaceEvent::AgentChanged {
+                    process: None,
+                    program_status: None,
+                    ..
+                }
+            )));
+            assert!(raw_osc_raises(&ws, tid), "a raw notification lands again");
+            assert!(!ws.wants_process_ticks());
+        }
+
+        /// E4's core: a Ctrl-Z of a 7501 agent with no hooks keeps its
+        /// row's process, suspended under the app, while the tab shows
+        /// what the prompt shows; the records are back on `fg`.
+        #[test]
+        fn a_suspended_7501_agent_shows_suspended_and_comes_back() {
+            let (ws, tid, probe) = stamped_codex();
+            *probe.lock().unwrap() = Foreground::Shell;
+            mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
+            sample(&ws, Foreground::Shell, None, Liveness::Stopped);
+            let tab = ws.tab(tid).unwrap();
+            assert_eq!(tab.state, TabState::None);
+            assert_eq!(tab.ownership, None);
+            let process = tab.process.expect("still stamped");
+            assert_eq!(
+                (process.state, process.agent.as_str()),
+                (ProcessState::Suspended, "codex")
+            );
+            assert!(raw_osc_raises(&ws, tid), "a suspended agent mutes nothing");
+
+            *probe.lock().unwrap() = Foreground::Group(AGENT.pgid);
+            mark(&ws, tid, PromptMark::OutputStart);
+            sample(&ws, Foreground::Group(AGENT.pgid), None, Liveness::Running);
+            let tab = ws.tab(tid).unwrap();
+            assert_eq!(tab.state, TabState::Running, "the record is back");
+            assert_eq!(
+                tab.process.map(|process| process.state),
+                Some(ProcessState::Running)
+            );
+        }
+
+        /// U13: the tick reads every tab holding a stamp, and only those —
+        /// not a plain tab, not records it found nothing to stamp for.
+        #[test]
+        fn the_tick_reads_only_tabs_holding_a_stamp() {
+            let (ws, stamped, _) = stamped_codex();
+            let project = ws.tab(stamped).unwrap().project_id;
+            let plain = ws
+                .open_tab(project, "/", "", true, TabOpener::None)
+                .unwrap()
+                .id;
+            let unstamped = ws
+                .open_tab(project, "/", "", true, TabOpener::None)
+                .unwrap()
+                .id;
+            ws.apply_program_status(
+                unstamped,
+                vec![codex(
+                    roost_ipc::program_status::ProgramStatusState::Working,
+                )],
+                T,
+            )
+            .unwrap();
+            sample(&ws, Foreground::Shell, None, Liveness::Running);
+            assert!(ws.take_process_requests(false).is_empty());
+
+            let ticked: Vec<i64> = ws
+                .take_process_requests(true)
+                .iter()
+                .map(|request| request.tab_id)
+                .collect();
+            assert_eq!(ticked, vec![stamped], "not {plain} or {unstamped}");
+            assert!(ws.wants_process_ticks());
+        }
+
+        /// A session's viewer coming or going asks a stamped tab for a
+        /// sample: the only focus a session sees.
+        #[cfg(feature = "server-vt")]
+        #[test]
+        fn a_viewer_coming_or_going_asks_a_stamped_tab_for_a_sample() {
+            use crate::tab_task::ServerVtWorkspace;
+            let (ws, tid, _) = stamped_codex();
+            assert!(ws.take_process_requests(false).is_empty());
+            ws.tab_viewers_changed(tid);
+            let requests = ws.take_process_requests(false);
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.tab_id)
+                    .collect::<Vec<_>>(),
+                vec![tid]
+            );
+        }
+
+        /// What the sampler would apply for every request now due, with
+        /// `named` the leader in front of tab `at` — cursor-agent — and the
+        /// shell in front of every other.
+        fn look(ws: &Workspace, at: i64, liveness: Liveness) -> Vec<i64> {
+            let requests = ws.take_process_requests(false);
+            for request in &requests {
+                let in_front = request.tab_id == at;
+                let sample = ProcessSample {
+                    incarnation: 1,
+                    foreground: if in_front {
+                        Foreground::Group(AGENT.pgid)
+                    } else {
+                        Foreground::Shell
+                    },
+                    leader: in_front.then_some(Leader {
+                        stamp: AGENT,
+                        agent: Some("cursor"),
+                    }),
+                    relayed: false,
+                    liveness: request
+                        .stamps
+                        .iter()
+                        .map(|stamp| (*stamp, liveness))
+                        .collect(),
+                };
+                ws.apply_process_sample(request, &sample);
+            }
+            requests.iter().map(|request| request.tab_id).collect()
+        }
+
+        /// U22: an agent no one owns and no record names is looked for
+        /// when its tab gains or loses the focus, never on the tick; once
+        /// named, it is on the wire, ticked, and ends by the same rule as
+        /// any stamp.
+        #[test]
+        fn an_agent_named_by_its_process_is_found_at_blur_and_ends_like_any_stamp() {
+            let (ws, tid, fg) = probed_ws();
+            let project = ws.tab(tid).unwrap().project_id;
+            let other = ws
+                .open_tab(project, "/", "", true, TabOpener::None)
+                .unwrap()
+                .id;
+            ws.focus_tab(tid).unwrap();
+            look(&ws, 0, Liveness::Running);
+            assert_eq!(ws.tab(tid).unwrap().process, None);
+
+            assert!(
+                ws.take_process_requests(true).is_empty(),
+                "the tick never looks, whatever runs in front"
+            );
+            assert!(!ws.wants_process_ticks());
+
+            let mut rx = ws.subscribe();
+            ws.focus_tab(other).unwrap();
+            assert!(
+                look(&ws, tid, Liveness::Running).contains(&tid),
+                "the blurred tab is looked at"
+            );
+            let tab = ws.tab(tid).unwrap();
+            let process = tab.process.clone().expect("named");
+            assert_eq!(
+                (process.agent.as_str(), process.pid, process.state),
+                ("cursor", AGENT.pid, ProcessState::Running)
+            );
+            assert_eq!(tab.ownership, None, "no owner is made up");
+            assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
+            assert!(drain(&mut rx).iter().any(|event| matches!(
+                event,
+                WorkspaceEvent::AgentChanged { process: Some(process), .. }
+                    if process.agent == "cursor"
+            )));
+            assert!(ws.wants_process_ticks());
+            assert_eq!(
+                ws.take_process_requests(true)
+                    .iter()
+                    .map(|request| request.tab_id)
+                    .collect::<Vec<_>>(),
+                vec![tid],
+                "a named agent is ticked"
+            );
+
+            *fg.lock().unwrap() = Foreground::Shell;
+            mark(&ws, tid, PromptMark::CommandEnd { exit_code: Some(0) });
+            sample(&ws, Foreground::Shell, None, Liveness::Gone);
+            assert_eq!(ws.tab(tid).unwrap().process, None);
+            assert!(drain(&mut rx)
+                .iter()
+                .any(|event| matches!(event, WorkspaceEvent::AgentChanged { process: None, .. })));
+            assert!(!ws.wants_process_ticks());
+        }
+
+        /// A session's viewer coming or going is its focus: on a tab
+        /// nothing follows, it looks for an agent in front.
+        #[cfg(feature = "server-vt")]
+        #[test]
+        fn a_viewer_coming_or_going_looks_for_an_agent() {
+            use crate::tab_task::ServerVtWorkspace;
+            let (ws, tid, _) = probed_ws();
+            assert!(ws.take_process_requests(false).is_empty());
+            ws.tab_viewers_changed(tid);
+            assert_eq!(look(&ws, tid, Liveness::Running), vec![tid]);
+            assert_eq!(
+                ws.tab(tid).unwrap().process.map(|process| process.agent),
+                Some("cursor".to_owned())
+            );
+        }
+
+        fn fired(rx: &mut broadcast::Receiver<WorkspaceEvent>) -> Vec<(String, String)> {
+            drain(rx)
+                .into_iter()
+                .filter_map(|event| match event {
+                    WorkspaceEvent::NotificationFired { title, body, .. } => Some((title, body)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The tick's read, as the sampler applies it.
+        fn tick(ws: &Workspace, foreground: Foreground, liveness: Liveness) {
+            for request in ws.take_process_requests(true) {
+                ws.apply_process_sample(
+                    &request,
+                    &ProcessSample {
+                        incarnation: 1,
+                        foreground,
+                        leader: None,
+                        relayed: false,
+                        liveness: vec![(AGENT, liveness)],
+                    },
+                );
+            }
+        }
+
+        /// U19, for a hook owner: a Claude killed mid-turn raises one
+        /// `killed (SIGKILL)` banner under its name, whether the sample
+        /// that ends it comes before the shell's `D` or after it.
+        #[test]
+        fn a_killed_working_owner_raises_one_exit_banner_whatever_the_order() {
+            let killed = vec![("Claude Code".to_owned(), "killed (SIGKILL)".to_owned())];
+            let d_137 = PromptMark::CommandEnd {
+                exit_code: Some(137),
+            };
+
+            let (ws, tid, fg) = stamped_claude();
+            let mut rx = ws.subscribe();
+            *fg.lock().unwrap() = Foreground::Shell;
+            mark(&ws, tid, d_137);
+            assert!(fired(&mut rx).is_empty(), "the D alone ends nothing");
+            sample(&ws, Foreground::Shell, None, Liveness::Gone);
+            assert_eq!(ws.tab(tid).unwrap().ownership, None);
+            assert_eq!(fired(&mut rx), killed, "D first");
+            assert!(ws.tab(tid).unwrap().has_notification);
+
+            let (ws, tid, fg) = stamped_claude();
+            let mut rx = ws.subscribe();
+            tick(&ws, Foreground::Shell, Liveness::Gone);
+            assert_eq!(ws.tab(tid).unwrap().ownership, None);
+            assert!(fired(&mut rx).is_empty(), "the code is the D's");
+            *fg.lock().unwrap() = Foreground::Shell;
+            mark(&ws, tid, d_137);
+            assert_eq!(fired(&mut rx), killed, "sample first");
+        }
+
+        /// The banner is a notification like any other: a tab being
+        /// watched raises none. Nor does an agent that was not working
+        /// or blocked when it died, or one that exited 0.
+        #[test]
+        fn a_watched_idle_or_successful_agent_raises_no_exit_banner() {
+            for (lifecycle, code, watched) in [
+                (AgentLifecycle::Working, 137, true),
+                (AgentLifecycle::Finished, 137, false),
+                (AgentLifecycle::Inactive, 1, false),
+                (AgentLifecycle::Working, 0, false),
+            ] {
+                let (ws, tid, fg) = probed_ws();
+                mark(&ws, tid, PromptMark::OutputStart);
+                assert!(claim(&ws, tid, "s1", lifecycle));
+                sample(
+                    &ws,
+                    Foreground::Group(AGENT.pgid),
+                    Some(AGENT),
+                    Liveness::Running,
+                );
+                ws.set_window_focused(watched);
+                let mut rx = ws.subscribe();
+                *fg.lock().unwrap() = Foreground::Shell;
+                mark(
+                    &ws,
+                    tid,
+                    PromptMark::CommandEnd {
+                        exit_code: Some(code),
+                    },
+                );
+                sample(&ws, Foreground::Shell, None, Liveness::Gone);
+                let case = format!("{lifecycle:?} {code} watched={watched}");
+                assert_eq!(ws.tab(tid).unwrap().ownership, None, "{case}");
+                assert!(fired(&mut rx).is_empty(), "{case}");
+                assert!(!ws.tab(tid).unwrap().has_notification, "{case}");
+            }
         }
     }
 }

@@ -119,7 +119,11 @@ pub fn panel_rows(sources: &[AgentSource<'_>], now: i64) -> Vec<PanelAgentRow> {
                 let Some(row) = row_agent(tab) else {
                     continue;
                 };
-                let lifecycle = tab.effective_lifecycle();
+                let lifecycle = if row.by_process {
+                    AgentLifecycle::Inactive
+                } else {
+                    tab.effective_lifecycle()
+                };
                 rows.push(PanelAgentRow {
                     tab: TabKey::new(source.host, tab.id),
                     project: ProjectKey::new(source.host, project.id),
@@ -296,6 +300,7 @@ mod tests {
             password_input: false,
             dropped_reports: None,
             program_status: None,
+            process: None,
         }
     }
 

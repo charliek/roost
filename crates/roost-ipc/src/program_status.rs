@@ -42,7 +42,11 @@ pub enum PromptMark {
     PromptStart,
     InputStart,
     OutputStart,
-    CommandEnd,
+    /// `exit_code` is the command's status, when the shell sent one
+    /// (`133;D;<code>`).
+    CommandEnd {
+        exit_code: Option<i32>,
+    },
 }
 
 /// One OSC 7501 report. Text the program didn't send is empty.

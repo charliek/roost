@@ -376,6 +376,12 @@ was fenced has no start left to catch: the writes still go through
 gate is skipped, the settled wait begins at once, and
 `started_after_ms` is `null`.
 
+**An agent that dies mid-turn settles in `none`**, not in the default
+`idle` or `needs_input`: once its process is gone, Roost releases it and
+the tab falls back to the shell's state
+([when a tab stays running](../guides/agents.md#when-a-tab-stays-running)).
+Add `--until none` to return then rather than at `--timeout`.
+
 **The stream is required.** Against a server whose `identify.ops` lacks
 `events.subscribe` and that names no `local_session_socket` — a Roost
 older than this `roostctl` — the verb exits 1 `unsupported` and writes

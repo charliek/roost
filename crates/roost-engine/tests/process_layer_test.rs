@@ -1,0 +1,705 @@
+#![cfg(feature = "server-vt")]
+//! The process layer (#621) over real PTYs: a session's tab task reads
+//! the shell's prompt marks through libghostty, the probe reads who has
+//! the terminal, and `LocalClient::watch_processes`'s sampler reads the
+//! stamped job — the whole loop a `roost-session` runs, minus the socket.
+//!
+//! The shells are `bash --norc --noprofile -i` with a `PROMPT_COMMAND`
+//! printing the `D` mark, as Roost's own integration does, so nothing
+//! from a user's startup files runs. After the `D` it sets the title to
+//! the prompt's number: a title is applied after the marks of the same
+//! read, so a test waiting on it knows that prompt's `D` has landed. The
+//! agent is a plain job and the hook claim comes from the test.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use roost_engine::tab_task::ServerVtConfig;
+use roost_engine::{LocalClient, PtySupervisor, TabOpener, Workspace};
+use roost_ipc::agent::{AgentLifecycle, OwnershipAction, ShellState, TabAgentReportParams};
+use roost_ipc::messages::{Tab, TabState};
+use roost_ipc::process::{ProcessState, TabProcess};
+
+const BUDGET: Duration = Duration::from_secs(20);
+
+struct Rig {
+    workspace: Arc<Workspace>,
+    supervisor: Arc<PtySupervisor>,
+    client: LocalClient,
+    project: i64,
+    _tabs: HangUp,
+}
+
+/// Hangs up every tab a test opened, whatever the test did.
+struct HangUp(Arc<PtySupervisor>, std::sync::Mutex<Vec<i64>>);
+
+impl Drop for HangUp {
+    fn drop(&mut self) {
+        for tab in self.1.lock().unwrap().iter() {
+            self.0.close(*tab);
+        }
+    }
+}
+
+impl Rig {
+    fn new() -> Option<Self> {
+        if which("bash").is_none() {
+            eprintln!("skipping the process-layer test: bash not found on PATH");
+            return None;
+        }
+        let workspace = Arc::new(Workspace::new());
+        workspace.set_window_focused(false);
+        let project = workspace.create_project("p", "/tmp").unwrap().id;
+        let supervisor = Arc::new(PtySupervisor::new());
+        supervisor
+            .enable_server_vt(ServerVtConfig::new(workspace.clone()))
+            .expect("server-vt enables once");
+        let client = LocalClient::new(
+            Arc::clone(&workspace),
+            Arc::clone(&supervisor),
+            PathBuf::from("/tmp/roost-process-layer-test.sock"),
+        );
+        client.watch_processes();
+        Some(Self {
+            _tabs: HangUp(supervisor.clone(), std::sync::Mutex::new(Vec::new())),
+            workspace,
+            supervisor,
+            client,
+            project,
+        })
+    }
+
+    /// A bash tab at a prompt whose every return prints `OSC 133 ; D`,
+    /// and its shell's pid.
+    async fn bash_tab(&self) -> (i64, u32) {
+        let argv = ["bash", "--norc", "--noprofile", "-i"].map(String::from);
+        let tab = self
+            .client
+            .open_tab(self.project, "/tmp", "t", &argv, 80, 24, &TabOpener::None)
+            .await
+            .expect("open a bash tab")
+            .id;
+        self._tabs.1.lock().unwrap().push(tab);
+        let mut output = self
+            .supervisor
+            .take_initial_receiver(tab)
+            .expect("the tab's first receiver");
+        wait_for_text(&mut output, "$ ").await;
+        // The pid is printed through `%s`, so only the output has digits
+        // after the marker; the echoed command line has `%s`.
+        self.type_line(
+            tab,
+            r#"PROMPT_COMMAND='n=$((n+1)); printf "\033]133;D\007\033]0;prompt %s\007" $n'; printf 'SHELL_PID_%s_\n' "$$""#,
+        )
+        .await;
+        let seen = wait_for_text(&mut output, "_\r\n").await;
+        let shell = seen
+            .split("SHELL_PID_")
+            .filter_map(|rest| rest.split('_').next()?.parse().ok())
+            .next()
+            .expect("the shell's pid");
+        self.prompted(tab, 1).await;
+        (tab, shell)
+    }
+
+    /// A `sh -i` tab — dash on Linux, bash in POSIX mode on macOS — which
+    /// prints no prompt marks at all, and its shell's pid.
+    async fn sh_tab(&self) -> (i64, u32) {
+        let argv = ["sh", "-i"].map(String::from);
+        let tab = self
+            .client
+            .open_tab(self.project, "/tmp", "t", &argv, 80, 24, &TabOpener::None)
+            .await
+            .expect("open a sh tab")
+            .id;
+        self._tabs.1.lock().unwrap().push(tab);
+        let mut output = self
+            .supervisor
+            .take_initial_receiver(tab)
+            .expect("the tab's first receiver");
+        wait_for_text(&mut output, "$ ").await;
+        self.type_line(tab, r#"printf 'SHELL_PID_%s_\n' "$$""#)
+            .await;
+        let seen = wait_for_text(&mut output, "_\r\n").await;
+        let shell = seen
+            .split("SHELL_PID_")
+            .filter_map(|rest| rest.split('_').next()?.parse().ok())
+            .next()
+            .expect("the shell's pid");
+        (tab, shell)
+    }
+
+    /// Wait until the tab's shell has drawn its `n`th prompt, its `D`
+    /// mark included.
+    async fn prompted(&self, tab: i64, n: u32) {
+        let title = format!("prompt {n}");
+        let listed = self.wait(tab, &title, |tab| tab.title == title).await;
+        assert_eq!(listed.shell_state, ShellState::AtPrompt);
+    }
+
+    async fn type_line(&self, tab: i64, line: &str) {
+        self.type_bytes(tab, format!("{line}\n").as_bytes()).await;
+    }
+
+    async fn type_bytes(&self, tab: i64, bytes: &[u8]) {
+        self.supervisor
+            .write(tab, bytes.to_vec())
+            .await
+            .expect("type into the tab");
+    }
+
+    fn claim(&self, tab: i64, lifecycle: AgentLifecycle) {
+        let report = TabAgentReportParams {
+            session_id: format!("s-{tab}"),
+            ..TabAgentReportParams::sessionless(
+                tab,
+                "claude",
+                OwnershipAction::Claim,
+                Some(lifecycle),
+            )
+        };
+        let (accepted, _) = self.workspace.agent_report(&report).expect("report");
+        assert!(accepted, "the claim is accepted");
+    }
+
+    async fn wait(&self, tab: i64, what: &str, done: impl Fn(&Tab) -> bool) -> Tab {
+        let deadline = Instant::now() + BUDGET;
+        loop {
+            let listed = self.workspace.tab(tab).expect("the tab is listed");
+            if done(&listed) {
+                return listed;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}: {listed:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A `sleep` job in front of `shell`, in `tab`, claimed by an agent
+    /// and stamped: its process, as `Tab.process` names it.
+    async fn stamped_job(&self, tab: (i64, u32)) -> TabProcess {
+        self.claimed_job(tab, "sleep 300").await
+    }
+
+    /// `command` as a job in front of `shell`, in `tab`, claimed by an
+    /// agent and stamped: the leader of its group.
+    async fn claimed_job(&self, (tab, shell): (i64, u32), command: &str) -> TabProcess {
+        self.type_line(tab, command).await;
+        wait_until("the job leads the terminal", || pid_of_job(shell).is_some()).await;
+        self.claim(tab, AgentLifecycle::Working);
+        let listed = self
+            .wait(tab, "the job's stamp", |tab| tab.process.is_some())
+            .await;
+        let process = listed.process.unwrap();
+        assert_eq!(
+            Some(process.pid),
+            pid_of_job(shell),
+            "the stamp is the job in front"
+        );
+        assert_eq!(process.state, ProcessState::Running);
+        assert_eq!(process.agent, "claude");
+        process
+    }
+}
+
+/// I1: the stamped job is killed; the shell's `D` parks, and the sample it
+/// asks for finds the process gone with the shell in front.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_killed_agent_releases_its_owner_at_the_prompt() {
+    let Some(rig) = Rig::new() else { return };
+    let (tab, shell) = rig.bash_tab().await;
+    let process = rig.stamped_job((tab, shell)).await;
+
+    signal(process.pid, libc::SIGKILL);
+    let listed = rig
+        .wait(tab, "the owner's release", |tab| tab.ownership.is_none())
+        .await;
+    assert!(!listed.hook_active);
+    assert_eq!(listed.process, None);
+    assert_eq!(listed.agent_lifecycle, AgentLifecycle::Inactive);
+}
+
+/// I2: Ctrl-Z keeps the owner and parks what it was doing; the agent shows
+/// suspended, and once it runs again in front, its lifecycle is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suspended_agent_keeps_its_owner_and_resumes_on_fg() {
+    let Some(rig) = Rig::new() else { return };
+    let (tab, shell) = rig.bash_tab().await;
+    let process = rig.stamped_job((tab, shell)).await;
+
+    rig.type_bytes(tab, b"\x1a").await;
+    let listed = rig
+        .wait(tab, "the suspended agent", |tab| {
+            tab.process.as_ref().map(|process| process.state) == Some(ProcessState::Suspended)
+        })
+        .await;
+    assert_eq!(
+        listed.ownership.as_ref().map(|owner| owner.source.as_str()),
+        Some("claude"),
+        "a stopped agent keeps its owner"
+    );
+    assert_eq!(listed.agent_lifecycle, AgentLifecycle::Inactive, "parked");
+
+    rig.type_line(tab, "fg").await;
+    wait_until("the job runs again", || !is_stopped(process.pid)).await;
+    // A focus asks for a sample; bash < 4.4 prints no `C` for the `fg`.
+    rig.workspace.focus_tab(tab).unwrap();
+    let listed = rig
+        .wait(tab, "the restored lifecycle", |tab| {
+            tab.agent_lifecycle == AgentLifecycle::Working
+        })
+        .await;
+    assert_eq!(
+        listed.process.map(|process| process.state),
+        Some(ProcessState::Running)
+    );
+
+    signal(process.pid, libc::SIGKILL);
+    rig.wait(tab, "the owner's release", |tab| tab.ownership.is_none())
+        .await;
+}
+
+/// I3: a claim made while the shell itself is in front — an agent in the
+/// background — stamps nothing, so the shell's next prompt releases it.
+/// A second tab's stamp is the fence: the sampler applies every request
+/// it took in tab order, so once the later tab is stamped, the earlier
+/// one's claim has been sampled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_with_the_shell_in_front_stamps_nothing() {
+    let Some(rig) = Rig::new() else { return };
+    let (background, _) = rig.bash_tab().await;
+    let (fence, fence_shell) = rig.bash_tab().await;
+    assert!(
+        background < fence,
+        "the precondition: tab order is id order"
+    );
+
+    rig.type_line(background, "sleep 300 &").await;
+    rig.prompted(background, 2).await;
+    rig.type_line(fence, "sleep 300").await;
+    wait_until("the fence's job leads its terminal", || {
+        pid_of_job(fence_shell).is_some()
+    })
+    .await;
+    rig.claim(background, AgentLifecycle::Working);
+    rig.claim(fence, AgentLifecycle::Working);
+    rig.wait(fence, "the fence's stamp", |tab| tab.process.is_some())
+        .await;
+
+    let listed = rig.workspace.tab(background).unwrap();
+    assert_eq!(
+        listed.process, None,
+        "the shell's own group is never stamped"
+    );
+    assert!(listed.ownership.is_some(), "the precondition: still owned");
+
+    rig.type_line(background, "true").await;
+    rig.wait(background, "the release at the shell's prompt", |tab| {
+        tab.ownership.is_none()
+    })
+    .await;
+}
+
+/// I4: a pipeline whose leader dies first keeps its owner while the rest
+/// of the pipeline has the terminal; once the last member is gone and the
+/// shell has the terminal back, the owner is released.
+///
+/// What proves the keep is a fence: a second tab, a shell with no prompt
+/// marks, whose stamped job is killed only after the pipeline's leader is
+/// gone. Nothing but the tick can release that one, and the tick reads
+/// and applies every stamped tab in id order, the pipeline's (the lower
+/// id) first — so once the fence is released, the pipeline's tab has had
+/// a sample that found its leader gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pipeline_keeps_its_owner_until_its_group_leaves_the_front() {
+    let Some(rig) = Rig::new() else { return };
+    let (pipe, pipe_shell) = rig.bash_tab().await;
+    let (fence, fence_shell) = rig.sh_tab().await;
+    assert!(pipe < fence, "the precondition: tab order is id order");
+
+    let leader = rig
+        .claimed_job((pipe, pipe_shell), "sleep 300 | sleep 301")
+        .await;
+    let _group = KillGroup(leader.pid);
+    let fence_job = rig.claimed_job((fence, fence_shell), "sleep 302").await;
+    let mate = || {
+        group_members(leader.pid)
+            .into_iter()
+            .find(|&pid| pid != leader.pid)
+    };
+    wait_until("the pipeline's second member", || mate().is_some()).await;
+    let mate = mate().unwrap();
+
+    signal(leader.pid, libc::SIGKILL);
+    wait_until("the leader is gone", || is_gone(leader.pid)).await;
+    // A margin, not a wait: the fence's read must come after the
+    // leader's death, and one batch's reads take microseconds.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    signal(fence_job.pid, libc::SIGKILL);
+    rig.wait(fence, "the tick releasing the fence", |tab| {
+        tab.ownership.is_none()
+    })
+    .await;
+    let listed = rig.workspace.tab(pipe).unwrap();
+    assert!(
+        listed.ownership.is_some(),
+        "the pipeline still has the terminal: {listed:?}"
+    );
+    assert_eq!(listed.process.map(|process| process.pid), Some(leader.pid));
+
+    signal(mate, libc::SIGKILL);
+    rig.wait(pipe, "the owner's release", |tab| tab.ownership.is_none())
+        .await;
+}
+
+/// I5: a straggler left in the stamped group (`sh -c 'sleep & exec …'`)
+/// never holds the owner: once the leader is gone and the shell takes the
+/// terminal back, the owner is released, with the straggler still alive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_straggler_in_the_group_does_not_keep_the_owner() {
+    let Some(rig) = Rig::new() else { return };
+    let (tab, shell) = rig.bash_tab().await;
+    let leader = rig
+        .claimed_job((tab, shell), "sh -c 'sleep 303 & exec sleep 304'")
+        .await;
+    let _group = KillGroup(leader.pid);
+    wait_until("the straggler joins the group", || {
+        group_members(leader.pid).len() == 2
+    })
+    .await;
+
+    signal(leader.pid, libc::SIGKILL);
+    rig.wait(tab, "the owner's release", |tab| tab.ownership.is_none())
+        .await;
+    assert_eq!(
+        group_members(leader.pid).len(),
+        1,
+        "the straggler is still in the group"
+    );
+}
+
+/// I6 (#519): in a shell with no prompt marks, a program's `working`
+/// record ends once the tick finds its process gone with the shell back
+/// in front — nothing else would ever end it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_marks_a_dead_programs_working_record_ends_on_the_tick() {
+    let Some(rig) = Rig::new() else { return };
+    let (tab, shell) = rig.sh_tab().await;
+    rig.type_line(
+        tab,
+        r#"sh -c 'printf "\033]7501;state=working:app=fakeagent\033\\\\"; exec sleep 305'"#,
+    )
+    .await;
+    let listed = rig
+        .wait(tab, "the record's stamp", |tab| tab.process.is_some())
+        .await;
+    assert_eq!(listed.state, TabState::Running);
+    let process = listed.process.unwrap();
+    assert_eq!(process.agent, "fakeagent");
+    assert_eq!(Some(process.pid), pid_of_job(shell), "the job in front");
+
+    signal(process.pid, libc::SIGKILL);
+    let listed = rig
+        .wait(tab, "the tick ending the record", |tab| {
+            tab.process.is_none()
+        })
+        .await;
+    assert_eq!(listed.state, TabState::None);
+    assert_eq!(listed.program_status, None);
+}
+
+/// I7: an agent no hook claims and no record names — cursor-agent with
+/// no hooks — is named by its process once its tab loses the focus, and
+/// goes with its process. The agent is a binary called `cursor-agent`: a
+/// copied `sleep` on Linux, where a process is named after the path it
+/// ran as, and on macOS, which names it after the binary and kills a
+/// copied system one, a sleeper built with `cc`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_named_by_its_process_shows_at_blur_and_goes_with_it() {
+    let Some(rig) = Rig::new() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let Some(command) = named_sleeper(dir.path(), "cursor-agent") else {
+        eprintln!("skipping the identity test: no way to run a cursor-agent here");
+        return;
+    };
+    let (tab, shell) = rig.bash_tab().await;
+    let (other, _) = rig.bash_tab().await;
+    rig.workspace.focus_tab(tab).unwrap();
+
+    rig.type_line(tab, &command).await;
+    wait_until("the agent leads the terminal, exec'd", || {
+        pid_of_job(shell).is_some_and(|job| !matches!(comm_of(job).as_str(), "" | "bash" | "sh"))
+    })
+    .await;
+    assert_eq!(
+        rig.workspace.tab(tab).unwrap().process,
+        None,
+        "the precondition: nothing has looked"
+    );
+    rig.workspace.focus_tab(other).unwrap();
+    let listed = rig
+        .wait(tab, "the agent named", |tab| tab.process.is_some())
+        .await;
+    let process = listed.process.unwrap();
+    assert_eq!(process.agent, "cursor");
+    assert_eq!(process.state, ProcessState::Running);
+    assert_eq!(Some(process.pid), pid_of_job(shell), "the job in front");
+    assert_eq!(listed.ownership, None, "no owner is made up");
+
+    signal(process.pid, libc::SIGKILL);
+    rig.wait(tab, "the agent gone", |tab| tab.process.is_none())
+        .await;
+}
+
+/// A `C` printed before the command forks, as bash's `PS0` and zsh's
+/// `preexec` print it, asks for a look that can find the shell, or its
+/// fork, still in front — on macOS it nearly always does. The look is
+/// taken again on the next tick, which names the agent. Here the job is
+/// `sh` until it execs a cursor-agent a moment later, so the `C`'s own
+/// look always misses; nothing focuses or blurs the tab.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_the_c_marks_look_missed_is_named_on_the_next_tick() {
+    let Some(rig) = Rig::new() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let Some(agent) = named_sleeper(dir.path(), "cursor-agent") else {
+        eprintln!("skipping the C-mark identity test: no way to run a cursor-agent here");
+        return;
+    };
+    let (tab, shell) = rig.bash_tab().await;
+
+    rig.type_line(
+        tab,
+        &format!(r#"printf '\033]133;C\007'; sh -c "sleep 0.3; exec {agent}""#),
+    )
+    .await;
+    wait_until("the agent leads the terminal, exec'd", || {
+        pid_of_job(shell).is_some_and(|job| comm_of(job) == "cursor-agent")
+    })
+    .await;
+    let listed = rig
+        .wait(tab, "the agent named", |tab| tab.process.is_some())
+        .await;
+    let process = listed.process.unwrap();
+    assert_eq!(process.agent, "cursor");
+    assert_eq!(Some(process.pid), pid_of_job(shell), "the job in front");
+
+    signal(process.pid, libc::SIGKILL);
+    rig.wait(tab, "the agent gone", |tab| tab.process.is_none())
+        .await;
+}
+
+/// An agent inside tmux claims while the tmux client has the terminal,
+/// so nothing is stamped. A detach ends the client and the shell takes
+/// the terminal back, with the agent alive behind the tmux server: the
+/// shell's `D` does what it always did, and the owner stays, so what the
+/// agent reports after a reattach still lands. The client here is a
+/// sleeper called `tmux`; a second tab's stamp is the fence, as in I3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_behind_a_multiplexer_outlives_its_client() {
+    let Some(rig) = Rig::new() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let Some(tmux) = named_sleeper(dir.path(), "tmux") else {
+        eprintln!("skipping the multiplexer test: no way to run a tmux here");
+        return;
+    };
+    let (relayed, relayed_shell) = rig.bash_tab().await;
+    let (fence, fence_shell) = rig.bash_tab().await;
+    assert!(relayed < fence, "the precondition: tab order is id order");
+
+    rig.type_line(relayed, &tmux).await;
+    wait_until("tmux leads the terminal, exec'd", || {
+        pid_of_job(relayed_shell).is_some_and(|job| comm_of(job) == "tmux")
+    })
+    .await;
+    rig.type_line(fence, "sleep 300").await;
+    wait_until("the fence's job leads its terminal", || {
+        pid_of_job(fence_shell).is_some()
+    })
+    .await;
+    rig.claim(relayed, AgentLifecycle::Working);
+    rig.claim(fence, AgentLifecycle::Working);
+    rig.wait(fence, "the fence's stamp", |tab| tab.process.is_some())
+        .await;
+    assert_eq!(
+        rig.workspace.tab(relayed).unwrap().process,
+        None,
+        "a multiplexer is never stamped"
+    );
+
+    signal(pid_of_job(relayed_shell).unwrap(), libc::SIGTERM);
+    rig.prompted(relayed, 2).await;
+    let listed = rig.workspace.tab(relayed).unwrap();
+    assert_eq!(
+        listed.ownership.as_ref().map(|owner| owner.source.as_str()),
+        Some("claude"),
+        "the detach keeps the owner"
+    );
+    assert_eq!(listed.agent_lifecycle, AgentLifecycle::Inactive, "today's");
+
+    let report = TabAgentReportParams {
+        session_id: format!("s-{relayed}"),
+        ..TabAgentReportParams::sessionless(
+            relayed,
+            "claude",
+            OwnershipAction::Preserve,
+            Some(AgentLifecycle::Working),
+        )
+    };
+    let (accepted, listed) = rig.workspace.agent_report(&report).expect("report");
+    assert!(accepted, "the agent's report after a reattach lands");
+    assert_eq!(listed.agent_lifecycle, AgentLifecycle::Working);
+}
+
+/// A command that runs a process called `name`, made in `dir` with `cc`
+/// (a copied `sleep` won't do: macOS kills a copied system binary, and a
+/// multicall coreutils picks its tool by the name it ran as). Without
+/// `cc`, Linux takes a shebang script, which it names after the file.
+fn named_sleeper(dir: &std::path::Path, name: &str) -> Option<String> {
+    let agent = dir.join(name);
+    if !build_named(&agent) {
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&agent, "#!/bin/sh\nwhile :; do sleep 300; done\n").ok()?;
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).ok()?;
+    }
+    Some(format!("'{}' 300", agent.display()))
+}
+
+/// Build a binary at `agent` that pauses forever, with `cc`.
+fn build_named(agent: &std::path::Path) -> bool {
+    (|| -> Option<()> {
+        let mut cc = std::process::Command::new("cc")
+            .args(["-x", "c", "-o"])
+            .arg(agent)
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        std::io::Write::write_all(
+            &mut cc.stdin.take()?,
+            b"#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
+        )
+        .ok()?;
+        cc.wait().ok()?.success().then_some(())
+    })()
+    .is_some()
+}
+
+/// `pid`'s name by `ps`, less any directory (macOS's `ps` prints the
+/// path).
+fn comm_of(pid: i64) -> String {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .unwrap_or_default();
+    out.rsplit('/').next().unwrap_or_default().to_owned()
+}
+
+/// Read the tab's output until `needle` shows, and answer what was read.
+async fn wait_for_text(
+    output: &mut tokio::sync::broadcast::Receiver<roost_engine::PtyOutputEvent>,
+    needle: &str,
+) -> String {
+    let mut seen = Vec::new();
+    let found = tokio::time::timeout(BUDGET, async {
+        loop {
+            match output.recv().await {
+                Ok(roost_engine::PtyOutputEvent::Bytes { data, .. }) => {
+                    seen.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&seen).contains(needle) {
+                        return;
+                    }
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(error) => panic!("the tab's output ended: {error}"),
+            }
+        }
+    })
+    .await;
+    let seen = String::from_utf8_lossy(&seen).into_owned();
+    assert!(found.is_ok(), "no {needle:?} in: {seen:?}");
+    seen
+}
+
+async fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + BUDGET;
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The leader of the job in front of `shell`'s terminal, when it is not
+/// the shell: the shell's own `tpgid`, by `ps` (macOS's `sess` is a
+/// pointer, not an id, so the session is not compared).
+fn pid_of_job(shell: u32) -> Option<i64> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "tpgid=", "-p", &shell.to_string()])
+        .output()
+        .ok()?;
+    let tpgid: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    (tpgid > 0 && tpgid != i64::from(shell)).then_some(tpgid)
+}
+
+fn is_stopped(pid: i64) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().starts_with('T'))
+        .unwrap_or(false)
+}
+
+/// The processes in group `pgid`, by `pgrep -g`.
+fn group_members(pgid: i64) -> Vec<i64> {
+    std::process::Command::new("pgrep")
+        .args(["-g", &pgid.to_string()])
+        .output()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether `pid` has exited: no process, or a zombie.
+fn is_gone(pid: i64) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .map(|out| {
+            let stat = String::from_utf8_lossy(&out.stdout);
+            let stat = stat.trim();
+            stat.is_empty() || stat.starts_with('Z')
+        })
+        .unwrap_or(false)
+}
+
+/// Kills what is left of a test's process group, whatever the test did:
+/// a straggler is in no shell's job table, so no hang-up reaches it.
+struct KillGroup(i64);
+
+impl Drop for KillGroup {
+    fn drop(&mut self) {
+        // SAFETY: a signal to a group this test started in its own tab.
+        unsafe { libc::kill(-(self.0 as libc::pid_t), libc::SIGKILL) };
+    }
+}
+
+fn signal(pid: i64, signal: i32) {
+    // SAFETY: a signal to a job this test started in its own tab.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, signal) }, 0);
+}
+
+fn which(program: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(program))
+        .find(|path| path.is_file())
+}

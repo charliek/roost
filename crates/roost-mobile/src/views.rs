@@ -7,7 +7,7 @@ use roost_client::mirror::HostMirror;
 use roost_ipc::agent::AgentLifecycle;
 use roost_ipc::messages::Tab;
 use roost_ipc::ssh::SshFailure;
-use roost_ui_model::agent_palette::tab_status_text;
+use roost_ui_model::agent_palette::{named_by_its_process_alone, tab_status_text};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostStateView {
@@ -128,15 +128,26 @@ pub fn workspace(mirror: &HostMirror) -> WorkspaceView {
 
 /// The badge is what the tab presents — its effective lifecycle, program
 /// status composed over the hooks — so the phone and the desktop's dot
-/// agree. A failed agent needs the user as much as a waiting one.
+/// agree. A failed agent needs the user as much as a waiting one. An
+/// agent `Tab.process` names (one stopped with `Ctrl-Z`) is an agent too,
+/// and one only its process names has no lifecycle, as on the desktop's
+/// Agents panel: its shell's running command is the agent itself.
 pub fn tab(tab: &Tab) -> TabView {
-    let effective = tab.effective_lifecycle();
+    let effective = if named_by_its_process_alone(tab) {
+        AgentLifecycle::Inactive
+    } else {
+        tab.effective_lifecycle()
+    };
     let has_agent = tab.ownership.is_some()
         || tab
             .program_status
             .as_ref()
             .and_then(|status| status.record.as_ref())
-            .is_some_and(|record| !record.app.is_empty());
+            .is_some_and(|record| !record.app.is_empty())
+        || tab
+            .process
+            .as_ref()
+            .is_some_and(|process| !process.agent.is_empty());
     let agent = match effective {
         AgentLifecycle::Working => AgentBadge::Working,
         AgentLifecycle::Waiting | AgentLifecycle::Failed => AgentBadge::Waiting,
@@ -220,6 +231,60 @@ mod tests {
             "ownership": {"source": "claude", "session_id": "s1"},
         })));
         assert_eq!(idle.agent, AgentBadge::Idle, "an agent between turns");
+    }
+
+    /// A 7501 agent stopped with Ctrl-Z has no record left (the prompt
+    /// mark set them aside) and no owner: `Tab.process` alone says it is
+    /// there, and the phone shows it as the desktop's row does.
+    #[test]
+    fn a_suspended_agent_named_only_by_its_process_is_an_idle_agent() {
+        let suspended = tab(&wire_tab(json!({
+            "process": {"state": "suspended", "agent": "codex", "pid": "48213", "since": 1},
+        })));
+        assert_eq!(suspended.agent, AgentBadge::Idle);
+        assert_eq!(suspended.status_text.as_deref(), Some("Suspended"));
+
+        let unnamed = tab(&wire_tab(json!({
+            "process": {"state": "running", "agent": "", "pid": "48213", "since": 1},
+        })));
+        assert_eq!(unnamed.agent, AgentBadge::None);
+
+        let named = tab(&wire_tab(json!({
+            "process": {"state": "running", "agent": "cursor", "pid": "48213", "since": 1},
+        })));
+        assert_eq!(
+            named.agent,
+            AgentBadge::Idle,
+            "an agent only its process names"
+        );
+        assert_eq!(named.status_text.as_deref(), Some("Running"));
+    }
+
+    /// cursor-agent with no hooks runs as the tab's command, so the
+    /// tab's shell says a command runs; that is the agent itself, not a
+    /// sign it is working. The phone reads it as the desktop's Agents
+    /// panel does — an idle agent, Running — and counts nothing working.
+    #[test]
+    fn an_agent_named_only_by_its_running_process_is_not_working() {
+        let wire = wire_tab(json!({
+            "shell_state": "foreground_process",
+            "process": {"state": "running", "agent": "cursor", "pid": "48213", "since": 1},
+        }));
+        assert_eq!(wire.effective_lifecycle(), AgentLifecycle::Working);
+        let view = tab(&wire);
+        assert_eq!(view.agent, AgentBadge::Idle);
+        assert_eq!(view.status_text.as_deref(), Some("Running"));
+
+        let mut mirror = HostMirror::default();
+        mirror.projects = vec![roost_ipc::messages::Project {
+            id: 1,
+            name: "roost".into(),
+            cwd: "/home/me".into(),
+            position: 0,
+            created_at: 0,
+            tabs: vec![wire],
+        }];
+        assert_eq!(agent_counts(&mirror), (0, 0));
     }
 
     #[test]

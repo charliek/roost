@@ -136,7 +136,7 @@ pub(crate) fn note(agent: Agent, mode: CardMode) -> &'static str {
         (Agent::Grok, _) => "Built in. Grok reports its status to the terminal itself.",
         (Agent::Cursor, CardMode::FirstRun) => {
             "Adds Roost's entries to the file below, because Cursor reads its turn-end hook \
-             only from that file. Without it, Roost shows nothing for Cursor."
+             only from that file. Without it, Roost shows only that Cursor is running."
         }
         (Agent::Cursor, CardMode::Preferences) => {
             "Adds Roost's entries to the file below, because Cursor reads its turn-end hook \

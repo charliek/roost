@@ -4177,6 +4177,7 @@ impl App {
         {
             let _runtime = runtime.enter();
             client.watch_password_input();
+            client.watch_processes();
         }
 
         // After `Workspace::open` (there is nothing to delete before
@@ -13566,6 +13567,7 @@ mod tests {
             password_input: false,
             dropped_reports: None,
             program_status: None,
+            process: None,
         }];
         listed.answer(Ok(serde_json::to_value(TabListResult {
             projects: vec![project],
@@ -13659,6 +13661,7 @@ mod tests {
             password_input: false,
             dropped_reports: None,
             program_status: None,
+            process: None,
         };
         open.answer(Ok(serde_json::to_value(TabOpenResult { tab }).unwrap()));
 
@@ -13699,6 +13702,7 @@ mod tests {
             password_input: false,
             dropped_reports: None,
             program_status: None,
+            process: None,
         }
     }
 

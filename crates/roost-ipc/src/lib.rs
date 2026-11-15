@@ -19,6 +19,8 @@
 //!   pinned by `tests/agent-state-fixtures/`.
 //! * [`program_status`] — OSC 7501 reports and the OSC 133 prompt marks
 //!   ordered with them, as `roost-engine`'s composition layer reads them.
+//! * [`process`] — the process layer: what a stamped agent process's
+//!   fate does to its tab's state, pinned by `tests/agent-state-fixtures/`.
 //! * [`format_chars`] — the Unicode `Cf` table that `roostctl doctor`
 //!   escapes and program-status text drops.
 //! * [`framing`] — newline-delimited JSON read/write over a
@@ -85,6 +87,7 @@ pub mod messages;
 pub mod old_session;
 pub mod opener;
 pub mod paths;
+pub mod process;
 pub mod program_status;
 pub mod schema;
 pub mod session_dir;

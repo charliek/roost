@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use roost_ipc::agent::{self, AgentLifecycle, Ownership, SOURCE_LEGACY, SOURCE_MANUAL};
 use roost_ipc::messages::{Project, Tab};
+use roost_ipc::process::ProcessState;
 use roost_ipc::program_status::{app_label, DecidedBy, ProgramStatusRecordView};
 
 use crate::agent_panel::{self, PanelAgentRow};
@@ -217,13 +218,19 @@ pub(crate) struct RowAgent {
     /// The hook layer's open `detail`; empty for a status-only row.
     pub(crate) detail: String,
     pub(crate) last_event_at: i64,
+    /// Nothing but `Tab.process` says an agent is there
+    /// ([`named_by_its_process_alone`]): the row shows no lifecycle.
+    pub(crate) by_process: bool,
 }
 
 /// A tab's agent row, or `None` for a tab that gets none (plan 082 D8.1):
 /// a live hook owner, else a program-status record naming an app — a
-/// 7501 agent without hooks (crush, pi, a Claude without hook consent).
-/// The second is a row without an owner: no hook ownership is made up
-/// for it.
+/// 7501 agent without hooks (crush, pi, a Claude without hook consent) —
+/// else the agent `Tab.process` names: a 7501 agent stopped with
+/// `Ctrl-Z`, whose records a prompt mark set aside (#519), or an agent
+/// known only by its process's name (cursor-agent with no hooks). The
+/// last two are rows without an owner: no hook ownership is made up for
+/// them.
 pub(crate) fn row_agent(tab: &Tab) -> Option<RowAgent> {
     let axes = tab.agent_state();
     if let Some(owner) = agent_owner(&axes) {
@@ -232,18 +239,57 @@ pub(crate) fn row_agent(tab: &Tab) -> Option<RowAgent> {
             name: row_name(tab, owner),
             detail: owner.detail.clone(),
             last_event_at: owner.last_event_at,
+            by_process: false,
         });
     }
-    let record = tab.program_status.as_ref()?.record.as_ref()?;
-    if record.app.is_empty() {
-        return None;
+    let record = tab
+        .program_status
+        .as_ref()
+        .and_then(|status| status.record.as_ref())
+        .filter(|record| !record.app.is_empty());
+    if let Some(record) = record {
+        return Some(RowAgent {
+            agent: normalize_line(app_label(&record.app).unwrap_or(&record.app)),
+            name: title_name(tab),
+            detail: String::new(),
+            last_event_at: record.updated_at,
+            by_process: false,
+        });
     }
+    let process = tab
+        .process
+        .as_ref()
+        .filter(|process| !process.agent.is_empty())?;
     Some(RowAgent {
-        agent: normalize_line(app_label(&record.app).unwrap_or(&record.app)),
+        agent: normalize_line(process_agent_name(&process.agent)),
         name: title_name(tab),
         detail: String::new(),
-        last_event_at: record.updated_at,
+        last_event_at: process.since,
+        by_process: named_by_its_process_alone(tab),
     })
+}
+
+/// Whether only `Tab.process` says an agent is on `tab`: no live owner,
+/// no program-status record at all. Its row never guesses what the agent
+/// is doing — the tab's shell may say a command runs, which is the agent
+/// itself — so it reads `Running` or `Suspended`, with no lifecycle.
+pub fn named_by_its_process_alone(tab: &Tab) -> bool {
+    agent_owner(&tab.agent_state()).is_none()
+        && tab
+            .program_status
+            .as_ref()
+            .and_then(|status| status.record.as_ref())
+            .is_none()
+        && tab
+            .process
+            .as_ref()
+            .is_some_and(|process| !process.agent.is_empty())
+}
+
+/// `Tab.process.agent`'s display name: it is a hook owner's `source` or a
+/// record's `app`, and the two tables never disagree on a name both list.
+fn process_agent_name(agent: &str) -> &str {
+    app_label(agent).unwrap_or_else(|| agent_display_name(agent))
 }
 
 /// The tab an agent row activates, or `None` for the empty sentinel
@@ -294,8 +340,22 @@ pub fn status_text(effective: AgentLifecycle, raw: AgentLifecycle, detail: &str)
 /// Failed row names (plan 082 D8.2) — already sanitized at ingest, and
 /// capped here like a hook's `detail`. The hook layer's `detail` is shown
 /// only while hooks decide: under a record, deciding or kept, it belongs
-/// to a state the record overrode.
+/// to a state the record overrode. An agent stopped with `Ctrl-Z` reads
+/// `Suspended`, whatever the shell in front of it shows, unless a live
+/// record or a working owner decides the tab: another agent run in front
+/// of the stopped one, whose state is the tab's. One only its process
+/// names reads `Running` while it runs.
 pub fn tab_status_text(tab: &Tab, effective: AgentLifecycle, detail: &str) -> String {
+    let suspended = tab
+        .process
+        .as_ref()
+        .is_some_and(|process| process.state == ProcessState::Suspended);
+    if suspended && deciding_record(tab).is_none() && !agent::agent_drives(&tab.agent_state()) {
+        return "Suspended".to_string();
+    }
+    if named_by_its_process_alone(tab) {
+        return "Running".to_string();
+    }
     let decided_by = tab.program_status.as_ref().map(|status| status.decided_by);
     let Some(record) = deciding_record(tab) else {
         return match decided_by {
@@ -349,27 +409,9 @@ pub fn compose_title(project: &str, name: &str) -> String {
     notification_inbox::compose_title(project, name)
 }
 
-/// A human-friendly name for an ownership `source` (plan 046 §3.7,
-/// W7). Matched against the five adapters' own `SOURCE` constants in
-/// `crates/roost-agent/src/*.rs` — spelled out here rather than
-/// imported, since `roost-agent` parses hook JSON and has no reason to
-/// depend on this crate's rendering, or vice versa.
-///
-/// `source` is an open string by design (AD-8): a third-party adapter
-/// that isn't one of the five renders **verbatim** rather than being
-/// hidden or mislabeled, so this table can never gate whether an
-/// agent's row appears — only how its name is spelled. Pinned by
-/// `tests/agent-display-name-fixtures/`.
-pub fn agent_display_name(source: &str) -> &str {
-    match source {
-        "claude" => "Claude Code",
-        "codex" => "Codex",
-        "opencode" => "OpenCode",
-        "grok" => "Grok",
-        "cursor" => "Cursor",
-        other => other,
-    }
-}
+/// A human-friendly name for an ownership `source`; see
+/// [`roost_ipc::agent::source_label`], which the engine's banners share.
+pub use roost_ipc::agent::source_label as agent_display_name;
 
 /// The colour role of one segment of the git-metrics column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,6 +625,7 @@ mod tests {
             password_input: false,
             dropped_reports: None,
             program_status: None,
+            process: None,
         }
     }
 
@@ -788,6 +831,173 @@ mod tests {
         assert_eq!(
             tab_status_text(&working, AgentLifecycle::Working, "background_tasks:3"),
             "Working"
+        );
+    }
+
+    fn with_process(
+        mut tab: Tab,
+        agent: &str,
+        state: roost_ipc::process::ProcessState,
+        since: i64,
+    ) -> Tab {
+        tab.process = Some(roost_ipc::process::TabProcess {
+            state,
+            agent: agent.to_string(),
+            pid: 4242,
+            since,
+        });
+        tab
+    }
+
+    /// U15: a 7501 agent with no hooks, stopped with Ctrl-Z, has no record
+    /// left to name it (the prompt mark set its records aside), so its row
+    /// comes from `Tab.process` and reads Suspended; a hook owner stopped
+    /// the same way keeps its own row and reads Suspended too.
+    #[test]
+    fn a_suspended_agent_keeps_a_row_that_reads_suspended() {
+        use roost_ipc::process::ProcessState::{Running, Suspended};
+        let suspended = with_process(tab(1, "deploy"), "codex", Suspended, NOW - 40);
+        let row = row_agent(&suspended).expect("a row from the process");
+        assert_eq!(
+            (row.agent.as_str(), row.name.as_str(), row.last_event_at),
+            ("Codex", "deploy", NOW - 40)
+        );
+        assert_eq!(
+            tab_status_text(&suspended, AgentLifecycle::Inactive, ""),
+            "Suspended"
+        );
+        let items = agent_items(&[project(1, "roost", vec![suspended])], HostId::LOCAL, NOW);
+        assert_eq!(agent_of(&items[0]).status_text, "Suspended");
+
+        for (agent, shown) in [
+            ("claude-code", "Claude Code"),
+            ("claude", "Claude Code"),
+            ("cursor", "Cursor"),
+            ("my-agent", "my-agent"),
+        ] {
+            let tab = with_process(tab(1, "t"), agent, Suspended, NOW);
+            assert_eq!(row_agent(&tab).expect(agent).agent, shown, "{agent}");
+        }
+        assert!(
+            row_agent(&with_process(tab(1, "t"), "", Suspended, NOW)).is_none(),
+            "an unnamed process makes no row"
+        );
+
+        let hooked = owned(tab(1, "t"), "claude", AgentLifecycle::Inactive, NOW - 3);
+        let stopped = with_process(hooked.clone(), "claude", Suspended, NOW);
+        assert_eq!(
+            row_agent(&stopped).expect("the owner's row").last_event_at,
+            NOW - 3
+        );
+        assert_eq!(
+            tab_status_text(&stopped, AgentLifecycle::Inactive, ""),
+            "Suspended"
+        );
+        let running = with_process(hooked, "claude", Running, NOW);
+        assert_eq!(
+            tab_status_text(&running, AgentLifecycle::Inactive, ""),
+            "Idle"
+        );
+    }
+
+    /// A second agent run in front of a stopped one decides the tab: a
+    /// live record of its own, or a hook owner at work, reads as itself
+    /// while `Tab.process` still names the stopped one. What the stopped
+    /// one kept — a root `done` no prompt took — decides nothing, and the
+    /// row reads Suspended over it.
+    #[test]
+    fn another_agents_live_state_reads_over_a_suspended_process() {
+        use roost_ipc::process::ProcessState::Suspended;
+        use roost_ipc::program_status::ProgramStatusState as S;
+        let stopped = with_process(tab(1, "t"), "codex", Suspended, NOW);
+
+        let reporting = recorded(
+            stopped.clone(),
+            AgentLifecycle::Working,
+            DecidedBy::Records,
+            Some(view(S::Working, "crush", "", NOW)),
+        );
+        assert_eq!(
+            tab_status_text(&reporting, AgentLifecycle::Working, ""),
+            "Working"
+        );
+        assert_eq!(row_agent(&reporting).expect("a row").agent, "Crush");
+
+        let hooked = owned(stopped.clone(), "claude", AgentLifecycle::Waiting, NOW);
+        assert_eq!(
+            tab_status_text(&hooked, AgentLifecycle::Waiting, ""),
+            "Waiting for input"
+        );
+
+        let kept = recorded(
+            stopped,
+            AgentLifecycle::Finished,
+            DecidedBy::KeptRecord,
+            Some(view(S::Done, "codex", "", NOW)),
+        );
+        assert_eq!(
+            tab_status_text(&kept, AgentLifecycle::Finished, ""),
+            "Suspended"
+        );
+    }
+
+    /// An agent only its process names (cursor-agent with no hooks)
+    /// gets a row that reads Running, with no lifecycle: its tab's shell
+    /// says a command runs, which is the agent, not a sign it is working.
+    /// Once a record or an owner names it, those decide again.
+    #[test]
+    fn an_agent_named_by_its_process_alone_reads_running_with_no_lifecycle() {
+        use roost_ipc::process::ProcessState::{Running, Suspended};
+        let mut running = with_process(tab(1, "deploy"), "cursor", Running, NOW - 7);
+        running.shell_state = ShellState::ForegroundProcess;
+        assert_eq!(running.effective_lifecycle(), AgentLifecycle::Working);
+        let row = row_agent(&running).expect("a row from the process");
+        assert_eq!((row.agent.as_str(), row.by_process), ("Cursor", true));
+        assert_eq!(
+            tab_status_text(&running, AgentLifecycle::Working, ""),
+            "Running"
+        );
+        let items = agent_items(
+            &[project(1, "roost", vec![running.clone()])],
+            HostId::LOCAL,
+            NOW,
+        );
+        let item = agent_of(&items[0]);
+        assert_eq!(
+            (item.status_text.as_str(), item.effective_lifecycle),
+            ("Running", AgentLifecycle::Inactive)
+        );
+
+        let mut stopped = running.clone();
+        stopped.process.as_mut().unwrap().state = Suspended;
+        assert_eq!(
+            tab_status_text(&stopped, AgentLifecycle::Inactive, ""),
+            "Suspended"
+        );
+
+        let hooked = owned(running.clone(), "cursor", AgentLifecycle::Working, NOW);
+        assert!(!row_agent(&hooked).unwrap().by_process);
+        assert_eq!(
+            tab_status_text(&hooked, AgentLifecycle::Working, ""),
+            "Working"
+        );
+        let unnamed_record = recorded(
+            running,
+            AgentLifecycle::Working,
+            DecidedBy::Records,
+            Some(view(
+                roost_ipc::program_status::ProgramStatusState::Working,
+                "",
+                "",
+                NOW,
+            )),
+        );
+        let row = row_agent(&unnamed_record).expect("named by the process");
+        assert_eq!((row.agent.as_str(), row.by_process), ("Cursor", false));
+        assert_eq!(
+            tab_status_text(&unnamed_record, AgentLifecycle::Working, ""),
+            "Working",
+            "the record decides what an unnamed program does"
         );
     }
 

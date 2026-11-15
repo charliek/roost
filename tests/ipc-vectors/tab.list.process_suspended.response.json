@@ -1,0 +1,47 @@
+{
+  "id": "4",
+  "ok": true,
+  "result": {
+    "projects": [
+      {
+        "id": "1",
+        "name": "Roost",
+        "cwd": "/Users/me/projects/roost",
+        "position": 0,
+        "created_at": 1700000000,
+        "tabs": [
+          {
+            "id": "5",
+            "project_id": "1",
+            "title": "claude",
+            "cwd": "/Users/me/projects/roost",
+            "state": "none",
+            "has_notification": true,
+            "is_active": false,
+            "user_titled": false,
+            "position": 0,
+            "created_at": 1700000000,
+            "last_active": 1700000050,
+            "hook_active": true,
+            "shell_state": "at_prompt",
+            "agent_lifecycle": "inactive",
+            "ownership": {
+              "source": "claude",
+              "session_id": "abc123",
+              "last_event_at": 1793158440,
+              "detail": "",
+              "metadata": {}
+            },
+            "process": {
+              "state": "suspended",
+              "agent": "claude",
+              "pid": "48213",
+              "since": 1793158470
+            }
+          }
+        ]
+      }
+    ],
+    "revision": 42
+  }
+}
