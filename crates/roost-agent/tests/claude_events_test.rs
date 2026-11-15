@@ -6,6 +6,7 @@ use roost_agent::claude::{
 };
 use roost_ipc::agent::{
     validate_report, AgentLifecycle, AttentionOp, OwnershipAction, Severity, TabAgentReportParams,
+    START_SOURCE_KEY,
 };
 use serde_json::{json, Value};
 
@@ -88,7 +89,7 @@ fn session_start_accepts_every_documented_source() {
             "SessionStart",
             &json!({ "session_id": "s", "source": source }),
         );
-        assert_eq!(report.metadata["source"], source);
+        assert_eq!(report.metadata[START_SOURCE_KEY], source);
         assert_eq!(report.detail, source);
         assert_eq!(report.lifecycle, Some(AgentLifecycle::Inactive));
     }

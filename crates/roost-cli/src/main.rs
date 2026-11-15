@@ -453,7 +453,6 @@ enum Cmd {
     /// like every other path, so a stale config never breaks a turn.
     AgentHook {
         /// `claude`, `grok`, `codex`, `cursor`, or `opencode`.
-        /// gx reports as `grok` and has no name of its own.
         agent: String,
     },
     /// Agent-hook install subcommands: wire Roost's hook entries into

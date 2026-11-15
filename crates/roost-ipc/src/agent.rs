@@ -381,7 +381,7 @@ pub enum DropReason {
     /// any report to a tab nobody owns.
     NotOwner,
     /// A claim from an agent the owner is running; see
-    /// [`is_nested_claim`].
+    /// [`is_nested_claim`] and [`starts_a_new_process`].
     NestedClaim,
     /// A report accepted while a program-status record decided the tab,
     /// whose lifecycle change or notification that record overrode.
@@ -543,8 +543,8 @@ pub fn apply_report(
 }
 
 /// Whether a claim comes from an agent the current owner is running —
-/// a `codex exec` review, a headless `gx -p` — rather than one taking
-/// the tab over.
+/// a `codex exec` review, a `claude -p` — rather than one taking the
+/// tab over.
 ///
 /// Anything an agent runs from a tool call inherits the tab's
 /// `ROOST_TAB_ID`. Honored, the inner agent's `SessionStart` evicts the
@@ -557,12 +557,13 @@ pub fn apply_report(
 /// `Waiting` under a foreground process has not exited, so a different
 /// agent claiming now is running inside it.
 ///
-/// The same source under a new session id still supersedes: that is
-/// the agent switching sessions itself (Claude's `/clear`). `manual`
-/// and `legacy` are someone taking the wheel, never nested. With no
-/// shell integration the shell axis stays `Unknown`, so claims
-/// supersede as they always did — no prompt mark would ever free a tab
-/// whose owner died.
+/// The same source under a new session id is nested only when
+/// [`starts_a_new_process`] says so; otherwise it is the agent switching
+/// sessions itself (Claude's `/clear`) and supersedes. `manual` and
+/// `legacy` are someone taking the wheel, never nested. With no shell
+/// integration the shell axis stays `Unknown`, so claims supersede as
+/// they always did — no prompt mark would ever free a tab whose owner
+/// died.
 fn is_nested_claim(current: &AgentTabState, report: &TabAgentReportParams) -> bool {
     let Some(owner) = &current.ownership else {
         return false;
@@ -572,9 +573,30 @@ fn is_nested_claim(current: &AgentTabState, report: &TabAgentReportParams) -> bo
             current.lifecycle,
             AgentLifecycle::Working | AgentLifecycle::Waiting
         )
-        && owner.source != report.source
         && is_agent_source(&owner.source)
         && is_agent_source(&report.source)
+        && (owner.source != report.source || starts_a_new_process(owner, report))
+}
+
+/// The `metadata` key a `claude` claim names its session's start in:
+/// Claude's `SessionStart.source`, verbatim (`startup`, `resume`,
+/// `clear`, `compact`).
+pub const START_SOURCE_KEY: &str = "source";
+
+/// Whether a claim from the owner's own agent, under another session id,
+/// comes from a new process of that agent rather than the owner switching
+/// sessions. Only Claude says which, in [`START_SOURCE_KEY`]: `startup`
+/// is a process starting, while `clear`, `resume` and `compact` are a
+/// running Claude moving to another session. While the owner is alive in
+/// the tab, a Claude starting there is one it runs, such as `claude -p`
+/// from a tool call. A `claude -p --resume` says `resume` and still
+/// supersedes.
+pub fn starts_a_new_process(owner: &Ownership, report: &TabAgentReportParams) -> bool {
+    report.ownership_action == OwnershipAction::Claim
+        && report.source == "claude"
+        && owner.source == report.source
+        && owner.session_id != report.session_id
+        && report.metadata.get(START_SOURCE_KEY).map(String::as_str) == Some("startup")
 }
 
 pub fn is_agent_source(source: &str) -> bool {
@@ -854,6 +876,103 @@ mod tests {
         ];
         for (why, current, claim) in cases {
             let out = apply_report(&current, &claim, 1_700_000_100);
+            assert!(out.accepted(), "{why}");
+            let new_owner = out.state.ownership.expect(why);
+            assert_eq!(
+                (new_owner.source.as_str(), new_owner.session_id.as_str()),
+                (claim.source.as_str(), claim.session_id.as_str()),
+                "{why}"
+            );
+        }
+    }
+
+    fn claude_start(session: &str, start: Option<&str>) -> TabAgentReportParams {
+        let mut claim = TabAgentReportParams {
+            lifecycle: Some(AgentLifecycle::Inactive),
+            ..report("claude", session, OwnershipAction::Claim)
+        };
+        if let Some(start) = start {
+            claim.metadata.insert(START_SOURCE_KEY.into(), start.into());
+        }
+        claim
+    }
+
+    #[test]
+    fn a_claude_p_run_from_a_claude_turn_leaves_the_owner_in_place() {
+        for lifecycle in [AgentLifecycle::Working, AgentLifecycle::Waiting] {
+            let claude = mid_turn(lifecycle, "claude", "outer");
+            let stop = TabAgentReportParams {
+                lifecycle: Some(AgentLifecycle::Finished),
+                ..report("claude", "inner", OwnershipAction::Preserve)
+            };
+            let end = report("claude", "inner", OwnershipAction::Release);
+            for (nested, reason) in [
+                (
+                    &claude_start("inner", Some("startup")),
+                    DropReason::NestedClaim,
+                ),
+                (&stop, DropReason::NotOwner),
+                (&end, DropReason::NotOwner),
+            ] {
+                let out = apply_report(&claude, nested, 1_700_000_100);
+                assert_eq!(out.dropped, Some(reason), "{lifecycle:?} {nested:?}");
+                assert_eq!(out.state, claude);
+            }
+
+            let outer_stop = TabAgentReportParams {
+                lifecycle: Some(AgentLifecycle::Finished),
+                ..report("claude", "outer", OwnershipAction::Preserve)
+            };
+            let out = apply_report(&claude, &outer_stop, 1_700_000_200);
+            assert!(out.accepted(), "the outer Claude still owns the tab");
+            assert_eq!(out.state.lifecycle, AgentLifecycle::Finished);
+        }
+    }
+
+    #[test]
+    fn a_claude_claim_that_does_not_start_a_process_still_supersedes() {
+        let live = mid_turn(AgentLifecycle::Working, "claude", "outer");
+        let label = AgentTabState {
+            shell: ShellState::AtPrompt,
+            lifecycle: AgentLifecycle::Inactive,
+            ownership: owner("claude", "outer"),
+        };
+        let unknown_shell = AgentTabState {
+            shell: ShellState::Unknown,
+            ..live.clone()
+        };
+        let mut codex_startup = report("codex", "next", OwnershipAction::Claim);
+        codex_startup
+            .metadata
+            .insert(START_SOURCE_KEY.into(), "startup".into());
+        let cases = [
+            ("/clear", &live, claude_start("next", Some("clear"))),
+            ("--resume", &live, claude_start("next", Some("resume"))),
+            ("a compaction", &live, claude_start("next", Some("compact"))),
+            ("no start source", &live, claude_start("next", None)),
+            (
+                "the owner exited",
+                &label,
+                claude_start("next", Some("startup")),
+            ),
+            (
+                "no shell integration",
+                &unknown_shell,
+                claude_start("next", Some("startup")),
+            ),
+            (
+                "the owner's own session",
+                &live,
+                claude_start("outer", Some("startup")),
+            ),
+            (
+                "only Claude names its start",
+                &mid_turn(AgentLifecycle::Working, "codex", "outer"),
+                codex_startup,
+            ),
+        ];
+        for (why, current, claim) in cases {
+            let out = apply_report(current, &claim, 1_700_000_100);
             assert!(out.accepted(), "{why}");
             let new_owner = out.state.ownership.expect(why);
             assert_eq!(

@@ -3536,7 +3536,8 @@ impl App {
     /// place decides between them: a caller that parked
     /// `CreateAfterConnect` gets its project unconditionally, and every
     /// purpose that *seeds* gets one only if the host came up holding
-    /// nothing.
+    /// nothing and is not the slot a parked launch migration is about to
+    /// replay onto ([`local_backend::ConnectPurpose::creates_on_landing`]).
     ///
     /// The emptiness is read here rather than carried, and it is a
     /// different question from §D6's `became_empty_by_delete`: a host
@@ -3557,11 +3558,11 @@ impl App {
             .hosts
             .mirror(incarnation)
             .is_some_and(|mirror| mirror.read().projects.is_empty());
-        let create = match purpose {
-            local_backend::ConnectPurpose::CreateAfterConnect => true,
-            purpose => purpose.seeds() && empty,
-        };
-        if !create {
+        let replay_parked = self.pending_migration.is_some()
+            && self
+                .local_slot_view()
+                .is_some_and(|slot| slot.saved_id == saved_id);
+        if !purpose.creates_on_landing(empty, replay_parked) {
             return UiTask::None;
         }
         tracing::info!(host = %saved_id, ?purpose, "creating a project on a host that just connected");
@@ -3672,6 +3673,26 @@ impl App {
     pub(super) fn is_local_slot(&self, host: HostId) -> bool {
         self.local_backend == LocalBackendMode::Session
             && self.local_slot_view().is_some_and(|slot| slot.host == host)
+    }
+
+    /// Tell the connection set which session it may start again when it
+    /// is lost ([`super::host_lifecycle::respawn_host`]).
+    ///
+    /// The one call site is `update()`'s post-dispatch funnel, so a
+    /// switch, an action claiming the slot or a change of mode reaches
+    /// the connection tasks by the end of the message that made it.
+    pub fn sync_session_respawn(&self) {
+        let slot = self.local_slot_view().map(|view| view.saved_id.as_str());
+        let host = super::host_lifecycle::respawn_host(
+            self.exit_state,
+            self.local_backend,
+            host_verbs::VerbPolicy::current(),
+            self.switch_in_flight(),
+            self.pending_migration.is_some(),
+            slot,
+            |saved_id| self.host_actions.claimed(saved_id),
+        );
+        self.hosts.set_respawn_host(host);
     }
 
     /// Rebuild every agent row the sidebar draws, from the local

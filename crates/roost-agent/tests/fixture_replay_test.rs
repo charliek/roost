@@ -7,13 +7,7 @@
 //! session ids kept. Most are the 2026-09-04 probe: the Claude file
 //! holds two back-to-back sessions (the second hit a permission dialog);
 //! the grok file holds five back-to-back sessions (the third hit a
-//! plan-mode permission prompt); gx, codex and cursor each hold one.
-//!
-//! `gx-gate.jsonl` and `gx-failure.jsonl` are a later gx capture
-//! (2026-09-07, plan 051) taken with a blocking Stop hook installed and
-//! with a bad provider key — the two shapes the 2026-09-04 probe could
-//! not produce: a `Stop` gate that continues a turn, and a `StopFailure`
-//! carrying `errorDetails`.
+//! plan-mode permission prompt); codex and cursor each hold one.
 //!
 //! `opencode.jsonl` is a different animal: opencode has no hooks, so
 //! this is its raw plugin **event bus** log, all 862 records of it. Only
@@ -53,11 +47,6 @@ const GROK_SESSION_TWO: &str = "01a06e3a-b244-7662-a783-2f58e653d534";
 const GROK_SESSION_THREE: &str = "01a06e3e-2d6b-7f13-bc74-f86b6c947e08";
 const GROK_SESSION_FOUR: &str = "01a06e46-ef99-76f1-afa8-6842c40cd6ab";
 const GROK_SESSION_FIVE: &str = "01a06e47-9664-74f3-abe5-8d5e188f3780";
-
-const GX_SESSION: &str = "01a06e35-1139-7931-8a33-a8c5f007b745";
-
-const GX_GATE_SESSION: &str = "01a07c88-1150-7110-916e-69a6816d3c68";
-const GX_FAILURE_SESSION: &str = "01a07c7e-99ba-7cf3-ae78-866701874ce6";
 
 const CODEX_SESSION: &str = "01a06e4d-b178-7f53-bbc3-f9e551c3b56b";
 
@@ -372,183 +361,6 @@ fn a_trailing_shutdown_stop_after_session_end_is_dropped() {
         1,
         "only the Stop banner from line 5, not the dropped trailing one"
     );
-}
-
-// ---------------------------------------------------------------------
-// The gx probe (grok's fork, same adapter, one session)
-// ---------------------------------------------------------------------
-
-#[test]
-fn the_gx_probe_replays_through_the_grok_adapter() {
-    use AgentLifecycle::{Finished, Inactive, Working};
-
-    let tab = replay(
-        grok_event_to_reports,
-        "gx",
-        &[
-            ("SessionStart", 1, Inactive, Some(GX_SESSION)),
-            ("UserPromptSubmit", 1, Working, Some(GX_SESSION)),
-            ("PreToolUse", 1, Working, Some(GX_SESSION)),
-            ("PostToolUse", 1, Working, Some(GX_SESSION)),
-            ("Stop", 1, Finished, Some(GX_SESSION)),
-            ("UserPromptSubmit", 1, Working, Some(GX_SESSION)),
-            ("StopCancelled", 1, Finished, Some(GX_SESSION)),
-            ("SessionEnd", 1, Inactive, None),
-            ("Stop", 1, Inactive, None),
-        ],
-    );
-
-    // gx never hit a Notification in this run, so its only banners are
-    // the plain "Turn complete" from the one Stop with no in-flight work.
-    assert_eq!(
-        tab.banners,
-        vec![(Severity::Info, "Turn complete".to_string())],
-    );
-    assert!(!tab.pending);
-}
-
-// ---------------------------------------------------------------------
-// The gx gate probe (plan 051): a blocking Stop hook, and a subagent
-// ---------------------------------------------------------------------
-
-/// gx's display text for the idle nag, verbatim from both new fixtures.
-const IDLE_PROMPT: &str = "Waiting for your next prompt";
-
-#[test]
-fn the_gx_gate_probe_holds_working_across_every_continued_stop_fire() {
-    use AgentLifecycle::{Finished, Inactive, Working};
-
-    // Two turns of the same shape: a first `Stop` the gate blocks, two
-    // more fires carrying `stopHookActive: true`, and the `idle_prompt`
-    // that settles the turn ~60 s later. The tab is `working` for the
-    // whole continuation instead of showing idle and re-bannering.
-    //
-    // The second turn runs a subagent. Its events (lines 10, 12-16)
-    // carry their own session id and `subagentType`, and it never fires
-    // a `SessionStart` of its own, so every one of its reports fails the
-    // owner match and the server drops it — the adapter still maps them,
-    // which is why the report count stays 1.
-    //
-    // There is no main-session `SessionEnd`: this session was
-    // leader-resident and gx fires none for those (grok-build#14), and
-    // the capture is kept honest rather than synthesized.
-    let tab = replay(
-        grok_event_to_reports,
-        "gx-gate",
-        &[
-            ("SessionStart", 1, Inactive, Some(GX_GATE_SESSION)),
-            ("UserPromptSubmit", 1, Working, Some(GX_GATE_SESSION)),
-            ("Stop", 1, Finished, Some(GX_GATE_SESSION)),
-            ("Stop", 1, Working, Some(GX_GATE_SESSION)),
-            ("Stop", 1, Working, Some(GX_GATE_SESSION)),
-            ("Notification", 1, Finished, Some(GX_GATE_SESSION)),
-            ("UserPromptSubmit", 1, Working, Some(GX_GATE_SESSION)),
-            ("PreToolUse", 1, Working, Some(GX_GATE_SESSION)),
-            ("PostToolUse", 1, Working, Some(GX_GATE_SESSION)),
-            ("UserPromptSubmit", 1, Working, Some(GX_GATE_SESSION)),
-            ("PreToolUse", 1, Working, Some(GX_GATE_SESSION)),
-            ("PreToolUse", 1, Working, Some(GX_GATE_SESSION)),
-            ("PreToolUse", 1, Working, Some(GX_GATE_SESSION)),
-            ("PostToolUse", 1, Working, Some(GX_GATE_SESSION)),
-            ("PostToolUse", 1, Working, Some(GX_GATE_SESSION)),
-            ("SessionEnd", 1, Working, Some(GX_GATE_SESSION)),
-            ("PostToolUse", 1, Working, Some(GX_GATE_SESSION)),
-            ("Stop", 1, Finished, Some(GX_GATE_SESSION)),
-            ("Stop", 1, Working, Some(GX_GATE_SESSION)),
-            ("Stop", 1, Working, Some(GX_GATE_SESSION)),
-            ("Notification", 1, Finished, Some(GX_GATE_SESSION)),
-        ],
-    );
-
-    // One "Turn complete" per turn — from the first fire only — then the
-    // nag that actually ends it. The continued fires never banner.
-    assert_eq!(
-        tab.banners,
-        vec![
-            (Severity::Info, "Turn complete".to_string()),
-            (Severity::Info, IDLE_PROMPT.to_string()),
-            (Severity::Info, "Turn complete".to_string()),
-            (Severity::Info, IDLE_PROMPT.to_string()),
-        ],
-    );
-
-    // Every line of this fixture carries `gxRemote`, so the metadata key
-    // it maps to is present by the end of the replay too.
-    assert_eq!(tab.metadata("gx.remote"), Some("http://127.0.0.1:2431"));
-}
-
-/// The two mid-run facts the row table has no column for.
-#[test]
-fn the_gx_gate_continued_fire_clears_the_dot_and_the_subagent_leaves_no_trace() {
-    let records = fixture("gx-gate");
-    let mut tab = Tab::default();
-
-    for (event, payload) in records.iter().take(4) {
-        tab.feed_via(grok_event_to_reports, event, payload);
-    }
-    assert_eq!(tab.detail(), Some("stop:continued"));
-    assert!(
-        !tab.pending,
-        "the continued fire clears the first fire's dot"
-    );
-
-    for (event, payload) in records.iter().take(9).skip(4) {
-        tab.feed_via(grok_event_to_reports, event, payload);
-    }
-    let before = tab.detail().map(str::to_string);
-    let lifecycle = tab.lifecycle();
-
-    // Line 10: the explore subagent's own `UserPromptSubmit`, under the
-    // subagent's session id.
-    let (event, payload) = &records[9];
-    tab.feed_via(grok_event_to_reports, event, payload);
-    assert_eq!(tab.detail().map(str::to_string), before);
-    assert_eq!(tab.lifecycle(), lifecycle);
-    assert_eq!(tab.owner_session(), Some(GX_GATE_SESSION));
-}
-
-// ---------------------------------------------------------------------
-// The gx failure probe (plan 051): a bad provider key
-// ---------------------------------------------------------------------
-
-#[test]
-fn the_gx_failure_probe_banners_the_401_exactly_once() {
-    use AgentLifecycle::{Failed, Inactive, Working};
-
-    let tab = replay(
-        grok_event_to_reports,
-        "gx-failure",
-        &[
-            ("SessionStart", 1, Inactive, Some(GX_FAILURE_SESSION)),
-            ("UserPromptSubmit", 1, Working, Some(GX_FAILURE_SESSION)),
-            // `agent_error`, carrying the same 401 text as the
-            // `StopFailure` that follows it: silent on purpose.
-            ("Notification", 1, Working, Some(GX_FAILURE_SESSION)),
-            ("StopFailure", 1, Failed, Some(GX_FAILURE_SESSION)),
-            // The ~60 s nag against a turn that failed: guarded on
-            // `working`, lands vetoed.
-            ("Notification", 1, Failed, Some(GX_FAILURE_SESSION)),
-        ],
-    );
-
-    assert_eq!(tab.banners.len(), 1);
-    assert_eq!(tab.banners[0].0, Severity::Error);
-    assert!(
-        tab.banners[0].1.starts_with("Unauthorized (401)"),
-        "the banner must carry gx's errorDetails, not the bare label: {}",
-        tab.banners[0].1
-    );
-
-    // `detail` at the failure itself — by the end of the replay the
-    // vetoed nag has merged its own detail over it.
-    let mut mid = Tab::default();
-    for (event, payload) in fixture("gx-failure").iter().take(4) {
-        mid.feed_via(grok_event_to_reports, event, payload);
-    }
-    assert_eq!(mid.detail(), Some("server_error"));
-
-    // Every line of this fixture carries `gxRemote` too.
-    assert_eq!(tab.metadata("gx.remote"), Some("http://127.0.0.1:2431"));
 }
 
 // ---------------------------------------------------------------------
@@ -868,9 +680,6 @@ fn foreign_fixtures_never_claim_ownership_through_the_wrong_adapter() {
         ("claude", "claude"),
         ("cursor", "cursor"),
         ("grok", "grok"),
-        ("gx", "grok"),
-        ("gx-gate", "grok"),
-        ("gx-failure", "grok"),
         ("codex", "codex"),
         ("opencode", "opencode"),
     ];
@@ -1008,13 +817,13 @@ fn the_grok_gate_is_not_vacuous() {
 }
 
 /// …and codex's fence, which mirrors Claude's own list, is not vacuous
-/// either: stripping grok's `hookEventName` twin (grok/gx carry none of
+/// either: stripping grok's `hookEventName` twin (grok carries none of
 /// cursor's two id fields) lets the same event names — `SessionStart`,
 /// `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SessionEnd`
 /// — map through the codex adapter.
 #[test]
 fn the_codex_gate_is_not_vacuous() {
-    for agent in ["grok", "gx", "gx-gate", "gx-failure", "cursor"] {
+    for agent in ["grok", "cursor"] {
         assert!(
             mapped_without_discriminators(codex_event_to_reports, agent) > 0,
             "{agent}.jsonl no longer overlaps codex's vocabulary; the isolation \
@@ -1031,7 +840,7 @@ fn the_codex_gate_is_not_vacuous() {
 /// it makes the very same payloads map.
 #[test]
 fn the_cursor_gate_is_not_vacuous() {
-    for agent in ["claude", "codex", "grok", "gx", "gx-gate", "gx-failure"] {
+    for agent in ["claude", "codex", "grok"] {
         assert!(
             mapped_with_grafted(cursor_event_to_reports, agent, "cursor_version") > 0,
             "{agent}.jsonl no longer overlaps cursor's vocabulary once cursor_version \
@@ -1185,9 +994,8 @@ fn an_idle_prompt_ends_an_interrupted_turn() {
     assert_eq!(tab.banners[0].0, Severity::Info);
 }
 
-/// gx awaits `SessionEnd`'s hooks before dispatching its trailing
-/// session-end `Stop`, so the server's ownership check catches that fire
-/// today. This is the order that check cannot catch — the `Stop` first,
+/// grok's trailing session-end `Stop` follows `SessionEnd`, so the
+/// server's ownership check catches that fire today. This is the order that check cannot catch — the `Stop` first,
 /// while the session still owns the tab — and the adapter's own `reason`
 /// rule is what keeps it from ending the turn on its own.
 #[test]

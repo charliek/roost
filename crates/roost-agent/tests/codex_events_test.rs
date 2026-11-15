@@ -209,7 +209,7 @@ fn unknown_event_names_map_to_nothing() {
 // Foreign / malformed input
 // ---------------------------------------------------------------------
 
-/// grok/gx always carry the camelCase `hookEventName` twin; cursor
+/// grok always carries the camelCase `hookEventName` twin; cursor
 /// always carries `conversation_id`/`cursor_version`. Neither ever
 /// appears in a real codex payload.
 #[test]

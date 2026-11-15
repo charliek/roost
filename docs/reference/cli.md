@@ -508,7 +508,9 @@ roostctl tab send-file --tab 5 ~/Desktop/shot.png       # a local tab
 
 Send local files to a tab. On a **host** tab each file is uploaded to
 that host and the host paths are pasted, so an agent running there can
-actually read them; on a local tab it pastes the escaped local paths.
+actually read them; on a local tab — including one on this machine's own
+`localhost` session, where local tabs run under `local-backend =
+session` — it pastes the escaped local paths.
 Exactly what dropping the files onto the tab does — same route, same
 gesture queue — backed by the [`tab.send_file`](ipc.md#tabsend_file) op.
 
@@ -847,7 +849,9 @@ say — for an agent you run outside Roost tabs, say; inside a Roost tab
 Claude Code then gets its hooks twice — and unions them into
 `agent-hooks`. `uninstall` removes any handler whose command is Roost's,
 the looser rule an explicit request may use, and narrows `agent-hooks`,
-spelling the result `off` when nothing would be left.
+spelling the result `off` when nothing would be left. For Cursor it also
+writes `-cursor` into `agent-integration`, so the next start does not
+wire it again; the other agents keep their switches.
 
 See the [Agent integration](../guides/agents.md) guide for the
 mechanism, the retire, and what each agent gets.
@@ -856,9 +860,8 @@ mechanism, the retire, and what each agent gets.
 
 Internal: the one hook entrypoint every supported agent's installed
 command invokes — `roostctl agent-hook <agent>`, where `<agent>` is
-`claude`, `codex`, `grok`, `cursor`, or `opencode` (gx reports through
-`grok`; there's no separate name for it). Reads the agent's JSON event
-payload from stdin, takes the event name from the payload itself
+`claude`, `codex`, `grok`, `cursor`, or `opencode`. Reads the agent's
+JSON event payload from stdin, takes the event name from the payload itself
 (`hook_event_name` — there is no `--event` flag, since one installed
 command string has to serve every event), dials `ROOST_SOCKET` for the
 tab named by `ROOST_TAB_ID`, and translates the event into a
@@ -1299,7 +1302,7 @@ Agents (process)
   skipped agent.claude.owning      unavailable (no tab.list from a running UI)
   ok      agent.claude.legacy_settings no leftover ~/.config/roost/claude-settings.json or shell alias found
   ok      agent.codex.wired        reports over OSC 7501; nothing written · old entries retired (v4) · backup ~/.config/roost/agent-backups/…
-  skipped agent.codex.trust        nothing wired for codex yet
+  skipped agent.codex.trust        no Roost hook in Codex's config, so nothing to trust: Codex reports over OSC 7501
   skipped agent.codex.owning       unavailable (no tab.list from a running UI)
   ok      agent.grok.wired         reports over OSC 7501; nothing written
   skipped agent.grok.owning        unavailable (no tab.list from a running UI)
@@ -1319,8 +1322,8 @@ only its `agent.cursor.wired` reports a `wired@v` version: the other four
 say how they connect and that nothing was written, plus "old entries
 retired" on a machine whose earlier file entries the upgrade took out.
 An agent whose config directory doesn't exist at all shows `skipped: not
-installed` instead, and Cursor present but never wired shows `warn: not
-wired` rather than `ok`.
+installed` instead. Cursor present and switched off, its default, shows
+`skipped` and how to turn it on; switched on but not wired, `warn`.
 
 `--json` carries the same facts as JSON — a top-level `schema_version: 2`,
 an explicit `exit_code` (so a script never has to re-derive "did

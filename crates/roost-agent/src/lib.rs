@@ -48,9 +48,6 @@ use serde_json::Value;
 /// nothing here can map, and the caller takes its "no adapter" path —
 /// drain stdin, answer `{}`, exit 0 — instead of hitting a silent no-op
 /// arm that looks like a working install.
-///
-/// gx shares grok's `$GROK_HOME` and reports under the same `source`,
-/// so it has no variant of its own — `Agent::Grok` covers both binaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {
     Claude,
@@ -160,20 +157,12 @@ mod tests {
         }
     }
 
-    /// `gx` has no `Agent` variant of its own: it shares grok's config
-    /// and reports as `grok`, so `roostctl agent-hook gx` is never a
-    /// thing — only `agent-hook grok` is installed for either binary.
-    #[test]
-    fn gx_has_no_variant_of_its_own() {
-        assert_eq!(Agent::parse("gx"), None);
-    }
-
     /// An agent whose adapter has not been written must not resolve:
     /// `roostctl` has a defined "no adapter" path and it only runs when
     /// `parse` says so.
     #[test]
     fn parse_rejects_everything_without_a_module() {
-        for name in ["", "gx", "amp", "gemini", "claude-code", "🙂"] {
+        for name in ["", "amp", "gemini", "claude-code", "🙂"] {
             assert_eq!(Agent::parse(name), None, "{name}");
         }
     }

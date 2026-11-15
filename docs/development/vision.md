@@ -59,9 +59,9 @@ As of v0.1.0 (2026-11-07):
   machines attach to one tab at once.
 - **Agent awareness.** Tab state and notifications come from what
   agents and shells write to the terminal (OSC 133, OSC 7501, OSC
-  9/99/777) and from agent hooks that `roostctl agent install` writes
-  into each agent's config, with consent. The sidebar has an Agents
-  panel.
+  9/99/777) and from agent hooks Roost delivers through the tab's
+  environment, writing no agent's config but Cursor's, an opt-in
+  ([DL-36](decision-history.md#dl-36-roost-connects-agents-without-writing-their-configs-2026-11-08)). The sidebar has an Agents panel.
 - **A scriptable surface.** `roostctl`, the JSON IPC socket and the
   agent skill reach every op the window does.
 - **Roost mobile**, a prototype: a Flutter + Rust Android client of
@@ -147,7 +147,9 @@ reasoning.
   that needs one
   ([DL-24](decision-history.md#dl-24-no-supervisor-artifact-a-session-comes-up-on-demand-2026-09-08)).
 - **The local backend is the user's choice**
-  ([DL-27](decision-history.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14)).
+  ([DL-27](decision-history.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14)),
+  until in-process local tabs are removed (decided 2026-11-14, not
+  scheduled).
 - **Local Unix sockets only, with a same-UID check.** A remote host is
   reached over SSH, never through a listener
   ([DL-3](decision-history.md#dl-3-unix-domain-socket-not-tcp)).
@@ -191,7 +193,9 @@ reasoning.
   seams, not in a second app. The accepted cost: an iced canvas gives
   VoiceOver almost nothing.
 - **No daemon unless the tabs should outlive the window.** The
-  in-process backend is one process with no daemon to supervise.
+  in-process backend is one process with no daemon to supervise. This
+  changes when in-process local tabs are removed (decided 2026-11-14, not
+  scheduled): every local tab then runs on a session.
 - **`roost-session` is the daemon when one is wanted.** The same engine,
   the same op set, on this machine or another. Nothing starts it at boot.
 - **JSON, not gRPC.** The control plane is small. Newline-delimited JSON
@@ -294,18 +298,15 @@ Then separate small plans: confirm before closing a running agent
 actions and the terminal menu (#710, #165), clickable paths and config
 reload (#708, #709). Note: `discovery/backlog-triage-2026-11.md`.
 
-**Agent integration without writing into agents' configs.** The main
-feature track. Today `roostctl agent install` merges hooks into
-`~/.claude/settings.json`, `~/.codex/hooks.json` and `config.toml`, and
-`~/.cursor/hooks.json`, and owns a file under Grok's and OpenCode's
-config. The goal is to stop writing users' configs where possible and
-make the integration better at the same time: OSC 7501 as the state
-source, hooks delivered through the tab's environment where an agent
-allows it, and process identity to clear a dead agent's state (#519,
-#621). Entries Roost wrote are removed automatically once nothing needs
-them, and only those Roost can prove it wrote; the first-run prompt that
-asks which integrations to turn on changes with it. A change here amends
-DL-13, DL-14 and DL-29, and the consent flow.
+**Agent integration, after the config writes.** The main feature
+track. Its first step shipped: Roost no longer writes agents' configs.
+Claude Code and OpenCode get their hooks through the tab's environment,
+Codex and Grok report over OSC 7501, Cursor's hooks file is an opt-in,
+and the entries older releases wrote are retired
+([DL-36](decision-history.md#dl-36-roost-connects-agents-without-writing-their-configs-2026-11-08)). Next is making the integration better: process
+identity to clear a dead agent's state (#519, #621), and how a tab
+presents what OSC 7501 and the hooks say. A change here amends DL-13,
+DL-14 and DL-29.
 Note: `discovery/agent-integration.md`.
 
 **Chrome comfort: size, color, opacity.** Make the chrome easier on the
@@ -322,9 +323,12 @@ fonts in the left panel. Pursued later. Note:
 `discovery/text-rendering.md`.
 
 **Sessions everywhere.** Sessions as the normal backend on every
-machine, so a tab can be picked up from any screen. Flipping the
-default for existing setups is #480; retiring in-process tabs is a later
-question. Notes: `discovery/sessions-everywhere.md`, and HS-4e
+machine, so a tab can be picked up from any screen. #480 (still open)
+tracked flipping the default for existing setups; on 2026-11-14 Charlie
+decided instead to remove in-process local tabs in one release, not yet
+scheduled, and that release closes #480 (`discovery/in-process-removal.md`).
+Notes:
+`discovery/sessions-everywhere.md`, and HS-4e
 porcelain in `discovery/host-sessions-roadmap.md`.
 
 **Roost mobile past the prototype.** A notification inbox, Share to
@@ -367,7 +371,7 @@ its record there and a row here, in the PR that builds it.
 | [11](decision-history.md#dl-11-one-command-core-thin-per-surface-adapters-2026-05-26) | One command core, thin adapters | 2026-05-26 | Current | The north star. |
 | [12](decision-history.md#dl-12-pytest-drives-the-tests-lua-is-a-user-scripting-surface-2026-05-26) | pytest drives tests; Lua is for users | 2026-05-26 | Current | pytest shipped; no Lua engine. |
 | [13](decision-history.md#dl-13-the-agent-state-model-four-axes-one-derivation-2026-07-27) | Agent state: four axes, one derivation | 2026-07-27 | Current | `tab.state` is derived, never written. |
-| [14](decision-history.md#dl-14-ownership-is-a-label-not-a-suppression-switch-2026-07-27) | Ownership is a label | 2026-07-27 | Current (amended in place) | No TTL; a nested agent's claim is dropped. |
+| [14](decision-history.md#dl-14-ownership-is-a-label-not-a-suppression-switch-2026-07-27) | Ownership is a label | 2026-07-27 | Current (amended in place) | No TTL; a nested agent's claim, `claude -p` included, is dropped. |
 | [15](decision-history.md#dl-15-linux-ships-iced-gtk4-rs-is-retired-and-removed-2026-08-25) | Linux ships iced; gtk4-rs removed | 2026-08-25 | Current (done) | `/usr/bin/roost` is iced since v0.0.18. |
 | [16](decision-history.md#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25) | Experimental mac-iced beside Swift | 2026-08-25 | Superseded (DL-33) | The hypothesis held. |
 | [17](decision-history.md#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28) | A headless `roost-session` daemon | 2026-08-28 | Amended (DL-27) | Also the local backend on fresh installs. |
@@ -380,7 +384,7 @@ its record there and a row here, in the PR that builds it.
 | [24](decision-history.md#dl-24-no-supervisor-artifact-a-session-comes-up-on-demand-2026-09-08) | No supervisor artifact | 2026-09-08 | Current | Sessions start when a client needs one. |
 | [25](decision-history.md#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08) | Raw input open to every same-UID client | 2026-09-08 | Superseded (DL-26, 31) | Open input still holds. |
 | [26](decision-history.md#dl-26-there-is-no-lease-2026-09-12) | There is no lease | 2026-09-12 | Current | Effects fan out; each client decides. Since protocol 5. |
-| [27](decision-history.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14) | The local backend is a user's choice | 2026-09-14 | Current | Fresh installs start on `session`; #480 is open. |
+| [27](decision-history.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14) | The local backend is a user's choice | 2026-09-14 | Current | Fresh installs start on `session`. To be superseded: in-process tabs will be removed (decided 2026-11-14, not scheduled). |
 | [28](decision-history.md#dl-28-roost-iced-becomes-the-recommended-mac-install-for-agent-driving-users-2026-09-19-pending) | Roost-Iced recommended on Mac | 2026-09-19 | Superseded (DL-33) | `Roost.app` is iced. |
 | [29](decision-history.md#dl-29-program-status-is-a-fourth-per-tab-axis-composed-above-the-hook-layer-2026-10-28) | Program status above the hook layer | 2026-10-28 | Current | OSC 7501 decides mid-turn; hooks keep identity. |
 | [30](decision-history.md#dl-30-one-osc-133-parser-per-sink-terminal-2026-10-28) | One OSC 133 parser per sink terminal | 2026-10-28 | Current | libghostty's stream feeds both layers. |
@@ -389,6 +393,7 @@ its record there and a row here, in the PR that builds it.
 | [33](decision-history.md#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03) | Swift retired; iced is the one desktop UI | 2026-11-03 | Current | Shipped in v0.1.0. |
 | [34](decision-history.md#dl-34-a-mobile-client-of-roost-session-2026-11-03) | A mobile client of `roost-session` | 2026-11-03 | Current | A prototype shipped in v0.1.0. |
 | [35](decision-history.md#dl-35-split-panes-leave-the-non-goals-under-discovery-2026-11-08) | Split panes leave the non-goals | 2026-11-08 | Current | Not a non-goal, not planned; a tab is one terminal. |
+| [36](decision-history.md#dl-36-roost-connects-agents-without-writing-their-configs-2026-11-08) | Agents connect without config writes | 2026-11-08 | Current | Env for Claude Code and OpenCode, 7501 for Codex and Grok, Cursor opt-in; gx dropped. |
 
 ## Related docs
 

@@ -59,7 +59,7 @@ came from — see [Per-agent caveats](#per-agent-caveats).
 
 [craze](https://github.com/charliek/craze) is the first entry that needs
 no hook install at all: it is the process driving the agent over ACP
-(cursor-agent, grok, or gx), so it calls `tab.agent_report` directly on
+(cursor-agent or grok), so it calls `tab.agent_report` directly on
 every state change rather than being invoked as a hook. Behavior worth a
 sentence beside its row:
 
@@ -114,9 +114,9 @@ shell out than hand-build the JSON.
   which reads to the caller as nothing happening at all. Anything that
   doesn't fit the existing axes belongs in `metadata` instead.
 - **`metadata` keys are namespaced.** A key a product defines itself is
-  prefixed `<product>.` (`craze.provider`, `gx.remote`); a key Roost
-  itself defines stays bare snake_case (`model`, `version`). See
-  [gx](#gx) below for the fuller statement of this rule.
+  prefixed `<product>.` (`craze.provider`); a key Roost itself defines
+  stays bare snake_case (`model`, `version`). See [Metadata
+  keys](#metadata-keys) below.
 - **Pin to the oldest server you support, and validate against the
   schema.** `identify.ops` says which *ops* a server serves, not which
   *fields* of an op's params it accepts — a server can list
@@ -182,7 +182,7 @@ an agent that speaks it is heard the moment it starts.
 | Grok CLI (1.0.70 or later) | yes | `grok` (1.0.77 or later), `grok-build` before |
 | crush | yes | `crush` |
 | pi | yes | `pi` |
-| gx, cursor-agent, OpenCode (1.19) | no — hooks only | |
+| cursor-agent, OpenCode (1.19) | no — hooks only | |
 
 What it gives you, beside the hooks:
 
@@ -204,7 +204,10 @@ The rules you see:
   or `error` and the shell hasn't shown a prompt since, the tab shows
   the record — and the hooks for that tab keep who owns it but stop
   moving its state. A hook from a *different* agent trying to claim the
-  tab then is refused (`foreign_app` in `roostctl doctor`).
+  tab then is refused (`foreign_app` in `roostctl doctor`), and so is a
+  new Claude session starting during the owner's `working` or `blocked`
+  record in the foreground, such as a `claude -p` it runs
+  (`nested_claim`).
 - **A shell prompt hands it back.** An OSC 133 prompt mark (`A`, `B` or
   `D`; Roost's shell integration sends them) ends a `working` or
   `blocked` record, the way a crashed agent's state should end. A
@@ -293,7 +296,16 @@ settings. Claude then refuses to start with `CLAUDE_CODE_PLUGIN_DIRS`
 set. Roost checks before it hands Claude the variable: a managed-settings
 file under `/etc/claude-code` (`/Library/Application Support/ClaudeCode`
 on macOS), Claude's cached server settings, and `claude plugin list
---json` run once in the background with the variable set. If the policy
+--json` run once in the background with the variable set. That last
+check waits until Claude has run on the machine (`~/.claude`, or
+`$CLAUDE_CONFIG_DIR`, exists), because Claude's first run writes its
+config and Roost would otherwise create it for someone who only
+installed Claude. Roost reads `$CLAUDE_CONFIG_DIR` from its own
+environment, so one set only in your shell's startup file isn't seen
+by a Roost started from the desktop. With no `~/.claude` either, that
+check keeps waiting, and a policy that reaches you only through Claude's
+server settings goes unseen; `roost.log` says once that it is waiting.
+If the policy
 is there, Roost leaves Claude's variable out, so Claude starts normally,
 and its status still shows over OSC 7501. Doctor names the policy and
 where it was found; switch Claude Code off under Agent Integration… to
@@ -386,7 +398,7 @@ roostctl agent set claude,codex,cursor      # via the running UI: the switches h
 roostctl agent set off --local              # write the switches here directly, with nothing running
 roostctl agent ensure [--json] [--startup]  # run the retire if due, then reconcile Cursor's file
 roostctl agent install <agent>|--all        # explicit: write an agent's file entries anyway
-roostctl agent uninstall <agent>|--all      # remove any entry whose command is Roost's
+roostctl agent uninstall <agent>|--all      # remove any entry whose command is Roost's; Cursor also switches off
 ```
 
 `agent status --json` reports, per agent, `on`, `delivery` (`env`,
@@ -400,7 +412,10 @@ works with nothing running. See
 it by name, for an agent outside Roost tabs, say. Inside a Roost tab
 Claude Code then gets its hooks twice, from the file and from the
 plugin. `agent uninstall` removes any handler whose command is Roost's,
-the looser rule an explicit request may use.
+the looser rule an explicit request may use. `agent uninstall cursor`
+also switches Cursor off in `agent-integration`, so the next start does
+not wire it again; the other agents keep their switches, since they are
+connected without a file.
 
 `roostctl claude install` remains a bare alias of `agent install claude`.
 
@@ -426,6 +441,15 @@ command's start: zsh, or bash 4.4 or newer. macOS's own `/bin/bash`
 ([details](cwd-tracking.md#switching-macos-default-to-homebrew-bash)),
 and without the mark the inner agent takes the tab over, as it did
 before. ([Claim rules](../reference/ipc.md#tabagent_report).)
+
+The same holds for a `claude -p` that Claude Code runs from a tool call.
+A Claude session that **starts** while Claude owns the tab mid-turn is
+ignored. A running Claude that moves to another session still takes the
+tab: `/clear`, `/resume` and a compaction do, and so does a `claude -p
+--resume`, because Claude reports it the same way. For a Claude that
+reports over [OSC 7501](#program-status-osc-7501), mid-turn is its own
+`working` or `blocked` report, and the same shell integration is
+needed: without it no prompt mark would end a killed Claude's report.
 
 Agent status isn't supported inside tmux, herdr or an ssh session
 running in a tab. Every pane there shares the tab's `ROOST_TAB_ID`, so
@@ -536,6 +560,10 @@ none itself.
 
 ## Codex trust
 
+This applies only while a Roost hook is in Codex's config: one you wrote
+with `roostctl agent install codex`, or an older release's entry the
+retire left in place. Codex itself reports over OSC 7501 and needs none.
+
 Codex additionally records a `trusted_hash` per hook handler under
 `[hooks.state]` in `config.toml` — the mechanism that stops it asking
 "Hooks need review — trust all?" on the next launch. Writing that hash
@@ -554,11 +582,11 @@ Roost's own hooks changed:
   relocating it (or a dotfile sync that changes it per machine, without
   `allow_symlinked_codex_home = true`) has the same effect.
 
-Both cost exactly one dialog; the next `roostctl agent ensure` or `agent
-install codex` recomputes and rewrites the stale keys, and doesn't
-require anything from you beyond running it. Doctor's
-`agent.codex.trust` check compares the hash codex would compute for the
-handler Roost actually installed against what's on disk right now, so a
+Both cost exactly one dialog; `roostctl agent install codex` recomputes
+and rewrites the stale keys, and `roostctl agent uninstall codex` takes
+the hook out instead. Doctor's `agent.codex.trust` check compares the
+hash codex would compute for the handler Roost installed against what's
+on disk right now, so a
 hand edit, a moved home, or a codex-side change to the hash formula
 itself is diagnosed by name instead of reappearing as an unexplained
 dialog with no cause attached.
@@ -757,63 +785,27 @@ already have: on a host, any client that can reach the socket can
 already run arbitrary commands there via `tab.open`. The third does
 widen the surface, on purpose, and the opt-out is the answer to it.
 
-## gx
+## Metadata keys
 
-Roost no longer installs anything for gx: Grok is connected over OSC
-7501 only, and gx does not speak it. What follows describes what a gx
-run reports through an entry an older release wrote, until the retire
-removes it.
-
-gx is a fork of grok that shares grok's config file and reports through
-the same adapter — it shows up as `source: "grok"`, same as stock grok;
-[Per-agent caveats](#per-agent-caveats) below covers where gx's behavior
-diverges from grok's.
-
-gx additionally announces a **remote lane** — an HTTP control surface
-for the running session — by stamping `gxRemote` (its own loopback base
-URL, e.g. `http://127.0.0.1:2421`) onto every hook payload once that
-lane comes up. Roost forwards it, when it parses as a **token-free
-loopback base URL** — `http://127.0.0.1:<port>`, `localhost`, or
-`[::1]`, and nothing after the port (no path, query, or fragment) —
-as the `gx.remote` key in the tab's `metadata`; anything else (a query
-string, a non-loopback host, `https`) is dropped rather than stamped.
-`roostctl doctor` prints the value when present.
-
-`gx.remote` is a **naming convention, not a new mechanism**: `metadata`
-is already the open extension channel every adapter writes into
+`metadata` is the open extension channel every adapter writes into
 ([`ipc.md`](../reference/ipc.md#tabagent_report)), and this is the rule
-for using it without collisions — a key owned by one product is
-prefixed `<product>.` (`gx.remote`), while a key roost itself defines
-stays bare snake_case (`model`, `session_title`).
+for using it without collisions: a key owned by one product is
+prefixed `<product>.` (`craze.provider`), while a key Roost itself
+defines stays bare snake_case (`model`, `session_title`).
 
-Treat the key as a **discovery hint, not liveness**. gx's remote-lane
-address is a process-global set once and never cleared, so it never
-tells you the lane died; and `metadata` itself is merge-only with no
-delete channel, so `gx.remote` can outlive the lane that announced it,
-and a same-process restart on another port is never reflected. The
-only thing that removes it is the reset path: a new `SessionStart`
-replaces `metadata` wholesale, so a stock-grok session started on the
-same tab afterward drops the key. It is absent to begin with on stock
-grok and on a gx run with `--no-leader` or `GX_REMOTE_DISABLE=1`.
+`metadata` is merge-only, with no delete channel: a key stays until a
+new claim replaces the whole map. So a key that names something live,
+such as an address, is a discovery hint, not proof that it is still
+there.
 
-A consumer must still follow gx's own client contract before treating
-the lane as usable — the key alone is never enough to act on: call the
-lane's token-free `GET /v1/healthz`, compare its `instanceId` against
-`$GROK_HOME/gx-remote.json`, and only then use the bearer token from
-`$GROK_HOME/gx-remote.token`. Roost carries neither the instance id nor
-the token; `gx.remote` is just the URL.
-
-The agents palette does not render `gx.remote` — a bare loopback URL has
-no in-terminal action to attach it to; revisit if a roost client action
-ever uses the lane. gx does not get its own `source`/`Agent` variant
-today; that's warranted only if its hook vocabulary diverges from
-grok's in a way the shared adapter can't map correctly, or it stops
-sharing `$GROK_HOME` with grok.
+One key decides something. A `claude` claim's `source` is Claude's own
+`SessionStart` source, and a claim saying `startup` while the tab's
+Claude is mid-turn is refused as nested ([Ownership](#ownership)).
 
 ## OpenCode keys
 
 OpenCode's adapter writes four keys into the owning tab's `metadata`.
-All four are bare snake_case under the convention [above](#gx): they are
+All four are bare snake_case under the convention [above](#metadata-keys): they are
 Roost's own, read off opencode's event bus by the plugin Roost ships,
 not a product stamping its name on a shared channel.
 
@@ -877,8 +869,8 @@ surface.
   lands at the **next** `session.created`, and until then that session
   is status-only.
 
-Treat it the way [`gx.remote`](#gx) is treated: a discovery hint, not
-liveness. `metadata` is merge-only with no delete channel, so the key
+Treat it as a discovery hint, not liveness. `metadata` is merge-only
+with no delete channel, so the key
 outlives the listener that announced it — a restarted `opencode` in the
 same tab publishes a new port on its next `session.created`, and until
 then the old one is stale. Dial it before believing it.
@@ -899,27 +891,17 @@ then the old one is stale. Dial it before believing it.
   the tab you attached from. There's no reliable fix from the plugin
   side (a session's `directory` matching your tab's cwd isn't a safe
   enough signal), so this is documented rather than papered over.
-- **gx leader mode misattributes hooks to the first tab, and a quit gx
-  keeps its tab owned** ([grok-build#14](https://github.com/charliek/grok-build/issues/14)).
-  gx's hooks run inside the `gx agent leader` process, not the TUI
-  itself, and that process inherits `ROOST_TAB_ID` from whichever TUI
-  spawned it — so every further gx TUI that attaches to the same leader
-  reports its events against the *first* tab (its `SessionStart` claims
-  that tab), and the second TUI's own tab stays `inactive`, the same
-  shape as the `opencode attach` caveat above. Separately, `SessionEnd`
-  never fires for a leader-resident session, so quitting a leader-backed
-  gx leaves its tab owned at whatever lifecycle it last reported,
-  instead of releasing to `inactive`. Stock grok (leader mode off) is
-  unaffected by either.
 - **grok's Stop gate leaves a residual "finished" window on the *first*
-  blocked fire.** A blocking Stop hook that blocks the very first `Stop`
+  blocked fire.** This and the next two apply only to hooks from a
+  `roost.json` an older release wrote; grok itself reports over OSC
+  7501. A blocking Stop hook that blocks the very first `Stop`
   of a turn shows the tab as `finished` (with a "Turn complete" banner)
   from that fire until the next tool event or the next `Stop` — which,
   once the gate has fired at least once, carries `stopHookActive: true`
   and correctly reads as `working` again. In that gate case the user
-  never sees a second "Turn complete"; instead they see gx's own
+  never sees a second "Turn complete"; instead they see grok's own
   `idle_prompt` banner roughly a minute after the turn actually ended.
-  If the 8-continuation cap is hit, gx forces a stop with no hook fired
+  If the 8-continuation cap is hit, grok forces a stop with no hook fired
   at all, so the tab stays `working` until `idle_prompt` settles it. A
   passive observer — which is all roost's adapter is — cannot close this
   gap without delaying every turn's "Turn complete" by that same minute,
@@ -927,7 +909,7 @@ then the old one is stale. Dial it before believing it.
 - **grok's `agent_error` Notification is deliberately silent.** It fires
   immediately before the `StopFailure` that reports the same failure,
   so banner-ing both would show the same error twice; only the
-  `StopFailure` banner (with gx's `errorDetails` text) reaches the tab.
+  `StopFailure` banner (with grok's `errorDetails` text) reaches the tab.
 - **grok subagents never claim the tab.** A subagent (from
   `spawn_subagent`) runs as its own session id, stamps `subagentType` on
   every event, and never fires its own `SessionStart` — so its reports
@@ -936,7 +918,7 @@ then the old one is stale. Dial it before believing it.
   filter is needed.
 - **codex re-trusts on reordering or a moved path.** See [Codex
   trust](#codex-trust) above — either one costs a single review dialog,
-  cleared by the next `ensure`.
+  cleared by `roostctl agent install codex`.
 - **codex `/rename` doesn't reach the tab label on codex 0.153 and
   earlier.** Roost's tab label mirrors whatever the program writes into
   the terminal title, and codex's default title items on those versions
@@ -948,10 +930,6 @@ then the old one is stale. Dial it before believing it.
   omitted when unnamed and puts it in the default set, so no config is
   needed there. Claude, grok and cursor already put the session name in
   the title.
-- **gx shares grok's file.** grok and its fork gx read the same
-  `$GROK_HOME`, so one install (`roostctl agent install grok`) wires
-  both binaries at once, and uninstalling `grok` removes the file both
-  share. See [gx](#gx) above for gx-specific behavior.
 - **cursor (and optionally grok) also execute Claude's hook format.** cursor always
   loads `~/.claude/settings.json` (`claudeUserHooks`), and grok can be
   configured to; with Roost's Claude entries installed, both would
@@ -976,12 +954,15 @@ what you'd otherwise have to guess at, per agent:
   skipped by its organization's plugin policy (with where the policy
   was found). It also names an old Roost entry still in the agent's
   file — a retire leftover, or one that came back — as the cause of
-  doubled events, and the backup the retire made. For Cursor: is Roost's
-  entry present, and at which integration version.
+  doubled events, and the backup the retire made. For Cursor: switched
+  off (its default), or is Roost's entry present, and at which
+  integration version. A switched-off Codex or Grok still reports over
+  OSC 7501, and doctor says so.
 - `agent.<name>.owning` — does that source currently own a tab on this
   UI (not a durable "ever observed" record — just right now).
-- `agent.codex.trust` — does the trust hash on disk match what codex
-  would compute for the handler Roost installed.
+- `agent.codex.trust` — when a Roost hook is in Codex's config (see
+  [Codex trust](#codex-trust)), does the trust hash on disk match what
+  codex would compute for it. Without one there is nothing to trust.
 - `agent.claude.legacy_settings` — is the retired
   `~/.config/roost/claude-settings.json` file or its shell alias still
   around.

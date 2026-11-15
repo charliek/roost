@@ -431,7 +431,7 @@ def test_option_as_meta_right(helper, launch_ui):
 
 
 def test_shift_enter(helper, launch_ui):
-    """Roost's half of the gx Shift+Enter report (§D10): the legacy
+    """Roost's half of the Shift+Enter report (§D10): the legacy
     modified-Enter form, then the kitty form once the protocol is pushed."""
     roost = launch_ui()
     tab = cat_tab(roost, helper)

@@ -1,17 +1,16 @@
-//! grok / gx hook adapter — plan 046 §3.1.
+//! grok hook adapter — plan 046 §3.1.
 //!
-//! grok (xAI's CLI) and gx (a fork of the same product) share one
-//! `$GROK_HOME` and are installed with the same hook file, so both
-//! report through this module with `source = "grok"`; there is no
-//! separate `gx` adapter or ownership source.
+//! grok reports over OSC 7501 and Roost writes no hook file for it any
+//! more. This adapter serves a `$GROK_HOME/hooks/roost.json` an older
+//! release wrote, until the retire removes it.
 //!
 //! # Verified hook contract
 //!
 //! Captured live against a real grok session on 2026-09-04 (plan 046's
-//! probe; four sessions back-to-back, 44 records) and extended by a gx
-//! probe on 2026-09-07 (plan 051; the `gx-gate` and `gx-failure`
-//! fixtures). The payload borrows Claude's envelope but duplicates most
-//! fields under both casings:
+//! probe; four sessions back-to-back, 44 records); the `Stop` gate and
+//! `StopFailure` rules (plan 051) are pinned by synthetic payloads. The
+//! payload borrows Claude's envelope but duplicates most fields under
+//! both casings:
 //!
 //! ```text
 //! SessionStart       source  (camel+snake: hookEventName/hook_event_name,
@@ -31,7 +30,7 @@
 //! StopFailure        error (a classified label: rate_limit,
 //!                     authentication_failed, invalid_request, server_error,
 //!                     max_output_tokens, unknown), errorDetails (camelCase
-//!                     only, clipped by gx at 1000 chars), lastAssistantMessage
+//!                     only, clipped at 1000 chars), lastAssistantMessage
 //! StopCancelled      reason: "user_interrupt", cancelTrigger: "esc",
 //!                     cancelledBy: "user" (all camelCase only) — the
 //!                     Esc-interrupt signal; grok has no interrupt hook
@@ -41,10 +40,6 @@
 //!                     observed types: permission_prompt, idle_prompt,
 //!                     agent_error
 //! SessionEnd         reason: "shutdown"
-//! (any event)        gxRemote (camelCase only — gx stamps this once its
-//!                     lane binds, so it can appear mid-session; a
-//!                     token-free loopback base URL, e.g.
-//!                     "http://127.0.0.1:2421")
 //! ```
 //!
 //! grok has no `PermissionRequest` hook. Its only blocked signal is
@@ -56,8 +51,7 @@
 //! the one place that reads `reason` and `stopHookActive`.
 //!
 //! Every session in the 2026-09-04 probe ends with `SessionEnd`
-//! immediately followed by a trailing `Stop{reason: shutdown}`, and gx
-//! still awaits `SessionEnd`'s hooks before dispatching that fire.
+//! immediately followed by a trailing `Stop{reason: shutdown}`.
 //! Ownership is already released by then, so the server drops it on the
 //! ownership mismatch (`apply_report`'s `owner_matches`) — asserted in
 //! the fixture replay. [`stop`]'s own `reason` check is a second line of
@@ -68,7 +62,7 @@
 //! and stamps `subagentType` on every event, with no `SessionStart` of
 //! its own. Its reports therefore never match the tab's owner and the
 //! server drops them, so there is no `subagentType` filter here and
-//! none is needed; the `gx-gate` replay pins that.
+//! none is needed.
 //!
 //! `PermissionDenied` and `PostToolUseFailure` are in grok's registered
 //! event list but have not been observed in either probe (auto-approve
@@ -80,9 +74,7 @@ use roost_ipc::agent::{
 };
 use serde_json::Value;
 
-use crate::common::{
-    bool_field, field, field_alias, has_field, loopback_base_url, non_empty, parse_normalized,
-};
+use crate::common::{bool_field, field, field_alias, has_field, non_empty, parse_normalized};
 
 pub const SOURCE: &str = "grok";
 
@@ -104,7 +96,7 @@ pub const GROK_HOOK_EVENTS: [&str; 11] = [
 
 const TITLE: &str = "Grok";
 
-/// Map one grok/gx hook event to the reports it implies. See
+/// Map one grok hook event to the reports it implies. See
 /// [`crate::claude::claude_event_to_reports`] for the shared discipline
 /// this mirrors (pure, total, malformed input costs nothing).
 pub fn grok_event_to_reports(
@@ -112,7 +104,7 @@ pub fn grok_event_to_reports(
     payload: &Value,
     tab_id: i64,
 ) -> Vec<TabAgentReportParams> {
-    // grok/gx always duplicates `hook_event_name` under the camelCase
+    // grok always duplicates `hook_event_name` under the camelCase
     // `hookEventName` twin (every one of the 44 probe records carries
     // both); Claude's and codex's own payloads are snake_case only. That
     // makes this key's presence the positive discriminator that keeps a
@@ -142,7 +134,7 @@ pub fn grok_event_to_reports(
         ..TabAgentReportParams::sessionless(tab_id, SOURCE, OwnershipAction::Preserve, None)
     };
 
-    let mut report = match kind {
+    let report = match kind {
         EventKind::SessionStart => session_start(base, payload),
         EventKind::UserPromptSubmit => user_prompt_submit(base),
         EventKind::PreToolUse => tool_progress(base, "pre_tool_use"),
@@ -155,22 +147,6 @@ pub fn grok_event_to_reports(
         EventKind::StopFailure => stop_failure(base, payload),
         EventKind::SessionEnd => session_end(base),
     };
-
-    // gx's lane binds asynchronously after the leader is up, so
-    // `gxRemote` can appear mid-session on any event kind rather than
-    // only on `SessionStart` — checked here, after the match, rather
-    // than per-kind. The value is a discovery hint, never liveness (see
-    // the module doc and plan 051 §3.3), which is exactly why the shape
-    // check below is load-bearing: it is what lets `doctor.rs` allowlist
-    // `gx.remote` for verbatim display without re-validating it there.
-    // Checking on `SessionEnd` too is harmless — `Release` drops the
-    // record regardless of what got stamped into it.
-    if let Some(url) = non_empty(field(payload, "gxRemote")).filter(|url| loopback_base_url(url)) {
-        report
-            .metadata
-            .insert("gx.remote".to_string(), url.to_string());
-    }
-
     vec![report]
 }
 
@@ -242,7 +218,7 @@ fn notification(mut report: TabAgentReportParams, payload: &Value) -> TabAgentRe
             Severity::Info,
             AttentionOp::Set,
         ),
-        // Silent: gx fires this immediately before the `StopFailure` for
+        // Silent: grok fires this immediately before the `StopFailure` for
         // the same turn, which carries the same text with the severity
         // that belongs on it. A generic `Info` banner here would just
         // show the failure twice, the first time understated.
@@ -265,7 +241,7 @@ fn notification(mut report: TabAgentReportParams, payload: &Value) -> TabAgentRe
 
 /// `Stop` is a gate, so a fire is not proof the turn ended.
 ///
-/// A blocking Stop hook makes gx continue and fire `Stop` again next
+/// A blocking Stop hook makes grok continue and fire `Stop` again next
 /// round, and `stopHookActive` is true for *every* fire of a continued
 /// turn — the final one included. A passive observer cannot tell a
 /// continuation from the end, so a continued fire reports the honest
@@ -300,12 +276,12 @@ fn stop(mut report: TabAgentReportParams, payload: &Value) -> TabAgentReportPara
     }
 
     // 1. Anything but a turn end. `shutdown` and `channel_closed` are
-    //    gx's session-end fires; a reason gx adds later gets the same
-    //    no-op, because gx's own guidance to hook authors is to gate on
-    //    `reason == "end_turn"` and the backstops (`idle_prompt`,
-    //    `SessionEnd`) bound what that costs. Absent or empty is treated
-    //    as a turn end — a producer that drops the field is likelier to
-    //    predate it than to mean something new by it.
+    //    grok's session-end fires; a reason grok adds later gets the same
+    //    no-op, because the gate is `reason == "end_turn"` and the
+    //    backstops (`idle_prompt`, `SessionEnd`) bound what that costs.
+    //    Absent or empty is treated as a turn end — a producer that drops
+    //    the field is likelier to predate it than to mean something new by
+    //    it.
     let reason = field(payload, "reason");
     if !reason.is_empty() && reason != "end_turn" {
         report.detail = format!("stop:{reason}");
@@ -349,7 +325,7 @@ fn stop_failure(mut report: TabAgentReportParams, payload: &Value) -> TabAgentRe
     report.attention = AttentionOp::Set;
     report.severity = Severity::Error;
     report.title = TITLE.to_string();
-    // gx emits only the camelCase spelling and clips it at 1000 chars;
+    // grok emits only the camelCase spelling and clips it at 1000 chars;
     // roost passes it through and leaves truncation to the renderers.
     report.body = non_empty(field_alias(payload, "error_details", "errorDetails"))
         .map(str::to_string)

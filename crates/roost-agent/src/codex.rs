@@ -79,7 +79,7 @@ pub fn codex_event_to_reports(
     payload: &Value,
     tab_id: i64,
 ) -> Vec<TabAgentReportParams> {
-    // grok/gx always carry the camelCase `hookEventName` twin; cursor
+    // grok always carries the camelCase `hookEventName` twin; cursor
     // always carries `conversation_id`/`cursor_version`. Codex's own
     // payload has none of the three, and neither does Claude's — this
     // rejects the first two agents outright and leaves the codex↔Claude

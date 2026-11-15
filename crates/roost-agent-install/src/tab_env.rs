@@ -505,6 +505,9 @@ struct Probe {
     /// The last `claude` found, looked up again when it is gone: a
     /// session outlives an install.
     claude: Option<PathBuf>,
+    /// Whether this process has logged that the probe waits for Claude's
+    /// config dir.
+    waiting_logged: bool,
 }
 
 type Locate = Box<dyn Fn() -> Option<PathBuf> + Send + Sync>;
@@ -514,6 +517,8 @@ struct Inner {
     config: Option<PathBuf>,
     managed_roots: Vec<PathBuf>,
     locate_claude: Locate,
+    /// Claude's config dir: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+    claude_config: Option<PathBuf>,
     remote_settings: Option<PathBuf>,
     probe: Mutex<Probe>,
     answered: Condvar,
@@ -538,15 +543,15 @@ impl TabEnv {
             .ok()?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let path = std::env::var_os("PATH");
-        let claude_config = std::env::var_os("CLAUDE_CONFIG_DIR")
-            .map(PathBuf::from)
-            .or_else(|| home.as_ref().map(|home| home.join(".claude")));
+        let claude_config = crate::Home::from_env()
+            .ok()
+            .map(|home| home.agent_dir(Agent::Claude).to_path_buf());
         let tab_env = TabEnv::new(
             dir,
             roost_ui_model::config::config_path(),
             MANAGED_SETTINGS_DIRS.iter().map(PathBuf::from).collect(),
             Box::new(move || find_claude(path.as_deref(), home.as_deref())),
-            claude_config.map(|dir| dir.join("remote-settings.json")),
+            claude_config,
         );
         if tab_env.switches().on(Agent::Claude) {
             tab_env.refresh_if_stale();
@@ -559,8 +564,11 @@ impl TabEnv {
         config: Option<PathBuf>,
         managed_roots: Vec<PathBuf>,
         locate_claude: Locate,
-        remote_settings: Option<PathBuf>,
+        claude_config: Option<PathBuf>,
     ) -> TabEnv {
+        let remote_settings = claude_config
+            .as_ref()
+            .map(|dir| dir.join("remote-settings.json"));
         let policy = read_policy_record(&dir)
             .map(|record| record.policy)
             .unwrap_or(ClaudePolicy::Unchecked);
@@ -569,12 +577,14 @@ impl TabEnv {
             config,
             managed_roots,
             locate_claude,
+            claude_config,
             remote_settings,
             probe: Mutex::new(Probe {
                 policy,
                 at: None,
                 running: None,
                 claude: None,
+                waiting_logged: false,
             }),
             answered: Condvar::new(),
         }))
@@ -679,12 +689,35 @@ impl TabEnv {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Start a probe on its own thread unless one is running or this
-    /// process's last verdict is fresh.
+    /// Start a probe on its own thread unless one is running, this
+    /// process's last verdict is fresh, or Claude has never run here.
+    ///
+    /// `claude plugin list` writes Claude's config (`~/.claude.json`,
+    /// `~/.claude/`) on a first run, so a user who installed Claude and
+    /// never started it would find both made by Roost. With no config
+    /// dir there is no cached server policy either; a managed-settings
+    /// file is still read at each spawn. Nothing is marked fresh, so the
+    /// first spawn after Claude's first run probes.
+    ///
+    /// The config dir is judged from this process's environment. A
+    /// `CLAUDE_CONFIG_DIR` set only in a shell's startup file, which a
+    /// Roost started from the desktop never sees, with no `~/.claude`
+    /// beside it, leaves the probe waiting, so a policy that only Claude's
+    /// server settings carry goes unseen. The wait is logged once.
     fn refresh_if_stale(&self) {
         {
             let mut probe = self.lock();
             if probe.running.is_some() || probe.at.is_some_and(|at| at.elapsed() < PROBE_TTL) {
+                return;
+            }
+            let config = self.0.claude_config.as_deref();
+            if !config.is_some_and(Path::is_dir) {
+                if !std::mem::replace(&mut probe.waiting_logged, true) {
+                    tracing::info!(
+                        config_dir = ?config,
+                        "Claude has not run here; its policy probe waits for its config dir"
+                    );
+                }
                 return;
             }
             probe.running = Some(Instant::now());
@@ -954,6 +987,7 @@ mod tests {
         _root: tempfile::TempDir,
         config: PathBuf,
         managed: PathBuf,
+        claude_config: PathBuf,
         tab_env: TabEnv,
     }
 
@@ -978,17 +1012,20 @@ mod tests {
         let managed = root.path().join("managed");
         let dir = root.path().join("cache/agent-integration");
         seed(&dir);
+        let claude_config = root.path().join("claude-config");
+        fs::create_dir(&claude_config).expect("claude config dir");
         let tab_env = TabEnv::new(
             dir,
             Some(config.clone()),
             vec![managed.clone()],
             locate,
-            Some(root.path().join("claude-config/remote-settings.json")),
+            Some(claude_config.clone()),
         );
         World {
             _root: root,
             config,
             managed,
+            claude_config,
             tab_env,
         }
     }
@@ -1368,6 +1405,45 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(world.tab_env.lock().policy, ClaudePolicy::NotInstalled);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// `claude plugin list` writes Claude's config on a first run, so a
+    /// Claude that has never run here is not probed: no `claude` is run,
+    /// no verdict is recorded, and the tab still gets the plugin. The
+    /// first spawn after its config dir appears probes.
+    #[test]
+    fn a_claude_that_has_never_run_is_not_probed() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let world = unprobed_world(
+            |_| {},
+            Box::new(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            }),
+        );
+        fs::remove_dir(&world.claude_config).unwrap();
+        for _ in 0..2 {
+            let env = world.tab("", &[]);
+            assert_eq!(
+                roost_dirs(&env).len(),
+                1,
+                "Claude still gets the plugin: {env:?}"
+            );
+            let probe = world.tab_env.lock();
+            assert!(probe.running.is_none() && probe.at.is_none());
+            assert!(probe.waiting_logged, "the wait is logged");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(read_policy_record(&world.tab_env.0.dir).is_none());
+
+        fs::create_dir(&world.claude_config).unwrap();
+        world.tab("", &[]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while world.tab_env.lock().at.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

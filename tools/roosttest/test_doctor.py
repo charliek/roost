@@ -669,8 +669,8 @@ def test_agents_section_reports_wiring_and_trust(tmp_path):
 def test_agents_section_names_present_but_unwired_agents(tmp_path):
     """`agent-hooks = off`: the jail still creates each agent's config
     directory, so every one of them is `present` — but nothing is
-    wired, and doctor says exactly that per agent, `warn` not `fail`
-    (§3.6: a config switch, not a break)."""
+    wired, and doctor says exactly that per agent. Cursor, the one
+    opt-in, is switched off rather than broken: `skipped`, not `warn`."""
     jail = Jail(tmp_path, agent_hooks="off")
     quiet = _run_agent(jail, "ensure", "--json")
     assert quiet.returncode == 0, quiet.stdout + quiet.stderr
@@ -678,8 +678,9 @@ def test_agents_section_names_present_but_unwired_agents(tmp_path):
     report = _run_doctor_in_jail(jail)
     checks = checks_by_id(report)
     cursor = checks["agent.cursor.wired"]
-    assert cursor["status"] == "warn", cursor
-    assert "not wired" in cursor["detail"], cursor
+    assert cursor["status"] == "skipped", cursor
+    assert "switched off" in cursor["detail"], cursor
+    assert "agent install cursor" in cursor["detail"], cursor
     # The rest need no file: doctor names how they connect instead.
     for agent in ("claude", "codex", "grok", "opencode"):
         wired_check = checks[f"agent.{agent}.wired"]

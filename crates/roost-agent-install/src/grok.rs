@@ -1,10 +1,8 @@
-//! grok / gx — a file of Roost's own, in Claude's shape.
+//! grok — a file of Roost's own, in Claude's shape.
 //!
 //! grok loads Claude-format hook settings from files under
 //! `$GROK_HOME/hooks/`, so Roost gets a whole file to itself
 //! (`hooks/roost.json`) rather than merging into one the user edits.
-//! gx shares `$GROK_HOME` and reports under the same source, so one
-//! install covers both binaries by construction.
 //!
 //! Owning the file does not mean owning the *name*: a `roost.json` that
 //! contains a command Roost never wrote is somebody else's, and is

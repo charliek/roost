@@ -149,7 +149,8 @@ Item numbers are stable. Other notes cite them (for example "item 13").
 Just outside: #365 (unsafe-paste prompt, M), #170 (hard restart, M, may need a
 protocol decision), #339 (pill width, S once a metric is picked), #608 (toast cancels
 a held drag, S–M), #188 (OSC 52 read with consent, M), #566 (warm tabs, M), #480 (the
-session default for existing setups, a ruling).
+session default for existing setups; superseded 2026-11-14 by removing in-process
+tabs, see [`in-process-removal.md`](in-process-removal.md)).
 
 ---
 
@@ -380,8 +381,10 @@ can run `roostctl` as the shipped skill expects.
   process stamps both read `ForegroundLeader`. Whichever plan lands first owns the
   shared "what is in front of this PTY" helper in `roost-engine`; the other reuses
   it. Neither waits for the other.
-- #706 gets lighter once #480 moves existing setups to sessions, since Quit no longer
-  ends shells there. Cmd-W still needs it.
+- #706 gets lighter once in-process tabs are removed
+  ([`in-process-removal.md`](in-process-removal.md)), since Quit no longer ends shells
+  on a session. Cmd-W still needs it. (#706 itself was deferred past the next release
+  on 2026-11-14.)
 
 **Test approach.**
 - roosttest through `tab.close`: a tab running `sleep` in front answers "would
@@ -514,7 +517,7 @@ Plan C's dependencies.
   question 10.
 - **Unblocked but low priority:** #209 (provider-gated queries), #188 (OSC 52 read
   with consent), #365 (unsafe-paste prompt).
-- **Rulings first:** #480 (session default for existing setups), #339 (pill metric),
+- **Rulings first:** #339 (pill metric),
   #170 (hard restart; may need a protocol decision).
 - **Deliberately parked:** #297 (multi-click timing; porting would regress idle
   double-clicks, per its 2026-08-05 comment).
@@ -606,7 +609,9 @@ The repo has no `XXX`, `FIXME` or `HACK` markers to mine.
    `8ded8291`, or stay per session? Plan A fixes the docs to today's behavior either
    way.
 8. #339: which pill metric?
-9. #480: is the mobile client reason enough to schedule the default flip?
+9. ~~#480: is the mobile client reason enough to schedule the default flip?~~
+   **Decided 2026-11-14:** no flip; in-process tabs are removed in one release, not yet
+   scheduled ([`in-process-removal.md`](in-process-removal.md)).
 10. Move the "when a consumer appears" issues to a docs list and close them?
 11. Plan E, #708: the editor template, and local tabs only at first?
 
