@@ -405,7 +405,11 @@ process. When someone looks at a tab that no one owns and whose records
 decide nothing — it gains or loses the focus, a session viewer attaches
 or detaches, or the shell marks a command starting (`C`) — the server
 reads the leader in front, as it would to stamp a claim, and checks its
-name against a small table:
+name against a small table. A shell prints its `C` before it forks the
+command, so that read can find the shell, or its fork not yet running
+the command; one that names nothing is read once more about a second
+later, unless another mark has come first. Nothing else reads a tab to
+name an agent.
 
 | The process | `agent` |
 |---|---|

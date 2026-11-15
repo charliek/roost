@@ -639,8 +639,12 @@ An agent that neither claims its tab with a hook nor reports over OSC
 anything, on its sign-in screen. Roost names it from its process, once
 it looks at the tab — when you switch to the tab or away from it, when
 a session tab gains or loses a viewer, or when the shell marks a command
-starting. So start cursor-agent, switch to another tab, and its row
-appears.
+starting. So start cursor-agent at a zsh or bash (4.4 or later) prompt
+with Roost's integration, and its row appears within about a second;
+anywhere else, it appears once you switch to another tab. The shell marks the command before it starts it, so the
+first look can be too early (on macOS it nearly always is); when it
+finds no agent, Roost looks once more a second later, unless the command
+has already ended.
 
 | The process in front | The row |
 |---|---|
@@ -662,8 +666,9 @@ as it exits shows no row in between.
 The name only labels the row: nothing ends because of it. A launcher
 that runs the agent as its child rather than becoming it (`npx`) is not
 named, nor is an agent inside `tmux`, `screen`, `zellij`, `ssh` or
-`mosh`. Roost never reads a tab's processes on a timer to find one, so
-a tab you never look at again shows no row for it.
+`mosh`. Beyond that second look after a command starts, Roost never
+reads a tab's processes on a timer to find one, so an agent started
+with no prompt mark, in a tab you never look at again, shows no row.
 
 ## Codex trust
 
