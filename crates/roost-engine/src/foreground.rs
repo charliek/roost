@@ -151,6 +151,39 @@ pub(crate) struct ProcessSample {
 }
 
 impl ProcessSample {
+    /// One sample of spawn `incarnation`, read in the order that lets its
+    /// parts be paired: who has the terminal, the leader when wanted, each
+    /// stamp's liveness, then who has the terminal again. The terminal can
+    /// change hands between the reads (`fg`, then the leader exits while a
+    /// group mate holds on), and a liveness read can't be paired with
+    /// either reading then: the sample says it doesn't know who is in
+    /// front, which ends nothing.
+    pub(crate) fn read(
+        incarnation: u64,
+        mut foreground: impl FnMut() -> Foreground,
+        leader: impl FnOnce() -> Option<Leader>,
+        liveness: impl Fn(&Stamp) -> Liveness,
+        stamps: &[Stamp],
+    ) -> Self {
+        let before = foreground();
+        let leader = leader();
+        let liveness = stamps
+            .iter()
+            .map(|stamp| (*stamp, liveness(stamp)))
+            .collect();
+        let after = foreground();
+        Self {
+            incarnation,
+            foreground: if before == after {
+                before
+            } else {
+                Foreground::Unknown
+            },
+            leader,
+            liveness,
+        }
+    }
+
     pub(crate) fn liveness_of(&self, stamp: &Stamp) -> Option<Liveness> {
         self.liveness
             .iter()
@@ -991,6 +1024,56 @@ mod tests {
         );
         assert_eq!(foreground_of(Some(700), 500, true), Foreground::Group(700));
         assert_eq!(foreground_of(None, 500, true), Foreground::Unknown);
+    }
+
+    /// `fg` brings a stopped pipeline back between a sample's foreground
+    /// read and its liveness read, and its leader exits while a group mate
+    /// holds the terminal: the first reading says the shell, the process
+    /// is gone, and the two together would end a group still in front.
+    /// The sample reads the terminal again, and seeing it changed hands,
+    /// knows no foreground, which ends nothing.
+    #[test]
+    fn a_sample_whose_terminal_changed_hands_mid_read_knows_no_foreground() {
+        let stamp = Stamp {
+            pid: 700,
+            start: (12_345, 0),
+            pgid: 700,
+            sid: 500,
+        };
+        let liveness_read = std::cell::Cell::new(false);
+        let raced = ProcessSample::read(
+            1,
+            || {
+                if liveness_read.get() {
+                    Foreground::Group(700)
+                } else {
+                    Foreground::Shell
+                }
+            },
+            || None,
+            |_| {
+                liveness_read.set(true);
+                Liveness::Gone
+            },
+            &[stamp],
+        );
+        assert_eq!(raced.foreground, Foreground::Unknown);
+        assert_eq!(
+            process::on_sample(Some(&stamp), Liveness::Gone, raced.foreground),
+            process::SampleVerdict::Keep
+        );
+
+        let steady = ProcessSample::read(
+            1,
+            || Foreground::Shell,
+            || None,
+            |_| Liveness::Gone,
+            &[stamp],
+        );
+        assert_eq!(
+            (steady.foreground, steady.liveness_of(&stamp)),
+            (Foreground::Shell, Some(Liveness::Gone))
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

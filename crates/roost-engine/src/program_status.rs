@@ -93,6 +93,16 @@ impl ParkedRecords {
         self.records.is_empty() && !self.root_unprompted
     }
 
+    /// What a `clear` of `id` leaves set aside: its subtree goes, and with
+    /// the root (an empty id, or RIS) so does the root's say.
+    pub(crate) fn clear(&mut self, id: &str) {
+        let id = clean(id, NAME_MAX_BYTES);
+        self.records.retain(|(key, _)| !in_subtree(key, &id));
+        if id == ROOT {
+            self.root_unprompted = false;
+        }
+    }
+
     /// A `working` or `blocked` record was set aside.
     pub(crate) fn holds_live(&self) -> bool {
         !self.records.is_empty()
@@ -396,9 +406,9 @@ impl ProgramStatusRecords {
     /// [`Self::apply`] with the tab's process layer beside the hook layer:
     /// each prompt mark also reaches `process`, read with `fg` in front,
     /// so a mark's release or park lands at its byte like everything else.
-    /// A mark that parks takes the records it would drop aside instead.
-    /// The batch then tells `process` whether the records still decide
-    /// the tab.
+    /// A mark that parks takes the records it would drop aside instead,
+    /// and a `clear` reaches what it set aside. After each event `process`
+    /// learns whether the records still decide the tab.
     pub(crate) fn apply_with_process(
         &mut self,
         agent: &mut AgentTabState,
@@ -411,7 +421,12 @@ impl ProgramStatusRecords {
         let mut before = compose(agent, self).lifecycle;
         for event in events {
             match event {
-                StatusEvent::Report(report) => self.report(&report, now_ms, &mut applied),
+                StatusEvent::Report(report) => {
+                    if report.state == ProgramStatusState::Clear {
+                        process.clear_parked(&report.id);
+                    }
+                    self.report(&report, now_ms, &mut applied);
+                }
                 StatusEvent::Prompt(mark) => {
                     if process.parks_records_at(mark, fg) {
                         process.park_records(self.park());
@@ -438,9 +453,9 @@ impl ProgramStatusRecords {
             if self.children() < MAX_CHILDREN {
                 self.cap_warned = false;
             }
+            process.records_settled(self);
             before = self.announce(agent, before, now_ms, &mut applied);
         }
-        process.records_settled(self);
         applied
     }
 

@@ -1194,25 +1194,25 @@ impl PtySupervisor {
             )
         };
         latch.read(|| ())?;
-        let pgrp = fd
-            .upgrade()
-            .and_then(|fd| process_reads::terminal_pgrp(fd.as_fd()))
-            .or_else(|| process_reads::tpgid_of(child));
-        let foreground = process_reads::foreground_of(pgrp, child, runs_a_shell);
-        let leader = leader_wanted
-            .then(|| process_reads::leader_in_front(child))
-            .flatten();
-        let liveness = stamps
-            .iter()
-            .map(|stamp| (*stamp, process_reads::liveness(stamp)))
-            .collect();
-        latch.read(|| ())?;
-        Some(ProcessSample {
+        let sample = ProcessSample::read(
             incarnation,
-            foreground,
-            leader,
-            liveness,
-        })
+            || {
+                let pgrp = fd
+                    .upgrade()
+                    .and_then(|fd| process_reads::terminal_pgrp(fd.as_fd()))
+                    .or_else(|| process_reads::tpgid_of(child));
+                process_reads::foreground_of(pgrp, child, runs_a_shell)
+            },
+            || {
+                leader_wanted
+                    .then(|| process_reads::leader_in_front(child))
+                    .flatten()
+            },
+            process_reads::liveness,
+            stamps,
+        );
+        latch.read(|| ())?;
+        Some(sample)
     }
 
     /// Spawn a shell for `tab_id`.

@@ -57,6 +57,11 @@ pub(crate) struct ProcessAxis {
     /// busy process gone after the shell took the terminal back from it,
     /// but before the shell printed the `D` that carries its exit code.
     exit_pending: Option<String>,
+    /// Counts the `A`, `B` and `D` marks read with a stamped layer's group
+    /// out of front. Such a mark parks, takes an exit code and notes the
+    /// group left; a sample asked for before it may have read the terminal
+    /// before it moved, and would undo all three, so it is read again.
+    marks: u64,
 }
 
 /// Records that stopped deciding by their program's own word — a
@@ -98,6 +103,10 @@ struct Followed<P> {
     /// What the stamped process's name said it is, read with the stamp.
     /// Display only: nothing it follows ends by it.
     agent: Option<&'static str>,
+    /// The tab's report count when the last read that found the stamped
+    /// group in front was asked for: what its process can be known to
+    /// have reported. A later report may be another job's.
+    seen_seq: u64,
 }
 
 impl<P> Default for Followed<P> {
@@ -112,6 +121,7 @@ impl<P> Default for Followed<P> {
             in_front: false,
             exit_code: None,
             agent: None,
+            seen_seq: 0,
         }
     }
 }
@@ -146,16 +156,19 @@ impl<P> Followed<P> {
         self.in_front = false;
         self.exit_code = None;
         self.agent = None;
+        self.seen_seq = 0;
     }
 
-    /// Take `leader`'s stamp, read in `incarnation`'s spawn at `now`.
-    fn stamp_with(&mut self, leader: &Leader, incarnation: u64, now: i64) {
+    /// Take `leader`'s stamp, read in `incarnation`'s spawn at `now` for a
+    /// request made at report count `seq`.
+    fn stamp_with(&mut self, leader: &Leader, incarnation: u64, seq: u64, now: i64) {
         self.follow = Follow::Stamped(leader.stamp);
         self.agent = leader.agent;
         self.incarnation = incarnation;
         self.since = now;
         // The leader stamped is the one in front.
         self.in_front = true;
+        self.seen_seq = seq;
     }
 
     fn has_a_sample_to_take(&self) -> bool {
@@ -200,11 +213,18 @@ impl<P> Followed<P> {
         }
     }
 
-    /// What `sample`, read for the layer as of `epoch`, says of it: a
-    /// wanted stamp is taken, and a stamp from another spawn forgotten, on
-    /// the way. `None` when the sample has nothing to say: it was read for
-    /// an earlier layer, or there was no stamp to read.
-    fn verdict(&mut self, epoch: u64, sample: &ProcessSample, now: i64) -> Option<SampleVerdict> {
+    /// What `sample`, read for the layer as of `epoch` at report count
+    /// `seq`, says of it: a wanted stamp is taken, and a stamp from
+    /// another spawn forgotten, on the way. `None` when the sample has
+    /// nothing to say: it was read for an earlier layer, or there was no
+    /// stamp to read.
+    fn verdict(
+        &mut self,
+        epoch: u64,
+        sample: &ProcessSample,
+        seq: u64,
+        now: i64,
+    ) -> Option<SampleVerdict> {
         if epoch != self.epoch {
             return None;
         }
@@ -212,7 +232,7 @@ impl<P> Followed<P> {
             Follow::Off | Follow::Unstamped => None,
             Follow::Wanted => {
                 match &sample.leader {
-                    Some(leader) => self.stamp_with(leader, sample.incarnation, now),
+                    Some(leader) => self.stamp_with(leader, sample.incarnation, seq, now),
                     None => self.follow = Follow::Unstamped,
                 }
                 None
@@ -232,6 +252,9 @@ impl<P> Followed<P> {
                     Foreground::Group(pgid) => self.in_front = pgid == stamp.pgid,
                     Foreground::Shell => self.in_front = false,
                     Foreground::Unknown => {}
+                }
+                if sample.foreground == Foreground::Group(stamp.pgid) {
+                    self.seen_seq = seq;
                 }
                 Some(process::on_sample(
                     Some(&stamp),
@@ -271,9 +294,10 @@ pub(crate) struct SampleRequest {
     owner_epoch: u64,
     records_epoch: u64,
     identity_epoch: u64,
-    /// The records' report count when the sample was asked for: what an
-    /// end may take is what was reported by then.
+    /// The records' report count when the sample was asked for.
     records_seq: u64,
+    /// [`ProcessAxis::marks`] when the sample was asked for.
+    marks: u64,
     /// Read the leader in front: a layer wants its stamp, or `discover`.
     pub(crate) leader_wanted: bool,
     /// Look for an agent in front to name.
@@ -472,13 +496,8 @@ impl ProcessAxis {
 
     /// What a parking mark took off the records. A second mark while they
     /// are parked keeps the first's: what it takes is whatever ran in
-    /// front meanwhile, which the mark drops as it always did.
-    ///
-    /// A park that took nothing holds nothing. Codex clears its own status
-    /// as it stops, often in the read that carries the shell's `D`; had
-    /// the clear come a read earlier, the records would have stopped
-    /// deciding and the layer ended before the mark, so it ends here too,
-    /// and what names a stopped Codex is its process ([`Left`]).
+    /// front meanwhile, which the mark drops as it always did. A park that
+    /// took nothing holds nothing.
     pub(crate) fn park_records(&mut self, parked: ParkedRecords) {
         if parked.is_empty() {
             return;
@@ -487,9 +506,24 @@ impl ProcessAxis {
         self.due = true;
     }
 
-    /// The records after a batch, or a sample: while they decide the tab,
-    /// or a mark parked some, the layer is live and wants a stamp; once
-    /// neither holds, it ends.
+    /// A `clear` of `id` and its subtree reaches what a mark set aside too,
+    /// so nothing cleared comes back with the program.
+    pub(crate) fn clear_parked(&mut self, id: &str) {
+        let Some(parked) = &mut self.records.parked else {
+            return;
+        };
+        parked.clear(id);
+        if parked.is_empty() {
+            self.records.parked = None;
+        }
+    }
+
+    /// The records after each event of a batch, or a sample: while they
+    /// decide the tab, or a mark parked some, the layer is live and wants
+    /// a stamp; once neither holds, it ends. Per event, not per batch, so
+    /// the outcome never depends on how the bytes were split (DL-29): one
+    /// program's `clear` and the next one's first report end one layer and
+    /// start another in either case.
     pub(crate) fn records_settled(&mut self, records: &ProgramStatusRecords) {
         let live = records.is_authoritative() || self.records.parked.is_some();
         match (live, self.records.follow) {
@@ -550,6 +584,17 @@ impl ProcessAxis {
             }),
             _ => None,
         };
+        if [
+            self.owner.stamp(),
+            self.records.stamp(),
+            self.identity.stamp(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|stamp| fg != Foreground::Group(stamp.pgid))
+        {
+            self.marks += 1;
+        }
         self.owner.at_mark(fg, exit_code);
         self.records.at_mark(fg, exit_code);
         self.hand_over(fg, agent);
@@ -576,22 +621,13 @@ impl ProcessAxis {
     }
 
     /// At an `A`, `B` or `D` read with `fg` in front: records that left
-    /// ([`Left`]) — before this mark, or in its own read, leaving it
-    /// nothing to park — pass their stamp to the identity layer, unshown,
-    /// with a read asked for, once the shell or another job has the
-    /// terminal and nothing else names the tab. A mark from the program's
-    /// own group keeps them for the next; one with no one known in front
-    /// forgets them.
+    /// ([`Left`]) pass their stamp to the identity layer, unshown, with a
+    /// read asked for, once the shell or another job has the terminal and
+    /// nothing else names the tab. A mark from the program's own group
+    /// keeps them for the next; one with no one known in front forgets
+    /// them.
     fn hand_over(&mut self, fg: Foreground, agent: &AgentTabState) {
-        let left_in_this_read = self
-            .records
-            .stamp()
-            .filter(|stamp| {
-                self.records.parked.is_none()
-                    && process::at_mark(Layer::Records, Some(stamp), fg) == MarkVerdict::Park
-            })
-            .and_then(|_| self.records.left());
-        let Some(left) = left_in_this_read.or_else(|| self.left.take()) else {
+        let Some(left) = self.left.take() else {
             return;
         };
         match fg {
@@ -650,6 +686,7 @@ impl ProcessAxis {
             records_epoch: self.records.epoch,
             identity_epoch: self.identity.epoch,
             records_seq: records.seq(),
+            marks: self.marks,
             leader_wanted,
             discover,
             stamps,
@@ -661,6 +698,8 @@ impl ProcessAxis {
     ///
     /// A layer that started over since the request changes nothing: the
     /// claim, release or new record that restarted it asked for its own.
+    /// Nor does a sample asked for before a mark moved a stamped group out
+    /// of front ([`Self::marks`]); it is asked for again.
     pub(crate) fn apply_sample(
         &mut self,
         request: &SampleRequest,
@@ -670,9 +709,15 @@ impl ProcessAxis {
         now: i64,
     ) -> Ended {
         let mut ended = Ended::default();
+        if request.marks != self.marks {
+            self.discover |= request.discover;
+            self.due = true;
+            return ended;
+        }
         let mut gone = Gone::default();
+        let seq = request.records_seq;
         let owner_in_front = self.owner.in_front;
-        match self.owner.verdict(request.owner_epoch, sample, now) {
+        match self.owner.verdict(request.owner_epoch, sample, seq, now) {
             None | Some(SampleVerdict::Keep) => {}
             Some(SampleVerdict::Restore) => {
                 self.owner.set_suspended(false, now);
@@ -706,7 +751,10 @@ impl ProcessAxis {
             }
         }
         let records_in_front = self.records.in_front;
-        match self.records.verdict(request.records_epoch, sample, now) {
+        match self
+            .records
+            .verdict(request.records_epoch, sample, seq, now)
+        {
             None | Some(SampleVerdict::Keep) => {}
             Some(SampleVerdict::Restore) => {
                 self.records.set_suspended(false, now);
@@ -722,9 +770,11 @@ impl ProcessAxis {
             }
             Some(SampleVerdict::End) => {
                 // With the shell back in front, nothing else can have
-                // reported; with another job there, what it reported
-                // since the request is its own.
-                let upto = (sample.foreground != Foreground::Shell).then_some(request.records_seq);
+                // reported; with another job there (an agent restarted
+                // in a loop), what was reported after the gone process
+                // was last seen in front may be that job's.
+                let upto =
+                    (sample.foreground != Foreground::Shell).then_some(self.records.seen_seq);
                 let parked = self.records.parked.take();
                 let app = match &parked {
                     Some(parked) => parked.app.clone(),
@@ -761,7 +811,10 @@ impl ProcessAxis {
         now: i64,
         ended: &mut Ended,
     ) {
-        match self.identity.verdict(request.identity_epoch, sample, now) {
+        match self
+            .identity
+            .verdict(request.identity_epoch, sample, request.records_seq, now)
+        {
             None | Some(SampleVerdict::Keep) => {}
             Some(verdict @ (SampleVerdict::Restore | SampleVerdict::Suspend)) => {
                 if !std::mem::replace(&mut self.identity_shown, true) {
@@ -791,7 +844,8 @@ impl ProcessAxis {
             .as_ref()
             .filter(|leader| leader.agent.is_some())
         {
-            self.identity.stamp_with(leader, sample.incarnation, now);
+            self.identity
+                .stamp_with(leader, sample.incarnation, request.records_seq, now);
             self.identity_shown = true;
             ended.named = leader.agent;
         }
@@ -1456,7 +1510,7 @@ mod tests {
             &request,
             &sample(Foreground::Group(800), None, Liveness::Gone),
         );
-        assert_eq!(tab.shows(), AgentLifecycle::Working, "the new Codex's");
+        assert!(tab.records.is_authoritative(), "the new Codex's");
         assert_eq!(tab.process(), None, "not the gone one's stamp");
         assert!(tab.axis.is_due(), "the new one is stamped next");
     }
@@ -1558,6 +1612,153 @@ mod tests {
         assert!(tab.process().is_some());
     }
 
+    /// The leader of the next run of a program a loop restarts
+    /// (`while true; do codex; done`), in front as group 800.
+    fn next_run(liveness: Liveness) -> ProcessSample {
+        let next = Stamp {
+            pid: 800,
+            start: (12_400, 0),
+            pgid: 800,
+            sid: 500,
+        };
+        ProcessSample {
+            incarnation: 1,
+            foreground: Foreground::Group(800),
+            leader: Some(Leader {
+                stamp: next,
+                agent: None,
+            }),
+            liveness: vec![(stamp(), liveness)],
+        }
+    }
+
+    /// The next run reports before the read that finds the last one gone
+    /// is even asked for. An end with another job in front takes only
+    /// what was reported by the last read that found the gone process in
+    /// front: its own child goes, the next run's root stays, and the next
+    /// run is stamped.
+    #[test]
+    fn an_end_takes_only_what_was_reported_while_the_gone_process_was_seen_in_front() {
+        let mut tab = stamped_codex();
+        tab.feed(
+            [report("sub", "", ProgramStatusState::Working)],
+            Foreground::Unknown,
+        );
+        tab.axis.request_tick();
+        tab.sample(&sample(Foreground::Group(700), None, Liveness::Running));
+
+        tab.feed(
+            [report("", "codex", ProgramStatusState::Working)],
+            Foreground::Unknown,
+        );
+        tab.axis.request_tick();
+        let ended = tab.sample(&next_run(Liveness::Gone));
+        assert!(ended.records);
+        assert_eq!(tab.records.children(), 0, "the gone run's child");
+        assert!(tab.records.is_authoritative(), "the next run's root");
+
+        tab.sample(&next_run(Liveness::Running));
+        assert_eq!(tab.process().map(|process| process.pid), Some(800));
+    }
+
+    /// One run's `clear` and the next run's first report, in one read or
+    /// two: the records stop deciding and start again either way, so the
+    /// next run is stamped, not left under the last one's stamp (DL-29:
+    /// the result never depends on the read split).
+    #[test]
+    fn a_clear_then_the_next_runs_report_restamp_however_the_read_splits() {
+        for split in [false, true] {
+            let mut tab = stamped_codex();
+            let clear = report("", "codex", ProgramStatusState::Clear);
+            let next = report("", "codex", ProgramStatusState::Working);
+            if split {
+                tab.feed([clear], Foreground::Unknown);
+                tab.feed([next], Foreground::Unknown);
+            } else {
+                tab.feed([clear, next], Foreground::Unknown);
+            }
+            assert_eq!(tab.process(), None, "split: {split}");
+            let request = tab.request();
+            assert!(request.leader_wanted, "split: {split}");
+            tab.apply(&request, &next_run(Liveness::Running));
+            assert_eq!(
+                tab.process().map(|process| process.pid),
+                Some(800),
+                "split: {split}"
+            );
+        }
+    }
+
+    /// A `clear` while a stopped program's records are set aside reaches
+    /// them: what it cleared never comes back with the program. A
+    /// subtree's takes that subtree; the root's takes everything, and
+    /// with nothing left aside the records follow no process.
+    #[test]
+    fn a_clear_reaches_records_set_aside() {
+        let parked = || {
+            let mut tab = stamped_codex();
+            tab.feed(
+                [
+                    report("job", "", ProgramStatusState::Working),
+                    report("other", "", ProgramStatusState::Working),
+                ],
+                Foreground::Unknown,
+            );
+            tab.mark(end(128 + libc::SIGTSTP), Foreground::Shell);
+            assert!(!tab.records.is_authoritative(), "the precondition: parked");
+            tab
+        };
+        let resume = |tab: &mut Tab| {
+            tab.mark(PromptMark::OutputStart, Foreground::Group(700));
+            tab.sample(&sample(Foreground::Group(700), None, Liveness::Running));
+        };
+
+        let mut subtree = parked();
+        subtree.feed(
+            [report("job", "", ProgramStatusState::Clear)],
+            Foreground::Unknown,
+        );
+        resume(&mut subtree);
+        assert_eq!(subtree.records.children(), 1, "only `other` came back");
+        assert!(subtree.records.is_authoritative(), "the root came back");
+
+        let mut root = parked();
+        root.feed(
+            [report("", "", ProgramStatusState::Clear)],
+            Foreground::Unknown,
+        );
+        assert_eq!(root.process(), None, "nothing left to follow");
+        resume(&mut root);
+        assert!(root.records.is_empty());
+        assert!(!root.records.is_authoritative());
+    }
+
+    /// RIS reports a root `clear`, and reaches records set aside the same.
+    #[cfg(feature = "vt")]
+    #[test]
+    fn ris_reaches_records_set_aside() {
+        let mut term = roost_vt::Terminal::new(roost_vt::TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+            ..Default::default()
+        })
+        .expect("terminal");
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        term.set_status_sink(std::sync::Arc::clone(&sink))
+            .expect("status sink");
+        term.vt_write(b"\x1bc");
+        let ris = crate::program_status::drain(&sink);
+
+        let mut tab = stamped_codex();
+        tab.mark(end(128 + libc::SIGTSTP), Foreground::Shell);
+        tab.feed(ris, Foreground::Unknown);
+        tab.mark(PromptMark::OutputStart, Foreground::Group(700));
+        tab.sample(&sample(Foreground::Group(700), None, Liveness::Running));
+        assert!(tab.records.is_empty());
+        assert!(!tab.records.is_authoritative());
+    }
+
     // Exit codes and the exit banner (commit 3).
 
     fn end(exit_code: i32) -> PromptMark {
@@ -1623,6 +1824,85 @@ mod tests {
         }
         sample_first.mark(end(1), Foreground::Shell);
         assert_eq!(sample_first.banners.len(), 1, "once per end");
+    }
+
+    /// A read asked for while the program ran, applied after the `D` the
+    /// shell printed when it was killed: the read saw it running and in
+    /// front, before the `D` moved the terminal. Applied, it would bring
+    /// back what the `D` set aside and forget the `D`'s code, and the next
+    /// read's end would owe its banner to the next command's `D`. It is
+    /// read again instead, and the end raises the kill's banner.
+    #[test]
+    fn a_sample_asked_for_before_a_mark_is_read_again() {
+        let mut tab = stamped_codex();
+        tab.axis.request_tick();
+        let stale = tab.request();
+        tab.mark(end(137), Foreground::Shell);
+        let ended = tab.apply(
+            &stale,
+            &sample(Foreground::Group(700), None, Liveness::Running),
+        );
+        assert_eq!(ended, Ended::default());
+        assert!(
+            !tab.records.is_authoritative(),
+            "nothing set aside came back"
+        );
+        assert!(tab.axis.is_due(), "read again");
+
+        tab.sample(&sample(Foreground::Shell, None, Liveness::Gone));
+        tab.mark(PromptMark::OutputStart, Foreground::Unknown);
+        tab.mark(end(1), Foreground::Shell);
+        assert_eq!(tab.banners, [exit_banner("Codex", "killed (SIGKILL)")]);
+    }
+
+    /// The same read landing after a `Ctrl-Z`'s `D` leaves the owner's
+    /// parked lifecycle parked; the read asked again finds it stopped. A
+    /// mark from the stamped group itself (Claude's Screen Reader marks)
+    /// moves nothing, and a read asked for before one still lands.
+    #[test]
+    fn a_sample_asked_for_before_a_suspend_leaves_the_park_alone() {
+        let mut agent = owned("claude", AgentLifecycle::Working);
+        let mut axis = stamped(&agent);
+        let mut none = ProgramStatusRecords::default();
+        axis.request_sample();
+        let stale = axis.take_request(1, &none, &agent).expect("due");
+        agent = mark(&mut axis, &agent, "D", Foreground::Shell);
+        axis.apply_sample(
+            &stale,
+            &sample(Foreground::Group(700), None, Liveness::Running),
+            &mut agent,
+            &mut none,
+            NOW,
+        );
+        assert_eq!(agent.lifecycle, AgentLifecycle::Inactive);
+        assert_eq!(axis.owner.parked, Some(AgentLifecycle::Working));
+        sampled(
+            &mut axis,
+            &mut agent,
+            &sample(Foreground::Shell, None, Liveness::Stopped),
+        );
+        assert_eq!(
+            axis.wire(&agent, &none).map(|process| process.state),
+            Some(ProcessState::Suspended)
+        );
+
+        let mut agent = owned("claude", AgentLifecycle::Working);
+        let mut axis = stamped(&agent);
+        axis.request_sample();
+        let read = axis.take_request(1, &none, &agent).expect("due");
+        agent = mark(&mut axis, &agent, "A", Foreground::Group(700));
+        axis.apply_sample(
+            &read,
+            &sample(Foreground::Group(700), None, Liveness::Stopped),
+            &mut agent,
+            &mut none,
+            NOW,
+        );
+        assert_eq!(
+            axis.wire(&agent, &none).map(|process| process.state),
+            Some(ProcessState::Suspended),
+            "its own mark moved nothing"
+        );
     }
 
     #[test]
