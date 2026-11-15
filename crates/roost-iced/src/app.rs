@@ -2661,7 +2661,8 @@ pub type UploadFuture = Pin<Box<dyn Future<Output = crate::host_conn::UploadResu
 /// Which half of the clipboard-image probe a target wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeSink {
-    /// A local tab: write the temp PNG and paste its path.
+    /// A tab whose shell reads this filesystem — a local tab, or one on
+    /// this machine's own session: write the temp PNG and paste its path.
     TempFile,
     /// A host tab: the encoded bytes, which go over the wire instead.
     Bytes,

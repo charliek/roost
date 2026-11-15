@@ -540,6 +540,9 @@ pub(crate) struct HostConnSet {
     /// spawn at all: a restart's target, held from its relaunch until the
     /// restart ends (plan 076 D8), whichever surface starts the connect.
     spawn_pins: HashMap<String, task::SpawnPin>,
+    /// Which host's session is started again when it is lost, shared
+    /// with every connection task. See [`task::RespawnSlot`].
+    respawn: task::RespawnSlot,
 }
 
 /// Everything the set holds for one saved host, keyed on
@@ -896,6 +899,15 @@ impl HostConnSet {
             next_ssh_request: 0,
             displaced: Vec::new(),
             spawn_pins: HashMap::new(),
+            respawn: task::RespawnSlot::default(),
+        }
+    }
+
+    /// Name the host whose session every connection task may start again
+    /// when it is lost without a word, or nobody.
+    pub(crate) fn set_respawn_host(&self, host: Option<&str>) {
+        if self.respawn.set(host) {
+            tracing::debug!(?host, "the local session to start again when it is lost");
         }
     }
 
@@ -1037,6 +1049,7 @@ impl HostConnSet {
             uploads: ops.uploads(),
             serving: ops.serving(),
             spawn_bin: self.spawn_pins.get(host).cloned(),
+            respawn: self.respawn.clone(),
         };
         // Detached on purpose: the task owns its own shutdown, bounds it
         // (`task::SHUTDOWN_GRACE`), and answers its queue on the way

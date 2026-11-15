@@ -30,7 +30,7 @@
 use std::path::{Path, PathBuf};
 
 use roost_ipc::session_version::BuildId;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use roost_ipc::client::{ClientError, EventFrame, EventStream, IpcClient, ServerCode};
@@ -52,15 +52,15 @@ use super::{HostIdMinter, HostWorkspaceEvent};
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
 pub(crate) use roost_client::task::{scale, Shutdown};
 
-/// How the *first* attempt treats a socket that is not there.
+/// How an attempt treats a socket that is not there.
 ///
 /// A daemon is started by an explicit Connect, and — since plan 063 §D5
 /// — by the launch-time dial of *the slot* under `local-backend =
 /// session`, which is not a host the user opted into but where this
 /// window's own tabs live. Launch-time auto-reconnect for every other
-/// host is connect-if-present (plan 037 §3.2), and a mid-session drop
-/// never spawns at all — so the mode is consumed by the first attempt
-/// and every retry after it is a plain dial.
+/// host is connect-if-present (plan 037 §3.2). The mode is consumed by
+/// the first attempt: every retry after it is a plain dial, except the
+/// slot's [`Self::Respawn`] when its session is gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectMode {
     /// Probe; an absent socket is a plain disconnected state, no daemon.
@@ -80,9 +80,115 @@ pub(crate) enum ConnectMode {
     /// startup. Every other spawn seeds, including a launch-time dial of
     /// the very same slot with no migration to run.
     SpawnUnseeded,
+    /// A retry of the slot whose session went away without a word — a
+    /// crash, a `kill -9` — and left nothing listening: start it again
+    /// from the launch ladder, seeded as a launch is, so it reopens its
+    /// saved layout as fresh shells. Never chosen by a caller; only
+    /// [`Respawns::retry`] picks it. A restart's [`SpawnPin`] does not
+    /// apply: it is lifted when the restart ends, and no respawn is
+    /// allowed while one is running ([`RespawnSlot`]).
+    Respawn,
     /// Dial straight away. What a non-localhost host always does — there
     /// is no local socket to probe and nothing this client could spawn.
     Dial,
+}
+
+/// Which saved host's session this window starts again when a
+/// connection to it is lost without a word.
+///
+/// The app names the slot here while it may do that
+/// (`App::sync_session_respawn`), and every connection task reads it
+/// when it decides how to retry — so a backend switch, a Restart Session
+/// or a change of slot takes effect at a running task's next retry, not
+/// only at its next connect.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RespawnSlot(Arc<Mutex<Option<String>>>);
+
+impl RespawnSlot {
+    /// Name `host`, or nobody. `true` when that changed the answer.
+    pub(crate) fn set(&self, host: Option<&str>) -> bool {
+        let mut named = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if named.as_deref() == host {
+            return false;
+        }
+        *named = host.map(str::to_string);
+        true
+    }
+
+    fn names(&self, host: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            == Some(host)
+    }
+}
+
+/// How many times in a row the slot's session is started again before
+/// the task stops and says so, rather than restarting one that cannot
+/// stay up for ever.
+const MAX_RESPAWNS: u32 = 3;
+
+/// How long a session has to stay connected for its loss to start the
+/// count over: one that dies once a day is started again every time.
+const RESPAWN_STABLE: Duration = Duration::from_secs(60);
+
+/// What the next retry of a lost connection does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    Dial,
+    Respawn,
+    /// The session was started again [`MAX_RESPAWNS`] times and none of
+    /// them stayed up: settle, so the window says it cannot start it.
+    GiveUp,
+}
+
+/// The respawns one connection task has spent.
+#[derive(Debug, Default)]
+struct Respawns {
+    spent: u32,
+}
+
+impl Respawns {
+    /// A connection that reached a session ended after `served`.
+    fn served(&mut self, served: Duration) {
+        if served >= RESPAWN_STABLE {
+            self.spent = 0;
+        }
+    }
+
+    /// The next retry, given whether this window may start the session
+    /// again and whether something already answers its socket.
+    ///
+    /// A socket that answers is dialed whoever is behind it — a session
+    /// started by hand, or one still coming up — and costs nothing: only
+    /// a respawn is counted, so a hung session is redialed as any other
+    /// drop is rather than spending the count on attempts that start
+    /// nothing. The launch ladder's own locks are what keep a respawn
+    /// from starting a second session beside a live one.
+    fn retry(&mut self, allowed: bool, socket_live: bool) -> Retry {
+        if !allowed || socket_live {
+            return Retry::Dial;
+        }
+        if self.spent >= MAX_RESPAWNS {
+            return Retry::GiveUp;
+        }
+        self.spent += 1;
+        Retry::Respawn
+    }
+}
+
+/// The band line and detail a task that gave up respawning settles on.
+fn respawns_exhausted(last_loss: &str) -> (String, String) {
+    let bin = session_launch::BIN_NAME;
+    (
+        format!("{bin} could not be restarted"),
+        format!(
+            "{bin} was started again {MAX_RESPAWNS} times and none of them stayed up for {}s; \
+             the last loss: {last_loss}",
+            RESPAWN_STABLE.as_secs()
+        ),
+    )
 }
 
 /// Where a reconnect picks a session's event stream back up: the
@@ -182,6 +288,9 @@ pub(crate) struct ConnectionConfig {
     /// runs, and a missing or changed one fails the attempt instead of
     /// falling back to the launch ladder.
     pub(crate) spawn_bin: Option<SpawnPin>,
+    /// Whether this host's session may be started again when it is lost;
+    /// read at every retry. Only ever names a localhost slot.
+    pub(crate) respawn: RespawnSlot,
 }
 
 /// The binary a restart agreed to run, and the build it identified as.
@@ -430,8 +539,11 @@ enum SpawnStage {
 /// spawn again** — it would dial a socket that nothing is left to
 /// create, and the dial's generic io error would overwrite this reason
 /// every 250 ms forever. Settling is the only honest verdict under that
-/// loop, and ↻ Reconnect is the recovery. A future policy that let a
-/// retry spawn would revisit this table first.
+/// loop, and ↻ Reconnect is the recovery. The one retry that does spawn,
+/// the slot's [`ConnectMode::Respawn`], settles on the same rows for the
+/// same reason: a binary that cannot run now will not run on the next
+/// rung either, and the window's cannot-start notice is the honest
+/// answer.
 ///
 /// A launcher that **exited** with no verdict settles for the same
 /// reason, once [`launch_session`]'s one confirm has found nothing
@@ -636,6 +748,11 @@ async fn connect_loop(
     // the session. The set's copy, which does outlive those, carries the
     // same table as real clearing.
     let mut resume: Option<Resume> = None;
+    let mut respawns = Respawns::default();
+    // When the connection being served came up, so its loss can tell a
+    // session that stayed up from one that keeps dying.
+    let mut serving_since: Option<tokio::time::Instant> = None;
+    let mut last_loss = String::new();
 
     loop {
         // Mint (and therefore register the ownership) before anything is
@@ -653,13 +770,15 @@ async fn connect_loop(
             () = shutdown.requested() => None,
             outcome = attempt(config, mode, checkpoint) => Some(outcome),
         };
-        // Only the first attempt may spawn or probe; a retry dials.
+        // Only the first attempt may spawn or probe; a retry dials, unless
+        // [`Respawns::retry`] picks a respawn for it below.
         mode = ConnectMode::Dial;
 
         let ended = match dialed {
             None => ConnEnd::Shutdown,
             Some(Err(error)) => error.into(),
             Some(Ok(live)) => {
+                serving_since = Some(tokio::time::Instant::now());
                 let _password_input = SuspendsPasswordInput(Arc::clone(&live.mirror));
                 // Taken before the connection is served rather than
                 // after: both halves of a checkpoint are known the
@@ -741,6 +860,10 @@ async fn connect_loop(
                 return;
             }
             ConnEnd::Dropped(reason) => {
+                if let Some(since) = serving_since.take() {
+                    respawns.served(since.elapsed());
+                }
+                last_loss.clone_from(&reason);
                 let state = machine.dropped(reason, jitter());
                 let retry = state.retry_in();
                 if !publish_state(feed, incarnation, state) {
@@ -760,6 +883,34 @@ async fn connect_loop(
                 return;
             }
             () = tokio::time::sleep(delay) => {}
+        }
+
+        // Asked now rather than at the drop: the slot can have moved, or
+        // an action taken the host, while this task was waiting.
+        let allowed = config.transport.is_localhost() && config.respawn.names(&config.host);
+        let live = allowed && socket_live(&config.socket).await;
+        match respawns.retry(allowed, live) {
+            Retry::Dial => {}
+            Retry::Respawn => {
+                tracing::info!(
+                    host = %config.host,
+                    attempt = respawns.spent,
+                    last_loss = %last_loss,
+                    "the local session is gone; starting it again"
+                );
+                mode = ConnectMode::Respawn;
+            }
+            Retry::GiveUp => {
+                let (reason, detail) = respawns_exhausted(&last_loss);
+                tracing::warn!(
+                    host = %config.host,
+                    %reason,
+                    detail = %detail,
+                    "the local session keeps going away; not starting it again"
+                );
+                publish_state(feed, incarnation, machine.settled(reason, detail));
+                return;
+            }
         }
     }
 }
@@ -985,10 +1136,24 @@ async fn ensure_socket_among(
         }
     }
     // Nothing is listening, so only a mode that may start one gets to.
+    match spawn_plan(mode, config.spawn_bin.as_ref()) {
+        Some((first_project, pin)) => spawn_session(config, first_project, pin).await,
+        None => Err(AttemptError::Transport(no_session_at(&config.socket))),
+    }
+}
+
+/// What an attempt in `mode` starts when nothing is listening: the first
+/// project the session seeds and the restart pin it runs from, or
+/// nothing at all.
+fn spawn_plan(
+    mode: ConnectMode,
+    pin: Option<&SpawnPin>,
+) -> Option<(FirstProject, Option<&SpawnPin>)> {
     match mode {
-        ConnectMode::SpawnIfMissing => spawn_session(config, FirstProject::Seed).await,
-        ConnectMode::SpawnUnseeded => spawn_session(config, FirstProject::Withheld).await,
-        _ => Err(AttemptError::Transport(no_session_at(&config.socket))),
+        ConnectMode::SpawnIfMissing => Some((FirstProject::Seed, pin)),
+        ConnectMode::SpawnUnseeded => Some((FirstProject::Withheld, pin)),
+        ConnectMode::Respawn => Some((FirstProject::Seed, None)),
+        ConnectMode::IfPresent | ConnectMode::Dial => None,
     }
 }
 
@@ -1029,6 +1194,7 @@ async fn old_path_session(
 async fn spawn_session(
     config: &ConnectionConfig,
     first_project: FirstProject,
+    pin: Option<&SpawnPin>,
 ) -> Result<(), AttemptError> {
     if !config.transport.is_localhost() {
         return Err(AttemptError::Transport(format!(
@@ -1036,7 +1202,7 @@ async fn spawn_session(
             no_session_at(&config.socket)
         )));
     }
-    if let Some(pinned) = &config.spawn_bin {
+    if let Some(pinned) = pin {
         return pinned_spawn(pinned, config.socket.clone(), first_project).await;
     }
     let bin = session_launch::locate_session_binary(
@@ -2482,6 +2648,7 @@ mod tests {
             uploads: Uploads::default(),
             serving: queue::Serving::default(),
             spawn_bin: None,
+            respawn: RespawnSlot::default(),
         }
     }
 
@@ -2535,7 +2702,7 @@ mod tests {
         let shown = bin.display().to_string();
 
         config.spawn_bin = Some(pin(bin.clone(), "0.0.23"));
-        match spawn_session(&config, FirstProject::Seed).await {
+        match spawn_session(&config, FirstProject::Seed, config.spawn_bin.as_ref()).await {
             Err(AttemptError::Unrecoverable { reason, .. }) => {
                 assert_eq!(
                     reason,
@@ -2546,7 +2713,7 @@ mod tests {
         }
 
         config.spawn_bin = Some(pin(dir.path().join("missing"), "0.0.22"));
-        match spawn_session(&config, FirstProject::Seed).await {
+        match spawn_session(&config, FirstProject::Seed, config.spawn_bin.as_ref()).await {
             Err(AttemptError::Unrecoverable { reason, .. }) => {
                 assert!(
                     reason.ends_with("missing is gone; nothing was started"),
@@ -2619,7 +2786,7 @@ mod tests {
         let revoked = pin(bin, "0.0.22");
         revoked.launches.revoke();
         config.spawn_bin = Some(revoked);
-        match spawn_session(&config, FirstProject::Seed).await {
+        match spawn_session(&config, FirstProject::Seed, config.spawn_bin.as_ref()).await {
             Err(AttemptError::Unrecoverable { reason, .. }) => {
                 assert_eq!(reason, "the restart was cancelled; nothing was started");
             }
@@ -2809,6 +2976,136 @@ mod tests {
         );
     }
 
+    /// A slot whose session was lost without a word is started again —
+    /// but only where the app named it, only when nothing answers its
+    /// socket, and only [`MAX_RESPAWNS`] times in a row: a session that
+    /// cannot stay up ends in a settle the window can show, not a loop.
+    #[test]
+    fn a_lost_session_is_started_again_only_while_allowed_and_only_so_often() {
+        let mut respawns = Respawns::default();
+        assert_eq!(respawns.retry(false, false), Retry::Dial, "not the slot");
+        assert_eq!(
+            respawns.retry(true, true),
+            Retry::Dial,
+            "something answers: dial whoever it is"
+        );
+        assert_eq!(respawns.spent, 0, "a dial costs nothing");
+        for _ in 0..MAX_RESPAWNS {
+            assert_eq!(respawns.retry(true, false), Retry::Respawn);
+        }
+        assert_eq!(respawns.retry(true, false), Retry::GiveUp);
+        assert_eq!(
+            respawns.retry(true, true),
+            Retry::Dial,
+            "a session somebody else started is still dialed after the count is spent"
+        );
+
+        respawns.served(RESPAWN_STABLE - Duration::from_millis(1));
+        assert_eq!(
+            respawns.retry(true, false),
+            Retry::GiveUp,
+            "a session that died young does not start the count over"
+        );
+        respawns.served(RESPAWN_STABLE);
+        assert_eq!(
+            respawns.retry(true, false),
+            Retry::Respawn,
+            "one that stayed up does"
+        );
+    }
+
+    /// What the window shows once the count is spent: a band line short
+    /// enough for the band, and the loss behind it in the detail that
+    /// makes it a settle ([`HostConnState::session_is_gone`]).
+    #[test]
+    fn giving_up_names_the_last_loss_in_the_detail() {
+        let (reason, detail) = respawns_exhausted("session ended");
+        assert_eq!(reason, "roost-session could not be restarted");
+        assert!(detail.ends_with("the last loss: session ended"), "{detail}");
+        let mut machine = HostStateMachine::new(true);
+        let settled = machine.settled(reason, detail);
+        assert!(settled.session_is_gone());
+        assert_eq!(settled.retry_in(), None, "nothing tries again on its own");
+    }
+
+    /// The slot cell names one host at a time, and says when that moved.
+    #[test]
+    fn the_respawn_slot_names_only_the_host_it_was_given() {
+        let slot = RespawnSlot::default();
+        assert!(!slot.names("h1"));
+        assert!(slot.set(Some("h1")));
+        assert!(!slot.set(Some("h1")), "the same answer is no change");
+        assert!(slot.clone().names("h1"), "every task shares the one cell");
+        assert!(!slot.names("h2"));
+        assert!(slot.set(None));
+        assert!(!slot.names("h1"));
+    }
+
+    /// A respawn starts the session the way a launch does — seeded, from
+    /// the launch ladder — and never from a restart's pin, which is
+    /// revoked once that restart ends and would refuse with "the restart
+    /// was cancelled" on a crash long after it. Every other mode keeps
+    /// the plan it had.
+    #[test]
+    fn a_respawn_seeds_from_the_ladder_and_never_from_a_restart_pin() {
+        let (feed, _rx) = crate::engine_feed::channel();
+        let pinned = SpawnPin {
+            path: PathBuf::from("/nonexistent/roost-session"),
+            identity: BuildId::default(),
+            launches: LaunchGate::new("h1", 1, feed),
+        };
+        let plan = |mode| spawn_plan(mode, Some(&pinned)).map(|(seed, pin)| (seed, pin.is_some()));
+        assert_eq!(
+            plan(ConnectMode::Respawn),
+            Some((FirstProject::Seed, false))
+        );
+        assert_eq!(
+            plan(ConnectMode::SpawnIfMissing),
+            Some((FirstProject::Seed, true))
+        );
+        assert_eq!(
+            plan(ConnectMode::SpawnUnseeded),
+            Some((FirstProject::Withheld, true))
+        );
+        assert_eq!(plan(ConnectMode::IfPresent), None);
+        assert_eq!(plan(ConnectMode::Dial), None);
+    }
+
+    /// A respawn that finds the session already back dials it: the probe
+    /// runs first, exactly as a launch's does.
+    #[tokio::test]
+    async fn a_respawn_onto_a_live_socket_dials_without_spawning() {
+        let dir = short_dir();
+        let socket = dir.path().join("live.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let config = config(socket, HostTransport::LocalSession, ConnectMode::Respawn);
+        assert!(
+            ensure_socket_among(&config, ConnectMode::Respawn, never_probed)
+                .await
+                .is_ok()
+        );
+    }
+
+    /// Only this machine's own session is ever started again: a socket
+    /// host that names the slot by mistake still refuses to spawn.
+    #[tokio::test]
+    async fn a_respawn_never_starts_a_remote_session() {
+        let config = config(
+            PathBuf::from("/nonexistent/roost-host-conn-remote.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Respawn,
+        );
+        let error = ensure_socket_among(&config, ConnectMode::Respawn, || {
+            panic!("a remote host must not read the old-path gate")
+        })
+        .await
+        .expect_err("no spawn");
+        let AttemptError::Transport(reason) = error else {
+            panic!("expected a transport outcome, got {error:?}");
+        };
+        assert!(reason.contains("localhost"), "{reason}");
+    }
+
     /// The old-path candidates for a case that must not look at any.
     fn never_probed() -> roost_ipc::old_session::Candidates {
         roost_ipc::old_session::Candidates::Closed("this test probes no old path")
@@ -2939,7 +3236,7 @@ mod tests {
             HostTransport::UnixSocket,
             ConnectMode::SpawnIfMissing,
         );
-        let error = spawn_session(&config, FirstProject::Seed)
+        let error = spawn_session(&config, FirstProject::Seed, None)
             .await
             .expect_err("no spawn");
         let AttemptError::Transport(reason) = error else {

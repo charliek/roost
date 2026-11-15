@@ -194,6 +194,21 @@ impl ConnectPurpose {
             Self::CreateAfterConnect | Self::SwitchDestination => false,
         }
     }
+
+    /// Whether the connect this purpose rode creates a project when it
+    /// lands: a `CreateAfterConnect` always, a purpose that [`Self::seeds`]
+    /// on a host found empty — unless §D5's launch migration is parked
+    /// on that host (`replay_parked`), whose replay owns the landing
+    /// whatever the connect carried. The launch dialed it as a
+    /// `SwitchDestination`, but a first attempt that dropped took that
+    /// purpose with it, so a redial that finds a daemon which bound late
+    /// lands with the default.
+    pub(crate) fn creates_on_landing(self, empty: bool, replay_parked: bool) -> bool {
+        match self {
+            Self::CreateAfterConnect => true,
+            purpose => purpose.seeds() && empty && !replay_parked,
+        }
+    }
 }
 
 /// What a tracked host op is, for the two questions asked of it.
@@ -3808,6 +3823,29 @@ mod tests {
         // The default is what an unrecorded connect means, and it has to
         // be the one that behaves like every pre-063 connect.
         assert_eq!(ConnectPurpose::default(), ConnectPurpose::OrdinaryConnect);
+    }
+
+    /// What a landing creates: the caller's own project whatever it
+    /// finds, a seed only on an empty host, and no seed under a launch
+    /// migration parked on that host, which replays the source there.
+    #[test]
+    fn a_parked_launch_migration_owns_the_landing_it_waits_for() {
+        use ConnectPurpose::*;
+        for parked in [false, true] {
+            assert!(CreateAfterConnect.creates_on_landing(false, parked));
+            assert!(CreateAfterConnect.creates_on_landing(true, parked));
+            assert!(!SwitchDestination.creates_on_landing(true, parked));
+            for purpose in [OrdinaryConnect, EnsureNonempty] {
+                assert!(!purpose.creates_on_landing(false, parked), "{purpose:?}");
+            }
+        }
+        for purpose in [OrdinaryConnect, EnsureNonempty] {
+            assert!(purpose.creates_on_landing(true, false), "{purpose:?}");
+            assert!(
+                !purpose.creates_on_landing(true, true),
+                "{purpose:?}: a seed beside the replay is a project the source never had"
+            );
+        }
     }
 
     /// A recent saved again under a name something else took while it

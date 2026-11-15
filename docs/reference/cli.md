@@ -488,7 +488,9 @@ roostctl tab send-file --tab 5 ~/Desktop/shot.png       # a local tab
 
 Send local files to a tab. On a **host** tab each file is uploaded to
 that host and the host paths are pasted, so an agent running there can
-actually read them; on a local tab it pastes the escaped local paths.
+actually read them; on a local tab — including one on this machine's own
+`localhost` session, where local tabs run under `local-backend =
+session` — it pastes the escaped local paths.
 Exactly what dropping the files onto the tab does — same route, same
 gesture queue — backed by the [`tab.send_file`](ipc.md#tabsend_file) op.
 

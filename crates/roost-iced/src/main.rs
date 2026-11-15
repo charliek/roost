@@ -626,12 +626,15 @@ fn window_settings(
 /// from it or removed its row, by any path, and the terminals' pointer
 /// cancel when anything rewraps the terminal widget. So does Secure
 /// Keyboard Entry, whose inputs — the active tab, its prompt, the toggle —
-/// move on as many paths.
+/// move on as many paths, and so does which local session a lost
+/// connection may start again, whose inputs — the mode, the slot, a
+/// switch, an action on the host — do too.
 fn update(app: &mut App, message: Message) -> Task<Message> {
     let dispatched = dispatch(app, message);
     app.observe_context_menu();
     app.sync_menu_gating();
     app.sync_secure_input();
+    app.sync_session_respawn();
     let (_, notice) = app.observe_notice();
     app.observe_terminal_wrapping(notice.is_some());
     Task::batch([

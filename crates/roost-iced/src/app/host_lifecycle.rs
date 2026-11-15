@@ -50,6 +50,44 @@ pub(super) fn reconnect_due(
     hosts.reconnect_due(saved_id, request)
 }
 
+/// Which saved host the connection set may start again when its session
+/// is lost without a word ([`crate::host_conn::task::RespawnSlot`]): the
+/// slot under `local-backend = session`, where this window's own tabs
+/// live, and only while nothing else decides what runs there.
+///
+/// * A build that withholds the localhost surface spawns nothing
+///   (`spawn_gate`), so it starts nothing again either.
+/// * A backend switch in flight owns everything that lands on the slot,
+///   and a seeded respawn would add a project its replay never made.
+/// * So does the launch's migration (plan 063 §D5) while it is parked
+///   waiting for the slot to connect: the slot was dialed unseeded for
+///   it, and a respawn before that connect would seed the empty session
+///   under the replay. Until then a lost slot redials, as a slot that
+///   never connects always has (`arm_pending_migration`).
+/// * An action holding the host — Restart Session, an update — stops and
+///   starts that session itself; a respawn beside it would start one the
+///   action never agreed to.
+/// * A quitting app starts nothing.
+pub(super) fn respawn_host(
+    exit: ExitState,
+    mode: LocalBackendMode,
+    policy: host_verbs::VerbPolicy,
+    switching: bool,
+    migration_parked: bool,
+    slot: Option<&str>,
+    claimed: impl FnOnce(&str) -> bool,
+) -> Option<&str> {
+    if exit != ExitState::Running
+        || mode != LocalBackendMode::Session
+        || !policy.localhost_surface
+        || switching
+        || migration_parked
+    {
+        return None;
+    }
+    slot.filter(|saved_id| !claimed(saved_id))
+}
+
 /// What a finished establish did, once the shutdown gate has had its
 /// say.
 ///
@@ -306,6 +344,70 @@ mod tests {
         an_unestablished_tunnel, band_reason, dropped, refused, ssh_target,
     };
     use roost_ipc::ssh::SshFailure;
+
+    /// The slot's session is started again only where it is this
+    /// window's own tabs — `session` mode, a build that spawns at all —
+    /// and only while nothing else is deciding what runs there: a switch,
+    /// the launch's parked migration, an action holding the host, a quit.
+    #[test]
+    fn only_the_slot_under_session_with_nothing_else_moving_it_is_started_again() {
+        let full = host_verbs::VerbPolicy::current();
+        let gated = host_verbs::VerbPolicy {
+            localhost_surface: false,
+        };
+        let respawn = |exit, mode, policy, switching, slot, claimed: bool| {
+            respawn_host(exit, mode, policy, switching, false, slot, |_| claimed)
+        };
+        let session = LocalBackendMode::Session;
+        let running = ExitState::Running;
+        assert_eq!(
+            respawn(running, session, full, false, Some("h1"), false),
+            Some("h1")
+        );
+        assert_eq!(
+            respawn(
+                running,
+                LocalBackendMode::InProcess,
+                full,
+                false,
+                Some("h1"),
+                false
+            ),
+            None,
+            "a `localhost` host under in-process is an ordinary host"
+        );
+        assert_eq!(
+            respawn(running, session, gated, false, Some("h1"), false),
+            None
+        );
+        assert_eq!(
+            respawn(running, session, full, true, Some("h1"), false),
+            None,
+            "a switch owns what lands on the slot"
+        );
+        assert_eq!(
+            respawn_host(running, session, full, false, true, Some("h1"), |_| false),
+            None,
+            "the launch's migration owns the slot's first landing"
+        );
+        assert_eq!(
+            respawn(running, session, full, false, Some("h1"), true),
+            None,
+            "an action holding the host starts its own session"
+        );
+        assert_eq!(
+            respawn(
+                ExitState::Requested,
+                session,
+                full,
+                false,
+                Some("h1"),
+                false
+            ),
+            None
+        );
+        assert_eq!(respawn(running, session, full, false, None, false), None);
+    }
 
     /// A saved host reached over ssh, as `state.json` carries one.
     fn an_ssh_host() -> HostSnapshot {

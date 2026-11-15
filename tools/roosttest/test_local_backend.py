@@ -102,7 +102,7 @@ from client import Roost, RoostError, scaled_timeout  # noqa: E402
 from eventstream import ENDED_EVENT, EventStream  # noqa: E402
 from relay import Relay  # noqa: E402
 from session import wait_until  # noqa: E402
-from test_host_client import view_grid  # noqa: E402
+from test_host_client import FIXTURE_FILES, require_system_clipboard, view_grid  # noqa: E402
 from test_host_local_spawn import roostctl_session, running_session_id  # noqa: E402
 from test_password_input import (  # noqa: E402
     READY,
@@ -4174,3 +4174,315 @@ def test_a_launch_migration_keeps_each_saved_opener(explicit_lane: Lane):
         daemon,
         {"SSH_CONNECTION": saved_remote["ssh_connection"], "SSH_CLIENT": saved_remote["ssh_client"]},
     )
+
+
+# ---------------------------------------------------------------------------
+# 19. Files dropped on a session tab are this machine's files
+# ---------------------------------------------------------------------------
+#
+# The slot is this machine's own session, so its shells read this
+# filesystem: a drop pastes the real paths, as a drop on an in-process tab
+# always has, instead of copying them into the session's file store under
+# a remote host's limits (no directories, 10 MiB a file).
+
+
+def shown_slot_tab(roost: Roost) -> str:
+    """The `h<n>.<id>` of the slot tab the window is showing."""
+    shown = int(roost.identify()["active_tab_id"])
+    key = slot_key(roost, shown)
+    assert key is not None, roost.sidebar_dump()
+    return key
+
+
+def test_files_sent_to_a_session_tab_paste_their_local_paths(lane: Lane, tmp_path):
+    """`tab.send_file` is the drop route as an op, so this is what a drop
+    on a session tab does. A directory is the sharpest witness: a host
+    target skips one as `directory`, and only a local paste keeps it."""
+    roost = session_ui(lane)
+    key = shown_slot_tab(roost)
+    note = tmp_path.resolve() / "a note.txt"
+    note.write_text("local\n")
+    folder = tmp_path.resolve() / "build"
+    folder.mkdir()
+    util.drain(roost, key)
+
+    result = roost.tab_send_file(key, [note, folder])
+
+    assert result["uploads"] == [], result
+    assert result["skipped"] == [], result
+    escaped = str(note).replace(" ", r"\ ")
+    assert result["pasted"] == f"{escaped}\n{folder}", result
+    util.drain_until_match(roost, key, re.escape(result["pasted"].encode()))
+
+
+def test_a_clipboard_image_pasted_into_a_session_tab_is_a_file_on_this_machine(
+    lane: Lane,
+):
+    """The clipboard image takes the local route too: written once into
+    the UI's temp directory and that path pasted, never uploaded into the
+    session's file store. Both are on this machine, so where the path
+    points is the oracle: an upload lands in the session's `files/`."""
+    roost = session_ui(lane)
+    key = shown_slot_tab(roost)
+    require_system_clipboard(roost)
+    source = FIXTURE_FILES / "shot.png"
+    try:
+        try:
+            roost.clipboard_write_image(source.read_bytes())
+        except RoostError as error:
+            if error.code == "not-supported":
+                pytest.skip(f"this UI cannot seed a clipboard image: {error.message}")
+            raise
+        assert not roost.clipboard_dump("system"), "the image write left text on the clipboard"
+        util.drain(roost, key)
+
+        roost.call("app.keybind_dispatch", {"action": "paste"})
+
+        image = re.compile(rb"/[A-Za-z0-9._/-]*roost-image-\d+-[0-9a-f]{16}\.png")
+        queued = util.drain_until_match(roost, key, image.pattern, timeout=60.0)
+        pasted = Path(image.search(queued).group(0).decode())
+        assert pasted.parent == Path(tempfile.gettempdir()).resolve(), (
+            f"the image was not written to this machine's temp dir: {pasted}"
+        )
+        assert not pasted.is_relative_to(lane.state_dir), f"the image went to the session: {pasted}"
+        assert pasted.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n", pasted
+        pasted.unlink()
+    finally:
+        with contextlib.suppress(RoostError):
+            roost.clipboard_write("system", "")
+
+
+# ---------------------------------------------------------------------------
+# 20. A local session lost without a word is started again
+# ---------------------------------------------------------------------------
+#
+# `kill -9`, not `roostctl session stop`: a stop says `session.stopping`,
+# which ends the connection on purpose (the notice in section 15). A
+# killed session says nothing, and before this the window redialed its
+# dead socket for ever with nothing on screen.
+
+
+def session_pid(lane: Lane) -> int:
+    """The daemon behind the slot's socket, by the kernel's own record of
+    who holds the socket lock — never the pid written in the file, which
+    outlives a killed holder."""
+    lock = lane.env.socket.parent / "roost.lock"
+    st = lock.stat()
+    ident = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}"
+    for line in Path("/proc/locks").read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 6 and fields[1] == "FLOCK" and fields[5] == ident:
+            return int(fields[4])
+    raise AssertionError(f"nothing holds {lock}")
+
+
+def kill_the_session(lane: Lane) -> str:
+    """SIGKILL the slot's session; the id it had."""
+    killed = running_session_id()
+    assert killed is not None, "no session to kill"
+    pid = session_pid(lane)
+    os.kill(pid, signal.SIGKILL)
+    wait_until(
+        lambda: not sessionlib.pid_alive(pid),
+        scaled_timeout(30.0),
+        f"the killed session (pid {pid}) to exit",
+    )
+    return killed
+
+
+def kept(projects: list[dict]) -> list[tuple]:
+    """What a restarted session reopens: each project's name and cwd, and
+    its tabs' cwds and title locks, in order. Not the titles a running
+    shell gives itself, which a fresh one has yet to give."""
+    return [
+        (
+            p["name"],
+            p["cwd"],
+            tuple((t["cwd"], bool(t.get("user_titled"))) for t in p["tabs"]),
+        )
+        for p in projects
+    ]
+
+
+def test_a_killed_local_session_is_started_again_with_its_layout(lane: Lane):
+    """The window starts a new session on its own, the layout comes back
+    as fresh shells in the same directories, and the window shows a tab of
+    the new session again — attached, not a frozen frame."""
+    roost = session_ui(lane)
+    with lane.session() as c:
+        project = c.create_project(name="kept", cwd="/usr")
+        c.set_title(c.open_tab(project, cwd="/var"), "pinned")
+    before = kept(lane.session_projects())
+    marked = session_tab_ids(lane)[0]
+    printed = token()
+    with lane.session() as c:
+        c.send(marked, f"echo {printed}\n")
+        wait_until(
+            lambda: printed in c.dump_text(marked),
+            scaled_timeout(30.0),
+            "the token to reach the shell",
+        )
+
+    killed = kill_the_session(lane)
+
+    wait_until(
+        lambda: running_session_id() not in (None, killed),
+        scaled_timeout(60.0),
+        "the window to start a new session",
+    )
+    wait_until(
+        lambda: local_band(roost)["state"] == "connected",
+        scaled_timeout(60.0),
+        "the slot to connect to it",
+    )
+    assert kept(lane.session_projects()) == before
+    tabs = session_tab_ids(lane)
+    with lane.session() as c:
+        for tab in tabs:
+            has_a_live_pty(c, tab)
+        dumped = c.dump(tabs[0], scrollback=200)
+    history = "\n".join(dumped.get("scrollback_text", []) + dumped["rows_text"])
+    assert printed not in history, "a restarted session's tabs are fresh shells"
+    wait_until(
+        lambda: selected(roost)[1] in tabs,
+        scaled_timeout(60.0),
+        "the window to show a tab of the new session",
+    )
+    attached(roost, selected(roost)[1])
+
+
+#: `MAX_RESPAWNS` (`crates/roost-iced/src/host_conn/task.rs`): how many
+#: times in a row a lost session is started again before the window
+#: gives up on it.
+MAX_RESPAWNS = 3
+
+
+class SessionLink:
+    """`ROOST_SESSION_BIN` for a UI, as a symlink a case can re-point
+    while that UI runs — renamed into place, so a launch never finds it
+    half-written."""
+
+    def __init__(self) -> None:
+        self.path = _ROOT / "session-link"
+        self.point_at(str(sessionlib.session_binary()))
+
+    def point_at(self, target: str) -> None:
+        swap = _ROOT / "session-link.swap"
+        swap.unlink(missing_ok=True)
+        swap.symlink_to(target)
+        os.replace(swap, self.path)
+
+    def env(self) -> dict[str, str]:
+        return {"ROOST_SESSION_BIN": str(self.path), **SHORT_CONFIRM}
+
+
+def never_serving_session(launches: Path) -> str:
+    """A `roost-session` whose `start` says it is ready and then serves
+    nothing, writing a line to `launches` each time it is started."""
+    stub = _ROOT / "never-serving-session"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"if [ \"$1\" = start ]; then echo start >> '{launches}'; fi\n"
+        'echo "ready pid=$$"\n'
+    )
+    stub.chmod(0o755)
+    return str(stub)
+
+
+def test_a_local_session_that_cannot_be_started_again_says_so(lane: Lane):
+    """Killed, and the binary it would be started from now dies on start:
+    the window does not loop on it. It settles, says so in the terminal
+    area the way a launch that cannot start does, and "Try again" brings
+    it back once the binary runs again."""
+    link = SessionLink()
+    roost = session_ui(lane, extra_env=link.env())
+    slot = local_band(roost)["saved_id"]
+
+    link.point_at(crashing_session()["ROOST_SESSION_BIN"])
+    kill_the_session(lane)
+
+    shown = shown_notice(roost, "the window to say it cannot start the session again")
+    notice = shown["terminal"]
+    assert notice["kind"] == CANNOT_START, notice
+    assert notice["message"] == CANNOT_START_MESSAGE, notice
+    assert (notice["detail"] or "").startswith(f"{EXITED_EARLY}. "), notice
+    host = roost.host_status(slot)["hosts"][0]
+    assert host["state"] == "disconnected", host
+    assert host.get("retry") is None, f"a settled slot schedules nothing: {host}"
+    assert running_session_id() is None
+
+    link.point_at(str(sessionlib.session_binary()))
+    roost.notice_answer(CANNOT_START, slot, shown["generation"], "reconnect")
+    wait_until(
+        lambda: local_band(roost)["state"] == "connected",
+        scaled_timeout(60.0),
+        "Try again to start the session",
+    )
+
+
+def test_a_local_session_that_never_comes_back_is_given_up_on(lane: Lane):
+    """A session started again that never comes up is started again only
+    so often: exactly `MAX_RESPAWNS` launches, then the window settles and
+    says it could not restart it, instead of launching on every rung of
+    the redial ladder for ever."""
+    link = SessionLink()
+    roost = session_ui(lane, extra_env=link.env())
+    launches = _ROOT / "never-serving-launches"
+    launches.unlink(missing_ok=True)
+    link.point_at(never_serving_session(launches))
+    kill_the_session(lane)
+
+    shown = shown_notice(roost, "the window to give up on the session")
+    notice = shown["terminal"]
+    assert notice["kind"] == CANNOT_START, notice
+    assert (notice["detail"] or "").startswith("roost-session could not be restarted. "), notice
+    slot = local_band(roost)["saved_id"]
+    host = roost.host_status(slot)["hosts"][0]
+    assert host.get("retry") is None, host
+    assert f"started again {MAX_RESPAWNS} times" in (host.get("detail") or ""), host
+    assert launches.read_text().splitlines() == ["start"] * MAX_RESPAWNS
+
+
+#: `BACKOFF_BASE` in milliseconds: the longest the slot's first redial
+#: rung can be armed for. A rung armed for longer is a later one, so the
+#: retry after the first rung has been decided by then.
+FIRST_RUNG_MS = int(LOCALHOST_FIRST_REDIAL_S * 1000)
+
+
+def test_a_launch_migration_whose_session_never_came_up_is_not_started_seeded(lane: Lane):
+    """§D5's launch migration dials the slot unseeded and parks until it
+    connects. A session that never came up for it is not started again on
+    a redial rung: a respawn seeds, and its first project would land beside
+    the replay. The slot redials instead, and once a session answers, the
+    migration lands exactly the source."""
+    roost = lane.start("in-process")
+    want = with_cwds(migration_layout(roost))
+    ui.quit(lane.target)
+
+    lane.write_config("session")
+    assert running_session_id() is None, "the launch must be what starts it"
+    link = SessionLink()
+    launches = _ROOT / "never-serving-launches"
+    launches.unlink(missing_ok=True)
+    link.point_at(never_serving_session(launches))
+    roost = lane.restart(extra_env=link.env())
+    assert roost.identify()["local_backend"] == "session"
+    slot = local_band(roost)["saved_id"]
+
+    def a_later_rung() -> bool:
+        retry = roost.host_status(slot)["hosts"][0].get("retry") or {}
+        return retry.get("delay_ms", 0) > FIRST_RUNG_MS
+
+    wait_until(a_later_rung, scaled_timeout(60.0), "the slot to redial past its first rung")
+    assert launches.read_text().splitlines() == ["start"], (
+        "only the launch's own unseeded dial starts a session while the migration is parked"
+    )
+
+    started = lane.env.start_daemonized(ROOST_SESSION_NO_SEED="1")
+    assert started.verdict.kind == "ready", started
+    lane.pid = started.verdict.pid
+    migrated(lane, roost)
+    assert with_cwds(lane.session_projects()) == want, (
+        "the migration landed on the session alone, with nothing seeded beside it"
+    )
+    assert launches.read_text().splitlines() == ["start"]
