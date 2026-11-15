@@ -730,7 +730,10 @@ the first sample after the layer becomes live (an accepted claim, or the
 first live record), milliseconds after receipt rather than at it: the UI
 thread never reads `/proc`. Nothing is stamped when the shell's own group
 is in front, or when the leader is `tmux`, `screen`, `zellij`, `ssh` or
-`mosh`; those keep today's behaviour. The process is sampled at hook
+`mosh`; those keep today's behaviour. For a multiplexer or remote session
+that includes the prompt mark: the owner is recorded as behind it and
+the #621 release skips it, since a tmux detach puts the shell back in
+front while the agent lives on. The process is sampled at hook
 reports, prompt marks that park, `C` marks on a stamped tab, and focus
 (attach and detach on a session), and on a 1 s tick **only** for tabs
 holding a stamp. That is evidence, not a TTL, so DL-14's no-TTL rule

@@ -518,10 +518,16 @@ and the agent's own process.
   shell prints its prompt mark, right after a command ends, and once a
   second while it has a process noted — so a shell that prints no marks
   clears within about a second too.
-- **The shell back in front.** When no process was noted — the agent
-  claimed from the background, or ran behind `tmux`, `screen`, `zellij`,
-  `ssh` or `mosh`, whose own process Roost never notes — a prompt mark
-  with the shell itself in front of the terminal releases the agent.
+- **The shell back in front.** When no process was noted because the
+  agent claimed from the background, a prompt mark with the shell itself
+  in front of the terminal releases the agent.
+- **Behind `tmux`, `screen`, `zellij`, `ssh` or `mosh`.** Roost never
+  notes the process of the client in front, and the agent outlives it:
+  detaching tmux puts the shell back in front while the agent runs on.
+  A prompt mark keeps such an agent's ownership as a label, as it always
+  did, so what it reports after you reattach still counts. If it dies
+  behind the multiplexer, its row stays until another agent claims the
+  tab or you clear it by hand.
 - **Anything else.** A prompt mark with some other program in front
   drops the lifecycle to `inactive` and keeps ownership as a label, so
   the tab falls through to shell-derived state instead of staying stuck.

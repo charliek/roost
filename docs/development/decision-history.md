@@ -260,8 +260,11 @@ terminal (pid, start time, group, session); nothing is stamped when the
 shell itself is in front, or the leader is a multiplexer or a remote
 session. The owner is released when its stamped process is gone **and**
 its group is no longer in front, and, for an owner with no stamp, at an
-`A`/`B`/`D` mark when the shell itself is back in front. A stopped owner
-keeps ownership and shows suspended. AD-3 stands: there is still no
+`A`/`B`/`D` mark when the shell itself is back in front — unless its
+claim found a multiplexer or a remote session in front: the agent runs
+behind that client and outlives it (a tmux detach), so such an owner
+keeps what a mark always did. A stopped owner keeps ownership and shows
+suspended. AD-3 stands: there is still no
 TTL, the process is read only when something happens on the tab, and
 every reading that cannot decide keeps the owner. `manual` and `legacy`
 owners are untouched. An end that takes an agent mid-turn raises one
@@ -280,7 +283,8 @@ whatever the agent was running has exited) drops the lifecycle to
 `inactive` while keeping ownership as a label, which simultaneously
 re-derives shell state and re-opens raw OSC. (Amended 2026-11-14,
 #621: with the shell itself in front and no stamp saying the agent lives
-elsewhere, the mark releases the owner instead; with a stamped agent
+elsewhere, nor a multiplexer or remote session it runs behind, the mark
+releases the owner instead; with a stamped agent
 stopped or in the background, what the mark dropped is set aside until
 the agent runs again.) Every other consumer of
 ownership (the tab tint, the rollup, the switcher) needs no equivalent

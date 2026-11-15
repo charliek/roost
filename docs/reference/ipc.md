@@ -1769,6 +1769,15 @@ neither on a timer. Both apply to an agent's claim only; `manual` and
   drops the lifecycle to `"inactive"` and keeps the owner as a label, as
   it always did. A tab whose child is not an interactive shell (a
   command tab, `sh -c …`) never reads as "the shell in front".
+* **Not behind a multiplexer or a remote session.** An owner whose claim
+  found `tmux`, `screen`, `zellij`, `ssh` or `mosh` in front is not
+  released at a mark either: the agent runs behind that client and
+  outlives it, so the shell back in front after a tmux detach says
+  nothing of the agent, and its reports after a reattach still match.
+  The mark keeps the owner as a label, as it always did. That holds
+  through a later claim whose read finds only the shell in front (the
+  agent behind a detached tmux compacting or `/clear`ing), and ends with
+  a release or a claim whose read stamps a process.
 * **When a stamped process is gone**: the owner is released once the
   stamped process is gone (exited, a zombie, its pid reused, or it left
   the tab's session) **and** its process group is no longer in front.
