@@ -1613,8 +1613,10 @@ the mutation can't race a concurrent report:
   record of the owner's own agent decides the tab, that record, not
   `agent_lifecycle`, says the owner is mid-turn: a `claude` claim with
   `metadata.source = "startup"` and a new `session_id` is dropped as
-  `nested_claim` whatever the shell state. An `idle` or `done` record
-  does not count.
+  `nested_claim` when the shell is in `foreground_process`. An `idle`
+  or `done` record does not count. Only a prompt mark ends a live
+  record, so with no shell integration a Claude killed mid-turn would
+  otherwise refuse every Claude started after it.
 * **`preserve`** requires the report's `(source, session_id)` to match
   the current owner; a mismatch is dropped (see `accepted` below).
   `detail`/`metadata` **merge** onto the existing owner rather than

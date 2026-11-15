@@ -248,9 +248,10 @@ nested too when it is a new Claude process, a `claude` claim whose
 start source, `metadata.source`, is `startup`, such as a `claude -p` run
 from a tool call. While the owner's own `working` or `blocked` OSC 7501
 record decides the tab, that record says the owner is mid-turn, since
-the hook lifecycle is held then. `clear`, `resume` and `compact` still
-supersede, and so does a `claude -p --resume`; herdr draws the same
-line.)
+the hook lifecycle is held then; the foreground process is still
+required, since only a prompt mark ends a record. `clear`, `resume`
+and `compact` still supersede, and so does a `claude -p --resume`;
+herdr draws the same line.)
 
 Raw-OSC suppression (dropping OSC 9/99/777 while a live agent owns the
 tab) is the **one exception that gets a real failsafe**, because it's

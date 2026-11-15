@@ -206,7 +206,8 @@ The rules you see:
   moving its state. A hook from a *different* agent trying to claim the
   tab then is refused (`foreign_app` in `roostctl doctor`), and so is a
   new Claude session starting during the owner's `working` or `blocked`
-  record, such as a `claude -p` it runs (`nested_claim`).
+  record in the foreground, such as a `claude -p` it runs
+  (`nested_claim`).
 - **A shell prompt hands it back.** An OSC 133 prompt mark (`A`, `B` or
   `D`; Roost's shell integration sends them) ends a `working` or
   `blocked` record, the way a crashed agent's state should end. A
@@ -442,7 +443,8 @@ ignored. A running Claude that moves to another session still takes the
 tab: `/clear`, `/resume` and a compaction do, and so does a `claude -p
 --resume`, because Claude reports it the same way. For a Claude that
 reports over [OSC 7501](#program-status-osc-7501), mid-turn is its own
-`working` or `blocked` report, which needs no shell integration.
+`working` or `blocked` report, and the same shell integration is
+needed: without it no prompt mark would end a killed Claude's report.
 
 Agent status isn't supported inside tmux, herdr or an ssh session
 running in a tab. Every pane there shares the tab's `ROOST_TAB_ID`, so

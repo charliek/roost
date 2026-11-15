@@ -259,13 +259,12 @@ def test_a_claude_p_run_inside_a_claude_turn_leaves_the_tab_to_the_outer_session
 ):
     """#623: a `claude -p` run from a tool call inherits the tab and fires
     a whole session of its own into it. Its `startup` claim is nested
-    while the outer Claude is mid-turn, so the outer session keeps the
-    tab and its later hooks land. A Claude speaking 7501 is mid-turn by
-    its own record, with no shell integration; without 7501 the hook
-    lifecycle says so, under a foreground command."""
+    while the outer Claude is mid-turn under a foreground command, so
+    the outer session keeps the tab and its later hooks land. A Claude
+    speaking 7501 is mid-turn by its own record; without 7501 the hook
+    lifecycle says so."""
     tab = lane.quiet_tab()
-    if not speaks_7501:
-        assert lane.fed(tab, b"\x1b]133;C\x07")["shell_state"] == "foreground_process"
+    assert lane.fed(tab, osc133(b"C"))["shell_state"] == "foreground_process"
     claude_hook(lane, tab, "SessionStart", "outer", source="startup")
     sessionlib.wait_until(
         lambda: (lane.client.ownership(tab) or {}).get("session_id") == "outer",
@@ -321,6 +320,37 @@ def test_a_claude_p_run_inside_a_claude_turn_leaves_the_tab_to_the_outer_session
         10.0,
         "a /clear to take the tab",
     )
+
+
+def test_with_no_shell_integration_a_new_claude_takes_a_tab_a_killed_one_left_working(lane):
+    """Only a prompt mark ends a `working` record, so with no shell
+    integration a Claude killed mid-turn leaves its record working. The
+    next Claude's `startup` claim then takes the tab instead of being
+    refused as nested, and its own hooks land."""
+    tab = lane.quiet_tab()
+    claude_hook(lane, tab, "SessionStart", "killed", source="startup")
+    sessionlib.wait_until(
+        lambda: (lane.client.ownership(tab) or {}).get("session_id") == "killed",
+        10.0,
+        "the first Claude's claim",
+    )
+    listed = lane.fed(tab, osc7501(state="working", app="claude-code"))
+    assert listed["state"] == "running" and listed["shell_state"] == "unknown", listed
+
+    claude_hook(lane, tab, "SessionStart", "next", source="startup")
+    sessionlib.wait_until(
+        lambda: (lane.client.ownership(tab) or {}).get("session_id") == "next",
+        10.0,
+        "the next Claude's claim",
+    )
+    claude_hook(lane, tab, "Stop", "next", stop_hook_active=False)
+    sessionlib.wait_until(
+        lambda: (lane.client.ownership(tab) or {}).get("detail") == "stop",
+        10.0,
+        "the next Claude's Stop to land",
+    )
+    drop = last_drop(lane, tab)
+    assert drop.get("reason") not in ("nested_claim", "not_owner"), drop
 
 
 def test_the_last_clear_sends_an_event_without_program_status(lane):

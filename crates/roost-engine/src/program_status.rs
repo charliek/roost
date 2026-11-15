@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use roost_ipc::agent::{
     self, AgentLifecycle, AgentTabState, ApplyOutcome, AttentionEffect, AttentionOp, DropReason,
-    OwnershipAction, TabAgentReportParams,
+    OwnershipAction, ShellState, TabAgentReportParams,
 };
 use roost_ipc::format_chars::is_format;
 use roost_ipc::messages::TabState;
@@ -603,12 +603,17 @@ pub fn apply_hook_report(
 /// owner's own app is the owner mid-turn. An `idle` or `done` one does
 /// not count, since it may be a new Claude's first report after a killed
 /// one left its owner behind as a label.
+///
+/// Like the hook layer's rule it needs a foreground process: only a
+/// prompt mark ends a live record, so with no shell integration a Claude
+/// killed mid-turn would refuse every Claude started after it.
 fn runs_inside_the_owner(
     agent: &AgentTabState,
     deciding: RecordView<'_>,
     report: &TabAgentReportParams,
 ) -> bool {
-    is_live(deciding.record.state)
+    agent.shell == ShellState::ForegroundProcess
+        && is_live(deciding.record.state)
         && agent.ownership.as_ref().is_some_and(|owner| {
             agent::starts_a_new_process(owner, report)
                 && apps_for_source(&owner.source).contains(&deciding.app)
@@ -1185,6 +1190,7 @@ mod tests {
     fn a_claude_p_inside_a_7501_claude_turn_leaves_the_owner_in_place() {
         for live in [S::Working, S::Blocked] {
             let mut tab = Tab::default();
+            tab.mark("C", T0);
             tab.hook(&claude_start("s1", "startup"));
             tab.feed([claude(live)], T0);
             tab.hook(&prompt_submit("claude"));
@@ -1253,6 +1259,7 @@ mod tests {
         // A Claude killed mid-turn leaves its owner behind; the prompt mark
         // ends its record, so the next `claude` takes the tab.
         let mut tab = Tab::default();
+        tab.mark("C", T0);
         tab.hook(&claude_start("s1", "startup"));
         tab.feed([claude(S::Working)], T0);
         tab.mark("D", LATE);
@@ -1260,6 +1267,21 @@ mod tests {
         let hook = tab.hook(&claude_start("s2", "startup"));
         assert!(hook.outcome.accepted());
         assert_eq!(tab.agent.ownership.as_ref().unwrap().session_id, "s2");
+
+        // With no shell integration no mark ever ends that record, so the
+        // next `claude` takes the tab while it still says `working`.
+        let mut tab = Tab::default();
+        tab.hook(&claude_start("s1", "startup"));
+        tab.feed([claude(S::Working)], T0);
+        assert_eq!(tab.agent.shell, ShellState::Unknown);
+        let hook = tab.hook(&claude_start("s2", "startup"));
+        assert!(hook.outcome.accepted());
+        assert_eq!(tab.agent.ownership.as_ref().unwrap().session_id, "s2");
+        let next = TabAgentReportParams {
+            session_id: "s2".into(),
+            ..stop("claude")
+        };
+        assert!(tab.hook(&next).outcome.accepted());
     }
 
     #[test]
