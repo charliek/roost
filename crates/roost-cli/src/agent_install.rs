@@ -91,8 +91,9 @@ pub enum AgentCmd {
         all: bool,
     },
     /// Remove Roost's entries from one agent, or all of them, and take
-    /// it back out of `agent-hooks` (`--all` writes `off`). Only what
-    /// Roost wrote comes out — a hook you wrote that happens to mention
+    /// it back out of `agent-hooks` (`--all` writes `off`); Cursor is
+    /// switched off in `agent-integration` too. Only what Roost wrote
+    /// comes out — a hook you wrote that happens to mention
     /// `$ROOST_AGENT_HOOK` stays exactly where it is.
     Uninstall {
         /// `claude`, `codex`, `grok`, `cursor`, or `opencode`.

@@ -388,7 +388,7 @@ roostctl agent set claude,codex,cursor      # via the running UI: the switches h
 roostctl agent set off --local              # write the switches here directly, with nothing running
 roostctl agent ensure [--json] [--startup]  # run the retire if due, then reconcile Cursor's file
 roostctl agent install <agent>|--all        # explicit: write an agent's file entries anyway
-roostctl agent uninstall <agent>|--all      # remove any entry whose command is Roost's
+roostctl agent uninstall <agent>|--all      # remove any entry whose command is Roost's; Cursor also switches off
 ```
 
 `agent status --json` reports, per agent, `on`, `delivery` (`env`,
@@ -402,7 +402,10 @@ works with nothing running. See
 it by name, for an agent outside Roost tabs, say. Inside a Roost tab
 Claude Code then gets its hooks twice, from the file and from the
 plugin. `agent uninstall` removes any handler whose command is Roost's,
-the looser rule an explicit request may use.
+the looser rule an explicit request may use. `agent uninstall cursor`
+also switches Cursor off in `agent-integration`, so the next start does
+not wire it again; the other agents keep their switches, since they are
+connected without a file.
 
 `roostctl claude install` remains a bare alias of `agent install claude`.
 

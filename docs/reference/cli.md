@@ -827,7 +827,9 @@ say — for an agent you run outside Roost tabs, say; inside a Roost tab
 Claude Code then gets its hooks twice — and unions them into
 `agent-hooks`. `uninstall` removes any handler whose command is Roost's,
 the looser rule an explicit request may use, and narrows `agent-hooks`,
-spelling the result `off` when nothing would be left.
+spelling the result `off` when nothing would be left. For Cursor it also
+writes `-cursor` into `agent-integration`, so the next start does not
+wire it again; the other agents keep their switches.
 
 See the [Agent integration](../guides/agents.md) guide for the
 mechanism, the retire, and what each agent gets.

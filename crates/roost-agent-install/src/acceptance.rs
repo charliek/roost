@@ -2267,6 +2267,53 @@ mod retire_cases {
         assert!(!cursor::hooks_path(&home).exists());
     }
 
+    /// `agent uninstall cursor` takes Cursor's switch off with its entry,
+    /// so the next start does not wire it back; every other answer, and a
+    /// name this build cannot resolve, stays.
+    #[test]
+    fn an_uninstall_switches_cursor_off_for_the_next_start() {
+        for (key, after) in [
+            (
+                "agent-integration = cursor, -opencode, gemini",
+                "-opencode, gemini, -cursor",
+            ),
+            (
+                "agent-hooks = claude, cursor",
+                "claude, -codex, -grok, -opencode, -cursor",
+            ),
+        ] {
+            let (_dir, home) = cursor_home(Some(key));
+            retire_now(&home);
+            assert!(cursor::hooks_path(&home).exists(), "{key}");
+
+            ensure::uninstall(&home, &[Agent::Cursor], Guard::PERMITTED).unwrap();
+            assert!(!cursor::hooks_path(&home).exists(), "{key}");
+            assert_eq!(
+                key_line(&home, "agent-integration").as_deref(),
+                Some(after),
+                "{key}"
+            );
+
+            retire_now(&home);
+            ensure::ensure(&home, "local", Guard::PERMITTED).unwrap();
+            assert!(
+                !cursor::hooks_path(&home).exists(),
+                "{key}: the next start wired Cursor again"
+            );
+        }
+    }
+
+    /// An uninstall of an agent with no file leaves its switch alone, and
+    /// one of a Cursor already off writes no switch.
+    #[test]
+    fn an_uninstall_leaves_every_other_switch_alone() {
+        let (_dir, home) = cursor_home(Some("agent-integration = -opencode"));
+        retire_now(&home);
+        let before = key_line(&home, "agent-integration");
+        ensure::uninstall(&home, &[Agent::Claude, Agent::Cursor], Guard::PERMITTED).unwrap();
+        assert_eq!(key_line(&home, "agent-integration"), before);
+    }
+
     /// `agent-hooks = off` with exact entries on disk: retired, and the
     /// answer stays off in both keys.
     #[test]
