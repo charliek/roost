@@ -20,7 +20,14 @@
 # prompt, and reports cwd over SSH (where the native read can't reach).
 #
 # Feature flags via $ROOST_SHELL_FEATURES (comma list; `no-<feature>`
-# disables): cwd, title, marks, prompt, ssh-env.
+# disables): cwd, title, marks, prompt, ssh-env, path.
+#
+# `path` runs once, at the first prompt, after your startup files: it puts
+# the app bundle's `bin` that Roost put first on PATH back in front (a login
+# shell's path_helper and many rc files move or reset PATH), and puts
+# Roost's Claude plugin folder back into CLAUDE_CODE_PLUGIN_DIRS if a
+# startup file replaced the list. It only restores what Roost handed this
+# tab ($ROOST_PATH_BIN, $ROOST_CLAUDE_PLUGIN_DIR).
 #
 # `ssh-env` adds `-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION FORCE_HYPERLINK"`
 # to every `ssh` invocation so modern TUIs (opencode, neovim with
@@ -126,7 +133,7 @@ fi
 _ROOST_BASH_LOADED=1
 
 _roost_feature() {
-  case ",${ROOST_SHELL_FEATURES:-cwd,title,marks,prompt,ssh-env}," in
+  case ",${ROOST_SHELL_FEATURES:-cwd,title,marks,prompt,ssh-env,path}," in
     *",no-$1,"*) return 1 ;;
     *) return 0 ;;
   esac
@@ -212,8 +219,34 @@ if _roost_feature marks && { [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] ||
   PS0='\e]133;C\e\\'"${PS0:-}"
 fi
 
+if ! declare -F __roost_paths >/dev/null; then
+__roost_paths() {
+  _roost_feature path || return 0
+  local dir="${ROOST_PATH_BIN:-}" p
+  if [[ -n $dir && ${PATH%%:*} != "$dir" ]]; then
+    p=":$PATH:"
+    while [[ $p == *":$dir:"* ]]; do p=${p/":$dir:"/:}; done
+    p=${p#:}
+    p=${p%:}
+    export PATH="$dir${p:+:$p}"
+  fi
+  if [[ -n "${ROOST_CLAUDE_PLUGIN_DIR:-}" &&
+    ":${CLAUDE_CODE_PLUGIN_DIRS:-}:" != *":$ROOST_CLAUDE_PLUGIN_DIR:"* ]]; then
+    export CLAUDE_CODE_PLUGIN_DIRS="${CLAUDE_CODE_PLUGIN_DIRS:+$CLAUDE_CODE_PLUGIN_DIRS:}$ROOST_CLAUDE_PLUGIN_DIR"
+  fi
+}
+fi
+
+# Once, at the first prompt: a manual `source` from .bashrc runs before
+# the rest of it.
+__roost_paths_once() {
+  [ -n "${_roost_paths_done:-}" ] && return 0
+  _roost_paths_done=1
+  __roost_paths
+}
+
 # Prepend so the user's existing PROMPT_COMMAND still runs.
-PROMPT_COMMAND="__roost_marks;__roost_osc7;__roost_title;${PROMPT_COMMAND:-}"
+PROMPT_COMMAND="__roost_paths_once;__roost_marks;__roost_osc7;__roost_title;${PROMPT_COMMAND:-}"
 
 # Default prompt (cwd in blue + a plain $) only when the user hasn't set
 # one — bash's stock interactive default is '\s-\v\$ ', else empty.

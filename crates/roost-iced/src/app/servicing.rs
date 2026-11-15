@@ -3129,11 +3129,13 @@ impl App {
             let Some(mtm) = seam_on_main("menu install") else {
                 return;
             };
+            let cli_link = Self::cli_link_bundled().then(|| self.cli_link_menu_title());
             let built = crate::macos::menu::install(
                 mtm,
                 self.title_fallback,
                 &self.keybindings,
                 self.feed_tx.clone(),
+                cli_link.as_deref(),
             );
             if built {
                 // A freshly built menu is all-enabled. Reset the cache to
@@ -3146,6 +3148,8 @@ impl App {
                 self.menu_window_rows = crate::macos::menu::WindowRows::default();
                 // And Secure Keyboard Entry's row was built unchecked.
                 self.menu_secure_input = None;
+                // And the `roostctl` item with the title read above.
+                self.menu_cli_link = cli_link;
             }
         }
     }
@@ -4355,6 +4359,9 @@ impl App {
                     }
                     Err(error) => Err(error),
                 });
+            }
+            UiRequest::AppCliLink { action, reply } => {
+                let _ = reply.send(Ok(self.cli_link(action)));
             }
             UiRequest::AppSecureInput { reply } => {
                 let result = if self.test_mode {

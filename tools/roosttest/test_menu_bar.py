@@ -99,6 +99,10 @@ STATIC_MENUS: dict[str, list[tuple | None]] = {
         (UPDATES_ITEM, "", [], ANY, "check_for_updates"),
         None,
         ("Settings…", ",", ["super"], True, "open_config"),
+        # The `roostctl` link (#261), built only when this Roost's
+        # `roostctl` sits in its own bundle; its title is the link state,
+        # pinned against `app.cli_link` below.
+        *([(ANY, "", [], True, "cli_link")] if ui.iced_bundle_app() is not None else []),
         # No default chord; `fixtures/launcher.conf` binds Ctrl+Shift+K
         # for `test_secure_input.py`.
         ("Secure Keyboard Entry", "k", ["shift", "ctrl"], True, "toggle_secure_input"),
@@ -310,6 +314,20 @@ class TestMenuShape:
         for title in ("Cut", "Select All"):
             assert edit[title]["enabled"] is False
             assert edit[title]["key_equivalent"] == ""
+
+    def test_the_roostctl_item_is_titled_by_the_link_state(self, roost):
+        """Only a bundle has a `roostctl` to link; the item's title is
+        `app.cli_link`'s label for what the link directories hold."""
+        items = [
+            item
+            for item in _menus_by_title(roost.app_menu_dump())[APP]["items"]
+            if item["action"] == "cli_link"
+        ]
+        if ui.iced_bundle_app() is None:
+            assert items == []
+            return
+        status = roost.call("app.cli_link", {"action": "status"})
+        assert [item["title"] for item in items] == [status["label"]]
 
     def test_check_for_updates_is_bound_to_the_sparkle_seam(self, roost):
         """Its ENABLED state is the updater's, not the menu's, so it is

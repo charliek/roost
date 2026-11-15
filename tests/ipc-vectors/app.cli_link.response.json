@@ -1,0 +1,16 @@
+{
+  "id": "41",
+  "ok": true,
+  "result": {
+    "state": "installed",
+    "label": "Uninstall 'roostctl' Command",
+    "link": "/Users/me/.local/bin/roostctl",
+    "target": null,
+    "source": "/Applications/Roost.app/Contents/Resources/bin/roostctl",
+    "bundled": true,
+    "outcome": "created",
+    "message": "Installed 'roostctl': /Users/me/.local/bin/roostctl → /Applications/Roost.app/Contents/Resources/bin/roostctl",
+    "command": null,
+    "path_line": "export PATH=\"$HOME/.local/bin:$PATH\""
+  }
+}

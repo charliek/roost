@@ -314,6 +314,8 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("app.key_event", OpClass::UiOwned),
     // This window's Secure Keyboard Entry.
     ("app.secure_input", OpClass::UiOwned),
+    // The link to this window's own `roostctl`.
+    ("app.cli_link", OpClass::UiOwned),
     // A row's right-click menu in this window.
     ("app.context_menu_dump", OpClass::UiOwned),
     ("app.context_menu_activate", OpClass::UiOwned),

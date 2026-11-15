@@ -84,6 +84,7 @@ EXPECTED_CHECK_IDS = {
     "agent.opencode.wired",
     "agent.opencode.owning",
     "session.old_path",
+    "cli.on_path",
 }
 
 # The `tab` section's seven axis checks (everything but `tab.selection`).

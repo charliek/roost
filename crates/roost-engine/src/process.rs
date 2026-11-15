@@ -120,7 +120,7 @@ pub async fn run(request: ProcessRequest) -> Result<ProcessOutput, ProcessError>
 }
 
 /// Resolve an executable shipped beside `executable` — rung 1 of
-/// [`roostctl_path`]'s ladder. Symlinked launch paths resolve to the real
+/// [`own_roostctl`]'s ladder. Symlinked launch paths resolve to the real
 /// install directory before selecting the sibling.
 pub fn sibling_executable_from(executable: &Path, name: &str) -> Option<PathBuf> {
     let executable = std::fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
@@ -134,7 +134,7 @@ pub fn sibling_executable_from(executable: &Path, name: &str) -> Option<PathBuf>
 /// from `current_exe()`: the answer is exported into child processes
 /// with cwds of their own, so a relative or symlink-spelled path is a
 /// path they cannot run. `canonicalize` also settles absoluteness, which
-/// [`resolve_roostctl`] then re-checks as a fence.
+/// [`own_roostctl`] then re-checks as a fence.
 pub fn executable_file(path: impl AsRef<Path>) -> Option<PathBuf> {
     let path = std::fs::canonicalize(path.as_ref()).ok()?;
     (path.is_absolute() && path.is_file() && is_executable_by_current_user(&path)).then_some(path)
@@ -168,9 +168,31 @@ pub fn is_executable_by_current_user(_path: &Path) -> bool {
 
 const ROOSTCTL: &str = "roostctl";
 
-/// Roost's own `roostctl`, as an absolute path — the value handed to
-/// providers as `ROOST_ROOSTCTL` and to every spawned tab as
-/// `ROOST_AGENT_HOOK` (plan 046 §3.2).
+/// Roost's own `roostctl`: the value handed to providers and every tab as
+/// `ROOST_ROOSTCTL`, and in a UI the tabs' `ROOST_AGENT_HOOK` (plan 046
+/// §3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Roostctl {
+    /// Absolute and canonical.
+    pub path: PathBuf,
+    /// The app bundle's `bin` directory, when this process found
+    /// `roostctl` in its own bundle — the directory a tab's `PATH` gets
+    /// first. `None` for one found on `PATH`, which a tab already reaches.
+    pub bundle_bin: Option<PathBuf>,
+}
+
+/// Resolved once per process: a UI on first use, `roost-session` pinned
+/// by [`pin_roostctl`] at start, for [`set_agent_hook_binary`]'s reason.
+static OWN_ROOSTCTL: OnceLock<Option<Roostctl>> = OnceLock::new();
+
+/// Pin [`roostctl`] before any tab exists. Returns whether this call is
+/// the one that set it.
+pub fn pin_roostctl(roostctl: Option<Roostctl>) -> bool {
+    OWN_ROOSTCTL.set(roostctl).is_ok()
+}
+
+/// This process's `roostctl`, resolved from its executable and `PATH` now.
+/// [`roostctl`] is the pinned answer; this is what pins it.
 ///
 /// Three rungs, tried in order:
 ///
@@ -180,34 +202,57 @@ const ROOSTCTL: &str = "roostctl";
 ///    executable, which is where `mac/scripts/bundle-iced.sh` embeds it
 ///    — the rung [`sibling_executable_from`] alone misses, which is why
 ///    `ROOST_ROOSTCTL` was absent inside `Roost-Iced.app`;
-/// 3. `PATH`.
+/// 3. `PATH`, skipping any app bundle's `bin`: one is there because an
+///    enclosing Roost's tab put it first, and its `roostctl` is that
+///    Roost's, not this build's.
 ///
 /// `None` when no rung answers. Callers **omit** their variable in that
 /// case rather than exporting a guess: a path that does not resolve is
 /// worse than an absent one, because the hook wrapper can only fall back
 /// to its inert branch when it can see the variable is unset.
-pub fn roostctl_path() -> Option<String> {
+pub fn own_roostctl() -> Option<Roostctl> {
     let executable = std::env::current_exe().ok();
-    resolve_roostctl(executable.as_deref(), std::env::var_os("PATH").as_deref())
-        .map(|path| path.to_string_lossy().into_owned())
+    locate_roostctl(executable.as_deref(), std::env::var_os("PATH").as_deref())
 }
 
-fn resolve_roostctl(executable: Option<&Path>, path_var: Option<&OsStr>) -> Option<PathBuf> {
+pub fn roostctl() -> Option<&'static Roostctl> {
+    OWN_ROOSTCTL.get_or_init(own_roostctl).as_ref()
+}
+
+/// [`roostctl`]'s path as a string, for an environment variable.
+pub fn roostctl_path() -> Option<String> {
+    roostctl().map(|roostctl| roostctl.path.to_string_lossy().into_owned())
+}
+
+fn locate_roostctl(executable: Option<&Path>, path_var: Option<&OsStr>) -> Option<Roostctl> {
     let executable = executable
         .map(|exe| std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf()))
         // A relative `current_exe()` would make both of the first two
         // rungs relative too, and this value is exported into shells
         // with cwds of their own.
         .filter(|exe| exe.is_absolute());
-    executable
+    let own = executable
         .as_deref()
-        .and_then(|exe| sibling_executable_from(exe, ROOSTCTL))
-        .or_else(|| executable.as_deref().and_then(bundled_roostctl))
-        .or_else(|| path_var.and_then(|path| lookup_on_path(path, ROOSTCTL)))
-        // The fence [`executable_file`]'s canonicalize already satisfies,
-        // restated because every caller exports this into a shell with a
-        // cwd of its own and a relative answer is unrunnable there.
-        .filter(|path| path.is_absolute())
+        .and_then(|exe| sibling_executable_from(exe, ROOSTCTL).or_else(|| bundled_roostctl(exe)));
+    let found = match own {
+        Some(path) => Roostctl {
+            bundle_bin: roost_ipc::cli_link::bundle_bin_dir_of(&path).map(Path::to_path_buf),
+            path,
+        },
+        None => Roostctl {
+            path: path_var.and_then(|path| lookup_on_path(path, ROOSTCTL))?,
+            bundle_bin: None,
+        },
+    };
+    // The fence [`executable_file`]'s canonicalize already satisfies,
+    // restated because every caller exports this into a shell with a cwd
+    // of its own and a relative answer is unrunnable there.
+    found.path.is_absolute().then_some(found)
+}
+
+#[cfg(test)]
+fn resolve_roostctl(executable: Option<&Path>, path_var: Option<&OsStr>) -> Option<PathBuf> {
+    locate_roostctl(executable, path_var).map(|found| found.path)
 }
 
 /// `Contents/MacOS/<exe>` → `Contents/Resources/bin/roostctl`. The
@@ -226,7 +271,7 @@ fn bundled_roostctl(executable: &Path) -> Option<PathBuf> {
 /// answer.
 fn lookup_on_path(path_var: &OsStr, name: &str) -> Option<PathBuf> {
     std::env::split_paths(path_var)
-        .filter(|dir| dir.is_absolute())
+        .filter(|dir| dir.is_absolute() && !roost_ipc::cli_link::is_bundle_bin_dir(dir))
         .find_map(|dir| executable_file(dir.join(name)))
 }
 
@@ -234,7 +279,7 @@ fn lookup_on_path(path_var: &OsStr, name: &str) -> Option<PathBuf> {
 ///
 /// [`set_agent_hook_binary`] exists for `roost-session`, whose answer is
 /// itself rather than a `roostctl`; every UI leaves it unset and gets
-/// [`roostctl_path`] on first use.
+/// [`roostctl_path`].
 static AGENT_HOOK_BINARY: OnceLock<Option<String>> = OnceLock::new();
 
 /// Pin the hook binary before any tab exists. Returns whether this call
@@ -517,6 +562,81 @@ mod tests {
         let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
         let up: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
         up.join(path.strip_prefix("/").unwrap())
+    }
+
+    /// Found in its own bundle, `roostctl`'s directory is what a tab's
+    /// `PATH` gets first; a sibling in `target/debug` or `/usr/bin` is
+    /// not a bundle and gets nothing.
+    #[test]
+    fn only_a_roostctl_in_this_bundle_names_a_bundle_bin() {
+        let (_dir, root) = real_tempdir();
+        let executable = root.join("Roost.app/Contents/MacOS/Roost");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, "app").unwrap();
+        let embedded = stub_roostctl(root.join("Roost.app/Contents/Resources/bin/roostctl"));
+        assert_eq!(
+            locate_roostctl(Some(&executable), None),
+            Some(Roostctl {
+                bundle_bin: Some(embedded.parent().unwrap().to_path_buf()),
+                path: embedded,
+            })
+        );
+
+        let dev = root.join("target/debug/roost-iced");
+        std::fs::create_dir_all(dev.parent().unwrap()).unwrap();
+        std::fs::write(&dev, "app").unwrap();
+        let sibling = stub_roostctl(root.join("target/debug/roostctl"));
+        assert_eq!(
+            locate_roostctl(Some(&dev), None),
+            Some(Roostctl {
+                path: sibling,
+                bundle_bin: None
+            })
+        );
+    }
+
+    /// A dev build run from inside a `Roost.app` tab inherits that
+    /// bundle's `bin` first on `PATH`. With no `roostctl` of its own it
+    /// must not adopt the bundle's: that one belongs to the other Roost.
+    #[test]
+    fn the_path_rung_skips_another_bundles_bin() {
+        let (_dir, root) = real_tempdir();
+        let outer = stub_roostctl(root.join("Roost.app/Contents/Resources/bin/roostctl"));
+        let dev = root.join("target/debug/roost-iced");
+        std::fs::create_dir_all(dev.parent().unwrap()).unwrap();
+        std::fs::write(&dev, "app").unwrap();
+        let outer_bin = outer.parent().unwrap().as_os_str().to_os_string();
+        assert_eq!(locate_roostctl(Some(&dev), Some(&outer_bin)), None);
+
+        let installed = stub_roostctl(root.join("usr/bin/roostctl"));
+        let path =
+            std::env::join_paths([outer.parent().unwrap(), installed.parent().unwrap()]).unwrap();
+        assert_eq!(
+            locate_roostctl(Some(&dev), Some(&path)),
+            Some(Roostctl {
+                path: installed,
+                bundle_bin: None
+            })
+        );
+    }
+
+    /// `/usr/local/bin/roostctl` linked into a bundle is on `PATH`
+    /// already: the answer is the bundle's file, but no `bin` to put
+    /// first.
+    #[test]
+    fn a_path_link_into_a_bundle_names_no_bundle_bin() {
+        let (_dir, root) = real_tempdir();
+        let embedded = stub_roostctl(root.join("Roost.app/Contents/Resources/bin/roostctl"));
+        let links = root.join("usr-local-bin");
+        std::fs::create_dir_all(&links).unwrap();
+        std::os::unix::fs::symlink(&embedded, links.join("roostctl")).unwrap();
+        assert_eq!(
+            locate_roostctl(None, Some(links.as_os_str())),
+            Some(Roostctl {
+                path: embedded,
+                bundle_bin: None
+            })
+        );
     }
 
     #[test]

@@ -69,6 +69,7 @@
 //! instead (see [`window`]).
 
 mod agent_install;
+mod cli_link;
 mod doctor;
 mod error;
 mod events;
@@ -475,6 +476,11 @@ enum Cmd {
     /// via an explicit `--socket`.
     #[command(subcommand)]
     Session(session::SessionCmd),
+    /// Put this `roostctl` on PATH for terminals outside Roost (macOS):
+    /// one symlink in /usr/local/bin or ~/.local/bin to the copy inside
+    /// Roost.app. Never dials a UI.
+    #[command(subcommand)]
+    Cli(cli_link::CliCmd),
     /// Client-side saved-host subcommands: add, list, remove, connect,
     /// disconnect (host-sessions HS-2). Unlike `session`, these address the
     /// ordinary UI socket target — a saved host is UI state, not the
@@ -1146,6 +1152,9 @@ async fn run(
         // `--target session` — #475). `start` has to work with nothing
         // listening at all, which a target-selector dial cannot promise.
         Cmd::Session(cmd) => session::run(&cmd, json).await,
+        // The link is a file next to `PATH`, not UI state: it has to work
+        // with nothing running.
+        Cmd::Cli(cmd) => cli_link::run(cmd, json),
         // doctor exists to report "no UI is running", so it must not
         // dial through [`UiSocket`], which fails on exactly that
         // condition before the verb's own code runs.
@@ -1973,7 +1982,8 @@ async fn run_on_ui(
         | Cmd::Skill
         | Cmd::Schema
         | Cmd::Doctor { .. }
-        | Cmd::Session(_) => unreachable!("`run` serves these without the UI socket"),
+        | Cmd::Session(_)
+        | Cmd::Cli(_) => unreachable!("`run` serves these without the UI socket"),
     }
     Ok(0)
 }
@@ -3661,6 +3671,10 @@ mod tests {
         &["session", "start"],
         &["session", "stop"],
         &["session", "status"],
+        &["cli", "install"],
+        &["cli", "repair"],
+        &["cli", "uninstall"],
+        &["cli", "status"],
         &["host", "add", "--label", "l", "--target", "t"],
         &["host", "list"],
         &["host", "status"],
