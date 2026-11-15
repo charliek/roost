@@ -333,8 +333,10 @@ second while the stamp is held.
   reads `suspended`. When the process runs again (`fg`, `bg`), the
   records come back, unless the tab moved on meanwhile: a live record,
   or a root reported since. A program that clears its own status as it
-  stops (Codex does) leaves nothing to set aside, so nothing follows it
-  until it reports again.
+  stops (Codex does) leaves nothing to set aside; when its process's
+  name says which agent it is, the process is followed by that name
+  instead ([an agent known by name](#an-agent-known-by-name)), and the
+  tab reads it suspended.
 * **Anything uncertain** — the group still in front (a pipeline, a
   straggler), a process that can't be read, no PTY — keeps the records.
   A mark from the stamped group itself (Claude's Screen Reader marks)
@@ -352,7 +354,8 @@ app.
 The process the tab's agent runs as, once one is stamped (#621, #519).
 Two things on a tab follow a process: its agent owner, from the moment
 an agent claims it, and its [program-status records](#tabprogram_status-osc-7501),
-while they decide the tab. At the first read after either starts, the
+while they decide the tab. A tab neither names can also carry an agent
+[known by name](#an-agent-known-by-name). At the first read after either starts, the
 server that holds the tab records the leader of the process group then
 in front of the tab's terminal: its pid, start time, group and session.
 It records nothing when the shell itself is in front (an agent in the
@@ -371,8 +374,8 @@ read. A `manual` or `legacy` claim records nothing either.
   the process runs again (`fg`, `bg`).
 * `agent` names the agent: the record's `app` while the records' process
   is the one described (a 7501 agent with no hooks: `codex`,
-  `claude-code`), else the owner's `source`. Empty when neither names
-  one.
+  `claude-code`), else the owner's `source`, else what the process's
+  name says it is (below). Empty when none names one.
 * `pid` is the stamped process, as a string like every other int64.
 * `since` is when it was stamped, or last moved between running and
   suspended, in unix seconds.
@@ -389,6 +392,35 @@ older server reads the same as a tab with no stamped process. What the
 stamp decides is in [`tab.agent_report`](#tabagent_report)'s
 [ownership end rules](#how-ownership-ends-without-a-report), and for
 records in [how a record ends](#how-a-record-ends-without-a-prompt).
+
+#### An agent known by name
+
+An agent that neither claims its tab nor reports OSC 7501 — cursor-agent
+with no hooks, Codex on its sign-in screen — is still named by its
+process. When someone looks at a tab that no one owns and whose records
+decide nothing — it gains or loses the focus, a session viewer attaches
+or detaches, or the shell marks a command starting (`C`) — the server
+reads the leader in front, as it would to stamp a claim, and checks its
+name against a small table:
+
+| The process | `agent` |
+|---|---|
+| `claude`, `codex`, `opencode`, `grok`, `crush`, `pi` | that name |
+| `cursor-agent` | `cursor` |
+| `node`, `bun`, `deno` or `python` (on Linux, node 24 reads `MainThread`) running a script with one of those names (`codex.js`), or one kept in a `claude-code`, `codex`, `opencode`, `opencode-ai` or `cursor-agent` directory (an npm package, cursor-agent's own install) | that agent (`claude` for `claude-code`) |
+
+A named process is stamped, and `process` carries it — and nothing else
+changes: no owner is made up, no lifecycle, and `Tab.state` stays what
+the shell axis says. It is followed like any stamp: `suspended` while
+stopped, ended once the process is gone and its group has left the
+front, read once a second while it holds. A claim, or records that start
+deciding, take over from it. Records that clear themselves (Codex, as it
+stops) pass their stamp on the same way, when the process is named,
+once the shell's prompt mark says it has the terminal back; that
+process shows only once a read finds it stopped or running on, so one
+that cleared its status as it exited never appears. The name is display
+only: no end rule reads it. Nothing looks on the tick, so an agent
+started in a tab nobody looks at again is not named until someone does.
 
 ### `tab.state` / `hook_active` — derived, and the compatibility contract
 

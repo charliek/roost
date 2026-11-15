@@ -306,8 +306,9 @@ Codex and Grok report over OSC 7501, Cursor's hooks file is an opt-in,
 and the entries older releases wrote are retired
 ([DL-36](decision-history.md#dl-36-roost-connects-agents-without-writing-their-configs-2026-11-08)). Next is making the integration better. A dead
 agent's process now ends its ownership (#621) and its OSC 7501 records,
-in shells with no prompt marks too (#519); next is how a tab presents
-what OSC 7501 and the hooks say. A change here amends DL-13,
+in shells with no prompt marks too (#519), and an agent that reports
+nothing is named by its process; next is how a tab presents what OSC
+7501 and the hooks say. A change here amends DL-13,
 DL-14 and DL-29.
 Note: `discovery/agent-integration.md`.
 

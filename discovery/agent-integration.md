@@ -1166,8 +1166,9 @@ the composition layer).
   needs a change to its own settings file to report fully:"
 - **Cursor:** "Adds Roost's entries to ~/.cursor/hooks.json, because
   Cursor reads its turn-end hook only from that file. Without it, Roost
-  shows only that Cursor is running." (The last clause needs Phase 3a;
-  before that, "shows nothing for Cursor".)
+  shows only that Cursor is running." (The last clause needed Phase 3a's
+  fourth commit, which names an agent by its process; before that, the
+  card said "shows nothing for Cursor".)
 - **First-run footer:** "Change this, or switch any agent off, from Agent
   integration… in the command palette."
 - **First-run buttons:** "Decide later" (writes nothing; the card returns
@@ -1769,6 +1770,14 @@ stamp and #621, its second the records' stamp, parking and the 1 s tick
 unprompted idle root included: a Ctrl-Z most often stops an agent idle
 at its own prompt, and a killed one left idle would otherwise mute raw
 OSC and refuse other agents' claims forever in a shell with no marks.
+Its third commit sends `133;D;$?` and the exit banner. Its fourth names
+an agent by its process (a small comm and argv table), found when the
+tab gains or loses the focus, a session viewer comes or goes, or a `C`
+mark: cursor-agent with no hooks reads "Cursor · Running". Codex clears
+its own 7501 status as it stops, so the records' stamp passes to that
+identity when the shell's prompt mark has the terminal back, and a
+suspended Codex reads "Codex · Suspended". Node 24 names its main
+thread `MainThread`, which is what Linux reports as its name.
 
 - **Two plans.** 3a, the process layer (identity, stamps, end rules,
   `133;D;$?`, the DL-14 and DL-29 amendments), is L on its own. 3b, peer-pid

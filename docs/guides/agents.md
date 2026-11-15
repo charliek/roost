@@ -14,7 +14,9 @@ them without editing their settings files**:
   crush and pi.
 - **Cursor** (cursor-agent) reads its turn-end hook only from its own
   `~/.cursor/hooks.json`, so it is the one agent Roost connects by
-  writing a file. That is an opt-in, off until you turn it on.
+  writing a file. That is an opt-in, off until you turn it on. Without
+  it, Roost still shows that Cursor is running ([agents known by
+  name](#agents-known-by-name)).
 
 All of these are on by default except Cursor, with no question asked.
 Roost shows a card at startup only when it has something to ask: Cursor
@@ -528,9 +530,11 @@ and the agent's own process.
   the tab shows what a prompt shows, so it mutes nothing while you work
   at the prompt. After `fg` (or `bg`), what it was doing comes back,
   OSC 7501 record included. A 7501 agent with no hooks keeps its row
-  through the suspend, named by its `process`, unless it clears its own
-  status as it stops: Codex does, so a suspended Codex has no row, and
-  its next report after `fg` brings the row back.
+  through the suspend, named by its `process`. One that clears its own
+  status as it stops — Codex does — leaves nothing to set aside, so its
+  row comes from its process's name instead
+  ([agents known by name](#agents-known-by-name)) and reads **Suspended**
+  all the same.
 
 A process Roost can't read (another user's, say) counts as alive, and a
 pipeline whose first command exited keeps the agent while the pipeline
@@ -619,6 +623,40 @@ reading is the spec's:
 
 A host tab's client shows what the session made of the marks; it reads
 none itself.
+
+## Agents known by name
+
+An agent that neither claims its tab with a hook nor reports over OSC
+7501 still gets an Agents row: cursor-agent without the
+[opt-in](#the-agent-integration-card), or Codex before it reports
+anything, on its sign-in screen. Roost names it from its process, once
+it looks at the tab — when you switch to the tab or away from it, when
+a session tab gains or loses a viewer, or when the shell marks a command
+starting. So start cursor-agent, switch to another tab, and its row
+appears.
+
+| The process in front | The row |
+|---|---|
+| `claude`, `codex`, `opencode`, `cursor-agent`, `grok`, `crush`, `pi` | that agent |
+| `node`, `bun`, `deno` or `python` running a script named like one of those (`codex.js`), or kept in a `claude-code`, `codex`, `opencode`, `opencode-ai` or `cursor-agent` directory | that agent |
+
+The row reads **Running**, or **Suspended** after `Ctrl-Z`, and never
+guesses more: no Working or Waiting, no banner, nothing muted, no owner,
+and the tab's own state is whatever its shell says. It goes once the
+process is gone and the shell has the terminal back, by the same rule as
+[any noted process](#when-a-tab-stays-running). Once the agent claims
+the tab or reports over OSC 7501, those decide the row again.
+
+Codex clears its own OSC 7501 status as it stops, so a `Ctrl-Z` would
+leave nothing to show; its process's name keeps its row, reading
+**Suspended**, and `fg` brings it back. A Codex that clears its status
+as it exits shows no row in between.
+
+The name only labels the row: nothing ends because of it. A launcher
+that runs the agent as its child rather than becoming it (`npx`) is not
+named, nor is an agent inside `tmux`, `screen`, `zellij`, `ssh` or
+`mosh`. Roost never reads a tab's processes on a timer to find one, so
+a tab you never look at again shows no row for it.
 
 ## Codex trust
 
