@@ -549,6 +549,10 @@ none itself.
 
 ## Codex trust
 
+This applies only while a Roost hook is in Codex's config: one you wrote
+with `roostctl agent install codex`, or an older release's entry the
+retire left in place. Codex itself reports over OSC 7501 and needs none.
+
 Codex additionally records a `trusted_hash` per hook handler under
 `[hooks.state]` in `config.toml` — the mechanism that stops it asking
 "Hooks need review — trust all?" on the next launch. Writing that hash
@@ -567,11 +571,11 @@ Roost's own hooks changed:
   relocating it (or a dotfile sync that changes it per machine, without
   `allow_symlinked_codex_home = true`) has the same effect.
 
-Both cost exactly one dialog; the next `roostctl agent ensure` or `agent
-install codex` recomputes and rewrites the stale keys, and doesn't
-require anything from you beyond running it. Doctor's
-`agent.codex.trust` check compares the hash codex would compute for the
-handler Roost actually installed against what's on disk right now, so a
+Both cost exactly one dialog; `roostctl agent install codex` recomputes
+and rewrites the stale keys, and `roostctl agent uninstall codex` takes
+the hook out instead. Doctor's `agent.codex.trust` check compares the
+hash codex would compute for the handler Roost installed against what's
+on disk right now, so a
 hand edit, a moved home, or a codex-side change to the hash formula
 itself is diagnosed by name instead of reappearing as an unexplained
 dialog with no cause attached.
@@ -903,7 +907,7 @@ then the old one is stale. Dial it before believing it.
   filter is needed.
 - **codex re-trusts on reordering or a moved path.** See [Codex
   trust](#codex-trust) above — either one costs a single review dialog,
-  cleared by the next `ensure`.
+  cleared by `roostctl agent install codex`.
 - **codex `/rename` doesn't reach the tab label on codex 0.153 and
   earlier.** Roost's tab label mirrors whatever the program writes into
   the terminal title, and codex's default title items on those versions
@@ -939,12 +943,15 @@ what you'd otherwise have to guess at, per agent:
   skipped by its organization's plugin policy (with where the policy
   was found). It also names an old Roost entry still in the agent's
   file — a retire leftover, or one that came back — as the cause of
-  doubled events, and the backup the retire made. For Cursor: is Roost's
-  entry present, and at which integration version.
+  doubled events, and the backup the retire made. For Cursor: switched
+  off (its default), or is Roost's entry present, and at which
+  integration version. A switched-off Codex or Grok still reports over
+  OSC 7501, and doctor says so.
 - `agent.<name>.owning` — does that source currently own a tab on this
   UI (not a durable "ever observed" record — just right now).
-- `agent.codex.trust` — does the trust hash on disk match what codex
-  would compute for the handler Roost installed.
+- `agent.codex.trust` — when a Roost hook is in Codex's config (see
+  [Codex trust](#codex-trust)), does the trust hash on disk match what
+  codex would compute for it. Without one there is nothing to trust.
 - `agent.claude.legacy_settings` — is the retired
   `~/.config/roost/claude-settings.json` file or its shell alias still
   around.

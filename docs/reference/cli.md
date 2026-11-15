@@ -1207,7 +1207,7 @@ Agents (process)
   skipped agent.claude.owning      unavailable (no tab.list from a running UI)
   ok      agent.claude.legacy_settings no leftover ~/.config/roost/claude-settings.json or shell alias found
   ok      agent.codex.wired        reports over OSC 7501; nothing written · old entries retired (v4) · backup ~/.config/roost/agent-backups/…
-  skipped agent.codex.trust        nothing wired for codex yet
+  skipped agent.codex.trust        no Roost hook in Codex's config, so nothing to trust: Codex reports over OSC 7501
   skipped agent.codex.owning       unavailable (no tab.list from a running UI)
   ok      agent.grok.wired         reports over OSC 7501; nothing written
   skipped agent.grok.owning        unavailable (no tab.list from a running UI)
@@ -1227,8 +1227,8 @@ only its `agent.cursor.wired` reports a `wired@v` version: the other four
 say how they connect and that nothing was written, plus "old entries
 retired" on a machine whose earlier file entries the upgrade took out.
 An agent whose config directory doesn't exist at all shows `skipped: not
-installed` instead, and Cursor present but never wired shows `warn: not
-wired` rather than `ok`.
+installed` instead. Cursor present and switched off, its default, shows
+`skipped` and how to turn it on; switched on but not wired, `warn`.
 
 `--json` carries the same facts as JSON — a top-level `schema_version: 2`,
 an explicit `exit_code` (so a script never has to re-derive "did

@@ -720,7 +720,9 @@ fn status_line(row: &Status, claude_blocked: bool) -> String {
     }
     let delivery = Delivery::of(row.agent);
     if delivery != Delivery::File {
-        let mut line = if !row.on {
+        let mut line = if !row.on && delivery == Delivery::Osc7501 {
+            "present, switched off, still reports over OSC 7501".to_string()
+        } else if !row.on {
             "present, switched off".to_string()
         } else if row.agent == Agent::Claude && claude_blocked {
             "present, skipped: your organization's Claude policy blocks plugin folders".to_string()
@@ -943,6 +945,14 @@ mod tests {
             ..clean(Agent::Opencode)
         };
         assert_eq!(status_line(&off, false), "present, switched off");
+        let grok_off = Status {
+            on: false,
+            ..clean(Agent::Grok)
+        };
+        assert_eq!(
+            status_line(&grok_off, false),
+            "present, switched off, still reports over OSC 7501"
+        );
         assert!(status_line(&a_row(Agent::Codex, true), false).ends_with("still in place"));
 
         assert_eq!(live_delivery(&clean(Agent::Claude), false), "env");
