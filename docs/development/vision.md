@@ -59,9 +59,9 @@ As of v0.1.0 (2026-11-07):
   machines attach to one tab at once.
 - **Agent awareness.** Tab state and notifications come from what
   agents and shells write to the terminal (OSC 133, OSC 7501, OSC
-  9/99/777) and from agent hooks that `roostctl agent install` writes
-  into each agent's config, with consent. The sidebar has an Agents
-  panel.
+  9/99/777) and from agent hooks Roost delivers through the tab's
+  environment, writing no agent's config but Cursor's, an opt-in
+  ([DL-36](decision-history.md#dl-36-roost-connects-agents-without-writing-their-configs-2026-11-08)). The sidebar has an Agents panel.
 - **A scriptable surface.** `roostctl`, the JSON IPC socket and the
   agent skill reach every op the window does.
 - **Roost mobile**, a prototype: a Flutter + Rust Android client of
@@ -294,18 +294,15 @@ Then separate small plans: confirm before closing a running agent
 actions and the terminal menu (#710, #165), clickable paths and config
 reload (#708, #709). Note: `discovery/backlog-triage-2026-11.md`.
 
-**Agent integration without writing into agents' configs.** The main
-feature track. Today `roostctl agent install` merges hooks into
-`~/.claude/settings.json`, `~/.codex/hooks.json` and `config.toml`, and
-`~/.cursor/hooks.json`, and owns a file under Grok's and OpenCode's
-config. The goal is to stop writing users' configs where possible and
-make the integration better at the same time: OSC 7501 as the state
-source, hooks delivered through the tab's environment where an agent
-allows it, and process identity to clear a dead agent's state (#519,
-#621). Entries Roost wrote are removed automatically once nothing needs
-them, and only those Roost can prove it wrote; the first-run prompt that
-asks which integrations to turn on changes with it. A change here amends
-DL-13, DL-14 and DL-29, and the consent flow.
+**Agent integration, after the config writes.** The main feature
+track. Its first step shipped: Roost no longer writes agents' configs.
+Claude Code and OpenCode get their hooks through the tab's environment,
+Codex and Grok report over OSC 7501, Cursor's hooks file is an opt-in,
+and the entries older releases wrote are retired
+([DL-36](decision-history.md#dl-36-roost-connects-agents-without-writing-their-configs-2026-11-08)). Next is making the integration better: process
+identity to clear a dead agent's state (#519, #621), and how a tab
+presents what OSC 7501 and the hooks say. A change here amends DL-13,
+DL-14 and DL-29.
 Note: `discovery/agent-integration.md`.
 
 **Chrome comfort: size, color, opacity.** Make the chrome easier on the
@@ -389,6 +386,7 @@ its record there and a row here, in the PR that builds it.
 | [33](decision-history.md#dl-33-the-swift-app-is-retired-iced-is-the-only-desktop-ui-2026-11-03) | Swift retired; iced is the one desktop UI | 2026-11-03 | Current | Shipped in v0.1.0. |
 | [34](decision-history.md#dl-34-a-mobile-client-of-roost-session-2026-11-03) | A mobile client of `roost-session` | 2026-11-03 | Current | A prototype shipped in v0.1.0. |
 | [35](decision-history.md#dl-35-split-panes-leave-the-non-goals-under-discovery-2026-11-08) | Split panes leave the non-goals | 2026-11-08 | Current | Not a non-goal, not planned; a tab is one terminal. |
+| [36](decision-history.md#dl-36-roost-connects-agents-without-writing-their-configs-2026-11-08) | Agents connect without config writes | 2026-11-08 | Current | Env for Claude Code and OpenCode, 7501 for Codex and Grok, Cursor opt-in; gx dropped. |
 
 ## Related docs
 
