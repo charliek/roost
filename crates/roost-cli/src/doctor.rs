@@ -1642,13 +1642,8 @@ const MAX_KEY_CHARS: usize = 40;
 /// Metadata keys whose values are safe to print. Everything else prints
 /// its length only — `session_title` is derived from the user's own
 /// prompt, and any adapter can invent new keys.
-const METADATA_VALUE_ALLOWLIST: [&str; 5] = [
-    "model",
-    "source",
-    "background_tasks",
-    "session_crons",
-    "gx.remote",
-];
+const METADATA_VALUE_ALLOWLIST: [&str; 4] =
+    ["model", "source", "background_tasks", "session_crons"];
 
 /// Keys whose value is printable only while it still passes the shape its
 /// producer promised. `tab.agent_report` takes arbitrary metadata and
@@ -1659,7 +1654,7 @@ const METADATA_VALUE_ALLOWLIST: [&str; 5] = [
 /// prints. Anything failing it falls back to the generic length.
 fn revalidated(key: &str, value: &str) -> Option<bool> {
     match key {
-        "server_url" | "gx.remote" => Some(roost_agent::loopback_base_url(value)),
+        "server_url" => Some(roost_agent::loopback_base_url(value)),
         _ => None,
     }
 }
@@ -5585,17 +5580,12 @@ mod tests {
         metadata.insert("model".to_string(), "claude-opus-5".to_string());
         metadata.insert("session_title".to_string(), "fix the \x07 bug".to_string());
         metadata.insert("x".repeat(200), "whatever".to_string());
-        metadata.insert("gx.remote".to_string(), "http://127.0.0.1:2421".to_string());
         metadata.insert(
             "server_url".to_string(),
             "http://127.0.0.1:41234".to_string(),
         );
         let out = redact_metadata(&metadata);
         assert!(out.contains("model=claude-opus-5"), "{out}");
-        assert!(
-            out.contains("gx.remote=http://127.0.0.1:2421"),
-            "an allowlisted key must print verbatim: {out}"
-        );
         assert!(
             out.contains("server_url=http://127.0.0.1:41234"),
             "a loopback URL is not a secret and is what makes the \

@@ -257,7 +257,7 @@ Most of these attach a single, unquoted, absolute path with the extension intact
 | **Claude Code** | Attaches images and PDFs. |
 | **Codex** | Attaches images — **if** `image_paste_enabled` is on in that user's Codex config. Off, Codex leaves the path as plain text (locally too; this is not a host-tab thing). One path per paste. |
 | **OpenCode** | Attaches images and PDFs. One path per paste. |
-| **grok / gx** | Attaches images, and deliberately **rejects tiny ones** — a 1×1 test PNG stays text. |
+| **grok** | Attaches images, and deliberately **rejects tiny ones** — a 1×1 test PNG stays text. |
 | **cursor-agent** | **Does not attach.** The path stays plain text in its composer, and cursor-agent reads it as part of your prompt — it will often try to `ls` or `cat` the file rather than look at it. Verified live, and it behaves the same way for an ordinary *local* paste, so this is cursor-agent's own composer rather than anything about host paths. |
 
 cursor-agent aside, three things follow. **A multi-file drop attaches in none of them** — several paths on one line is not a shape any of these parse — but the paths are still real paths on the host, so an agent can be asked to read them. And **any regular file uploads**, not just images: what you always get is a working host path, and whether the agent turns it into an attachment chip depends on that agent's own supported types.

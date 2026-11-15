@@ -836,9 +836,8 @@ mechanism, the retire, and what each agent gets.
 
 Internal: the one hook entrypoint every supported agent's installed
 command invokes — `roostctl agent-hook <agent>`, where `<agent>` is
-`claude`, `codex`, `grok`, `cursor`, or `opencode` (gx reports through
-`grok`; there's no separate name for it). Reads the agent's JSON event
-payload from stdin, takes the event name from the payload itself
+`claude`, `codex`, `grok`, `cursor`, or `opencode`. Reads the agent's
+JSON event payload from stdin, takes the event name from the payload itself
 (`hook_event_name` — there is no `--event` flag, since one installed
 command string has to serve every event), dials `ROOST_SOCKET` for the
 tab named by `ROOST_TAB_ID`, and translates the event into a

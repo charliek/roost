@@ -56,7 +56,7 @@ the captures used:
 | `codex-permission`, `codex-shell`, `codex-interrupt`, `codex-ctrlz`, `codex-startup` | `codex -s read-only -a on-request` (the flags force an approval prompt) |
 | `grok-permission` (trust prompt, then a turn), `grok-startup` | `grok`, in a fresh untrusted directory |
 | `crush-turn` | `crush` |
-| `gx-startup`, `cursor-startup`, `opencode-startup`, `pi-startup` | `gx`, `cursor-agent`, `opencode`, `pi` |
+| `cursor-startup`, `opencode-startup`, `pi-startup` | `cursor-agent`, `opencode`, `pi` |
 
 Cases not covered yet (no capture backed them): Claude Ctrl-Z, Grok
 shell, interrupt, Ctrl-Z and background, Codex background, and startup

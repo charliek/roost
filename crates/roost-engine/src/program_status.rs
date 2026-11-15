@@ -628,7 +628,7 @@ fn repeats_kept_record(
 
 /// The OSC 7501 `app`s a hook source's agent reports. grok named itself
 /// `grok-build` until 1.0.77 (the 2026-10-28 captures) and `grok` from
-/// then on (2026-11-08); gx shares the `grok` source.
+/// then on (2026-11-08).
 pub fn apps_for_source(source: &str) -> &'static [&'static str] {
     match source {
         "claude" => &["claude-code"],
@@ -1157,8 +1157,7 @@ mod tests {
         assert_eq!(tab.agent.lifecycle, L::Working);
         assert_eq!(tab.shows(), (L::Working, By::Records));
 
-        // gx shares the grok source; grok 1.0.77 reports `grok`, older
-        // builds `grok-build`.
+        // grok 1.0.77 reports `grok`, older builds `grok-build`.
         for app in ["grok", "grok-build"] {
             let mut grok = Tab::default();
             grok.feed([report(S::Working, "", app, "")], T0);

@@ -831,8 +831,6 @@ mod tests {
             (Some("codex"), true),
             (None, false),
             (Some("gemini"), false),
-            // gx reports as grok and has no name of its own.
-            (Some("gx"), false),
         ] {
             let refused = targets(agent, all).expect_err("refused");
             assert_eq!(refused.exit_code(), 2, "{agent:?} {all}: {refused:?}");

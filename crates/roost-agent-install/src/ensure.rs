@@ -1132,15 +1132,6 @@ mod tests {
         assert_eq!(unknown, vec!["gemini"]);
     }
 
-    /// gx shares grok's file and reports as grok; it is not a name of
-    /// its own, so naming it has to be visible rather than silent.
-    #[test]
-    fn a_name_no_agent_answers_to_is_unknown() {
-        let (known, unknown) = resolve_names(["gx"]);
-        assert!(known.is_empty());
-        assert_eq!(unknown, vec!["gx"]);
-    }
-
     fn a_home(root: &std::path::Path) -> Home {
         std::fs::create_dir_all(root.join(".claude")).unwrap();
         Home::rooted(root).every_agent_by_file()

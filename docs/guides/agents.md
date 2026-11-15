@@ -59,7 +59,7 @@ came from — see [Per-agent caveats](#per-agent-caveats).
 
 [craze](https://github.com/charliek/craze) is the first entry that needs
 no hook install at all: it is the process driving the agent over ACP
-(cursor-agent, grok, or gx), so it calls `tab.agent_report` directly on
+(cursor-agent or grok), so it calls `tab.agent_report` directly on
 every state change rather than being invoked as a hook. Behavior worth a
 sentence beside its row:
 
@@ -114,9 +114,9 @@ shell out than hand-build the JSON.
   which reads to the caller as nothing happening at all. Anything that
   doesn't fit the existing axes belongs in `metadata` instead.
 - **`metadata` keys are namespaced.** A key a product defines itself is
-  prefixed `<product>.` (`craze.provider`, `gx.remote`); a key Roost
-  itself defines stays bare snake_case (`model`, `version`). See
-  [gx](#gx) below for the fuller statement of this rule.
+  prefixed `<product>.` (`craze.provider`); a key Roost itself defines
+  stays bare snake_case (`model`, `version`). See [Metadata
+  keys](#metadata-keys) below.
 - **Pin to the oldest server you support, and validate against the
   schema.** `identify.ops` says which *ops* a server serves, not which
   *fields* of an op's params it accepts — a server can list
@@ -182,7 +182,7 @@ an agent that speaks it is heard the moment it starts.
 | Grok CLI (1.0.70 or later) | yes | `grok` (1.0.77 or later), `grok-build` before |
 | crush | yes | `crush` |
 | pi | yes | `pi` |
-| gx, cursor-agent, OpenCode (1.19) | no — hooks only | |
+| cursor-agent, OpenCode (1.19) | no — hooks only | |
 
 What it gives you, beside the hooks:
 
@@ -767,63 +767,27 @@ already have: on a host, any client that can reach the socket can
 already run arbitrary commands there via `tab.open`. The third does
 widen the surface, on purpose, and the opt-out is the answer to it.
 
-## gx
+## Metadata keys
 
-Roost no longer installs anything for gx: Grok is connected over OSC
-7501 only, and gx does not speak it. What follows describes what a gx
-run reports through an entry an older release wrote, until the retire
-removes it.
-
-gx is a fork of grok that shares grok's config file and reports through
-the same adapter — it shows up as `source: "grok"`, same as stock grok;
-[Per-agent caveats](#per-agent-caveats) below covers where gx's behavior
-diverges from grok's.
-
-gx additionally announces a **remote lane** — an HTTP control surface
-for the running session — by stamping `gxRemote` (its own loopback base
-URL, e.g. `http://127.0.0.1:2421`) onto every hook payload once that
-lane comes up. Roost forwards it, when it parses as a **token-free
-loopback base URL** — `http://127.0.0.1:<port>`, `localhost`, or
-`[::1]`, and nothing after the port (no path, query, or fragment) —
-as the `gx.remote` key in the tab's `metadata`; anything else (a query
-string, a non-loopback host, `https`) is dropped rather than stamped.
-`roostctl doctor` prints the value when present.
-
-`gx.remote` is a **naming convention, not a new mechanism**: `metadata`
-is already the open extension channel every adapter writes into
+`metadata` is the open extension channel every adapter writes into
 ([`ipc.md`](../reference/ipc.md#tabagent_report)), and this is the rule
-for using it without collisions — a key owned by one product is
-prefixed `<product>.` (`gx.remote`), while a key roost itself defines
-stays bare snake_case (`model`, `session_title`).
+for using it without collisions: a key owned by one product is
+prefixed `<product>.` (`craze.provider`), while a key Roost itself
+defines stays bare snake_case (`model`, `session_title`).
 
-Treat the key as a **discovery hint, not liveness**. gx's remote-lane
-address is a process-global set once and never cleared, so it never
-tells you the lane died; and `metadata` itself is merge-only with no
-delete channel, so `gx.remote` can outlive the lane that announced it,
-and a same-process restart on another port is never reflected. The
-only thing that removes it is the reset path: a new `SessionStart`
-replaces `metadata` wholesale, so a stock-grok session started on the
-same tab afterward drops the key. It is absent to begin with on stock
-grok and on a gx run with `--no-leader` or `GX_REMOTE_DISABLE=1`.
+`metadata` is merge-only, with no delete channel: a key stays until a
+new claim replaces the whole map. So a key that names something live,
+such as an address, is a discovery hint, not proof that it is still
+there.
 
-A consumer must still follow gx's own client contract before treating
-the lane as usable — the key alone is never enough to act on: call the
-lane's token-free `GET /v1/healthz`, compare its `instanceId` against
-`$GROK_HOME/gx-remote.json`, and only then use the bearer token from
-`$GROK_HOME/gx-remote.token`. Roost carries neither the instance id nor
-the token; `gx.remote` is just the URL.
-
-The agents palette does not render `gx.remote` — a bare loopback URL has
-no in-terminal action to attach it to; revisit if a roost client action
-ever uses the lane. gx does not get its own `source`/`Agent` variant
-today; that's warranted only if its hook vocabulary diverges from
-grok's in a way the shared adapter can't map correctly, or it stops
-sharing `$GROK_HOME` with grok.
+One key decides something. A `claude` claim's `source` is Claude's own
+`SessionStart` source, and a claim saying `startup` while the tab's
+Claude is mid-turn is refused as nested ([Ownership](#ownership)).
 
 ## OpenCode keys
 
 OpenCode's adapter writes four keys into the owning tab's `metadata`.
-All four are bare snake_case under the convention [above](#gx): they are
+All four are bare snake_case under the convention [above](#metadata-keys): they are
 Roost's own, read off opencode's event bus by the plugin Roost ships,
 not a product stamping its name on a shared channel.
 
@@ -887,8 +851,8 @@ surface.
   lands at the **next** `session.created`, and until then that session
   is status-only.
 
-Treat it the way [`gx.remote`](#gx) is treated: a discovery hint, not
-liveness. `metadata` is merge-only with no delete channel, so the key
+Treat it as a discovery hint, not liveness. `metadata` is merge-only
+with no delete channel, so the key
 outlives the listener that announced it — a restarted `opencode` in the
 same tab publishes a new port on its next `session.created`, and until
 then the old one is stale. Dial it before believing it.
@@ -909,27 +873,17 @@ then the old one is stale. Dial it before believing it.
   the tab you attached from. There's no reliable fix from the plugin
   side (a session's `directory` matching your tab's cwd isn't a safe
   enough signal), so this is documented rather than papered over.
-- **gx leader mode misattributes hooks to the first tab, and a quit gx
-  keeps its tab owned** ([grok-build#14](https://github.com/charliek/grok-build/issues/14)).
-  gx's hooks run inside the `gx agent leader` process, not the TUI
-  itself, and that process inherits `ROOST_TAB_ID` from whichever TUI
-  spawned it — so every further gx TUI that attaches to the same leader
-  reports its events against the *first* tab (its `SessionStart` claims
-  that tab), and the second TUI's own tab stays `inactive`, the same
-  shape as the `opencode attach` caveat above. Separately, `SessionEnd`
-  never fires for a leader-resident session, so quitting a leader-backed
-  gx leaves its tab owned at whatever lifecycle it last reported,
-  instead of releasing to `inactive`. Stock grok (leader mode off) is
-  unaffected by either.
 - **grok's Stop gate leaves a residual "finished" window on the *first*
-  blocked fire.** A blocking Stop hook that blocks the very first `Stop`
+  blocked fire.** This and the next two apply only to hooks from a
+  `roost.json` an older release wrote; grok itself reports over OSC
+  7501. A blocking Stop hook that blocks the very first `Stop`
   of a turn shows the tab as `finished` (with a "Turn complete" banner)
   from that fire until the next tool event or the next `Stop` — which,
   once the gate has fired at least once, carries `stopHookActive: true`
   and correctly reads as `working` again. In that gate case the user
-  never sees a second "Turn complete"; instead they see gx's own
+  never sees a second "Turn complete"; instead they see grok's own
   `idle_prompt` banner roughly a minute after the turn actually ended.
-  If the 8-continuation cap is hit, gx forces a stop with no hook fired
+  If the 8-continuation cap is hit, grok forces a stop with no hook fired
   at all, so the tab stays `working` until `idle_prompt` settles it. A
   passive observer — which is all roost's adapter is — cannot close this
   gap without delaying every turn's "Turn complete" by that same minute,
@@ -937,7 +891,7 @@ then the old one is stale. Dial it before believing it.
 - **grok's `agent_error` Notification is deliberately silent.** It fires
   immediately before the `StopFailure` that reports the same failure,
   so banner-ing both would show the same error twice; only the
-  `StopFailure` banner (with gx's `errorDetails` text) reaches the tab.
+  `StopFailure` banner (with grok's `errorDetails` text) reaches the tab.
 - **grok subagents never claim the tab.** A subagent (from
   `spawn_subagent`) runs as its own session id, stamps `subagentType` on
   every event, and never fires its own `SessionStart` — so its reports
@@ -958,10 +912,6 @@ then the old one is stale. Dial it before believing it.
   omitted when unnamed and puts it in the default set, so no config is
   needed there. Claude, grok and cursor already put the session name in
   the title.
-- **gx shares grok's file.** grok and its fork gx read the same
-  `$GROK_HOME`, so one install (`roostctl agent install grok`) wires
-  both binaries at once, and uninstalling `grok` removes the file both
-  share. See [gx](#gx) above for gx-specific behavior.
 - **cursor (and optionally grok) also execute Claude's hook format.** cursor always
   loads `~/.claude/settings.json` (`claudeUserHooks`), and grok can be
   configured to; with Roost's Claude entries installed, both would

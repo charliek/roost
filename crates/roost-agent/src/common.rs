@@ -38,7 +38,7 @@ pub(crate) fn non_empty(value: &str) -> Option<&str> {
 /// A string field read snake_case first, falling back to camelCase when
 /// the snake key is absent or empty.
 ///
-/// grok/gx pay every field it borrows from Claude's vocabulary twice,
+/// grok pays every field it borrows from Claude's vocabulary twice,
 /// once per casing, but not every field is a *pair*: `notification_type`
 /// has no snake_case form at all (camelCase-only), and grok's
 /// `tool_response` is not `toolResponse` under another name — it is a
@@ -65,11 +65,11 @@ pub(crate) fn array_len(payload: &Value, key: &str) -> usize {
 /// `[::1]`, followed by `:` and a decimal port in `1..=65535` and
 /// nothing else — no userinfo, path, query, or fragment.
 ///
-/// Two adapters take a base URL from an agent that announces where its
-/// own control surface listens (grok's `gxRemote`, opencode's
-/// `server_url`), and neither may hand a consumer anything but a
-/// loopback address: the announcement is agent-supplied, and roost
-/// re-publishes it verbatim through `metadata`. Callers filter an
+/// opencode's adapter takes a base URL from the plugin, which announces
+/// where its control surface listens (`server_url`), and may hand a
+/// consumer nothing but a loopback address: the announcement is
+/// agent-supplied, and roost re-publishes it verbatim through
+/// `metadata`. Callers filter an
 /// absent/empty/non-string value with [`non_empty`] first; this only
 /// judges the shape once a non-empty string is in hand.
 pub fn loopback_base_url(value: &str) -> bool {
