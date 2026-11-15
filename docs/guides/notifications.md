@@ -93,6 +93,8 @@ Ownership is normally claimed by a `SessionStart` hook and released by a matchin
 
 An agent's own OSC 7501 record mutes raw OSC the same way while it decides the tab ([program status](agents.md#program-status-osc-7501)), and it ends the same two ways: at a prompt mark, or once the agent's process is gone and the shell has the terminal back. In a shell that prints no prompt marks (`sh`, dash, integration off) the second is the only one, and Roost reads a noted process once a second, so a killed agent's tab takes raw notifications again within about a second ([#519](https://github.com/charliek/roost/issues/519)). A record set aside by `Ctrl-Z` mutes nothing either.
 
+An agent that dies mid-turn — working or waiting on you when its process went — raises one notification of its own under the agent's name when the shell's OSC 133 `D` reports a failure: `exited (3)`, or `killed (SIGKILL)` for a death by signal. Roost's bash and zsh integration put the command's exit status on every `D`. A clean exit, a `Ctrl-Z`, or a shell that reports no status raises nothing ([when an agent dies mid-turn](agents.md#when-a-tab-stays-running)). The banner follows the focus policy like any other.
+
 ## Manual override (`tab set-state`)
 
 `roostctl tab set-state --tab N --state STATE` claims ownership as `manual` (an empty session id), which **supersedes whatever currently owns the tab** — if Claude is mid-turn, its subsequent hook events are dropped until its next `SessionStart`. That's intentional: running the command means you're taking the wheel.

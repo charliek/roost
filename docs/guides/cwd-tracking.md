@@ -166,6 +166,13 @@ it. Default: `cwd,title,marks,prompt,ssh-env`.
 - `cwd` — emit OSC 7 (the working directory).
 - `title` — set the tab title to the cwd.
 - `marks` — emit OSC 133 command marks (these drive the tab's run-state dot).
+  The `D` mark carries the command's exit status, which is how Roost tells
+  an agent that crashed from one that exited cleanly. In bash it is read
+  from `$?` by `__roost_marks`, which Roost puts first in `PROMPT_COMMAND`
+  and which hands `$?` on unchanged; a function you prepend to
+  `PROMPT_COMMAND` *after* the integration has loaded runs before it, so
+  it must hand `$?` on too (`local s=$?; …; return $s`). zsh gives every
+  `precmd` hook the command's status, so order does not matter there.
 - `prompt` — set a default prompt (only when you haven't set one).
 - `ssh-env` — wrap `ssh` so it adds
   `-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION FORCE_HYPERLINK"`

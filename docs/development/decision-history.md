@@ -264,7 +264,11 @@ its group is no longer in front, and, for an owner with no stamp, at an
 keeps ownership and shows suspended. AD-3 stands: there is still no
 TTL, the process is read only when something happens on the tab, and
 every reading that cannot decide keeps the owner. `manual` and `legacy`
-owners are untouched. See
+owners are untouched. An end that takes an agent mid-turn raises one
+banner (`exited (3)`, `killed (SIGKILL)`) when the exit code on the
+shell's `OSC 133 ; D` says it failed, and none without a code, since
+nothing then tells a crash from a normal exit; a stop's code is never
+an exit's. See
 [`tab.agent_report`](../reference/ipc.md#how-ownership-ends-without-a-report).)
 
 Raw-OSC suppression (dropping OSC 9/99/777 while a live agent owns the

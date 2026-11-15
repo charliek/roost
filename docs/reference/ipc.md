@@ -343,7 +343,9 @@ second while the stamp is held.
 Nothing ends on time: the once-a-second read only gathers evidence. A
 record whose program was never stamped (one behind `tmux` or `ssh`, or
 reported with the shell itself in front) ends only at a prompt mark, as
-before.
+before. An end that takes a live record can raise the
+[exit banner](#how-ownership-ends-without-a-report), under the record's
+app.
 
 ### `Tab.process` — the agent's process
 
@@ -1752,6 +1754,23 @@ process, a failed read, no PTY — keeps today's behaviour. A release by
 either rule changes nothing about attention: a pending notification
 stays. A late `preserve` or `release` from the dead agent's session is
 then refused as `not_owner`.
+
+**The exit banner.** An end by the second rule that takes an agent
+which was `working` or `waiting` raises one
+[`notification.fired`](#events), unless the tab is being watched, when
+the shell reported a failing exit code for it. The code is the one on
+the OSC 133 `D;<code>` the shell printed as it took the terminal back
+from the stamped process (Roost's bash and zsh integration send `$?`
+there), whether that `D` was read before the end or just after it; a
+`D` printed later, for another command, never counts. `title` is the
+agent's name (`Claude Code`, `Codex`, the `source` or 7501 `app`
+otherwise; the tab's title when none), and `body` is `exited (<code>)`
+for a code from 1 to 128, or `killed (<signal>)` above 128, the signal
+named as the host running the tab numbers it (`killed (SIGKILL)` for
+137), or `killed (signal <n>)` when it has no name. A code of 0, a stop
+(`Ctrl-Z`, whose `D` reports 128 + `SIGTSTP`), an agent killed while
+stopped or running in the background, and a shell that sends no code
+raise none.
 
 #### Guarded reports
 

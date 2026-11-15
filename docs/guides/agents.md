@@ -547,12 +547,35 @@ and bash: zsh's
 `preexec`/`precmd` hooks fire the `C` and `D` marks unconditionally;
 bash's `PROMPT_COMMAND` fires `D` on every version, but the `C`
 (command-start) mark needs bash ≥ 4.4 — `PS0` is silently ignored on
-older bash, including macOS's stock `/bin/bash` 3.2. A shell with no
+older bash, including macOS's stock `/bin/bash` 3.2. Every `D` carries
+the command's exit status (`D;<status>`), on every bash and zsh
+version. A shell with no
 prompt marks at all — dash, plain `sh`, or bash/zsh with the
 integration disabled — relies on the agent's process: a noted process
 that is gone clears the tab within about a second. An agent Roost
 noted no process for (one behind `tmux` or `ssh`) can stay stuck there;
 the manual clear below is the way out.
+
+**When an agent dies mid-turn.** If Roost ends an agent this way while
+it was working or waiting on you, and the shell's `D` says it failed,
+Roost raises one notification under the agent's name:
+
+- `exited (3)` — it exited with that status (1 to 128);
+- `killed (SIGKILL)` — it died of a signal (a status above 128 is 128
+  plus the signal, named as the machine running the tab numbers it; one
+  with no name reads `killed (signal N)`).
+
+The status is the one the shell's `D` reports as it takes the terminal
+back from the agent, so a later command's status is never taken for
+the agent's. Like any notification, the banner is dropped while you are
+looking at the tab. Nothing is raised when the agent exited 0, was idle
+at its own prompt, ended with its own `SessionEnd`, or died in the
+background (`bg`) where no `D` reports it. A `Ctrl-Z` raises nothing
+either: the `D` it causes reports 128 + `SIGTSTP` (148 on Linux, 146 on
+macOS), a stop rather than an exit, and an agent killed while stopped
+(`kill -9 %1`) has no `D` of its own. A shell that sends no status —
+`sh`, dash, the integration off, or a `D` with no code — gives no
+banner: Roost can't tell a crash from a normal exit there.
 
 **Manual clear.** From any shell:
 
@@ -588,7 +611,7 @@ reading is the spec's:
 
 | The mark | What it does |
 |---|---|
-| `A`, `P`, `N` — a prompt starting (with `k=i` or no `k`); `B`, `I` — input starting; `D`, `D;<exit code>` — a command ending | the shell is at a prompt: an agent's lifecycle drops to `inactive` and its `working`/`blocked` records end; ownership stays as a label unless the agent is [gone](#when-a-tab-stays-running), and what a stopped or backgrounded agent had is set aside until it runs again |
+| `A`, `P`, `N` — a prompt starting (with `k=i` or no `k`); `B`, `I` — input starting; `D`, `D;<exit code>` — a command ending | the shell is at a prompt: an agent's lifecycle drops to `inactive` and its `working`/`blocked` records end; ownership stays as a label unless the agent is [gone](#when-a-tab-stays-running), and what a stopped or backgrounded agent had is set aside until it runs again. The exit code of the `D` that takes the terminal back from an agent decides whether its end raises a [banner](#when-a-tab-stays-running) |
 | `C`, `C;<options>` — a command starting | the shell has a foreground process; the agent's lifecycle stays |
 | `A;k=s`, `A;k=r`, `A;k=c`, and `P`/`N` with those — a secondary, right or continuation prompt | nothing |
 | a letter not followed by `;` or the end (`Axyz`, `D0`), `L`, an empty or unknown body | nothing |
