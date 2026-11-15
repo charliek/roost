@@ -44,6 +44,11 @@ use serde_json::Value;
 use crate::env_delivery::{self, is_roost_claude_plugin_dir, is_roost_opencode_plugin};
 
 pub const CLAUDE_PLUGIN_DIRS: &str = "CLAUDE_CODE_PLUGIN_DIRS";
+/// The Claude plugin folder this tab was handed in
+/// [`CLAUDE_PLUGIN_DIRS`], and only that: the shell integration puts it
+/// back after a startup file replaced the list. Unset when Roost handed
+/// none (off, or a policy skip), so nothing is put back then.
+pub const ROOST_CLAUDE_PLUGIN_DIR: &str = "ROOST_CLAUDE_PLUGIN_DIR";
 pub const OPENCODE_CONFIG_CONTENT: &str = "OPENCODE_CONFIG_CONTENT";
 
 /// The file, in the integration directory, that holds the last Claude
@@ -470,6 +475,11 @@ fn deliver(
         plugin_dir,
     );
     set(env, CLAUDE_PLUGIN_DIRS, merged);
+    set(
+        env,
+        ROOST_CLAUDE_PLUGIN_DIR,
+        plugin_dir.map(|dir| dir.as_os_str().to_os_string()),
+    );
     match merge_opencode_content(
         env.get(OsStr::new(OPENCODE_CONFIG_CONTENT))
             .map(OsString::as_os_str),
@@ -1042,6 +1052,34 @@ mod tests {
         let opencode: Value = serde_json::from_str(&env[OPENCODE_CONFIG_CONTENT]).unwrap();
         assert_eq!(opencode["plugin"][0], "mine");
         assert!(names_roost_plugin(opencode["plugin"][1].as_str().unwrap()));
+        assert_eq!(
+            env.get(ROOST_CLAUDE_PLUGIN_DIR).map(String::as_str),
+            Some(dirs[1]),
+            "the shell integration's copy names exactly Roost's entry"
+        );
+    }
+
+    /// No folder handed over is no folder named for the shell integration
+    /// to put back, whatever an enclosing Roost exported.
+    #[test]
+    fn a_tab_handed_no_claude_folder_names_none_to_restore() {
+        let inherited = [(ROOST_CLAUDE_PLUGIN_DIR, OLD_ROOST_DIR)];
+        let world = world(ClaudePolicy::Allowed);
+        for config in ["agent-integration = off", "agent-integration = -claude"] {
+            let env = world.tab(config, &inherited);
+            assert_eq!(env.get(ROOST_CLAUDE_PLUGIN_DIR), None, "{config}");
+        }
+        let blocked = self::world(ClaudePolicy::Blocked("probe".into()));
+        assert_eq!(
+            blocked.tab("", &inherited).get(ROOST_CLAUDE_PLUGIN_DIR),
+            None
+        );
+        let mut env: BTreeMap<OsString, OsString> =
+            [(os(ROOST_CLAUDE_PLUGIN_DIR), os(OLD_ROOST_DIR))]
+                .into_iter()
+                .collect();
+        strip(&mut env);
+        assert!(env.is_empty());
     }
 
     #[test]

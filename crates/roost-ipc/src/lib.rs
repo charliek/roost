@@ -29,6 +29,8 @@
 //!   its own IPC handler reads (plan 063 §D1), in this crate because
 //!   `roost-engine` cannot see `roost-ui-model`.
 //! * [`paths`] — `BundleProfile` path resolution.
+//! * [`cli_link`] — the `roostctl` symlink for terminals outside Roost,
+//!   and the shape test for an app bundle's `bin` directory.
 //! * [`old_session`] — finding a session still on a path an older build
 //!   used, for the upgrade across the session socket's move.
 //! * [`socket_state`] — the one shared answer to "is a listener alive
@@ -73,6 +75,7 @@
 
 pub mod agent;
 pub mod bootstrap;
+pub mod cli_link;
 pub mod codes;
 pub mod dataframe;
 pub mod format_chars;

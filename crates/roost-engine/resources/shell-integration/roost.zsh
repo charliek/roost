@@ -10,7 +10,14 @@
 # prompt, and reports cwd over SSH (where the native read can't reach).
 #
 # Feature flags via $ROOST_SHELL_FEATURES (comma list; `no-<feature>`
-# disables): cwd, title, marks, prompt, ssh-env.
+# disables): cwd, title, marks, prompt, ssh-env, path.
+#
+# `path` runs once, at the first prompt, after your startup files: it puts
+# the app bundle's `bin` that Roost put first on PATH back in front (a login
+# shell's path_helper and many rc files move or reset PATH), and puts
+# Roost's Claude plugin folder back into CLAUDE_CODE_PLUGIN_DIRS if a
+# startup file replaced the list. It only restores what Roost handed this
+# tab ($ROOST_ROOSTCTL, $ROOST_CLAUDE_PLUGIN_DIR).
 #
 # `ssh-env` adds `-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION FORCE_HYPERLINK"`
 # to every `ssh` invocation so modern TUIs (opencode, neovim with
@@ -29,7 +36,7 @@
 typeset -g _ROOST_ZSH_LOADED=1
 
 _roost_feature() {
-  case ",${ROOST_SHELL_FEATURES:-cwd,title,marks,prompt,ssh-env}," in
+  case ",${ROOST_SHELL_FEATURES:-cwd,title,marks,prompt,ssh-env,path}," in
     (*",no-$1,"*) return 1 ;;
     (*) return 0 ;;
   esac
@@ -116,7 +123,41 @@ if (( ! $+functions[__roost_mark_d] )); then
 __roost_mark_d() { _roost_feature marks && printf '\033]133;D\033\\'; }
 fi
 
+if (( ! $+functions[__roost_paths] )); then
+__roost_paths() {
+  _roost_feature path || return 0
+  local dir app p
+  if [[ -n "${ROOST_ROOSTCTL:-}" ]]; then
+    dir=${ROOST_ROOSTCTL%/*}
+    app=${dir%/Contents/Resources/bin}
+    if [[ $app != "$dir" && ${app##*/} == ?*.app && ${PATH%%:*} != "$dir" ]]; then
+      p=":$PATH:"
+      while [[ $p == *":$dir:"* ]]; do p=${p/":$dir:"/:}; done
+      p=${p#:}
+      p=${p%:}
+      export PATH="$dir${p:+:$p}"
+    fi
+  fi
+  if [[ -n "${ROOST_CLAUDE_PLUGIN_DIR:-}" &&
+    ":${CLAUDE_CODE_PLUGIN_DIRS:-}:" != *":$ROOST_CLAUDE_PLUGIN_DIR:"* ]]; then
+    export CLAUDE_CODE_PLUGIN_DIRS="${CLAUDE_CODE_PLUGIN_DIRS:+$CLAUDE_CODE_PLUGIN_DIRS:}$ROOST_CLAUDE_PLUGIN_DIR"
+  fi
+}
+fi
+
 autoload -Uz add-zsh-hook
+# The ZDOTDIR shim loads this file at the first prompt, after every
+# startup file, and a hook added inside precmd waits for the next one; a
+# manual `source` from .zshrc runs before the rest of it.
+if [[ -n "${_roost_first_prompt:-}" ]]; then
+  __roost_paths
+else
+  __roost_paths_once() {
+    add-zsh-hook -d precmd __roost_paths_once
+    __roost_paths
+  }
+  add-zsh-hook precmd __roost_paths_once
+fi
 add-zsh-hook precmd __roost_osc7
 add-zsh-hook precmd __roost_title
 add-zsh-hook preexec __roost_mark_c

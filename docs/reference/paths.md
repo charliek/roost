@@ -517,13 +517,15 @@ own tabs and `roost-session`'s; Linux tabs keep the locale they inherit.
 |-----------------|----------------------------------------------------------------------|
 | `ROOST_TAB_ID`  | Integer tab id (used by `roostctl` to route notifications). Gate any shell-integration extension you write on this. |
 | `ROOST_SOCKET`  | Absolute path to the Unix domain socket (`roostctl` auto-detects it from this). |
+| `ROOST_ROOSTCTL` | Absolute path to the `roostctl` of the Roost serving the tab; unset when it has none. When that `roostctl` is in its app bundle, the bundle's `Contents/Resources/bin` is also put first on the tab's `PATH`, and a bundle `bin` an enclosing Roost put there is taken out. See [Where `roostctl` lives](cli.md#where-roostctl-lives). |
+| `ROOST_CLAUDE_PLUGIN_DIR` | The Claude plugin folder Roost added to `CLAUDE_CODE_PLUGIN_DIRS` for this tab, and unset when it added none. The shell integration's [`path` feature](../guides/cwd-tracking.md#feature-flags) puts it back if a startup file replaced the list. |
 
 ### Shell integration
 
 | Variable                  | Value                              | Purpose                                                 |
 |---------------------------|------------------------------------|---------------------------------------------------------|
 | `ROOST_SHELL_INTEGRATION` | `1`                                | Marker that the shell-integration env contract is in effect. |
-| `ROOST_SHELL_FEATURES`    | `cwd,title,marks,prompt,ssh-env`*  | Comma list of features the shipped scripts enable. Prefix any feature with `no-` to disable it (e.g. `cwd,title,marks,prompt,no-ssh-env`). See [Feature flags](../guides/cwd-tracking.md#feature-flags). |
+| `ROOST_SHELL_FEATURES`    | `cwd,title,marks,prompt,ssh-env,path`*  | Comma list of features the shipped scripts enable. Prefix any feature with `no-` to disable it (e.g. `cwd,title,marks,prompt,no-ssh-env`). See [Feature flags](../guides/cwd-tracking.md#feature-flags). |
 | `ROOST_RESOURCES_DIR`     | absolute path                      | Directory holding the shipped `shell-integration/` scripts. Source `$ROOST_RESOURCES_DIR/shell-integration/roost.bash` (or `.zsh`) to load them manually. |
 
 \* Default only when `ROOST_SHELL_FEATURES` is unset in the inherited

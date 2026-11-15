@@ -397,7 +397,8 @@ pub struct LocatedBin {
 }
 
 /// First hit *this user can actually run* wins: `ROOST_SESSION_BIN`,
-/// then a sibling of `caller_exe`, then `PATH`.
+/// then a sibling of `caller_exe` (as spelled, then as resolved through
+/// symlinks), then `PATH` minus any app bundle's `bin`.
 ///
 /// `caller_exe` is whichever program is climbing the ladder — the UI's
 /// own connect path and `roostctl session start` both do, and a packaged
@@ -439,7 +440,20 @@ pub fn locate_session_binary(
     let sibling = caller_exe
         .and_then(Path::parent)
         .map(|dir| dir.join(BIN_NAME));
-    if let Some(path) = sibling.clone().filter(|p| is_executable_file(p)) {
+    // The caller as `PATH` spelled it first, then where it really lives:
+    // a `roostctl` reached through the link `roostctl cli install` makes
+    // has the bundle's daemon beside its target, not beside the link.
+    let resolved_sibling = || {
+        std::fs::canonicalize(caller_exe?)
+            .ok()?
+            .parent()
+            .map(|dir| dir.join(BIN_NAME))
+    };
+    if let Some(path) = sibling
+        .clone()
+        .filter(|p| is_executable_file(p))
+        .or_else(|| resolved_sibling().filter(|p| is_executable_file(p)))
+    {
         return Ok(LocatedBin {
             path,
             origin: BinOrigin::Sibling,
@@ -455,6 +469,14 @@ pub fn locate_session_binary(
         // that resolves against our cwd. Skip it — an implicit
         // cwd-relative daemon is not something to start.
         if dir.as_os_str().is_empty() {
+            continue;
+        }
+        // A bundle's `bin` on `PATH` is there because a Roost tab put it
+        // first; its daemon belongs to that bundle's own binaries, which
+        // find it as a sibling. A different build climbing this rung from
+        // inside such a tab — a dev `roostctl` in a `Roost.app` tab —
+        // would otherwise start the other Roost's daemon.
+        if crate::cli_link::is_bundle_bin_dir(dir) {
             continue;
         }
         let candidate = dir.join(BIN_NAME);
@@ -1241,6 +1263,57 @@ mod tests {
             .expect("the bundled roostctl must find its sibling symlink");
         assert_eq!(found.origin, BinOrigin::Sibling);
         assert_eq!(found.path, link);
+    }
+
+    fn executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// `roostctl cli install`'s link: `/usr/local/bin/roostctl` →
+    /// the bundle's. `session start` run through it must still find the
+    /// bundle's daemon, with no `PATH` rung to fall back on.
+    #[test]
+    fn the_sibling_rung_looks_beside_a_linked_callers_target() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let bin = root.path().join("Roost.app/Contents/Resources/bin");
+        executable(&bin.join("roostctl"));
+        executable(&bin.join(BIN_NAME));
+        let links = root.path().join("usr-local-bin");
+        std::fs::create_dir_all(&links).expect("links");
+        std::os::unix::fs::symlink(bin.join("roostctl"), links.join("roostctl")).expect("link");
+
+        let found = locate_session_binary(None, Some(&links.join("roostctl")), None)
+            .expect("the linked roostctl must find the bundle's daemon");
+        assert_eq!(found.origin, BinOrigin::Sibling);
+        assert_eq!(
+            std::fs::canonicalize(found.path).expect("canonical"),
+            std::fs::canonicalize(bin.join(BIN_NAME)).expect("canonical")
+        );
+    }
+
+    /// Inside a `Roost.app` tab the bundle's `bin` is first on `PATH`; a
+    /// build with no daemon beside it must not pick that bundle's up.
+    #[test]
+    fn the_path_rung_skips_a_bundles_bin_dir() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let bundle_bin = root.path().join("Roost.app/Contents/Resources/bin");
+        executable(&bundle_bin.join(BIN_NAME));
+        let installed = root.path().join("usr/bin");
+        executable(&installed.join(BIN_NAME));
+        let dev = root.path().join("target/debug/roostctl");
+        executable(&dev);
+        let path = std::env::join_paths([&bundle_bin, &installed]).expect("join");
+
+        let found = locate_session_binary(None, Some(&dev), Some(&path)).expect("found");
+        assert_eq!(found.origin, BinOrigin::Path);
+        assert_eq!(found.path, installed.join(BIN_NAME));
+
+        let only_bundle = std::env::join_paths([&bundle_bin]).expect("join");
+        locate_session_binary(None, Some(&dev), Some(&only_bundle))
+            .expect_err("a bundle's daemon is not on PATH for another build");
     }
 
     #[test]

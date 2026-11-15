@@ -7,6 +7,8 @@ description: "Drive Roost, the desktop terminal multiplexer for coding agents, t
 
 Roost is a desktop terminal multiplexer for coding agents: a sidebar of projects, tabs in each project, one terminal per tab. `roostctl` talks to the running Roost over a local socket. Use it to open tabs, send input, read a tab's screen, wait on a tab's state, and notify the user.
 
+If `command -v roostctl` finds nothing, run `"$ROOST_ROOSTCTL"` wherever this skill says `roostctl`; if that is unset too, `roostctl` is not installed where this shell runs (a tab on a remote host, for example).
+
 Before any other command, check that a Roost answers:
 
 ```bash
