@@ -2421,9 +2421,9 @@ impl Workspace {
             .collect()
     }
 
-    /// Whether any tab holds a stamp, so the sampler's tick has something
-    /// to read.
-    pub(crate) fn holds_process_stamps(&self) -> bool {
+    /// Whether the sampler's tick has something to read: a tab holds a
+    /// stamp, or owes a look ([`ProcessAxis::ticks`]).
+    pub(crate) fn wants_process_ticks(&self) -> bool {
         let inner = self.inner.lock().unwrap();
         inner.tabs.values().any(|row| row.process.ticks())
     }
@@ -8948,7 +8948,7 @@ mod tests {
                 }
             )));
             assert!(raw_osc_raises(&ws, tid), "a raw notification lands again");
-            assert!(!ws.holds_process_stamps());
+            assert!(!ws.wants_process_ticks());
         }
 
         /// E4's core: a Ctrl-Z of a 7501 agent with no hooks keeps its
@@ -9012,7 +9012,7 @@ mod tests {
                 .map(|request| request.tab_id)
                 .collect();
             assert_eq!(ticked, vec![stamped], "not {plain} or {unstamped}");
-            assert!(ws.holds_process_stamps());
+            assert!(ws.wants_process_ticks());
         }
 
         /// A session's viewer coming or going asks a stamped tab for a
@@ -9084,7 +9084,7 @@ mod tests {
                 ws.take_process_requests(true).is_empty(),
                 "the tick never looks, whatever runs in front"
             );
-            assert!(!ws.holds_process_stamps());
+            assert!(!ws.wants_process_ticks());
 
             let mut rx = ws.subscribe();
             ws.focus_tab(other).unwrap();
@@ -9105,7 +9105,7 @@ mod tests {
                 WorkspaceEvent::AgentChanged { process: Some(process), .. }
                     if process.agent == "cursor"
             )));
-            assert!(ws.holds_process_stamps());
+            assert!(ws.wants_process_ticks());
             assert_eq!(
                 ws.take_process_requests(true)
                     .iter()
@@ -9122,7 +9122,7 @@ mod tests {
             assert!(drain(&mut rx)
                 .iter()
                 .any(|event| matches!(event, WorkspaceEvent::AgentChanged { process: None, .. })));
-            assert!(!ws.holds_process_stamps());
+            assert!(!ws.wants_process_ticks());
         }
 
         /// A session's viewer coming or going is its focus: on a tab

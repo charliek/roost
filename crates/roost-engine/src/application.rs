@@ -441,14 +441,15 @@ impl LocalClient {
 
 /// How often the sampler reads every tab that holds a stamp (#519): in a
 /// shell that prints no prompt marks, nothing else says a stamped agent
-/// died. A tick only reads; what it finds ends something only on the
+/// died. It also takes the second look a `C` owes when its first named
+/// nothing. A tick only reads; what it finds ends something only on the
 /// evidence a mark's sample would need.
 const PROCESS_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// [`LocalClient::watch_processes`]'s sampler: every request the tabs'
 /// process layers made since it last woke, read off the lock, applied
-/// under it, and, every [`PROCESS_TICK`] while any tab holds a stamp,
-/// every such tab. It sleeps on its wake while none does. A sample of a
+/// under it, and, every [`PROCESS_TICK`] while any tab holds a stamp or
+/// owes a look, every such tab. It sleeps on its wake while none does. A sample of a
 /// spawn the tab no longer has is dropped, as a stale password report is.
 async fn sample_processes(
     workspace: Weak<Workspace>,
@@ -478,7 +479,7 @@ async fn sample_processes(
             sample(&workspace, &supervisor, requests).await;
         }
         next_tick = match next_tick {
-            _ if !workspace.holds_process_stamps() => None,
+            _ if !workspace.wants_process_ticks() => None,
             Some(at) if !tick => Some(at),
             _ => Some(tokio::time::Instant::now() + PROCESS_TICK),
         };

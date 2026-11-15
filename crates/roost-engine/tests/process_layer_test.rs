@@ -454,6 +454,43 @@ async fn an_agent_named_by_its_process_shows_at_blur_and_goes_with_it() {
         .await;
 }
 
+/// A `C` printed before the command forks, as bash's `PS0` and zsh's
+/// `preexec` print it, asks for a look that can find the shell, or its
+/// fork, still in front — on macOS it nearly always does. The look is
+/// taken again on the next tick, which names the agent. Here the job is
+/// `sh` until it execs a cursor-agent a moment later, so the `C`'s own
+/// look always misses; nothing focuses or blurs the tab.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_the_c_marks_look_missed_is_named_on_the_next_tick() {
+    let Some(rig) = Rig::new() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let Some(agent) = named_sleeper(dir.path(), "cursor-agent") else {
+        eprintln!("skipping the C-mark identity test: no way to run a cursor-agent here");
+        return;
+    };
+    let (tab, shell) = rig.bash_tab().await;
+
+    rig.type_line(
+        tab,
+        &format!(r#"printf '\033]133;C\007'; sh -c "sleep 0.3; exec {agent}""#),
+    )
+    .await;
+    wait_until("the agent leads the terminal, exec'd", || {
+        pid_of_job(shell).is_some_and(|job| comm_of(job) == "cursor-agent")
+    })
+    .await;
+    let listed = rig
+        .wait(tab, "the agent named", |tab| tab.process.is_some())
+        .await;
+    let process = listed.process.unwrap();
+    assert_eq!(process.agent, "cursor");
+    assert_eq!(Some(process.pid), pid_of_job(shell), "the job in front");
+
+    signal(process.pid, libc::SIGKILL);
+    rig.wait(tab, "the agent gone", |tab| tab.process.is_none())
+        .await;
+}
+
 /// An agent inside tmux claims while the tmux client has the terminal,
 /// so nothing is stamped. A detach ends the client and the shell takes
 /// the terminal back, with the agent alive behind the tmux server: the

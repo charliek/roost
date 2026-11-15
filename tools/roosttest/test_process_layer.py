@@ -613,6 +613,38 @@ def test_an_agent_named_by_its_process_alone_shows_running_and_goes_with_it(lane
         )
 
 
+def bash_prints_c() -> bool:
+    """Whether the tabs' bash sends `C`: `PS0` needs bash 4.4."""
+    out = subprocess.run(
+        [BARE_SHELL_ARGV[0], "-c", 'echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"'],
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    return tuple(int(part) for part in out) >= (4, 4)
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+def test_an_agent_started_at_the_prompt_is_named_with_no_focus_change(lane, shell, tmp_path):
+    """E13 at a command's start: the shell's `C` asks for a look, so an
+    agent no hook or record names is named while its tab keeps the focus.
+    The shell prints the `C` before it forks the command, and on macOS
+    that look nearly always finds the shell; the next tick looks again."""
+    if shell == "bash" and not bash_prints_c():
+        pytest.skip("this bash is older than 4.4 and prints no C (macOS's /bin/bash)")
+    command = named_agent(str(tmp_path), "cursor-agent")
+    tab, shell_pid = lane.integrated_tab(shell)
+    lane.client.focus(tab)
+    job = lane.in_front(tab, shell_pid, command)
+
+    listed = lane.wait(tab, "the agent named", lambda t: "process" in t)
+    process = listed["process"]
+    assert (process["agent"], int(process["pid"])) == ("cursor", job), process
+    assert listed.get("ownership") is None, listed
+
+    os.kill(job, signal.SIGKILL)
+    lane.wait(tab, "the agent gone", lambda t: "process" not in t)
+
+
 def test_a_7501_agent_that_clears_as_it_stops_reads_suspended_by_its_process(lane, tmp_path):
     """Codex clears its own OSC 7501 status as it stops, so a Ctrl-Z
     leaves its records nothing to set aside; its process's name still

@@ -62,6 +62,25 @@ pub(crate) struct ProcessAxis {
     /// group left; a sample asked for before it may have read the terminal
     /// before it moved, and would undo all three, so it is read again.
     marks: u64,
+    /// Counts every OSC 133 mark, so a look's answer knows whether a mark
+    /// came after it was asked for.
+    mark_seq: u64,
+    /// The look a `C` asked for. A shell prints its `C` before it forks
+    /// the command (bash's `PS0`, zsh's `preexec`), and on macOS that
+    /// look finds the shell, or its fork not yet exec'd, nearly every
+    /// time. A look that names nothing is taken once more, on the next
+    /// tick, unless a mark comes first: the command is then over. It
+    /// samples; nothing ends on it.
+    command_look: Option<CommandLook>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandLook {
+    /// The look the `C` numbered so by [`ProcessAxis::mark_seq`] asked
+    /// for is due, or being read.
+    Asked(u64),
+    /// It named nothing: the next tick looks again.
+    Again,
 }
 
 /// Records that stopped deciding by their program's own word — a
@@ -311,6 +330,8 @@ pub(crate) struct SampleRequest {
     records_seq: u64,
     /// [`ProcessAxis::marks`] when the sample was asked for.
     marks: u64,
+    /// [`ProcessAxis::mark_seq`] when the sample was asked for.
+    mark_seq: u64,
     /// Read the leader in front: a layer wants its stamp, or `discover`.
     pub(crate) leader_wanted: bool,
     /// Look for an agent in front to name.
@@ -481,18 +502,23 @@ impl ProcessAxis {
     }
 
     /// Whether the tick reads this tab: it holds a stamp, and with it
-    /// whatever it parked. A tab that holds none is never looked at on a
-    /// tick, whatever runs in front of it; nor is an unshown identity,
-    /// which the mark that handed it over asked a read for.
+    /// whatever it parked, or a `C`'s look named nothing and no mark has
+    /// followed ([`Self::command_look`]). A tab otherwise is never looked
+    /// at on a tick, whatever runs in front of it; nor is an unshown
+    /// identity, which the mark that handed it over asked a read for.
     pub(crate) fn ticks(&self) -> bool {
         self.owner.stamp().is_some()
             || self.records.stamp().is_some()
             || (self.identity_shown && self.identity.stamp().is_some())
+            || self.command_look == Some(CommandLook::Again)
     }
 
     /// Ask for the tick's sample, when [`Self::ticks`]. Answers whether it
     /// asked.
     pub(crate) fn request_tick(&mut self) -> bool {
+        if self.command_look == Some(CommandLook::Again) {
+            self.discover = true;
+        }
         self.due |= self.ticks();
         self.ticks()
     }
@@ -580,6 +606,8 @@ impl ProcessAxis {
         agent: &mut AgentTabState,
         fg: Foreground,
     ) -> Option<Banner> {
+        self.mark_seq += 1;
+        self.command_look = None;
         let exit_code = match mark {
             PromptMark::OutputStart => {
                 self.exit_pending = None;
@@ -589,7 +617,9 @@ impl ProcessAxis {
                 if !self.identity_shown && self.identity.stamp().is_some() {
                     self.identity.restart(Follow::Off);
                 }
-                self.request_look(agent);
+                if self.request_look(agent) && self.discover {
+                    self.command_look = Some(CommandLook::Asked(self.mark_seq));
+                }
                 return None;
             }
             PromptMark::CommandEnd { exit_code } => exit_code,
@@ -687,6 +717,13 @@ impl ProcessAxis {
             return None;
         }
         let discover = std::mem::take(&mut self.discover) && self.discoverable(agent);
+        match self.command_look {
+            // The tick's look, the last one owed.
+            Some(CommandLook::Again) if discover => self.command_look = None,
+            // Something follows the tab or owns it now: nothing to name.
+            Some(_) if !discover => self.command_look = None,
+            _ => {}
+        }
         let leader_wanted = discover
             || self.owner.follow == Follow::Wanted
             || self.records.follow == Follow::Wanted;
@@ -713,6 +750,7 @@ impl ProcessAxis {
             identity_epoch: self.identity.epoch,
             records_seq: records.seq(),
             marks: self.marks,
+            mark_seq: self.mark_seq,
             leader_wanted,
             discover,
             stamps,
@@ -859,10 +897,14 @@ impl ProcessAxis {
         if self.identity.follow == Follow::Unstamped {
             self.identity.restart(Follow::Off);
         }
-        if !request.discover
-            || request.identity_epoch != self.identity.epoch
-            || !self.discoverable(agent)
-        {
+        if !request.discover {
+            return;
+        }
+        let commands_look = self.command_look == Some(CommandLook::Asked(request.mark_seq));
+        if commands_look {
+            self.command_look = None;
+        }
+        if request.identity_epoch != self.identity.epoch || !self.discoverable(agent) {
             return;
         }
         if let Some(leader) = sample
@@ -874,6 +916,8 @@ impl ProcessAxis {
                 .stamp_with(leader, sample.incarnation, request.records_seq, now);
             self.identity_shown = true;
             ended.named = leader.agent;
+        } else if commands_look {
+            self.command_look = Some(CommandLook::Again);
         }
     }
 
@@ -2386,6 +2430,118 @@ mod tests {
         let mut tab = Tab::new();
         tab.mark(PromptMark::OutputStart, Foreground::Unknown);
         assert!(tab.request().discover);
+    }
+
+    /// What a `C`'s look reads on macOS: the shell prints the `C` before
+    /// it forks the command, so the shell is still in front.
+    fn the_shell_before_its_fork() -> ProcessSample {
+        sample(Foreground::Shell, None, Liveness::Running)
+    }
+
+    fn command_end() -> PromptMark {
+        PromptMark::CommandEnd { exit_code: Some(0) }
+    }
+
+    #[test]
+    fn a_c_marks_look_that_names_nothing_is_taken_again_on_the_next_tick() {
+        let mut tab = Tab::new();
+        tab.mark(PromptMark::OutputStart, Foreground::Unknown);
+        tab.sample(&the_shell_before_its_fork());
+        assert_eq!(tab.process(), None);
+        assert!(!tab.axis.is_due(), "not before the tick");
+        assert!(tab.axis.ticks(), "the next tick looks again");
+
+        assert!(tab.axis.request_tick());
+        let request = tab.request();
+        assert!(request.discover && request.leader_wanted);
+        tab.apply(
+            &request,
+            &named(Foreground::Group(700), Some("cursor"), Liveness::Running),
+        );
+        assert_eq!(
+            tab.process().map(|process| process.agent),
+            Some("cursor".to_owned())
+        );
+    }
+
+    /// The second look is the last: a command that is no agent costs one
+    /// more read, and the tick then leaves the tab alone.
+    #[test]
+    fn a_c_marks_look_is_taken_again_only_once() {
+        let mut tab = Tab::new();
+        tab.mark(PromptMark::OutputStart, Foreground::Unknown);
+        tab.sample(&the_shell_before_its_fork());
+        assert!(tab.axis.request_tick());
+        tab.sample(&named(Foreground::Group(700), None, Liveness::Running));
+        assert!(!tab.axis.ticks());
+        assert!(!tab.axis.request_tick());
+        assert!(!tab.axis.is_due());
+    }
+
+    /// A mark after the `C` says the command is over, so no second look is
+    /// owed — nor when the mark lands while the first is being read.
+    #[test]
+    fn a_mark_after_the_c_drops_its_second_look() {
+        let mut tab = Tab::new();
+        tab.mark(PromptMark::OutputStart, Foreground::Unknown);
+        tab.sample(&the_shell_before_its_fork());
+        tab.mark(command_end(), Foreground::Shell);
+        assert!(!tab.axis.ticks());
+
+        let mut tab = Tab::new();
+        tab.mark(PromptMark::OutputStart, Foreground::Unknown);
+        let request = tab.request();
+        tab.mark(command_end(), Foreground::Shell);
+        tab.apply(&request, &the_shell_before_its_fork());
+        assert!(!tab.axis.ticks());
+    }
+
+    /// A tab at its prompt owes no look, and one a focus looked at in vain
+    /// owes no second: only a `C`'s look is taken again.
+    #[test]
+    fn only_a_c_marks_look_is_taken_again() {
+        let mut tab = Tab::new();
+        tab.mark(command_end(), Foreground::Shell);
+        tab.mark(PromptMark::PromptStart, Foreground::Shell);
+        assert!(!tab.axis.is_due());
+        assert!(!tab.axis.ticks());
+
+        assert!(tab.look());
+        tab.sample(&the_shell_before_its_fork());
+        assert!(!tab.axis.ticks());
+    }
+
+    /// A `C` while the last command's look is still being read owes its
+    /// own second look: that answer is not this command's.
+    #[test]
+    fn each_c_owes_its_own_second_look() {
+        let mut tab = Tab::new();
+        tab.mark(PromptMark::OutputStart, Foreground::Unknown);
+        let first = tab.request();
+        tab.mark(command_end(), Foreground::Shell);
+        tab.mark(PromptMark::OutputStart, Foreground::Unknown);
+        tab.apply(&first, &the_shell_before_its_fork());
+        assert!(!tab.axis.ticks(), "the second C's own look is still due");
+
+        tab.sample(&the_shell_before_its_fork());
+        assert!(tab.axis.ticks(), "and it, naming nothing, is taken again");
+    }
+
+    /// A claim before the tick: the tab is followed now, with nothing left
+    /// to name.
+    #[test]
+    fn a_claim_drops_a_second_look() {
+        let mut tab = Tab::new();
+        tab.mark(PromptMark::OutputStart, Foreground::Unknown);
+        tab.sample(&the_shell_before_its_fork());
+        tab.agent = owned("claude", AgentLifecycle::Working);
+        tab.axis.owner_changed(&tab.agent);
+        tab.sample(&sample(
+            Foreground::Group(700),
+            Some(stamp()),
+            Liveness::Running,
+        ));
+        assert_eq!(tab.axis.command_look, None);
     }
 
     /// A stamped layer the records' `app` or the owner's `source` leave
