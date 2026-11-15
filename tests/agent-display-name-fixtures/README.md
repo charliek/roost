@@ -1,9 +1,10 @@
 # Agent display-name golden fixtures
 
 Canonical `source → display name` corpus for the agents palette row
-label (plan 046 §3.7 W7) — `agent_display_name` in
-`crates/roost-ui-model/src/agent_palette.rs`, so a spelling like
-"OpenCode" vs "opencode" is pinned outside the code that renders it.
+label (plan 046 §3.7 W7) — `source_label` in `crates/roost-ipc/src/agent.rs`,
+which `crates/roost-ui-model/src/agent_palette.rs` re-exports as
+`agent_display_name` — so a spelling like "OpenCode" vs "opencode" is
+pinned outside the code that renders it.
 
 Loader:
 

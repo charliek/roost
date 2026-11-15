@@ -218,7 +218,7 @@ records.]*
 
 ### DL-14: Ownership is a label, not a suppression switch (2026-07-27)
 
-Status (2026-11-14): **Current, amended in place** by plan 052, on 2026-10-10 and on 2026-11-14; the amendments are in the text below.
+Status (2026-11-14): **Current, amended in place** by plan 052, on 2026-10-10, and twice on 2026-11-14 (#623, then the process layer for #621); the amendments are in the text below.
 
 Ownership identity is the **pair** `(source, session_id)`, not
 `session_id` alone — two agents could otherwise collide on an opaque
@@ -252,6 +252,20 @@ the hook lifecycle is held then; the foreground process is still
 required, since only a prompt mark ends a record. `clear`, `resume`
 and `compact` still supersede, and so does a `claude -p --resume`;
 herdr draws the same line.)
+(Amended 2026-11-14, #621, the process layer: an agent's ownership
+also ends without a report, on evidence read from the tab's own
+processes by the server that holds the tab. When an agent claims, that
+server stamps the leader of the process group in front of the tab's
+terminal (pid, start time, group, session); nothing is stamped when the
+shell itself is in front, or the leader is a multiplexer or a remote
+session. The owner is released when its stamped process is gone **and**
+its group is no longer in front, and, for an owner with no stamp, at an
+`A`/`B`/`D` mark when the shell itself is back in front. A stopped owner
+keeps ownership and shows suspended. AD-3 stands: there is still no
+TTL, the process is read only when something happens on the tab, and
+every reading that cannot decide keeps the owner. `manual` and `legacy`
+owners are untouched. See
+[`tab.agent_report`](../reference/ipc.md#how-ownership-ends-without-a-report).)
 
 Raw-OSC suppression (dropping OSC 9/99/777 while a live agent owns the
 tab) is the **one exception that gets a real failsafe**, because it's
@@ -260,7 +274,11 @@ notifications forever with no agent left to unmute it. An OSC 133
 `A`/`B`/`D` mark (the shell reaching a prompt, which only happens once
 whatever the agent was running has exited) drops the lifecycle to
 `inactive` while keeping ownership as a label, which simultaneously
-re-derives shell state and re-opens raw OSC. Every other consumer of
+re-derives shell state and re-opens raw OSC. (Amended 2026-11-14,
+#621: with the shell itself in front and no stamp saying the agent lives
+elsewhere, the mark releases the owner instead; with a stamped agent
+stopped or in the background, what the mark dropped is set aside until
+the agent runs again.) Every other consumer of
 ownership (the tab tint, the rollup, the switcher) needs no equivalent
 failsafe, because the cosmetic-degradation argument in the paragraph
 above already covers them. See

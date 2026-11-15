@@ -169,7 +169,8 @@ terminal from. It shares the socket path but not the framing; see
     "ownership": "<Ownership, omitted when unowned>",
     "password_input": "<bool, omitted while false>",
     "dropped_reports": "<DroppedReports, omitted until a report is dropped or vetoed>",
-    "program_status": "<ProgramStatus, omitted while the tab has no record>"
+    "program_status": "<ProgramStatus, omitted while the tab has no record>",
+    "process": "<TabProcess, omitted while no process is stamped>"
   },
   "Project": {
     "id": "<string-int64>",
@@ -303,6 +304,36 @@ reads the whole object as absent rather than failing the tab.
 `shell_state`, `agent_lifecycle` and `ownership` stay the hook layer's
 values; read the presented lifecycle as `program_status.effective_lifecycle`
 when present, else the derivation below. New at session protocol `7`.
+
+### `Tab.process` — the agent's process
+
+The process the tab's agent owner runs as, once one is stamped (#621).
+When an agent claims a tab, the server that holds the tab records the
+leader of the process group then in front of the tab's terminal: its
+pid, start time, group and session. It records nothing when the shell
+itself is in front (an agent in the background), when the leader is a
+multiplexer or a remote session (`tmux`, `screen`, `zellij`, `ssh`,
+`mosh`), or when the leader can't be read. A `manual` or `legacy` claim
+records nothing either.
+
+```json
+"process": {"state": "running", "agent": "claude", "pid": "48213", "since": 1793158441}
+```
+
+* `state` is `running`, or `suspended` while the process is stopped by
+  job control (`Ctrl-Z`). A suspended agent keeps its owner; `Tab.state`
+  then reads what a prompt leaves (`none`), and the lifecycle the prompt
+  mark dropped comes back when the process runs again (`fg`, `bg`).
+* `agent` is the owner's `source`.
+* `pid` is the stamped process, as a string like every other int64.
+* `since` is when it was stamped, or last moved between running and
+  suspended, in unix seconds.
+
+The object and `state` are **open**: a client that cannot read them reads
+`process` as absent. The key is omitted while nothing is stamped, so an
+older server reads the same as a tab with no stamped process. What the
+stamp decides is in [`tab.agent_report`](#tabagent_report)'s
+[ownership end rules](#how-ownership-ends-without-a-report).
 
 ### `tab.state` / `hook_active` — derived, and the compatibility contract
 
@@ -1631,6 +1662,42 @@ the mutation can't race a concurrent report:
 * **`release`** also requires a match; it clears ownership and forces
   `lifecycle` to `"inactive"`.
 
+#### How ownership ends without a report
+
+An agent that is killed, crashes or loses its `SessionEnd` sends no
+`release`. Two rules end an agent's ownership for it (#621), each read
+from the tab's own processes by the server that holds the tab, and
+neither on a timer. Both apply to an agent's claim only; `manual` and
+`legacy` owners keep what a prompt mark always did to them.
+
+* **At a prompt mark** (OSC 133 `A`, `B` or `D`): if the shell itself is
+  back in front of the tab's terminal, and the owner has no stamped
+  [`process`](#tabprocess-the-agents-process), the owner is released.
+  The shell takes the terminal back only once what it ran has stopped or
+  ended. With another job in front, or nothing known (no PTY), the mark
+  drops the lifecycle to `"inactive"` and keeps the owner as a label, as
+  it always did. A tab whose child is not an interactive shell (a
+  command tab, `sh -c …`) never reads as "the shell in front".
+* **When a stamped process is gone**: the owner is released once the
+  stamped process is gone (exited, a zombie, its pid reused, or it left
+  the tab's session) **and** its process group is no longer in front.
+  The group still being in front (a pipeline, a straggler in the group)
+  keeps it. The server samples the stamped process when the agent
+  claims or reports, at a prompt mark, at a `C` mark, and when the tab
+  is focused, never on its own.
+
+A stopped process (`Ctrl-Z`) is neither: its owner stays, and a prompt
+mark with another group in front sets aside the lifecycle it drops
+instead of losing it. `process.state` reads `suspended` until the
+process runs again, when the lifecycle comes back, unless a claim or a
+release has moved the tab on meanwhile. A mark from the stamped group
+itself (Claude's own Screen Reader prompt marks) does what any prompt
+mark does. Every reading the server can't make — another user's
+process, a failed read, no PTY — keeps today's behaviour. A release by
+either rule changes nothing about attention: a pending notification
+stays. A late `preserve` or `release` from the dead agent's session is
+then refused as `not_owner`.
+
 #### Guarded reports
 
 `lifecycle_if` makes a report conditional on where the tab already
@@ -1669,7 +1736,8 @@ still running" without reading state first:
   client had before plan 046.
 
 The interaction worth knowing: the OSC 133 failsafe (`A`/`B`/`D` drops
-the lifecycle to `"inactive"` while keeping ownership as a label) leaves
+the lifecycle to `"inactive"`, keeping ownership as a label unless the
+[end rules](#how-ownership-ends-without-a-report) release it) can leave
 a tab whose agent is gone but still owned. A later report guarded on
 `["working"]` then correctly no-ops instead of re-lighting a dead
 agent's dot.
@@ -4822,13 +4890,16 @@ discipline, the last frame before the stream closes. See
   standing value off [`tab.list`](#tablist). An older client that does
   not know the name skips it.
 * `notification.fired` — `{"tab_id": "<id>", "title": "<string>", "body": "<string>", "generation": <int>}`. Mirrors the legacy proto's `NotificationEvent`; useful for tools that mirror notifications elsewhere. `generation` numbers the raises on that tab, counting from one; a client acknowledging this raise sends it back on [`tab.clear_notification`](#tabclear_notification) — see [Notifications fan out](#notifications-fan-out). Live-only on a session's event stream: never replayed into a resume.
-* `agent_report.changed` — `{"tab_id": "<id>", "shell_state": "<ShellState>", "agent_lifecycle": "<AgentLifecycle>", "ownership": "<Ownership, omitted when unowned>", "state": "<TabState>", "hook_active": <bool>, "program_status": "<ProgramStatus, omitted when the tab has no record>"}`.
+* `agent_report.changed` — `{"tab_id": "<id>", "shell_state": "<ShellState>", "agent_lifecycle": "<AgentLifecycle>", "ownership": "<Ownership, omitted when unowned>", "state": "<TabState>", "hook_active": <bool>, "program_status": "<ProgramStatus, omitted when the tab has no record>", "process": "<TabProcess, omitted while none is stamped>"}`.
   Fires whenever an accepted `tab.agent_report`, an OSC 133 shell
-  mark or an OSC 7501 report changes the agent record or its
-  [`program_status`](#tabprogram_status-osc-7501) (a message change
-  alone included; a repeat that moves only `updated_at` does not). An
-  event without `program_status` means the tab has no records left, so
-  a mirror assigns the field as it comes, absent included. `tab.state_changed` and
+  mark, an OSC 7501 report or a sample of the tab's
+  [stamped process](#tabprocess-the-agents-process) changes the agent
+  record, its [`program_status`](#tabprogram_status-osc-7501) (a message
+  change alone included; a repeat that moves only `updated_at` does not)
+  or its `process`. An event without `program_status` means the tab has
+  no records left, and one without `process` means no process is
+  stamped, so a mirror assigns both fields as they come, absent
+  included. `tab.state_changed` and
   `hook_active.changed` still fire for their (derived) slices, so
   existing subscribers keep working unmodified — this event carries
   what those two projections lose: which lifecycle, whose session, and

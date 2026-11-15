@@ -162,7 +162,7 @@ reasoning.
   ([DL-8](decision-history.md#dl-8-osc-routing-is-the-differentiator)).
 - **Agent state is derived, never written directly**
   ([DL-13](decision-history.md#dl-13-the-agent-state-model-four-axes-one-derivation-2026-07-27)).
-  Ownership is a label
+  Ownership is a label, until the agent's own process is gone
   ([DL-14](decision-history.md#dl-14-ownership-is-a-label-not-a-suppression-switch-2026-07-27)).
 - **An agent's own OSC 7501 report sits above the hook layer**
   ([DL-29](decision-history.md#dl-29-program-status-is-a-fourth-per-tab-axis-composed-above-the-hook-layer-2026-10-28)),
@@ -303,9 +303,10 @@ track. Its first step shipped: Roost no longer writes agents' configs.
 Claude Code and OpenCode get their hooks through the tab's environment,
 Codex and Grok report over OSC 7501, Cursor's hooks file is an opt-in,
 and the entries older releases wrote are retired
-([DL-36](decision-history.md#dl-36-roost-connects-agents-without-writing-their-configs-2026-11-08)). Next is making the integration better: process
-identity to clear a dead agent's state (#519, #621), and how a tab
-presents what OSC 7501 and the hooks say. A change here amends DL-13,
+([DL-36](decision-history.md#dl-36-roost-connects-agents-without-writing-their-configs-2026-11-08)). Next is making the integration better. A dead
+agent's process now ends its ownership (#621); next are its OSC 7501
+records and shells with no prompt marks (#519), and how a tab presents
+what OSC 7501 and the hooks say. A change here amends DL-13,
 DL-14 and DL-29.
 Note: `discovery/agent-integration.md`.
 
@@ -371,7 +372,7 @@ its record there and a row here, in the PR that builds it.
 | [11](decision-history.md#dl-11-one-command-core-thin-per-surface-adapters-2026-05-26) | One command core, thin adapters | 2026-05-26 | Current | The north star. |
 | [12](decision-history.md#dl-12-pytest-drives-the-tests-lua-is-a-user-scripting-surface-2026-05-26) | pytest drives tests; Lua is for users | 2026-05-26 | Current | pytest shipped; no Lua engine. |
 | [13](decision-history.md#dl-13-the-agent-state-model-four-axes-one-derivation-2026-07-27) | Agent state: four axes, one derivation | 2026-07-27 | Current | `tab.state` is derived, never written. |
-| [14](decision-history.md#dl-14-ownership-is-a-label-not-a-suppression-switch-2026-07-27) | Ownership is a label | 2026-07-27 | Current (amended in place) | No TTL; a nested agent's claim, `claude -p` included, is dropped. |
+| [14](decision-history.md#dl-14-ownership-is-a-label-not-a-suppression-switch-2026-07-27) | Ownership is a label | 2026-07-27 | Current (amended in place) | No TTL; a nested agent's claim, `claude -p` included, is dropped; a dead agent's process ends its ownership. |
 | [15](decision-history.md#dl-15-linux-ships-iced-gtk4-rs-is-retired-and-removed-2026-08-25) | Linux ships iced; gtk4-rs removed | 2026-08-25 | Current (done) | `/usr/bin/roost` is iced since v0.0.18. |
 | [16](decision-history.md#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25) | Experimental mac-iced beside Swift | 2026-08-25 | Superseded (DL-33) | The hypothesis held. |
 | [17](decision-history.md#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28) | A headless `roost-session` daemon | 2026-08-28 | Amended (DL-27) | Also the local backend on fresh installs. |
