@@ -2894,12 +2894,14 @@ fn probe_wanted(target: ClipboardOp, text: Option<&str>) -> bool {
 /// Where a clipboard image goes before it is pasted, decided by the tab
 /// the paste started on: a file on this machine for a tab whose shell
 /// reads this filesystem, and bytes alone for a host tab — whose image
-/// must never become a file on this machine.
-fn probe_sink(target: Target) -> ProbeSink {
-    if target == Target::Local {
-        ProbeSink::TempFile
-    } else {
-        ProbeSink::Bytes
+/// must never become a file on this machine. A target that refuses gets
+/// no probe at all, so the bytes route only ever starts from a remote
+/// host, which no later re-derivation can turn into [`Target::Local`].
+fn probe_sink(target: Target) -> Option<ProbeSink> {
+    match target {
+        Target::Local => Some(ProbeSink::TempFile),
+        Target::Host => Some(ProbeSink::Bytes),
+        Target::Frozen | Target::Unavailable => None,
     }
 }
 
@@ -2995,9 +2997,7 @@ impl App {
                 // whose bytes would have nowhere to go (plan 047 §3.2).
                 // The text half of the paste is unaffected: it goes to
                 // the tab below exactly as it always has.
-                let probe = Some(self.transfer_target(tab))
-                    .filter(|target| *target != Target::Unavailable)
-                    .map(probe_sink);
+                let probe = probe_sink(self.transfer_target(tab));
                 let Some(terminal) = self.tabs.get(&tab) else {
                     tracing::debug!(?tab, request_id, "discarded paste for a closed tab");
                     return self.clipboard.start_next();
@@ -5933,14 +5933,14 @@ mod tests {
 
     /// A clipboard image is written to a file here only for a tab whose
     /// shell reads this filesystem — a local tab, or one on this
-    /// machine's own session ([`file_transfer::target_of`]). Every other
-    /// target keeps it as bytes: a remote host's image must never become
-    /// a file on this machine, and a refusing target uploads nothing.
+    /// machine's own session ([`file_transfer::target_of`]); a remote
+    /// host keeps it as bytes, and a refusing target is not probed.
     #[test]
     fn only_a_local_target_writes_the_clipboard_image_to_a_file_here() {
-        assert_eq!(probe_sink(Target::Local), ProbeSink::TempFile);
-        for target in [Target::Host, Target::Frozen, Target::Unavailable] {
-            assert_eq!(probe_sink(target), ProbeSink::Bytes, "{target:?}");
+        assert_eq!(probe_sink(Target::Local), Some(ProbeSink::TempFile));
+        assert_eq!(probe_sink(Target::Host), Some(ProbeSink::Bytes));
+        for target in [Target::Frozen, Target::Unavailable] {
+            assert_eq!(probe_sink(target), None, "{target:?}");
         }
     }
 
