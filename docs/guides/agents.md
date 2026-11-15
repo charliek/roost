@@ -204,7 +204,9 @@ The rules you see:
   or `error` and the shell hasn't shown a prompt since, the tab shows
   the record — and the hooks for that tab keep who owns it but stop
   moving its state. A hook from a *different* agent trying to claim the
-  tab then is refused (`foreign_app` in `roostctl doctor`).
+  tab then is refused (`foreign_app` in `roostctl doctor`), and so is a
+  new Claude session starting during the owner's `working` or `blocked`
+  record, such as a `claude -p` it runs (`nested_claim`).
 - **A shell prompt hands it back.** An OSC 133 prompt mark (`A`, `B` or
   `D`; Roost's shell integration sends them) ends a `working` or
   `blocked` record, the way a crashed agent's state should end. A
@@ -426,6 +428,14 @@ command's start: zsh, or bash 4.4 or newer. macOS's own `/bin/bash`
 ([details](cwd-tracking.md#switching-macos-default-to-homebrew-bash)),
 and without the mark the inner agent takes the tab over, as it did
 before. ([Claim rules](../reference/ipc.md#tabagent_report).)
+
+The same holds for a `claude -p` that Claude Code runs from a tool call.
+A Claude session that **starts** while Claude owns the tab mid-turn is
+ignored. A running Claude that moves to another session still takes the
+tab: `/clear`, `/resume` and a compaction do, and so does a `claude -p
+--resume`, because Claude reports it the same way. For a Claude that
+reports over [OSC 7501](#program-status-osc-7501), mid-turn is its own
+`working` or `blocked` report, which needs no shell integration.
 
 Agent status isn't supported inside tmux, herdr or an ssh session
 running in a tab. Every pane there shares the tab's `ROOST_TAB_ID`, so

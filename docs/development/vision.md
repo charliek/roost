@@ -367,7 +367,7 @@ its record there and a row here, in the PR that builds it.
 | [11](decision-history.md#dl-11-one-command-core-thin-per-surface-adapters-2026-05-26) | One command core, thin adapters | 2026-05-26 | Current | The north star. |
 | [12](decision-history.md#dl-12-pytest-drives-the-tests-lua-is-a-user-scripting-surface-2026-05-26) | pytest drives tests; Lua is for users | 2026-05-26 | Current | pytest shipped; no Lua engine. |
 | [13](decision-history.md#dl-13-the-agent-state-model-four-axes-one-derivation-2026-07-27) | Agent state: four axes, one derivation | 2026-07-27 | Current | `tab.state` is derived, never written. |
-| [14](decision-history.md#dl-14-ownership-is-a-label-not-a-suppression-switch-2026-07-27) | Ownership is a label | 2026-07-27 | Current (amended in place) | No TTL; a nested agent's claim is dropped. |
+| [14](decision-history.md#dl-14-ownership-is-a-label-not-a-suppression-switch-2026-07-27) | Ownership is a label | 2026-07-27 | Current (amended in place) | No TTL; a nested agent's claim, `claude -p` included, is dropped. |
 | [15](decision-history.md#dl-15-linux-ships-iced-gtk4-rs-is-retired-and-removed-2026-08-25) | Linux ships iced; gtk4-rs removed | 2026-08-25 | Current (done) | `/usr/bin/roost` is iced since v0.0.18. |
 | [16](decision-history.md#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25) | Experimental mac-iced beside Swift | 2026-08-25 | Superseded (DL-33) | The hypothesis held. |
 | [17](decision-history.md#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28) | A headless `roost-session` daemon | 2026-08-28 | Amended (DL-27) | Also the local backend on fresh installs. |

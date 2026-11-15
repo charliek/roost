@@ -515,10 +515,12 @@ pub fn summary(
 /// [`agent::apply_report`] with program status in front of it (rule 5).
 ///
 /// While records are authoritative, a claim from an agent other than the
-/// deciding record's app is dropped, and every other agent report keeps
-/// its identity effects but loses its lifecycle patch and any
-/// notification. `manual` and `legacy` are someone taking the wheel: they
-/// apply as sent, and the record still decides what the tab shows.
+/// deciding record's app is dropped, as is one from a new process of the
+/// owner's agent while the owner's record is mid-turn
+/// ([`runs_inside_the_owner`]); every other agent report keeps its
+/// identity effects but loses its lifecycle patch and any notification.
+/// `manual` and `legacy` are someone taking the wheel: they apply as
+/// sent, and the record still decides what the tab shows.
 ///
 /// Once authority ends, an agent's notification that would leave the tab
 /// showing a kept, announced root `done`/`error`'s lifecycle again is
@@ -550,14 +552,20 @@ pub fn apply_hook_report(
             vetoed: None,
         };
     };
-    if report.ownership_action == OwnershipAction::Claim
-        && !deciding.app.is_empty()
-        && !apps_for_source(&report.source).contains(&deciding.app)
-    {
+    let refused = if report.ownership_action != OwnershipAction::Claim {
+        None
+    } else if !deciding.app.is_empty() && !apps_for_source(&report.source).contains(&deciding.app) {
+        Some(DropReason::ForeignApp)
+    } else if runs_inside_the_owner(agent, deciding, report) {
+        Some(DropReason::NestedClaim)
+    } else {
+        None
+    };
+    if let Some(reason) = refused {
         return HookOutcome {
             outcome: ApplyOutcome {
                 state: agent.clone(),
-                dropped: Some(DropReason::ForeignApp),
+                dropped: Some(reason),
                 ownership_changed: false,
                 lifecycle_changed: false,
                 attention: AttentionEffect::Unchanged,
@@ -586,6 +594,25 @@ pub fn apply_hook_report(
             session_id: report.session_id.clone(),
         }),
     }
+}
+
+/// The hook layer's nested-claim rule ([`agent::starts_a_new_process`]),
+/// judged by what decides the tab. While records decide, every hook
+/// lifecycle change is vetoed, so a Claude that speaks 7501 shows its
+/// turn only in its record: a `working` or `blocked` record of the
+/// owner's own app is the owner mid-turn. An `idle` or `done` one does
+/// not count, since it may be a new Claude's first report after a killed
+/// one left its owner behind as a label.
+fn runs_inside_the_owner(
+    agent: &AgentTabState,
+    deciding: RecordView<'_>,
+    report: &TabAgentReportParams,
+) -> bool {
+    is_live(deciding.record.state)
+        && agent.ownership.as_ref().is_some_and(|owner| {
+            agent::starts_a_new_process(owner, report)
+                && apps_for_source(&owner.source).contains(&deciding.app)
+        })
 }
 
 fn repeats_kept_record(
@@ -1140,6 +1167,100 @@ mod tests {
                 "{app}"
             );
         }
+    }
+
+    fn claude_start(session: &str, start: &str) -> TabAgentReportParams {
+        let mut claim = TabAgentReportParams {
+            session_id: session.into(),
+            ..session_start("claude")
+        };
+        claim
+            .metadata
+            .insert(agent::START_SOURCE_KEY.into(), start.into());
+        claim
+    }
+
+    /// #623 for a Claude that speaks 7501: its hook lifecycle stays where
+    /// the records found it, so only its record says it is mid-turn.
+    #[test]
+    fn a_claude_p_inside_a_7501_claude_turn_leaves_the_owner_in_place() {
+        for live in [S::Working, S::Blocked] {
+            let mut tab = Tab::default();
+            tab.hook(&claude_start("s1", "startup"));
+            tab.feed([claude(live)], T0);
+            tab.hook(&prompt_submit("claude"));
+            assert_eq!(tab.agent.lifecycle, L::Inactive, "the records vetoed it");
+            let before = tab.agent.clone();
+
+            let nested = tab.hook(&claude_start("inner", "startup"));
+            assert_eq!(
+                nested.outcome.dropped,
+                Some(DropReason::NestedClaim),
+                "{live:?}"
+            );
+            assert!(nested.vetoed.is_none());
+            for (action, lifecycle) in [
+                (OwnershipAction::Preserve, Some(L::Finished)),
+                (OwnershipAction::Release, None),
+            ] {
+                let inner = TabAgentReportParams {
+                    session_id: "inner".into(),
+                    ..hook("claude", action, lifecycle)
+                };
+                assert_eq!(tab.hook(&inner).outcome.dropped, Some(DropReason::NotOwner));
+            }
+            assert_eq!(tab.agent, before, "{live:?}");
+
+            let outer_stop = tab.hook(&stop("claude"));
+            assert!(outer_stop.outcome.accepted(), "{live:?}");
+            assert_eq!(
+                tab.agent.ownership.as_ref().unwrap().session_id,
+                "s1",
+                "{live:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_claude_claim_that_starts_no_process_or_follows_no_live_turn_supersedes() {
+        for (why, records, start) in [
+            ("/clear", vec![claude(S::Working)], "clear"),
+            ("--resume", vec![claude(S::Working)], "resume"),
+            ("a compaction", vec![claude(S::Blocked)], "compact"),
+            (
+                "a new Claude's first word",
+                vec![claude(S::Idle)],
+                "startup",
+            ),
+            ("a finished turn", vec![claude(S::Done)], "startup"),
+            (
+                "someone else's record",
+                vec![report(S::Working, "", "", "")],
+                "startup",
+            ),
+        ] {
+            let mut tab = Tab::default();
+            tab.hook(&claude_start("s1", "startup"));
+            tab.feed(records, T0);
+            let hook = tab.hook(&claude_start("s2", start));
+            assert!(hook.outcome.accepted(), "{why}");
+            assert_eq!(
+                tab.agent.ownership.as_ref().unwrap().session_id,
+                "s2",
+                "{why}"
+            );
+        }
+
+        // A Claude killed mid-turn leaves its owner behind; the prompt mark
+        // ends its record, so the next `claude` takes the tab.
+        let mut tab = Tab::default();
+        tab.hook(&claude_start("s1", "startup"));
+        tab.feed([claude(S::Working)], T0);
+        tab.mark("D", LATE);
+        tab.mark("C", LATE);
+        let hook = tab.hook(&claude_start("s2", "startup"));
+        assert!(hook.outcome.accepted());
+        assert_eq!(tab.agent.ownership.as_ref().unwrap().session_id, "s2");
     }
 
     #[test]

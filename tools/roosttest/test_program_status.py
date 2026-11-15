@@ -33,6 +33,7 @@ Condition waits only.
 from __future__ import annotations
 
 import base64
+import json
 import random
 from dataclasses import dataclass
 from typing import Callable
@@ -42,7 +43,7 @@ import session as sessionlib
 import ui
 from client import Roost
 from eventstream import EventStream
-from util import wait_tab_attached
+from util import run_hook, wait_tab_attached
 
 COLS, ROWS = 80, 24
 QUIET_ARGV = ["/bin/sh", "-c", "exec sleep 300"]
@@ -239,6 +240,87 @@ def test_clear_keeps_the_hook_owner(lane):
     assert listed["hook_active"] is True, listed
     # The hooks decide again, from where they stood.
     assert listed["state"] == "running", listed
+
+
+def claude_hook(lane: Lane, tab: int, event: str, session: str, **fields) -> None:
+    """One Claude hook event through `roostctl agent-hook claude`, the
+    command Roost's plugin runs."""
+    payload = {"hook_event_name": event, "session_id": session, "cwd": "/tmp", **fields}
+    run_hook(["agent-hook", "claude"], tab, lane.events_socket, json.dumps(payload).encode())
+
+
+def last_drop(lane: Lane, tab: int) -> dict:
+    return ((lane.client.tab(tab) or {}).get("dropped_reports") or {}).get("last") or {}
+
+
+@pytest.mark.parametrize("speaks_7501", [True, False], ids=["7501", "hooks-only"])
+def test_a_claude_p_run_inside_a_claude_turn_leaves_the_tab_to_the_outer_session(
+    lane, speaks_7501
+):
+    """#623: a `claude -p` run from a tool call inherits the tab and fires
+    a whole session of its own into it. Its `startup` claim is nested
+    while the outer Claude is mid-turn, so the outer session keeps the
+    tab and its later hooks land. A Claude speaking 7501 is mid-turn by
+    its own record, with no shell integration; without 7501 the hook
+    lifecycle says so, under a foreground command."""
+    tab = lane.quiet_tab()
+    if not speaks_7501:
+        assert lane.fed(tab, b"\x1b]133;C\x07")["shell_state"] == "foreground_process"
+    claude_hook(lane, tab, "SessionStart", "outer", source="startup")
+    sessionlib.wait_until(
+        lambda: (lane.client.ownership(tab) or {}).get("session_id") == "outer",
+        10.0,
+        "the outer Claude's claim",
+    )
+    if speaks_7501:
+        lane.fed(tab, osc7501(state="working", app="claude-code"))
+    claude_hook(lane, tab, "UserPromptSubmit", "outer", prompt="run claude -p")
+    sessionlib.wait_until(
+        lambda: lane.client.tab(tab)["state"] == "running", 10.0, "the outer turn"
+    )
+
+    claude_hook(lane, tab, "SessionStart", "inner", source="startup")
+    drop = sessionlib.wait_until(
+        lambda: (d := last_drop(lane, tab)).get("session_id") == "inner" and d,
+        10.0,
+        "the nested claim's drop",
+    )
+    assert drop["reason"] == "nested_claim", drop
+    assert drop["ownership_action"] == "claim", drop
+    claude_hook(lane, tab, "UserPromptSubmit", "inner", prompt="hi")
+    claude_hook(lane, tab, "Stop", "inner", stop_hook_active=False)
+    claude_hook(lane, tab, "SessionEnd", "inner", reason="other")
+    sessionlib.wait_until(
+        lambda: last_drop(lane, tab).get("ownership_action") == "release",
+        10.0,
+        "the nested session's end",
+    )
+    assert last_drop(lane, tab)["reason"] == "not_owner", last_drop(lane, tab)
+    owner = lane.client.ownership(tab)
+    assert owner is not None and owner["session_id"] == "outer", owner
+
+    claude_hook(lane, tab, "Stop", "outer", stop_hook_active=False)
+    sessionlib.wait_until(
+        lambda: (lane.client.ownership(tab) or {}).get("detail") == "stop",
+        10.0,
+        "the outer Stop to land on its own session",
+    )
+    if speaks_7501:
+        lane.fed(tab, osc7501(state="done", app="claude-code"))
+    listed = lane.client.tab(tab)
+    assert listed["ownership"]["session_id"] == "outer", listed
+    assert listed["state"] == "idle", listed
+
+    # A running Claude moving to another session still takes the tab.
+    claude_hook(lane, tab, "UserPromptSubmit", "outer", prompt="next")
+    if speaks_7501:
+        lane.fed(tab, osc7501(state="working", app="claude-code"))
+    claude_hook(lane, tab, "SessionStart", "cleared", source="clear")
+    sessionlib.wait_until(
+        lambda: (lane.client.ownership(tab) or {}).get("session_id") == "cleared",
+        10.0,
+        "a /clear to take the tab",
+    )
 
 
 def test_the_last_clear_sends_an_event_without_program_status(lane):

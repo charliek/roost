@@ -1601,9 +1601,20 @@ the mutation can't race a concurrent report:
   `ROOST_TAB_ID`, and honoring it would evict the owner and then
   release the tab out from under it. The same `source` under a new
   `session_id` still supersedes, since that is the agent switching
-  sessions itself. `manual` and `legacy` claims always supersede. A tab
-  whose shell has no integration (`shell_state: "unknown"`) never
-  treats a claim as nested.
+  sessions itself, with one exception: a `claude` claim whose
+  `metadata.source` is `"startup"` (Claude's `SessionStart` source) is a
+  new Claude process, such as a `claude -p` run from a tool call, and is
+  nested too. `clear`, `resume` and `compact` still supersede. `manual`
+  and `legacy` claims always supersede. A tab whose shell has no
+  integration (`shell_state: "unknown"`) never treats a claim as nested
+  by these rules.
+
+  While a `working` or `blocked` [program-status](#tabprogram_status-osc-7501)
+  record of the owner's own agent decides the tab, that record, not
+  `agent_lifecycle`, says the owner is mid-turn: a `claude` claim with
+  `metadata.source = "startup"` and a new `session_id` is dropped as
+  `nested_claim` whatever the shell state. An `idle` or `done` record
+  does not count.
 * **`preserve`** requires the report's `(source, session_id)` to match
   the current owner; a mismatch is dropped (see `accepted` below).
   `detail`/`metadata` **merge** onto the existing owner rather than

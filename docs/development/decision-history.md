@@ -218,7 +218,7 @@ records.]*
 
 ### DL-14: Ownership is a label, not a suppression switch (2026-07-27)
 
-Status (2026-11-08): **Current, amended in place** by plan 052 and on 2026-10-10; both amendments are in the text below.
+Status (2026-11-14): **Current, amended in place** by plan 052, on 2026-10-10 and on 2026-11-14; the amendments are in the text below.
 
 Ownership identity is the **pair** `(source, session_id)`, not
 `session_id` alone — two agents could otherwise collide on an opaque
@@ -243,6 +243,14 @@ under a foreground process is a *nested* agent the owner is running,
 which inherited `ROOST_TAB_ID`, and it is dropped. The shell axis,
 not a timestamp, makes that call, so AD-3 stands. See
 [`tab.agent_report`](../reference/ipc.md#tabagent_report).)
+(Amended 2026-11-14, #623: a claim from the owner's own source is
+nested too when it is a new Claude process, a `claude` claim whose
+start source, `metadata.source`, is `startup`, such as a `claude -p` run
+from a tool call. While the owner's own `working` or `blocked` OSC 7501
+record decides the tab, that record says the owner is mid-turn, since
+the hook lifecycle is held then. `clear`, `resume` and `compact` still
+supersede, and so does a `claude -p --resume`; herdr draws the same
+line.)
 
 Raw-OSC suppression (dropping OSC 9/99/777 while a live agent owns the
 tab) is the **one exception that gets a real failsafe**, because it's
