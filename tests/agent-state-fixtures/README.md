@@ -163,8 +163,8 @@ what a read of a stamped process does.
 }
 ```
 
-- `layer` ∈ `owner | records` — the hook owner, or the tab's live OSC
-  7501 records.
+- `layer` ∈ `owner | records` — the hook owner, or the tab's OSC 7501
+  records while they decide it.
 - `stamp` is `null` (nothing stamped) or the stamped process's
   `{pid, start, pgid, sid}`; `start` is `[seconds_or_ticks, micros]`.
 - `fg` is who has the terminal: `"shell"` (the tab's shell, back in

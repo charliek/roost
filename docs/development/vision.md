@@ -166,7 +166,8 @@ reasoning.
   ([DL-14](decision-history.md#dl-14-ownership-is-a-label-not-a-suppression-switch-2026-07-27)).
 - **An agent's own OSC 7501 report sits above the hook layer**
   ([DL-29](decision-history.md#dl-29-program-status-is-a-fourth-per-tab-axis-composed-above-the-hook-layer-2026-10-28)),
-  and each sink terminal has one OSC 133 parser
+  and ends with its process as well as at a prompt; each sink terminal
+  has one OSC 133 parser
   ([DL-30](decision-history.md#dl-30-one-osc-133-parser-per-sink-terminal-2026-10-28)).
 - **Files cross a host boundary as bytes through the op set,** pasted as
   validated host paths; an op an older peer could not refuse meaningfully
@@ -304,8 +305,8 @@ Claude Code and OpenCode get their hooks through the tab's environment,
 Codex and Grok report over OSC 7501, Cursor's hooks file is an opt-in,
 and the entries older releases wrote are retired
 ([DL-36](decision-history.md#dl-36-roost-connects-agents-without-writing-their-configs-2026-11-08)). Next is making the integration better. A dead
-agent's process now ends its ownership (#621); next are its OSC 7501
-records and shells with no prompt marks (#519), and how a tab presents
+agent's process now ends its ownership (#621) and its OSC 7501 records,
+in shells with no prompt marks too (#519); next is how a tab presents
 what OSC 7501 and the hooks say. A change here amends DL-13,
 DL-14 and DL-29.
 Note: `discovery/agent-integration.md`.

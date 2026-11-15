@@ -267,9 +267,11 @@ tab's authoritative terminal answers the `OSC 7501 ; ?` probe and keeps
 the tab's records: a session tab's, inside the session, and an
 in-process tab's, inside the UI. A window showing a host
 tab mirrors the session's summary and keeps none of its own. Prompt marks (OSC 133 `A`, `B`, `D`) drop `working` and `blocked`
-records. While a `working` or `blocked` record exists, or a root record
-no prompt mark has followed, the records decide what the tab shows and
-the hook layer keeps only its identity.
+records, and so does the end of the program that reported them
+([below](#how-a-record-ends-without-a-prompt)). While a `working` or
+`blocked` record exists, or a root record no prompt mark has followed,
+the records decide what the tab shows and the hook layer keeps only its
+identity.
 
 `Tab.program_status` is present while the tab has any record:
 
@@ -305,16 +307,56 @@ reads the whole object as absent rather than failing the tab.
 values; read the presented lifecycle as `program_status.effective_lifecycle`
 when present, else the derivation below. New at session protocol `7`.
 
+#### How a record ends without a prompt
+
+A shell with no prompt marks (`sh`, dash, a bash or zsh with Roost's
+integration off) never says a program ended, and a program that is
+killed never sends its `clear`. So while the records decide the tab,
+they follow a process, as an agent's claim does (#519): the server
+stamps the leader in front of the tab's terminal (see
+[`Tab.process`](#tabprocess-the-agents-process)), and reads it again
+when something happens on the tab — a record, a hook report, a prompt
+mark, a focus, a session viewer attaching or detaching — and once a
+second while the stamp is held.
+
+* **The process is gone and its group is no longer in front**: the
+  records end as a prompt mark would end them. Live records go, and the
+  root loses its say over the tab; a root `done` or `error` stays
+  shown, as after a prompt. If another job already has the terminal (an
+  agent restarted in a loop), only records reported before the read
+  end; later ones are the new job's, and it is stamped next.
+* **The process is stopped** (`Ctrl-Z`): a prompt mark with another
+  group in front sets aside what it drops rather than discarding it; in
+  a shell with no marks, the read that finds it stopped does the same.
+  The tab reads what a prompt leaves — nothing set aside decides it,
+  mutes a raw notification, or refuses a claim — and `process.state`
+  reads `suspended`. When the process runs again (`fg`, `bg`), the
+  records come back, unless the tab moved on meanwhile: a live record,
+  or a root reported since. A program that clears its own status as it
+  stops (Codex does) leaves nothing to set aside, so nothing follows it
+  until it reports again.
+* **Anything uncertain** — the group still in front (a pipeline, a
+  straggler), a process that can't be read, no PTY — keeps the records.
+  A mark from the stamped group itself (Claude's Screen Reader marks)
+  drops what any prompt mark drops.
+
+Nothing ends on time: the once-a-second read only gathers evidence. A
+record whose program was never stamped (one behind `tmux` or `ssh`, or
+reported with the shell itself in front) ends only at a prompt mark, as
+before.
+
 ### `Tab.process` — the agent's process
 
-The process the tab's agent owner runs as, once one is stamped (#621).
-When an agent claims a tab, the server that holds the tab records the
-leader of the process group then in front of the tab's terminal: its
-pid, start time, group and session. It records nothing when the shell
-itself is in front (an agent in the background), when the leader is a
-multiplexer or a remote session (`tmux`, `screen`, `zellij`, `ssh`,
-`mosh`), or when the leader can't be read. A `manual` or `legacy` claim
-records nothing either.
+The process the tab's agent runs as, once one is stamped (#621, #519).
+Two things on a tab follow a process: its agent owner, from the moment
+an agent claims it, and its [program-status records](#tabprogram_status-osc-7501),
+while they decide the tab. At the first read after either starts, the
+server that holds the tab records the leader of the process group then
+in front of the tab's terminal: its pid, start time, group and session.
+It records nothing when the shell itself is in front (an agent in the
+background), when the leader is a multiplexer or a remote session
+(`tmux`, `screen`, `zellij`, `ssh`, `mosh`), or when the leader can't be
+read. A `manual` or `legacy` claim records nothing either.
 
 ```json
 "process": {"state": "running", "agent": "claude", "pid": "48213", "since": 1793158441}
@@ -322,18 +364,29 @@ records nothing either.
 
 * `state` is `running`, or `suspended` while the process is stopped by
   job control (`Ctrl-Z`). A suspended agent keeps its owner; `Tab.state`
-  then reads what a prompt leaves (`none`), and the lifecycle the prompt
-  mark dropped comes back when the process runs again (`fg`, `bg`).
-* `agent` is the owner's `source`.
+  then reads what a prompt leaves (`none`), and what the prompt mark
+  dropped — the owner's lifecycle, the live records — comes back when
+  the process runs again (`fg`, `bg`).
+* `agent` names the agent: the record's `app` while the records' process
+  is the one described (a 7501 agent with no hooks: `codex`,
+  `claude-code`), else the owner's `source`. Empty when neither names
+  one.
 * `pid` is the stamped process, as a string like every other int64.
 * `since` is when it was stamped, or last moved between running and
   suspended, in unix seconds.
+
+When both are stamped, `process` describes the records', since they
+decide what the tab shows. A tab whose 7501 agent is suspended has no
+live record left (the prompt mark set them aside) and often no owner;
+`process.agent` is then the only thing that names it, and the Agents
+panel lists the tab under that name, reading `Suspended`.
 
 The object and `state` are **open**: a client that cannot read them reads
 `process` as absent. The key is omitted while nothing is stamped, so an
 older server reads the same as a tab with no stamped process. What the
 stamp decides is in [`tab.agent_report`](#tabagent_report)'s
-[ownership end rules](#how-ownership-ends-without-a-report).
+[ownership end rules](#how-ownership-ends-without-a-report), and for
+records in [how a record ends](#how-a-record-ends-without-a-prompt).
 
 ### `tab.state` / `hook_active` — derived, and the compatibility contract
 
@@ -1682,9 +1735,11 @@ neither on a timer. Both apply to an agent's claim only; `manual` and
   stamped process is gone (exited, a zombie, its pid reused, or it left
   the tab's session) **and** its process group is no longer in front.
   The group still being in front (a pipeline, a straggler in the group)
-  keeps it. The server samples the stamped process when the agent
-  claims or reports, at a prompt mark, at a `C` mark, and when the tab
-  is focused, never on its own.
+  keeps it. The server reads the stamped process when the agent claims
+  or reports, at a prompt mark, at a `C` mark, when the tab is focused
+  or a session viewer attaches or detaches, and once a second while the
+  stamp is held — which is what ends an agent in a shell that prints no
+  prompt marks. The once-a-second read is evidence, not a timeout.
 
 A stopped process (`Ctrl-Z`) is neither: its owner stays, and a prompt
 mark with another group in front sets aside the lifecycle it drops

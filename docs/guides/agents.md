@@ -216,6 +216,13 @@ The rules you see:
   only in Screen Reader Mode, and they count the same way. The record
   layer and the hook layer read the same marks, in the same order, so
   [which forms count](#which-marks-count) is one rule for both.
+- **So does the agent's process.** While its records decide the tab,
+  Roost notes the agent's process, as it does for a hook claim. Once
+  that process is gone and the shell has the terminal back, its records
+  end as a prompt would end them — within about a second in a shell
+  that prints no prompt marks. A `Ctrl-Z` sets them aside instead: the
+  row reads **Suspended**, and after `fg` or `bg` they are back. See
+  [when a tab stays running](#when-a-tab-stays-running).
 - **One banner per change.** A record moving the tab into Waiting,
   Failed or Finished raises one desktop banner, titled with the
   record's title (else the agent's name) and carrying its message (else
@@ -499,13 +506,16 @@ mid-turn — so what clears a stuck tab is evidence from the tab itself:
 the shell's OSC 133 prompt marks ([which forms count](#which-marks-count))
 and the agent's own process.
 
-- **The agent's process.** When an agent claims a tab, the server that
-  holds the tab notes the process in front of the tab's terminal, and
-  `roostctl tab list --json` shows it as the tab's `process`. Once that
-  process is gone and the shell has the terminal back, the agent is
-  released: its row leaves the Agents panel and raw notifications work
-  again. The shell prints its prompt mark right after a command ends,
-  and that is when Roost looks.
+- **The agent's process.** When an agent claims a tab, or its OSC 7501
+  records start deciding it, the server that holds the tab notes the
+  process in front of the tab's terminal, and `roostctl tab list --json`
+  shows it as the tab's `process`. Once that process is gone and the
+  shell has the terminal back, the agent is released and its live
+  records end: its row leaves the Agents panel, the tab leaves
+  `running`, and raw notifications work again. Roost looks when the
+  shell prints its prompt mark, right after a command ends, and once a
+  second while it has a process noted — so a shell that prints no marks
+  clears within about a second too.
 - **The shell back in front.** When no process was noted — the agent
   claimed from the background, or ran behind `tmux`, `screen`, `zellij`,
   `ssh` or `mosh`, whose own process Roost never notes — a prompt mark
@@ -514,13 +524,20 @@ and the agent's own process.
   drops the lifecycle to `inactive` and keeps ownership as a label, so
   the tab falls through to shell-derived state instead of staying stuck.
 - **`Ctrl-Z`.** A stopped agent is still alive. It keeps the tab, its
-  `process` reads `suspended`, and the tab shows what a prompt shows.
-  After `fg` (or `bg`), what it was doing comes back.
+  `process` reads `suspended`, its Agents row reads **Suspended**, and
+  the tab shows what a prompt shows, so it mutes nothing while you work
+  at the prompt. After `fg` (or `bg`), what it was doing comes back,
+  OSC 7501 record included. A 7501 agent with no hooks keeps its row
+  through the suspend, named by its `process`, unless it clears its own
+  status as it stops: Codex does, so a suspended Codex has no row, and
+  its next report after `fg` brings the row back.
 
 A process Roost can't read (another user's, say) counts as alive, and a
 pipeline whose first command exited keeps the agent while the pipeline
 still has the terminal. The rules are spelled out under
-[`tab.agent_report`](../reference/ipc.md#how-ownership-ends-without-a-report).
+[`tab.agent_report`](../reference/ipc.md#how-ownership-ends-without-a-report)
+and, for OSC 7501 records, under
+[`Tab.program_status`](../reference/ipc.md#how-a-record-ends-without-a-prompt).
 A command tab (`roostctl tab open -- claude`) needs none of this: when
 its program exits, the tab closes and its state goes with it.
 
@@ -532,7 +549,10 @@ bash's `PROMPT_COMMAND` fires `D` on every version, but the `C`
 (command-start) mark needs bash ≥ 4.4 — `PS0` is silently ignored on
 older bash, including macOS's stock `/bin/bash` 3.2. A shell with no
 prompt marks at all — dash, plain `sh`, or bash/zsh with the
-integration disabled — never clears a stuck lifecycle on its own.
+integration disabled — relies on the agent's process: a noted process
+that is gone clears the tab within about a second. An agent Roost
+noted no process for (one behind `tmux` or `ssh`) can stay stuck there;
+the manual clear below is the way out.
 
 **Manual clear.** From any shell:
 
@@ -551,12 +571,12 @@ shell state reads `at_prompt` from the first prompt, and a tab left
 next prompt — the same as Roost's own bash integration. Older fish
 releases were not tested.
 
-Roost reads a tab's processes only when something happens there — the
-agent reports, the shell prints a mark, or the tab is focused in a
-window that runs it in-process — never on a timer. So in a shell with
-no prompt marks, a killed agent's tab clears only when the next such
-thing happens. A periodic check for those tabs is tracked in
-[#519](https://github.com/charliek/roost/issues/519).
+Roost reads a tab's processes when something happens there — the agent
+reports, the shell prints a mark, the tab is focused, or a session tab
+gains or loses a viewer — and once a second for each tab with a process
+noted ([#519](https://github.com/charliek/roost/issues/519)), never for
+any other. The once-a-second read only gathers evidence: nothing ends
+because time passed, only because the process is gone.
 
 ### Which marks count
 
@@ -568,7 +588,7 @@ reading is the spec's:
 
 | The mark | What it does |
 |---|---|
-| `A`, `P`, `N` — a prompt starting (with `k=i` or no `k`); `B`, `I` — input starting; `D`, `D;<exit code>` — a command ending | the shell is at a prompt, and an agent's lifecycle drops to `inactive`; ownership stays as a label unless the agent is [gone](#when-a-tab-stays-running) |
+| `A`, `P`, `N` — a prompt starting (with `k=i` or no `k`); `B`, `I` — input starting; `D`, `D;<exit code>` — a command ending | the shell is at a prompt: an agent's lifecycle drops to `inactive` and its `working`/`blocked` records end; ownership stays as a label unless the agent is [gone](#when-a-tab-stays-running), and what a stopped or backgrounded agent had is set aside until it runs again |
 | `C`, `C;<options>` — a command starting | the shell has a foreground process; the agent's lifecycle stays |
 | `A;k=s`, `A;k=r`, `A;k=c`, and `P`/`N` with those — a secondary, right or continuation prompt | nothing |
 | a letter not followed by `;` or the end (`Axyz`, `D0`), `L`, an empty or unknown body | nothing |

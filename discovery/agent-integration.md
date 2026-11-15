@@ -1764,7 +1764,11 @@ pass](#third-pass-charlies-second-answers-and-phase-0-probes)):
 
 Status (2026-11-14): 3a is planned (plan 3a, four commits on
 `feat/process-layer`); its first commit ships the readers, the owner's
-stamp and #621.
+stamp and #621, its second the records' stamp, parking and the 1 s tick
+(#519). The records follow a process while they decide the tab, an
+unprompted idle root included: a Ctrl-Z most often stops an agent idle
+at its own prompt, and a killed one left idle would otherwise mute raw
+OSC and refuse other agents' claims forever in a shell with no marks.
 
 - **Two plans.** 3a, the process layer (identity, stamps, end rules,
   `133;D;$?`, the DL-14 and DL-29 amendments), is L on its own. 3b, peer-pid

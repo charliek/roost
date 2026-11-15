@@ -1034,7 +1034,7 @@ resolution of it.
 
 ### DL-29: program status is a fourth per-tab axis, composed above the hook layer (2026-10-28)
 
-Status (2026-11-08): **Current.** Since [DL-30](#dl-30-one-osc-133-parser-per-sink-terminal-2026-10-28) the hook layer reads its marks from the same ordered stream.
+Status (2026-11-14): **Current, amended in place.** Since [DL-30](#dl-30-one-osc-133-parser-per-sink-terminal-2026-10-28) the hook layer reads its marks from the same ordered stream; on 2026-11-14 the process layer (#519) amended how records end, in the text below.
 
 Plan 082 (protocol 7) lets an agent report its own state in the
 terminal with OSC 7501. It is not routed through `tab.agent_report`,
@@ -1073,6 +1073,29 @@ Prompt marks are A, B and D, not only A, because Roost's bash and zsh
 integration never sends A. The user-facing rules are in
 [`guides/agents.md`](../guides/agents.md#program-status-osc-7501); the
 wire shape is [`Tab.program_status`](../reference/ipc.md#tabprogram_status-osc-7501).
+
+(Amended 2026-11-14, #519, the process layer of
+[DL-14](#dl-14-ownership-is-a-label-not-a-suppression-switch-2026-07-27):
+a prompt mark is no longer the only thing that ends a record. While the
+records decide the tab, the server that holds it stamps the leader of
+the process group then in front of its terminal, as it does for an
+agent's claim. A live record, and an unprompted root's say over the tab,
+also end when that stamped process is gone **and** its group is no
+longer in front — read when something happens on the tab, and once a
+second while a stamp is held, which is what a shell that prints no
+prompt marks needs. The end is a prompt's: a kept root `done`/`error`
+survives it. With another job already in front (an agent restarted in a
+loop), only what was reported before the read ends. A prompt mark read
+while a stamped program is stopped or in the background sets aside what
+it would drop instead of discarding it, and it comes back when the
+program runs again (`fg`, `bg`), unless the tab moved on meanwhile: a
+live record, or a root reported since. The tab meanwhile reads exactly
+what the mark left — nothing parked decides it, mutes raw notifications,
+or refuses a claim — and `Tab.process` reads `suspended`. Rule (c) is
+unchanged: a mark from the stamped group itself drops what it always
+dropped. Still no TTL: the once-a-second read only gathers evidence,
+and every reading that cannot decide keeps the records. See
+[`Tab.process`](../reference/ipc.md#tabprocess-the-agents-process).)
 
 ### DL-30: one OSC 133 parser per sink terminal (2026-10-28)
 
