@@ -1016,8 +1016,8 @@ refuses and prints the `ln -sf …` command that does it by hand.
 `cli uninstall` removes every link Roost made in the two directories,
 and only those. `cli status` says which of `installed`, `broken` or
 `absent` the directories hold. `roostctl doctor`'s `cli.on_path` check
-reports a broken link and a `PATH` whose `roostctl` is another binary;
-neither verb runs on its own.
+reports a link whose app is gone and a `PATH` whose `roostctl` is another
+binary; it repairs nothing.
 
 | Verb | Exit 0 | Exit 1 |
 |---|---|---|
@@ -1176,7 +1176,7 @@ judge a *tab* fact unless the selected tab is doctor's own tab.
 | `tab` | tab | Which tab is selected — the one check in the section, and it can fail if a `--tab`/`$ROOST_TAB_ID` no longer exists — then, for that tab, its four agent axes (shell state, agent lifecycle, attention, ownership), the state derived from them, whether raw OSC 9/99/777 is currently suppressed, and the agent reports the tab's server has dropped (how many, the latest, and a note when the latest was dropped while no agent owned the tab and that agent doesn't own it now: if it is still running, it has lost the tab). Those seven are observations, not verdicts. |
 | `session` | process | Is a session running at a socket path this build no longer uses (`session.old_path`)? A warn names each one and the `session stop --old-path` fix; skipped, saying why, where the probe may not run (an override or test mode is in effect) |
 | `claude` | process (`claude.observed` is tab-scoped) | Is `claude` on `PATH`, does `~/.claude/settings.json` parse, is any Roost hook command still in it (Claude connects through the tab environment, so one left there doubles every event, and doctor says how to remove it), has this tab actually seen a Claude hook fire? Doctor never asks for Roost's hooks in that file — see the `agents` section below for how each agent is connected |
-| `cli` | process | Does a bare `roostctl` on `PATH` run this `roostctl` (`cli.on_path`)? A warn names both paths when `PATH` finds another one, says how to [link it](#cli-subcommands) when there is none, and reports a `roostctl` link that points at an app that is gone or another Roost's |
+| `cli` | process | Does a bare `roostctl` on `PATH` run this `roostctl` (`cli.on_path`)? A warn names both paths when `PATH` finds another one, says how to [link it](#cli-subcommands) when there is none, and reports a `roostctl` link whose app is gone |
 | `agents` | process (the `owning` checks are tab-scoped) | Is `$ROOST_AGENT_HOOK` set and executable from this tab; per agent (claude, codex, grok, cursor, opencode), is Roost's hook entry present and at the current integration version, and does that source currently own a tab on this UI; for codex, does its `trusted_hash` on disk match what codex would compute; is a legacy `~/.config/roost/claude-settings.json` or shell alias still lying around? See the [Agent integration](../guides/agents.md) guide |
 
 Every entry carries a stable `id` (`env.tab_id`, `ui.socket`,

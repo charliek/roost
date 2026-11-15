@@ -774,8 +774,11 @@ pub struct Inputs {
     /// The first `roostctl` on `PATH`, as `PATH` spells it, and where it
     /// really lives.
     pub cli_on_path: Option<(PathBuf, Option<PathBuf>)>,
-    /// What the `roostctl cli install` directories hold.
-    pub cli_link: roost_ipc::cli_link::Status,
+    /// A link Roost made in the `roostctl cli install` directories whose
+    /// target is gone: the link, and where it points. A link to another
+    /// Roost that is still there is not broken here; the `PATH` comparison
+    /// names it when it is the one a bare `roostctl` runs.
+    pub cli_dangling_link: Option<(PathBuf, PathBuf)>,
 }
 
 /// What the old-path probe found, or why it did not run.
@@ -827,7 +830,7 @@ impl Default for Inputs {
             old_sessions: OldSessionProbe::NotProbed("not collected".into()),
             cli_self: None,
             cli_on_path: None,
-            cli_link: roost_ipc::cli_link::Status::Absent,
+            cli_dangling_link: None,
         }
     }
 }
@@ -947,10 +950,15 @@ pub async fn collect(
         legacy_claude_settings_present,
         legacy_claude_alias_in_rc,
         old_sessions,
-        cli_link: roost_ipc::cli_link::status(
+        cli_dangling_link: match roost_ipc::cli_link::status(
             cli_self.as_deref().unwrap_or(Path::new("")),
             &roost_ipc::cli_link::dirs_from_env(),
-        ),
+        ) {
+            roost_ipc::cli_link::Status::Broken { link, target } if !target.exists() => {
+                Some((link, target))
+            }
+            _ => None,
+        },
         cli_self,
         cli_on_path,
     }
@@ -1996,18 +2004,13 @@ fn cli_on_path_check(inputs: &Inputs) -> Check {
     } else {
         format!("add {this}'s directory to PATH")
     };
-    if let roost_ipc::cli_link::Status::Broken { link, target } = &inputs.cli_link {
-        let why = if target.exists() {
-            "another app's roostctl"
-        } else {
-            "which no longer exists"
-        };
+    if let Some((link, target)) = &inputs.cli_dangling_link {
         return check(
             ID,
             TITLE,
             Status::Warn,
             format!(
-                "{} points at {}, {why}; run `{this} cli install` to repair it",
+                "{} points at {}, which no longer exists; run `{this} cli install` to repair it",
                 redact_path(link),
                 redact_path(target)
             ),
@@ -4399,10 +4402,10 @@ mod tests {
     fn cli_on_path_reports_a_broken_link_first() {
         let broken = Inputs {
             cli_self: Some(PathBuf::from(BUNDLED)),
-            cli_link: roost_ipc::cli_link::Status::Broken {
-                link: PathBuf::from("/usr/local/bin/roostctl"),
-                target: PathBuf::from("/nonexistent/Old.app/Contents/Resources/bin/roostctl"),
-            },
+            cli_dangling_link: Some((
+                PathBuf::from("/usr/local/bin/roostctl"),
+                PathBuf::from("/nonexistent/Old.app/Contents/Resources/bin/roostctl"),
+            )),
             ..healthy()
         };
         let c = find(&evaluate(&broken), "cli.on_path").clone();
