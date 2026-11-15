@@ -1029,6 +1029,11 @@ neither verb runs on its own.
 (`state`, `label`, `link`, `target`, `source`, `bundled`, `outcome`,
 `message`, `command`, `path_line`).
 
+Tests point both callers at other directories with
+`ROOST_TEST_CLI_LINK_DIRS` (`:`-separated, in preference order), read
+only under `ROOST_TEST_MODE=1`, so a suite never writes to
+`/usr/local/bin` or the real `~/.local/bin`.
+
 ## `host` subcommands
 
 Manage the **client-side** saved-host registry for [host sessions](../guides/host-sessions.md) — `add`, `list`, `remove`, `connect`, `disconnect`, `status`. Unlike `session`, a saved host is UI state (`Workspace.hosts` in the running UI's own `state.json`), not a session daemon's workspace — so every verb here addresses the ordinary UI socket (`--target` / auto-detect / `ROOST_BUNDLE_PROFILE`, same as `tab`/`project`), never `--socket` against a session. Each verb drives the matching `host.*` IPC op one-to-one, so the CLI can never diverge from what a palette click does. See [ipc.md](ipc.md) for the wire.
