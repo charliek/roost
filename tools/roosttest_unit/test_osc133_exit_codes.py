@@ -9,8 +9,10 @@ before every prompt, and writes the prompts to stderr.
 The status must reach the mark however the user's own prompt hooks are
 arranged, and stay the status for what runs after it. In bash a
 `PROMPT_COMMAND` entry sees only what the entry before it returned, so
-`__roost_marks` has to run first and hand `$?` on; zsh gives every
-`precmd` hook the command's status.
+`__roost_marks` has to run first and hand `$?` on — ahead of the `path`
+feature's first-prompt hook too, which returns 0; zsh gives every
+`precmd` hook the command's status. Every feature is on, as in a tab, and
+the `path` hook is seen to have run.
 
 ROOST_TEST_BASH / ROOST_TEST_ZSH pick the shell binary. A missing shell
 skips locally and fails under CI.
@@ -53,9 +55,10 @@ SETUP = {
         r"""add-zsh-hook precmd __user_later"""
     ),
 }
-COMMANDS = ["false", "(exit 3)", "true", "sh -c 'kill -TERM $$'"]
+COMMANDS = ["false", "(exit 3)", "true", "sh -c 'kill -TERM $$'", r"""printf '[path:%s]' "${PATH%%:*}" """]
 # The setup's code, then each command's.
-CODES = ["0", "1", "3", "0", "143"]
+CODES = ["0", "1", "3", "0", "143", "0"]
+FEATURES = "cwd,title,marks,prompt,ssh-env,path"
 
 
 def _shell(case: unittest.TestCase, name: str) -> str:
@@ -78,8 +81,14 @@ def _seen(out: bytes, what: str) -> list[str]:
     return [code.decode() for code in re.findall(rf"\[{what}:(\d+)\]".encode(), out)]
 
 
+def _path_head(out: bytes) -> list[str]:
+    return [head.decode() for head in re.findall(rb"\[path:([^\]]*)\]", out)]
+
+
 class ExitCodeMarkTest(unittest.TestCase):
-    def _run(self, name: str, lines: list[str], features: str = "marks") -> subprocess.CompletedProcess[bytes]:
+    path_bin = "/roost-unit-marks/bin"
+
+    def _run(self, name: str, lines: list[str], features: str = FEATURES) -> subprocess.CompletedProcess[bytes]:
         _, flags = SHELLS[name]
         with tempfile.TemporaryDirectory(prefix="roost-unit-marks-") as home:
             env = {
@@ -87,6 +96,7 @@ class ExitCodeMarkTest(unittest.TestCase):
                 "HOME": home,
                 "ROOST_TAB_ID": "1",
                 "ROOST_SHELL_FEATURES": features,
+                "ROOST_PATH_BIN": self.path_bin,
                 "ROOST_TEST_SCRIPT": str(SCRIPTS / f"roost.{name}"),
                 "LC_ALL": "C",
             }
@@ -105,11 +115,13 @@ class ExitCodeMarkTest(unittest.TestCase):
 
     def test_bash_d_carries_the_status_and_the_prompt_still_sees_it(self) -> None:
         run = self._run("bash", [SETUP["bash"], *COMMANDS])
+        self.assertEqual(_path_head(run.stdout), [self.path_bin], run.stdout)
         self.assertEqual(_codes(run.stdout), CODES, run.stdout)
         self.assertEqual(_seen(run.stderr, "ps1")[-len(CODES) :], CODES, run.stderr)
 
     def test_zsh_d_carries_the_status_whatever_hook_runs_first(self) -> None:
         run = self._run("zsh", [SETUP["zsh"], *COMMANDS])
+        self.assertEqual(_path_head(run.stdout), [self.path_bin], run.stdout)
         self.assertEqual(_codes(run.stdout), CODES, run.stdout)
         # The user's hook runs once before Roost's and once after it.
         self.assertEqual(
@@ -135,7 +147,7 @@ class ExitCodeMarkTest(unittest.TestCase):
                     self.assertEqual(_codes(run.stdout), [], run.stdout)
 
     def test_zsh_marks_off_prints_no_mark(self) -> None:
-        run = self._run("zsh", [SETUP["zsh"], *COMMANDS], "no-marks")
+        run = self._run("zsh", [SETUP["zsh"], *COMMANDS], f"{FEATURES},no-marks")
         self.assertEqual(_codes(run.stdout), [], run.stdout)
 
 
