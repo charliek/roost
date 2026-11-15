@@ -1,0 +1,7 @@
+{
+  "id": "41",
+  "op": "app.cli_link",
+  "params": {
+    "action": "install"
+  }
+}

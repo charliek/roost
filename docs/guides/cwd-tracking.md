@@ -161,7 +161,7 @@ default prompt only when `PS1` is unset or the shell's stock default.
 ### Feature flags
 
 `$ROOST_SHELL_FEATURES` is a comma list; prefix a feature with `no-` to disable
-it. Default: `cwd,title,marks,prompt,ssh-env`.
+it. Default: `cwd,title,marks,prompt,ssh-env,path`.
 
 - `cwd` — emit OSC 7 (the working directory).
 - `title` — set the tab title to the cwd.
@@ -185,6 +185,20 @@ it. Default: `cwd,title,marks,prompt,ssh-env`.
   setting; if the server rejects them, SendEnv is a silent no-op (no
   worse than current behavior). Scoped to bare `ssh` — `scp`, `rsync`,
   and `git push` use their own binaries and aren't wrapped.
+- `path` — once, at the first prompt, after your startup files have run,
+  put back what Roost handed the tab and a startup file undid. On macOS
+  Roost puts `Roost.app/Contents/Resources/bin` first on a tab's `PATH`
+  so a bare `roostctl` is Roost's own
+  ([Where `roostctl` lives](../reference/cli.md#where-roostctl-lives)); a
+  login shell's `path_helper` or an rc file that rebuilds `PATH` pushes it
+  down, and this moves it back to the front. It also adds Roost's Claude
+  plugin folder back to `CLAUDE_CODE_PLUGIN_DIRS` if a startup file set
+  that variable over it, after your own entries, so Claude still reports
+  to Roost ([Agent integration](agents.md)). It only restores what Roost
+  delivered to this tab (`$ROOST_PATH_BIN` and
+  `$ROOST_CLAUDE_PLUGIN_DIR`): nothing on Linux's `PATH`, nothing when the
+  agent integration is off for Claude or a policy skips it. Changes you
+  make after the first prompt are left alone. `no-path` turns it off.
 
 The flags are opt-*out*: every feature is on unless its `no-` form is present.
 So to keep your own title and prompt, set

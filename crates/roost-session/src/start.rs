@@ -122,6 +122,7 @@ pub fn start(
     // `/proc/self/exe` then reads `… (deleted)` — resolving lazily at
     // the first spawn would hand tabs a path that no longer exists.
     roost_engine::process::set_agent_hook_binary(crate::agent_hook::hook_binary());
+    roost_engine::process::pin_roostctl(roost_engine::process::own_roostctl());
     // The same window, the same reason: `session.identify.exe_path`
     // must name the binary this daemon started from.
     let exe_path = crate::identity::canonical_exe();

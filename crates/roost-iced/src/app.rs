@@ -89,6 +89,7 @@ pub(crate) mod agent_hooks_dialog;
 mod agents_panel;
 pub(crate) mod background_resize;
 pub(crate) mod bootstrap;
+mod cli_link;
 pub(crate) mod context_menu;
 pub(crate) mod file_transfer;
 mod forwarded_open;
@@ -3553,6 +3554,10 @@ pub struct App {
     /// push, and again whenever the menu is rebuilt.
     #[cfg(target_os = "macos")]
     menu_secure_input: Option<bool>,
+    /// The `roostctl` item's title as last pushed; `None` when the menu
+    /// has no such item.
+    #[cfg(target_os = "macos")]
+    menu_cli_link: Option<String>,
     git_probe: Arc<git_metrics::GitProbe>,
     metrics_cache: git_metrics::MetricsCache,
     provider_request: u64,
@@ -4067,6 +4072,8 @@ impl App {
             secure_inputs_pushed: None,
             #[cfg(target_os = "macos")]
             menu_secure_input: None,
+            #[cfg(target_os = "macos")]
+            menu_cli_link: None,
             palette_visibility_retries: 0,
             git_probe: Arc::new(git_metrics::GitProbe::new()),
             metrics_cache: git_metrics::MetricsCache::default(),
@@ -5840,6 +5847,13 @@ impl App {
                                 Some(host_dialog::HostDialog::Bootstrap(_)) => {
                                     self.host_bootstrap_confirmed();
                                 }
+                                Some(host_dialog::HostDialog::CliLink(card)) => {
+                                    if card.primary.is_some() {
+                                        task = self.cli_link_card_confirmed();
+                                    } else {
+                                        self.host_dialog_cancel();
+                                    }
+                                }
                                 // The agent-hooks card never reaches
                                 // here: it returns above with its own
                                 // whole keyboard.
@@ -6082,6 +6096,13 @@ impl App {
             // targeting the app delegate, not `NSApplication`'s Quit).
             MenuEvent::Quit => {
                 self.exit_state.request();
+                UiTask::None
+            }
+            MenuEvent::CliLink => {
+                if !command_enabled(self.menu_gating(), false) {
+                    return UiTask::None;
+                }
+                self.cli_link_menu_activated();
                 UiTask::None
             }
             // Ungated for Quit's reason, and additionally guarded by the
@@ -6342,6 +6363,10 @@ impl App {
     pub fn native_window_focus(&mut self, focused: bool) {
         if !focused {
             self.native_focus_losses += 1;
+        } else {
+            // A `roostctl cli install` in another terminal moves what the
+            // App menu's item should say.
+            self.refresh_cli_link_menu();
         }
         self.set_window_focus(focused, "native");
     }
@@ -6541,6 +6566,22 @@ impl App {
                 )
             ],
             host_dialog::HostDialog::AgentHooks(draft) => agent_hooks_body(&self.chrome, draft),
+            // The `roostctl` link (#261): what happened and, when there
+            // is one, the line or command to copy — or Repair's consent.
+            host_dialog::HostDialog::CliLink(card) => column![
+                modal_heading(&self.chrome, card.title.clone(), &card.body),
+                modal_buttons(
+                    &self.chrome,
+                    card.dismiss,
+                    Message::HostDialogCancel,
+                    card.primary.as_ref().map(|(label, _)| ConfirmButton {
+                        label: (*label).into(),
+                        style: ConfirmStyle::Primary,
+                        press: Some(Message::CliLinkCardConfirm),
+                    }),
+                    None,
+                )
+            ],
         };
         Some(Modal {
             card: modal_card(&self.chrome, body),
@@ -9529,6 +9570,12 @@ impl App {
                 UiTask::None
             }
             Some(host_dialog::HostDialog::AgentHooks(_)) => self.agent_hooks_confirmed(),
+            Some(host_dialog::HostDialog::CliLink(card)) => {
+                if card.primary.is_none() {
+                    return Err("this dialog has no confirming action".to_string());
+                }
+                self.cli_link_card_confirmed()
+            }
             None => unreachable!("checked above"),
         };
         self.reconcile();
@@ -10960,6 +11007,14 @@ fn dialog_shape(dialog: &host_dialog::HostDialog) -> roost_ipc::messages::AppDia
             draft.buttons(),
             None,
         ),
+        host_dialog::HostDialog::CliLink(card) => (
+            "cli_link",
+            None,
+            card.title.clone(),
+            card.body.clone(),
+            card.buttons(),
+            None,
+        ),
     };
     // The one dialog with rows: five switches whose state is the whole
     // question, and which no title or body could carry.
@@ -11526,6 +11581,7 @@ impl Message {
             Self::HostBootstrapConfirm => app.host_bootstrap_confirmed(),
             Self::AgentHooksToggled(index) => app.agent_hooks_toggled(index),
             Self::AgentHooksConfirm => return app.agent_hooks_confirmed(),
+            Self::CliLinkCardConfirm => return app.cli_link_card_confirmed(),
             Self::ConfirmDeleteCancel => app.cancel_confirm_delete(),
             Self::ConfirmDeleteConfirm => return app.execute_confirmed_delete(),
             _ => {}

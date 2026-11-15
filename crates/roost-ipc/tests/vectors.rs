@@ -700,3 +700,33 @@ fn the_reorder_event_vectors_keep_string_encoded_id_lists() {
     assert_eq!(ev.event, ops::EVENT_PROJECTS_REORDERED);
     assert_eq!(ev.data["project_ids"], serde_json::json!(["2", "1"]));
 }
+
+/// `app.cli_link` into its typed params and result: the link a UI made
+/// in a directory its `PATH` lacks carries the line that adds it.
+#[test]
+fn cli_link_vectors_decode_into_their_types() {
+    use roost_ipc::cli_link::Action;
+    use roost_ipc::messages::{ops, AppCliLinkParams, AppCliLinkResult, RawRequest};
+
+    let mut path = vectors_dir();
+    path.push("app.cli_link.request.json");
+    let raw = fs::read_to_string(&path).expect("read request vector");
+    let req: RawRequest = serde_json::from_str(&raw).expect("decode envelope");
+    assert_eq!(req.op, ops::APP_CLI_LINK);
+    let params: AppCliLinkParams = serde_json::from_value(req.params).expect("decode params");
+    assert_eq!(Action::parse(&params.action), Some(Action::Install));
+
+    let mut path = vectors_dir();
+    path.push("app.cli_link.response.json");
+    let raw = fs::read_to_string(&path).expect("read response vector");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("decode envelope");
+    let result: AppCliLinkResult =
+        serde_json::from_value(value["result"].clone()).expect("decode result");
+    assert_eq!(result.state, "installed");
+    assert_eq!(result.outcome, "created");
+    assert!(result.bundled);
+    assert_eq!(
+        result.path_line.as_deref(),
+        Some("export PATH=\"$HOME/.local/bin:$PATH\"")
+    );
+}

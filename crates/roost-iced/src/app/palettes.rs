@@ -293,15 +293,21 @@ const SECURE_INPUT_ROW_ID: &str = "toggle_secure_input";
 /// Put the Secure Keyboard Entry row right after "Open Settings File",
 /// where the menu bar puts its item after "Settings…".
 fn splice_secure_input_row(items: &mut Vec<palette::PaletteItem>, shortcut: Option<String>) {
+    splice_after_open_config(
+        items,
+        palette::PaletteItem::new(SECURE_INPUT_ROW_ID, "Toggle Secure Keyboard Entry")
+            .with_trailing(shortcut),
+    );
+}
+
+/// `row` right after "Open Settings File", ahead of any row put there
+/// before it — the App menu's order after "Settings…".
+fn splice_after_open_config(items: &mut Vec<palette::PaletteItem>, row: palette::PaletteItem) {
     let at = items
         .iter()
         .position(|item| item.id == "open_config")
         .map_or(items.len(), |index| index + 1);
-    items.insert(
-        at,
-        palette::PaletteItem::new(SECURE_INPUT_ROW_ID, "Toggle Secure Keyboard Entry")
-            .with_trailing(shortcut),
-    );
+    items.insert(at, row);
 }
 
 /// The host verb rows, as palette items.
@@ -978,16 +984,22 @@ impl App {
         self.cancel_editor_for_interaction();
         self.cancel_confirm_delete();
         let frame = match kind {
-            "" | "commands" => command_palette_frame(
-                self.notification_inbox.count(),
-                &self.config.providers,
-                &self.keybindings,
-                &self.host_verb_rows(),
-                &self.host_recent_rows(),
-                self.local_slot_input(),
-                self.switch_in_flight(),
-                self.local_slot_history(),
-            ),
+            "" | "commands" => {
+                let mut frame = command_palette_frame(
+                    self.notification_inbox.count(),
+                    &self.config.providers,
+                    &self.keybindings,
+                    &self.host_verb_rows(),
+                    &self.host_recent_rows(),
+                    self.local_slot_input(),
+                    self.switch_in_flight(),
+                    self.local_slot_history(),
+                );
+                if let Some(row) = Self::cli_link_row() {
+                    splice_after_open_config(&mut frame.items, row);
+                }
+                frame
+            }
             "launcher" => launcher_palette_frame(&self.config),
             "agents" => self.agent_frame_now(),
             "notifications" => notification_inbox::frame(&self.notification_inbox),
@@ -1534,6 +1546,12 @@ impl App {
                 SECURE_INPUT_ROW_ID => {
                     self.clear_palette_state();
                     self.toggle_secure_input();
+                }
+                super::cli_link::INSTALL_ROW_ID
+                | super::cli_link::REPAIR_ROW_ID
+                | super::cli_link::UNINSTALL_ROW_ID => {
+                    self.clear_palette_state();
+                    self.cli_link_requested(&item.id);
                 }
                 "agent_hooks" => {
                     self.clear_palette_state();

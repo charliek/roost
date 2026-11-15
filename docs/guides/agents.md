@@ -1077,7 +1077,11 @@ variables: `CLAUDE_CODE_PLUGIN_DIRS` should end with a folder under
 Roost's `agent-integration` cache directory, and `OPENCODE_CONFIG_CONTENT`
 should name Roost's plugin. A tab opened before you switched the agent
 on does not have them; open a new one. Claude Code older than 2.1.280
-ignores the variable.
+ignores the variable. A startup file that sets `CLAUDE_CODE_PLUGIN_DIRS`
+outright (`export CLAUDE_CODE_PLUGIN_DIRS=…` rather than appending to it)
+would drop Roost's folder; the shell integration's
+[`path` feature](cwd-tracking.md#feature-flags) adds it back at the first
+prompt, after your own entries.
 
 If a hook genuinely never fires, check first whether something strips
 the tab's environment before the agent sees it — a wrapper using `env

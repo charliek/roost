@@ -2377,14 +2377,16 @@ fn roost_resources_dir() -> Option<&'static std::path::Path> {
 /// starter's minus the whole opener set, `runtime_dir` as its
 /// `XDG_RUNTIME_DIR` when one derived ([`user_runtime_dir`]), then the
 /// variables `opener` brings, `system_lang`'s `LANG` when the tab has no
-/// locale ([`crate::locale::fill_lang`]), then what the serving process's
-/// `extend` adds ([`crate::process::set_tab_env`]). Neither kind of opener
+/// locale ([`crate::locale::fill_lang`]), `roostctl`'s variable and `PATH`
+/// ([`roostctl_environment`]), then what the serving process's `extend`
+/// adds ([`crate::process::set_tab_env`]). Neither kind of opener
 /// inherits the starter's: a local tab gets its opener's display, a
 /// remote one its opener's SSH identity.
 fn tab_environment(
     starter: impl Iterator<Item = (OsString, OsString)>,
     opener: &TabOpener,
     runtime_dir: Option<PathBuf>,
+    roostctl: Option<&crate::process::Roostctl>,
     extend: Option<&crate::process::TabEnvFn>,
     system_lang: impl FnOnce() -> Option<&'static str>,
 ) -> Vec<(OsString, OsString)> {
@@ -2398,11 +2400,67 @@ fn tab_environment(
         env.insert(name.into(), value.into());
     }
     crate::locale::fill_lang(&mut env, system_lang);
+    roostctl_environment(&mut env, roostctl);
     if let Some(extend) = extend {
         extend(&mut env);
     }
     env.into_iter().collect()
 }
+
+/// `ROOST_ROOSTCTL` naming this Roost's `roostctl`, or unset when none
+/// resolved — a value inherited from an enclosing Roost names that one.
+/// When it was found in this process's own app bundle, that bundle's `bin`
+/// goes first on `PATH` so a bare `roostctl` in the tab is this Roost's
+/// (#261), and `ROOST_PATH_BIN` names it for the shell integration to put
+/// back in front; otherwise `ROOST_PATH_BIN` is unset. `ROOST_ROOSTCTL`'s
+/// shape can't stand in for it: a `roostctl` found on `PATH` through a
+/// link into another Roost's bundle canonicalizes into that bundle. Every
+/// bundle `bin` holding a `roostctl` is taken out of the inherited `PATH`
+/// first, whether one goes back in or not: it is there because an
+/// enclosing Roost's tab put it there. A `PATH` with nothing to take out
+/// or put in comes back byte for byte.
+fn roostctl_environment(
+    env: &mut BTreeMap<OsString, OsString>,
+    roostctl: Option<&crate::process::Roostctl>,
+) {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    match roostctl {
+        Some(found) => env.insert(ROOSTCTL_ENV.into(), found.path.clone().into_os_string()),
+        None => env.remove(OsStr::new(ROOSTCTL_ENV)),
+    };
+    match roostctl.and_then(|found| found.bundle_bin.as_deref()) {
+        Some(dir) => env.insert(PATH_BIN_ENV.into(), dir.as_os_str().to_os_string()),
+        None => env.remove(OsStr::new(PATH_BIN_ENV)),
+    };
+    let Some(path) = env.get(OsStr::new("PATH")) else {
+        return;
+    };
+    let entries: Vec<&[u8]> = path.as_bytes().split(|&byte| byte == b':').collect();
+    let kept: Vec<&[u8]> = entries
+        .iter()
+        .copied()
+        .filter(|entry| {
+            !roost_ipc::cli_link::is_roost_bundle_bin_dir(std::path::Path::new(OsStr::from_bytes(
+                entry,
+            )))
+        })
+        .collect();
+    let first = roostctl.and_then(|found| found.bundle_bin.as_deref());
+    if first.is_none() && kept.len() == entries.len() {
+        return;
+    }
+    let parts: Vec<&[u8]> = first
+        .map(|dir| dir.as_os_str().as_bytes())
+        .into_iter()
+        .chain(kept)
+        .collect();
+    let joined = OsString::from_vec(parts.join(&b':'));
+    env.insert("PATH".into(), joined);
+}
+
+const ROOSTCTL_ENV: &str = "ROOST_ROOSTCTL";
+const PATH_BIN_ENV: &str = "ROOST_PATH_BIN";
 
 /// Replace everything `cmd` inherited with `env`, keeping the `SHELL`
 /// `CommandBuilder::new` chose: the passwd shell, which the starter's own
@@ -2492,6 +2550,7 @@ fn build_command(
             std::env::vars_os(),
             opener,
             user_runtime_dir(),
+            crate::process::roostctl(),
             crate::process::tab_env(),
             crate::locale::system_lang,
         ),
@@ -2542,7 +2601,10 @@ fn build_command(
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
     cmd.env("ROOST_SHELL_INTEGRATION", "1");
     if std::env::var_os("ROOST_SHELL_FEATURES").is_none() {
-        cmd.env("ROOST_SHELL_FEATURES", "cwd,title,marks,prompt,ssh-env");
+        cmd.env(
+            "ROOST_SHELL_FEATURES",
+            "cwd,title,marks,prompt,ssh-env,path",
+        );
     }
     if let Some(dir) = resources_dir {
         cmd.env("ROOST_RESOURCES_DIR", dir);
@@ -3133,6 +3195,7 @@ mod tests {
             &TabOpener::None,
             None,
             None,
+            None,
             || None,
         );
         assert_eq!(openers(&env), BTreeMap::new());
@@ -3148,7 +3211,14 @@ mod tests {
     #[test]
     fn a_local_opener_adds_exactly_its_values_empty_ones_included() {
         let local = TabOpener::Local(values(&[("DISPLAY", ":7"), ("SSH_AUTH_SOCK", "")]));
-        let env = tab_environment(crowded_starter().into_iter(), &local, None, None, || None);
+        let env = tab_environment(
+            crowded_starter().into_iter(),
+            &local,
+            None,
+            None,
+            None,
+            || None,
+        );
         assert_eq!(
             openers(&env),
             values(&[("DISPLAY", ":7"), ("SSH_AUTH_SOCK", "")])
@@ -3161,7 +3231,14 @@ mod tests {
             ssh_connection: Some("3.3.3.3 3 4.4.4.4 22".into()),
             ssh_client: Some("3.3.3.3 3 22".into()),
         };
-        let env = tab_environment(crowded_starter().into_iter(), &remote, None, None, || None);
+        let env = tab_environment(
+            crowded_starter().into_iter(),
+            &remote,
+            None,
+            None,
+            None,
+            || None,
+        );
         assert_eq!(
             openers(&env),
             values(&[
@@ -3178,6 +3255,7 @@ mod tests {
             &TabOpener::None,
             Some(PathBuf::from("/run/user/4242")),
             None,
+            None,
             || None,
         );
         assert_eq!(get(&env, "XDG_RUNTIME_DIR"), Some("/run/user/4242"));
@@ -3185,6 +3263,7 @@ mod tests {
             os_env(&[("PATH", "/bin")]).into_iter(),
             &TabOpener::None,
             Some(PathBuf::from("/run/user/4242")),
+            None,
             None,
             || None,
         );
@@ -3205,6 +3284,7 @@ mod tests {
             crowded_starter().into_iter(),
             &local,
             None,
+            None,
             Some(&extend),
             || None,
         );
@@ -3220,6 +3300,7 @@ mod tests {
             &TabOpener::None,
             None,
             None,
+            None,
             system,
         );
         assert_eq!(get(&bare, "LANG"), Some("sv_SE.UTF-8"));
@@ -3228,9 +3309,153 @@ mod tests {
             &TabOpener::None,
             None,
             None,
+            None,
             system,
         );
         assert_eq!(get(&named, "LANG"), None);
+    }
+
+    /// A bundle at `<root>/<app>` with an executable `roostctl` in its
+    /// `Contents/Resources/bin`, which is returned.
+    fn bundle_bin(root: &std::path::Path, app: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join(app).join("Contents/Resources/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("roostctl"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(bin.join("roostctl"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        bin
+    }
+
+    fn roostctl_env(
+        starter: &[(&str, &str)],
+        roostctl: Option<&crate::process::Roostctl>,
+    ) -> Vec<(OsString, OsString)> {
+        tab_environment(
+            os_env(starter).into_iter(),
+            &TabOpener::None,
+            None,
+            roostctl,
+            None,
+            || None,
+        )
+    }
+
+    /// In `Roost.app` the bundle's `bin` goes first, and the `bin` an
+    /// enclosing Roost's tab put on `PATH` comes out; another app's
+    /// `Resources/bin` with no `roostctl` (Docker's) stays.
+    #[test]
+    fn a_bundled_roostctls_bin_goes_first_and_an_outer_roosts_comes_out() {
+        let root = tempfile::tempdir().unwrap();
+        let own = bundle_bin(root.path(), "Roost-Iced.app");
+        let outer = bundle_bin(root.path(), "Roost.app");
+        let docker = root.path().join("Docker.app/Contents/Resources/bin");
+        std::fs::create_dir_all(&docker).unwrap();
+        let roostctl = crate::process::Roostctl {
+            path: own.join("roostctl"),
+            bundle_bin: Some(own.clone()),
+        };
+        let path = format!(
+            "{}:/usr/bin:{}:{}:/bin",
+            outer.display(),
+            docker.display(),
+            own.display()
+        );
+        let env = roostctl_env(
+            &[
+                ("PATH", &path),
+                ("ROOST_ROOSTCTL", &format!("{}/roostctl", outer.display())),
+                ("ROOST_PATH_BIN", &outer.display().to_string()),
+            ],
+            Some(&roostctl),
+        );
+        assert_eq!(
+            get(&env, "PATH").map(str::to_string),
+            Some(format!(
+                "{}:/usr/bin:{}:/bin",
+                own.display(),
+                docker.display()
+            ))
+        );
+        assert_eq!(
+            get(&env, "ROOST_ROOSTCTL").map(str::to_string),
+            Some(format!("{}/roostctl", own.display()))
+        );
+        assert_eq!(
+            get(&env, "ROOST_PATH_BIN").map(str::to_string),
+            Some(own.display().to_string())
+        );
+    }
+
+    /// `/usr/bin` and `target/debug` are not bundles: `PATH` comes back
+    /// byte for byte, empty entries included.
+    #[test]
+    fn a_roostctl_outside_a_bundle_leaves_path_alone() {
+        let roostctl = crate::process::Roostctl {
+            path: PathBuf::from("/usr/bin/roostctl"),
+            bundle_bin: None,
+        };
+        let env = roostctl_env(&[("PATH", "/usr/bin::/bin:")], Some(&roostctl));
+        assert_eq!(get(&env, "PATH"), Some("/usr/bin::/bin:"));
+        assert_eq!(get(&env, "ROOST_ROOSTCTL"), Some("/usr/bin/roostctl"));
+        assert_eq!(get(&env, "ROOST_PATH_BIN"), None);
+    }
+
+    /// A `roostctl` found on `PATH` through `/usr/local/bin/roostctl`, a
+    /// link into another Roost's bundle, names that bundle's file — and no
+    /// `bin` for the shell to put first, whatever an enclosing Roost said.
+    #[test]
+    fn a_roostctl_in_a_bundle_not_its_own_names_no_path_bin() {
+        let root = tempfile::tempdir().unwrap();
+        let other = bundle_bin(root.path(), "Roost.app");
+        let roostctl = crate::process::Roostctl {
+            path: other.join("roostctl"),
+            bundle_bin: None,
+        };
+        let env = roostctl_env(
+            &[
+                ("PATH", "/usr/local/bin:/usr/bin"),
+                ("ROOST_PATH_BIN", &other.display().to_string()),
+            ],
+            Some(&roostctl),
+        );
+        assert_eq!(get(&env, "PATH"), Some("/usr/local/bin:/usr/bin"));
+        assert_eq!(
+            get(&env, "ROOST_ROOSTCTL").map(str::to_string),
+            Some(other.join("roostctl").display().to_string())
+        );
+        assert_eq!(get(&env, "ROOST_PATH_BIN"), None);
+    }
+
+    /// Nothing resolved: the variable an enclosing Roost exported goes,
+    /// and so does that Roost's `bin`.
+    #[test]
+    fn no_roostctl_clears_an_inherited_one() {
+        let root = tempfile::tempdir().unwrap();
+        let outer = bundle_bin(root.path(), "Roost.app");
+        let path = format!("{}:/usr/bin", outer.display());
+        let env = roostctl_env(
+            &[
+                ("PATH", &path),
+                ("ROOST_ROOSTCTL", &format!("{}/roostctl", outer.display())),
+                ("ROOST_PATH_BIN", &outer.display().to_string()),
+            ],
+            None,
+        );
+        assert_eq!(get(&env, "ROOST_ROOSTCTL"), None);
+        assert_eq!(get(&env, "ROOST_PATH_BIN"), None);
+        assert_eq!(get(&env, "PATH"), Some("/usr/bin"));
+    }
+
+    #[test]
+    fn no_path_gets_no_path() {
+        let root = tempfile::tempdir().unwrap();
+        let own = bundle_bin(root.path(), "Roost.app");
+        let roostctl = crate::process::Roostctl {
+            path: own.join("roostctl"),
+            bundle_bin: Some(own),
+        };
+        assert_eq!(get(&roostctl_env(&[], Some(&roostctl)), "PATH"), None);
     }
 
     #[test]

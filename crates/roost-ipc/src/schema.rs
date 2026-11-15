@@ -315,6 +315,7 @@ const OP_TYPES: &[Row] = &[
     op::<AppNoticeAnswerParams, EmptyResult>(ops::APP_NOTICE_ANSWER),
     op::<AppKeyEventParams, EmptyResult>(ops::APP_KEY_EVENT),
     op::<AppSecureInputParams, AppSecureInputResult>(ops::APP_SECURE_INPUT),
+    op::<AppCliLinkParams, AppCliLinkResult>(ops::APP_CLI_LINK),
     op::<AppContextMenuDumpParams, AppContextMenuDumpResult>(ops::APP_CONTEXT_MENU_DUMP),
     op::<AppContextMenuActivateParams, EmptyResult>(ops::APP_CONTEXT_MENU_ACTIVATE),
     op::<AppContextMenuOpenParams, EmptyResult>(ops::APP_CONTEXT_MENU_OPEN),

@@ -31,6 +31,7 @@ fi
         autoload -Uz add-zsh-hook
         _roost_zdotdir_load() {
             add-zsh-hook -d precmd _roost_zdotdir_load
+            local _roost_first_prompt=1
             [[ -r "$ROOST_RESOURCES_DIR/shell-integration/roost.zsh" ]] &&
                 source "$ROOST_RESOURCES_DIR/shell-integration/roost.zsh"
             unfunction _roost_zdotdir_load 2>/dev/null

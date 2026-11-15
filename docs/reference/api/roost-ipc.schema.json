@@ -278,6 +278,80 @@
       ],
       "type": "object"
     },
+    "AppCliLinkParams": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "AppCliLinkResult": {
+      "properties": {
+        "bundled": {
+          "type": "boolean"
+        },
+        "command": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "link": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "path_line": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "type": "string"
+        },
+        "target": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "state",
+        "label",
+        "bundled",
+        "outcome",
+        "message"
+      ],
+      "type": "object"
+    },
     "AppContextMenuActivateParams": {
       "additionalProperties": false,
       "properties": {
@@ -5652,6 +5726,14 @@
       },
       "result": {
         "$ref": "#/$defs/AppActiveTerminalFocusedResult"
+      }
+    },
+    "app.cli_link": {
+      "params": {
+        "$ref": "#/$defs/AppCliLinkParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppCliLinkResult"
       }
     },
     "app.context_menu_activate": {

@@ -574,6 +574,12 @@ pub enum UiRequest {
         reply:
             tokio::sync::oneshot::Sender<Result<roost_ipc::messages::AppSecureInputResult, String>>,
     },
+    /// `app.cli_link` — read, make or remove the `roostctl` link (#261).
+    /// `action` is already one `roost_ipc::cli_link::Action` names.
+    AppCliLink {
+        action: roost_ipc::cli_link::Action,
+        reply: tokio::sync::oneshot::Sender<Result<roost_ipc::messages::AppCliLinkResult, String>>,
+    },
     /// `app.context_menu_dump` — the right-click menu `target` would show
     /// now (plan 073 D9). Gated like `AppDialogDump`.
     AppContextMenuDump {
@@ -4645,6 +4651,23 @@ async fn dispatch(
                 .map_err(map_test_op_err)?;
             encode(&result)
         }
+        ops::APP_CLI_LINK => {
+            let p: roost_ipc::messages::AppCliLinkParams = decode(params)?;
+            let action = roost_ipc::cli_link::Action::parse(&p.action).ok_or_else(|| {
+                HandlerError::new(
+                    codes::INVALID_PARAM,
+                    format!(
+                        "action {:?} is not one of \"status\", \"install\", \"uninstall\"",
+                        p.action
+                    ),
+                )
+            })?;
+            let result = h
+                .ui_call(|reply| UiRequest::AppCliLink { action, reply })
+                .await?
+                .map_err(|e| HandlerError::new(codes::INTERNAL, e))?;
+            encode(&result)
+        }
         ops::APP_CONTEXT_MENU_DUMP => {
             let p: AppContextMenuDumpParams = decode(params)?;
             let result = h
@@ -4970,6 +4993,7 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
         (ops::APP_NOTICE_ANSWER, &[NeedsUi, TestMode]),
         (ops::APP_KEY_EVENT, &[NeedsUi, TestMode]),
         (ops::APP_SECURE_INPUT, &[NeedsUi, TestMode]),
+        (ops::APP_CLI_LINK, &[NeedsUi]),
         (ops::APP_CONTEXT_MENU_DUMP, &[NeedsUi, TestMode]),
         (ops::APP_CONTEXT_MENU_ACTIVATE, &[NeedsUi, TestMode]),
         (ops::APP_CONTEXT_MENU_OPEN, &[NeedsUi, TestMode]),
@@ -6232,6 +6256,7 @@ mod tests {
     const UI: &[&str] = &[
         "agent.set_hooks",
         "app.activate",
+        "app.cli_link",
         "app.active_terminal_focused",
         "app.cursor_shape",
         "app.render_stats",

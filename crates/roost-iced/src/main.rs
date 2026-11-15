@@ -251,6 +251,9 @@ enum Message {
     HostDialogCardPressed,
     /// The Stop Session confirmation's destructive button.
     HostStopConfirm,
+    /// The `roostctl` link card's primary button: copy its line or
+    /// command, or Repair (#261).
+    CliLinkCardConfirm,
     /// The local-backend switch confirmation's destructive button
     /// (plan 063 §D8). The direction is on the dialog, not the message:
     /// the card is the only thing that knows which way the user was
@@ -894,6 +897,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::HostDialogCardPressed
         | Message::HostStopConfirm
         | Message::LocalSwitchConfirm
+        | Message::CliLinkCardConfirm
         | Message::HostRestartConfirm
         | Message::HostBootstrapConfirm
         | Message::AgentHooksToggled(_)
