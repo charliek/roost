@@ -323,8 +323,9 @@ second while the stamp is held.
   records end as a prompt mark would end them. Live records go, and the
   root loses its say over the tab; a root `done` or `error` stays
   shown, as after a prompt. If another job already has the terminal (an
-  agent restarted in a loop), only records reported before the read
-  end; later ones are the new job's, and it is stamped next.
+  agent restarted in a loop), only records reported by the last read
+  that found the gone process's group in front end; a later one may be
+  the new job's, so it stays, and the new job is stamped next.
 * **The process is stopped** (`Ctrl-Z`): a prompt mark with another
   group in front sets aside what it drops rather than discarding it; in
   a shell with no marks, the read that finds it stopped does the same.
@@ -332,7 +333,8 @@ second while the stamp is held.
   mutes a raw notification, or refuses a claim — and `process.state`
   reads `suspended`. When the process runs again (`fg`, `bg`), the
   records come back, unless the tab moved on meanwhile: a live record,
-  or a root reported since. A program that clears its own status as it
+  a root reported since, or a `clear` (or RIS) that took them. A
+  program that clears its own status as it
   stops (Codex does) leaves nothing to set aside; when its process's
   name says which agent it is, the process is followed by that name
   instead ([an agent known by name](#an-agent-known-by-name)), and the
@@ -384,7 +386,9 @@ When both are stamped, `process` describes the records', since they
 decide what the tab shows. A tab whose 7501 agent is suspended has no
 live record left (the prompt mark set them aside) and often no owner;
 `process.agent` is then the only thing that names it, and the Agents
-panel lists the tab under that name, reading `Suspended`.
+panel lists the tab under that name, reading `Suspended` — unless
+another agent run in front of it decides the tab, with a live record or
+an owner at work, which then reads as itself.
 
 The object and `state` are **open**: a client that cannot read them reads
 `process` as absent. The key is omitted while nothing is stamped, so an
@@ -1773,7 +1777,11 @@ neither on a timer. Both apply to an agent's claim only; `manual` and
   or reports, at a prompt mark, at a `C` mark, when the tab is focused
   or a session viewer attaches or detaches, and once a second while the
   stamp is held — which is what ends an agent in a shell that prints no
-  prompt marks. The once-a-second read is evidence, not a timeout.
+  prompt marks. The once-a-second read is evidence, not a timeout. A
+  read that can't be paired with one reading of who has the terminal —
+  the terminal changed hands while it was read, or a prompt mark moved
+  the stamped group out of front between asking for the read and
+  applying it — decides nothing, and is taken again.
 
 A stopped process (`Ctrl-Z`) is neither: its owner stays, and a prompt
 mark with another group in front sets aside the lifecycle it drops

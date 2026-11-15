@@ -526,7 +526,8 @@ and the agent's own process.
   drops the lifecycle to `inactive` and keeps ownership as a label, so
   the tab falls through to shell-derived state instead of staying stuck.
 - **`Ctrl-Z`.** A stopped agent is still alive. It keeps the tab, its
-  `process` reads `suspended`, its Agents row reads **Suspended**, and
+  `process` reads `suspended`, its Agents row reads **Suspended** (until
+  another agent you run in front of it reports or works), and
   the tab shows what a prompt shows, so it mutes nothing while you work
   at the prompt. After `fg` (or `bg`), what it was doing comes back,
   OSC 7501 record included. A 7501 agent with no hooks keeps its row

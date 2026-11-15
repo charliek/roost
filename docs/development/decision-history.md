@@ -1089,11 +1089,13 @@ longer in front — read when something happens on the tab, and once a
 second while a stamp is held, which is what a shell that prints no
 prompt marks needs. The end is a prompt's: a kept root `done`/`error`
 survives it. With another job already in front (an agent restarted in a
-loop), only what was reported before the read ends. A prompt mark read
-while a stamped program is stopped or in the background sets aside what
-it would drop instead of discarding it, and it comes back when the
-program runs again (`fg`, `bg`), unless the tab moved on meanwhile: a
-live record, or a root reported since. The tab meanwhile reads exactly
+loop), only what was reported by the last read that found the stamped
+group in front ends; a later report may be the new job's, and stays. A
+prompt mark read while a stamped program is stopped or in the background
+sets aside what it would drop instead of discarding it, and it comes
+back when the program runs again (`fg`, `bg`), unless the tab moved on
+meanwhile: a live record, a root reported since, or a `clear` (RIS
+included) that took it. The tab meanwhile reads exactly
 what the mark left — nothing parked decides it, mutes raw notifications,
 or refuses a claim — and `Tab.process` reads `suspended`. Rule (c) is
 unchanged: a mark from the stamped group itself drops what it always
