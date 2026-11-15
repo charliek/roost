@@ -112,7 +112,7 @@ portable-pty = "0.8"
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # FFI / build
-bindgen = "0.70"
+bindgen = "0.73"
 cc      = "1.0"
 
 # Hashing (release-asset checksums, roost-ipc's bootstrap download)
