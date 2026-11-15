@@ -174,7 +174,7 @@ different places:
 tab gets `ROOST_ROOSTCTL`, the absolute path of the `roostctl` that
 belongs to the Roost serving it, and when that `roostctl` sits in the app
 bundle, the bundle's `Contents/Resources/bin` goes first on the tab's
-`PATH`. A login shell's `path_helper` or an rc file that rebuilds `PATH`
+`PATH` and `ROOST_PATH_BIN` names it. A login shell's `path_helper` or an rc file that rebuilds `PATH`
 would push it back down, so the shell integration's
 [`path` feature](../guides/cwd-tracking.md#feature-flags) puts it in
 front again at the first prompt. A Linux tab's `PATH` is left as it is:

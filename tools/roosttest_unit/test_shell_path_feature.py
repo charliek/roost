@@ -1,6 +1,7 @@
 """The shell integration's `path` feature (#261): after the user's startup
-files, Roost's app-bundle `bin` goes back to the front of `PATH` and its
-Claude plugin folder back into `CLAUDE_CODE_PLUGIN_DIRS`.
+files, the app-bundle `bin` Roost put first (`$ROOST_PATH_BIN`) goes back to
+the front of `PATH` and its Claude plugin folder back into
+`CLAUDE_CODE_PLUGIN_DIRS`.
 
 `__roost_paths` is called directly for the decision table, in both shipped
 scripts. The startup-order cases run a real interactive shell on a pty to
@@ -101,38 +102,42 @@ class PathsCallTest(unittest.TestCase):
 
     def test_a_bundle_bin_moved_back_goes_first_once(self):
         self.check(
-            {"ROOST_ROOSTCTL": ROOSTCTL, "PATH": f"/usr/local/bin:{BUNDLE_BIN}:/usr/bin:{BUNDLE_BIN}:/bin"},
+            {"ROOST_PATH_BIN": BUNDLE_BIN, "PATH": f"/usr/local/bin:{BUNDLE_BIN}:/usr/bin:{BUNDLE_BIN}:/bin"},
             f"{BUNDLE_BIN}:/usr/local/bin:/usr/bin:/bin",
         )
 
     def test_a_bundle_bin_an_rc_dropped_comes_back(self):
         self.check(
-            {"ROOST_ROOSTCTL": ROOSTCTL, "PATH": "/usr/bin:/bin"},
+            {"ROOST_PATH_BIN": BUNDLE_BIN, "PATH": "/usr/bin:/bin"},
             f"{BUNDLE_BIN}:/usr/bin:/bin",
         )
 
     def test_a_bundle_bin_already_first_is_left_alone(self):
         path = f"{BUNDLE_BIN}:/usr/bin:{BUNDLE_BIN}"
-        self.check({"ROOST_ROOSTCTL": ROOSTCTL, "PATH": path}, path)
+        self.check({"ROOST_PATH_BIN": BUNDLE_BIN, "PATH": path}, path)
 
     def test_an_app_name_with_pattern_characters_is_matched_literally(self):
         odd = "/Apps/My [Roost]* ?.app/Contents/Resources/bin"
         self.check(
-            {"ROOST_ROOSTCTL": f"{odd}/roostctl", "PATH": f"/usr/bin:{odd}:/bin:/Apps/My Xoost.app/Contents/Resources/bin"},
+            {"ROOST_PATH_BIN": odd, "PATH": f"/usr/bin:{odd}:/bin:/Apps/My Xoost.app/Contents/Resources/bin"},
             f"{odd}:/usr/bin:/bin:/Apps/My Xoost.app/Contents/Resources/bin",
         )
 
-    def test_a_roostctl_outside_a_bundle_changes_nothing(self):
-        for roostctl in ("/usr/bin/roostctl", "/home/u/roost/target/debug/roostctl", "/x/.app/Contents/Resources/bin/roostctl"):
+    def test_a_roostctl_with_no_bin_to_restore_changes_nothing(self):
+        """`ROOST_ROOSTCTL` alone moves nothing, even inside a bundle: a
+        roostctl found on PATH through `/usr/local/bin/roostctl`, a link
+        into another Roost's bundle, names that bundle's file, and the
+        engine gave that tab no `bin` to put first."""
+        for roostctl in (ROOSTCTL, "/usr/bin/roostctl", "/home/u/roost/target/debug/roostctl"):
             self.check({"ROOST_ROOSTCTL": roostctl, "PATH": "/usr/local/bin:/usr/bin"}, "/usr/local/bin:/usr/bin")
 
-    def test_no_roostctl_changes_nothing(self):
+    def test_nothing_handed_over_changes_nothing(self):
         self.check({"PATH": "/usr/local/bin:/usr/bin"}, "/usr/local/bin:/usr/bin")
 
     def test_no_path_turns_it_off(self):
         self.check(
             {
-                "ROOST_ROOSTCTL": ROOSTCTL,
+                "ROOST_PATH_BIN": BUNDLE_BIN,
                 "PATH": "/usr/bin",
                 "ROOST_SHELL_FEATURES": "cwd,no-path",
                 "ROOST_CLAUDE_PLUGIN_DIR": PLUGIN,
@@ -223,6 +228,7 @@ class StartupOrderTest(unittest.TestCase):
             "LC_ALL": "C",
             "ROOST_TAB_ID": "1",
             "ROOST_ROOSTCTL": ROOSTCTL,
+            "ROOST_PATH_BIN": BUNDLE_BIN,
             "ROOST_CLAUDE_PLUGIN_DIR": PLUGIN,
             "CLAUDE_CODE_PLUGIN_DIRS": PLUGIN,
             "PATH": f"{BUNDLE_BIN}:/usr/bin:/bin",

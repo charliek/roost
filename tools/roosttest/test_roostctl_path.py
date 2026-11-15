@@ -2,7 +2,8 @@
 tab's screen.
 
 Every tab gets `ROOST_ROOSTCTL`; when that `roostctl` sits in the app
-bundle, the bundle's `Contents/Resources/bin` goes first on `PATH`. The
+bundle, the bundle's `Contents/Resources/bin` goes first on `PATH` and
+`ROOST_PATH_BIN` names it for the shell integration. The
 shared-UI case runs in every lane: on Linux and a bare macOS binary the
 `PATH` a tab gets is the UI's own, unchanged; in the bundle lane
 (`ROOST_ICED_APP`) the bundle's `bin` is first.
@@ -36,6 +37,7 @@ PROBE = (
     "emit() { printf '%s\\n' \"$2\" | fold -w 50 | sed \"s/^/@@$1+/; s/\\$/@@/\"; }; "
     "emit which \"$(command -v roostctl || echo none)\"; "
     "emit env \"${ROOST_ROOSTCTL:-unset}\"; "
+    "emit pathbin \"${ROOST_PATH_BIN:-unset}\"; "
     "emit path \"$PATH\"; "
     "printf '@@done@@\\n'; "
     "exec sleep 600"
@@ -80,6 +82,7 @@ def test_a_bare_roostctl_in_a_tab_is_this_roosts(roost, project):
         assert found["first"] == bundle_bin, found
         assert found["which"] == roostctl, found
         assert found["env"] == roostctl, found
+        assert found["pathbin"] == bundle_bin, found
         return
     if ui.session_state_dir() is None:
         pytest.skip("a reused UI's own PATH is unknown to the harness")
@@ -89,6 +92,7 @@ def test_a_bare_roostctl_in_a_tab_is_this_roosts(roost, project):
     assert found["path"] == path, found
     expected = shutil.which("roostctl", path=path) or "none"
     assert found["which"] == expected, found
+    assert found["pathbin"] == "unset", found
     sibling = ui.rust_binary_path("iced")[0].parent / "roostctl"
     if os.access(sibling, os.X_OK):
         assert found["env"] == os.path.realpath(sibling), found
@@ -147,6 +151,7 @@ def fake_bundle(target):
     extra = {
         "PATH": path,
         "ROOST_ROOSTCTL": str(world.outer_bin / "roostctl"),
+        "ROOST_PATH_BIN": str(world.outer_bin),
         "ROOST_TEST_CLI_LINK_DIRS": f"{world.links}/system:{world.links}/user",
     }
     saved = os.environ.get("ROOST_ICED_BIN")
@@ -183,6 +188,7 @@ def test_a_bundled_roostctls_bin_goes_first_and_an_outer_roosts_comes_out(fake_b
     found = probe(roost, project)
     assert found["which"] == str(fake_bundle.roostctl), found
     assert found["env"] == str(fake_bundle.roostctl), found
+    assert found["pathbin"] == str(fake_bundle.bin), found
     assert found["path"] == f"{fake_bundle.bin}:/usr/bin:{fake_bundle.docker_bin}:/bin", found
 
 

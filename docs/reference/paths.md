@@ -518,6 +518,7 @@ own tabs and `roost-session`'s; Linux tabs keep the locale they inherit.
 | `ROOST_TAB_ID`  | Integer tab id (used by `roostctl` to route notifications). Gate any shell-integration extension you write on this. |
 | `ROOST_SOCKET`  | Absolute path to the Unix domain socket (`roostctl` auto-detects it from this). |
 | `ROOST_ROOSTCTL` | Absolute path to the `roostctl` of the Roost serving the tab; unset when it has none. When that `roostctl` is in its app bundle, the bundle's `Contents/Resources/bin` is also put first on the tab's `PATH`, and a bundle `bin` an enclosing Roost put there is taken out. See [Where `roostctl` lives](cli.md#where-roostctl-lives). |
+| `ROOST_PATH_BIN` | The app bundle's `Contents/Resources/bin` that Roost put first on this tab's `PATH`, set only when the Roost serving the tab found its `roostctl` in its own bundle, and unset otherwise (an inherited value included). The shell integration's [`path` feature](../guides/cwd-tracking.md#feature-flags) puts it back in front at the first prompt. |
 | `ROOST_CLAUDE_PLUGIN_DIR` | The Claude plugin folder Roost added to `CLAUDE_CODE_PLUGIN_DIRS` for this tab, and unset when it added none. The shell integration's [`path` feature](../guides/cwd-tracking.md#feature-flags) puts it back if a startup file replaced the list. |
 
 ### Shell integration

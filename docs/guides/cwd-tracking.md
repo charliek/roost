@@ -188,7 +188,7 @@ it. Default: `cwd,title,marks,prompt,ssh-env,path`.
   plugin folder back to `CLAUDE_CODE_PLUGIN_DIRS` if a startup file set
   that variable over it, after your own entries, so Claude still reports
   to Roost ([Agent integration](agents.md)). It only restores what Roost
-  delivered to this tab (`$ROOST_ROOSTCTL`'s app-bundle directory and
+  delivered to this tab (`$ROOST_PATH_BIN` and
   `$ROOST_CLAUDE_PLUGIN_DIR`): nothing on Linux's `PATH`, nothing when the
   agent integration is off for Claude or a policy skips it. Changes you
   make after the first prompt are left alone. `no-path` turns it off.

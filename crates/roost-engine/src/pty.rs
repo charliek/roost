@@ -2621,10 +2621,14 @@ fn tab_environment(
 /// resolved — a value inherited from an enclosing Roost names that one.
 /// When it was found in this process's own app bundle, that bundle's `bin`
 /// goes first on `PATH` so a bare `roostctl` in the tab is this Roost's
-/// (#261). Every bundle `bin` holding a `roostctl` is taken out of the
-/// inherited `PATH` first, whether one goes back in or not: it is there
-/// because an enclosing Roost's tab put it there. A `PATH` with nothing
-/// to take out or put in comes back byte for byte.
+/// (#261), and `ROOST_PATH_BIN` names it for the shell integration to put
+/// back in front; otherwise `ROOST_PATH_BIN` is unset. `ROOST_ROOSTCTL`'s
+/// shape can't stand in for it: a `roostctl` found on `PATH` through a
+/// link into another Roost's bundle canonicalizes into that bundle. Every
+/// bundle `bin` holding a `roostctl` is taken out of the inherited `PATH`
+/// first, whether one goes back in or not: it is there because an
+/// enclosing Roost's tab put it there. A `PATH` with nothing to take out
+/// or put in comes back byte for byte.
 fn roostctl_environment(
     env: &mut BTreeMap<OsString, OsString>,
     roostctl: Option<&crate::process::Roostctl>,
@@ -2634,6 +2638,10 @@ fn roostctl_environment(
     match roostctl {
         Some(found) => env.insert(ROOSTCTL_ENV.into(), found.path.clone().into_os_string()),
         None => env.remove(OsStr::new(ROOSTCTL_ENV)),
+    };
+    match roostctl.and_then(|found| found.bundle_bin.as_deref()) {
+        Some(dir) => env.insert(PATH_BIN_ENV.into(), dir.as_os_str().to_os_string()),
+        None => env.remove(OsStr::new(PATH_BIN_ENV)),
     };
     let Some(path) = env.get(OsStr::new("PATH")) else {
         return;
@@ -2662,6 +2670,7 @@ fn roostctl_environment(
 }
 
 const ROOSTCTL_ENV: &str = "ROOST_ROOSTCTL";
+const PATH_BIN_ENV: &str = "ROOST_PATH_BIN";
 
 /// Replace everything `cmd` inherited with `env`, keeping the `SHELL`
 /// `CommandBuilder::new` chose: the passwd shell, which the starter's own
@@ -3566,6 +3575,7 @@ mod tests {
             &[
                 ("PATH", &path),
                 ("ROOST_ROOSTCTL", &format!("{}/roostctl", outer.display())),
+                ("ROOST_PATH_BIN", &outer.display().to_string()),
             ],
             Some(&roostctl),
         );
@@ -3581,6 +3591,10 @@ mod tests {
             get(&env, "ROOST_ROOSTCTL").map(str::to_string),
             Some(format!("{}/roostctl", own.display()))
         );
+        assert_eq!(
+            get(&env, "ROOST_PATH_BIN").map(str::to_string),
+            Some(own.display().to_string())
+        );
     }
 
     /// `/usr/bin` and `target/debug` are not bundles: `PATH` comes back
@@ -3594,6 +3608,33 @@ mod tests {
         let env = roostctl_env(&[("PATH", "/usr/bin::/bin:")], Some(&roostctl));
         assert_eq!(get(&env, "PATH"), Some("/usr/bin::/bin:"));
         assert_eq!(get(&env, "ROOST_ROOSTCTL"), Some("/usr/bin/roostctl"));
+        assert_eq!(get(&env, "ROOST_PATH_BIN"), None);
+    }
+
+    /// A `roostctl` found on `PATH` through `/usr/local/bin/roostctl`, a
+    /// link into another Roost's bundle, names that bundle's file — and no
+    /// `bin` for the shell to put first, whatever an enclosing Roost said.
+    #[test]
+    fn a_roostctl_in_a_bundle_not_its_own_names_no_path_bin() {
+        let root = tempfile::tempdir().unwrap();
+        let other = bundle_bin(root.path(), "Roost.app");
+        let roostctl = crate::process::Roostctl {
+            path: other.join("roostctl"),
+            bundle_bin: None,
+        };
+        let env = roostctl_env(
+            &[
+                ("PATH", "/usr/local/bin:/usr/bin"),
+                ("ROOST_PATH_BIN", &other.display().to_string()),
+            ],
+            Some(&roostctl),
+        );
+        assert_eq!(get(&env, "PATH"), Some("/usr/local/bin:/usr/bin"));
+        assert_eq!(
+            get(&env, "ROOST_ROOSTCTL").map(str::to_string),
+            Some(other.join("roostctl").display().to_string())
+        );
+        assert_eq!(get(&env, "ROOST_PATH_BIN"), None);
     }
 
     /// Nothing resolved: the variable an enclosing Roost exported goes,
@@ -3607,10 +3648,12 @@ mod tests {
             &[
                 ("PATH", &path),
                 ("ROOST_ROOSTCTL", &format!("{}/roostctl", outer.display())),
+                ("ROOST_PATH_BIN", &outer.display().to_string()),
             ],
             None,
         );
         assert_eq!(get(&env, "ROOST_ROOSTCTL"), None);
+        assert_eq!(get(&env, "ROOST_PATH_BIN"), None);
         assert_eq!(get(&env, "PATH"), Some("/usr/bin"));
     }
 

@@ -27,7 +27,7 @@
 # shell's path_helper and many rc files move or reset PATH), and puts
 # Roost's Claude plugin folder back into CLAUDE_CODE_PLUGIN_DIRS if a
 # startup file replaced the list. It only restores what Roost handed this
-# tab ($ROOST_ROOSTCTL, $ROOST_CLAUDE_PLUGIN_DIR).
+# tab ($ROOST_PATH_BIN, $ROOST_CLAUDE_PLUGIN_DIR).
 #
 # `ssh-env` adds `-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION FORCE_HYPERLINK"`
 # to every `ssh` invocation so modern TUIs (opencode, neovim with
@@ -222,17 +222,13 @@ fi
 if ! declare -F __roost_paths >/dev/null; then
 __roost_paths() {
   _roost_feature path || return 0
-  local dir app p
-  if [ -n "${ROOST_ROOSTCTL:-}" ]; then
-    dir=${ROOST_ROOSTCTL%/*}
-    app=${dir%/Contents/Resources/bin}
-    if [[ $app != "$dir" && ${app##*/} == ?*.app && ${PATH%%:*} != "$dir" ]]; then
-      p=":$PATH:"
-      while [[ $p == *":$dir:"* ]]; do p=${p/":$dir:"/:}; done
-      p=${p#:}
-      p=${p%:}
-      export PATH="$dir${p:+:$p}"
-    fi
+  local dir="${ROOST_PATH_BIN:-}" p
+  if [[ -n $dir && ${PATH%%:*} != "$dir" ]]; then
+    p=":$PATH:"
+    while [[ $p == *":$dir:"* ]]; do p=${p/":$dir:"/:}; done
+    p=${p#:}
+    p=${p%:}
+    export PATH="$dir${p:+:$p}"
   fi
   if [[ -n "${ROOST_CLAUDE_PLUGIN_DIR:-}" &&
     ":${CLAUDE_CODE_PLUGIN_DIRS:-}:" != *":$ROOST_CLAUDE_PLUGIN_DIR:"* ]]; then
