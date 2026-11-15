@@ -102,7 +102,7 @@ from client import Roost, RoostError, scaled_timeout  # noqa: E402
 from eventstream import ENDED_EVENT, EventStream  # noqa: E402
 from relay import Relay  # noqa: E402
 from session import wait_until  # noqa: E402
-from test_host_client import view_grid  # noqa: E402
+from test_host_client import FIXTURE_FILES, require_system_clipboard, view_grid  # noqa: E402
 from test_host_local_spawn import roostctl_session, running_session_id  # noqa: E402
 from test_password_input import (  # noqa: E402
     READY,
@@ -4174,3 +4174,79 @@ def test_a_launch_migration_keeps_each_saved_opener(explicit_lane: Lane):
         daemon,
         {"SSH_CONNECTION": saved_remote["ssh_connection"], "SSH_CLIENT": saved_remote["ssh_client"]},
     )
+
+
+# ---------------------------------------------------------------------------
+# 19. Files dropped on a session tab are this machine's files
+# ---------------------------------------------------------------------------
+#
+# The slot is this machine's own session, so its shells read this
+# filesystem: a drop pastes the real paths, as a drop on an in-process tab
+# always has, instead of copying them into the session's file store under
+# a remote host's limits (no directories, 10 MiB a file).
+
+
+def shown_slot_tab(roost: Roost) -> str:
+    """The `h<n>.<id>` of the slot tab the window is showing."""
+    shown = int(roost.identify()["active_tab_id"])
+    key = slot_key(roost, shown)
+    assert key is not None, roost.sidebar_dump()
+    return key
+
+
+def test_files_sent_to_a_session_tab_paste_their_local_paths(lane: Lane, tmp_path):
+    """`tab.send_file` is the drop route as an op, so this is what a drop
+    on a session tab does. A directory is the sharpest witness: a host
+    target skips one as `directory`, and only a local paste keeps it."""
+    roost = session_ui(lane)
+    key = shown_slot_tab(roost)
+    note = tmp_path.resolve() / "a note.txt"
+    note.write_text("local\n")
+    folder = tmp_path.resolve() / "build"
+    folder.mkdir()
+    util.drain(roost, key)
+
+    result = roost.tab_send_file(key, [note, folder])
+
+    assert result["uploads"] == [], result
+    assert result["skipped"] == [], result
+    escaped = str(note).replace(" ", r"\ ")
+    assert result["pasted"] == f"{escaped}\n{folder}", result
+    util.drain_until_match(roost, key, re.escape(result["pasted"].encode()))
+
+
+def test_a_clipboard_image_pasted_into_a_session_tab_is_a_file_on_this_machine(
+    lane: Lane,
+):
+    """The clipboard image takes the local route too: written once into
+    the UI's temp directory and that path pasted, never uploaded into the
+    session's file store. Both are on this machine, so where the path
+    points is the oracle: an upload lands in the session's `files/`."""
+    roost = session_ui(lane)
+    key = shown_slot_tab(roost)
+    require_system_clipboard(roost)
+    source = FIXTURE_FILES / "shot.png"
+    try:
+        try:
+            roost.clipboard_write_image(source.read_bytes())
+        except RoostError as error:
+            if error.code == "not-supported":
+                pytest.skip(f"this UI cannot seed a clipboard image: {error.message}")
+            raise
+        assert not roost.clipboard_dump("system"), "the image write left text on the clipboard"
+        util.drain(roost, key)
+
+        roost.call("app.keybind_dispatch", {"action": "paste"})
+
+        image = re.compile(rb"/[A-Za-z0-9._/-]*roost-image-\d+-[0-9a-f]{16}\.png")
+        queued = util.drain_until_match(roost, key, image.pattern, timeout=60.0)
+        pasted = Path(image.search(queued).group(0).decode())
+        assert pasted.parent == Path(tempfile.gettempdir()).resolve(), (
+            f"the image was not written to this machine's temp dir: {pasted}"
+        )
+        assert not pasted.is_relative_to(lane.state_dir), f"the image went to the session: {pasted}"
+        assert pasted.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n", pasted
+        pasted.unlink()
+    finally:
+        with contextlib.suppress(RoostError):
+            roost.clipboard_write("system", "")

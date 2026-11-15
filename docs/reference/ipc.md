@@ -699,7 +699,11 @@ Response: `{}`.
 Send local files to a tab. On a **host** tab each one is uploaded to
 that host with [`session.put_file`](#sessionput_file) and the host paths
 are pasted; on a local tab nothing crosses a boundary and the escaped
-local paths are pasted, which is what a file drop has always done. UI
+local paths are pasted, which is what a file drop has always done. A
+tab on this machine's own session — the `localhost` target, which is
+where local tabs run under `local-backend = session` — is a local tab
+here: its shells read the same filesystem, so its paths are pasted as
+they are, directories included. UI
 socket only, ungated. The same function the native drop handler calls —
 the op *is* the drop, minus the window event.
 
@@ -745,7 +749,7 @@ everything else has a `len()` that lies.
 [`tab.capture_pty_input`](#tabcapture_pty_input-test-only-gated) sees.
 Not host receipt, and not agent attachment: the data plane has no
 acknowledgement and none was added for this. `uploads` is empty for a
-local tab. A gesture is **all-or-nothing for the paste**: if one upload
+local tab, and for a tab on this machine's own session. A gesture is **all-or-nothing for the paste**: if one upload
 fails nothing is pasted, and the files that already crossed stay on the
 host until it is swept.
 

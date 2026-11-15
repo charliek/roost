@@ -206,7 +206,7 @@ Copy a screenshot and press Ctrl+V in a host tab, or drag a file onto one, and t
 
 It has to work differently underneath, and knowing how explains everything else on this page. Every agent reads the clipboard *itself* when you press Ctrl+V, which cannot reach across an SSH connection. What Roost does instead is send the **bytes** to the host and paste the **host path** the session answers with. So a clipboard image is written on `workbox`, never on your laptop, and what appears in the composer is a `workbox` path the agent can open. A dropped file works the same way; the basename is preserved (`design.pdf` stays `design.pdf`, which is what the agent shows you in its chip) under a random directory, so two drops of the same name never collide.
 
-Local tabs are unchanged — nothing crosses a boundary and the local path is pasted, exactly as before.
+Local tabs are unchanged — nothing crosses a boundary and the local path is pasted, exactly as before. That includes a tab on **this machine's own session**: your local tabs under [`local-backend = session`](#switching-the-local-backend) (a fresh install's default), or a `localhost` host. Its shells read the same disk Roost does, so a drop pastes the real paths, directories included, and a clipboard image is written to a temp file here and that path pasted. Nothing is copied into the session's file store, and none of the limits below apply.
 
 The same thing is a command, for scripts and for when a drop is awkward:
 

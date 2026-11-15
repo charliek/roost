@@ -35,7 +35,7 @@ use roost_ui_model::keys::{HostId, TabKey};
 
 use super::interactions::deliver_paste_image;
 use crate::app::UiTask;
-use crate::host_conn::{HostOpError, UploadResult, UploadSource};
+use crate::host_conn::{HostOpError, HostTransport, UploadResult, UploadSource};
 
 /// Where a gesture's terminal outcome goes when something is waiting for
 /// it. Native drops and clipboard images carry `None`; C6's
@@ -177,6 +177,11 @@ pub(super) enum PasteGate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TransferFacts {
     is_local: bool,
+    /// The tab's session runs on this machine — the `localhost`
+    /// sentinel, which is where the local band lives under
+    /// `local-backend = session`. Its shells share this filesystem, so a
+    /// path from here is already a path there and nothing is uploaded.
+    on_this_machine: bool,
     /// The origin tab is still one worth pasting into: it has a terminal,
     /// and — if it is local — the workspace still has it.
     tab_live: bool,
@@ -296,6 +301,11 @@ fn kind_of(path: &Path) -> Kind {
 }
 
 /// Which [`Target`] a tab is.
+///
+/// A tab on this machine's own session is [`Target::Local`] only while
+/// it could take a [`Target::Host`] gesture: its paste still travels
+/// down the session's data connection, so a frozen or unserved one
+/// refuses exactly as a remote host's does.
 pub(super) fn target_of(facts: &TransferFacts) -> Target {
     if facts.is_local {
         return Target::Local;
@@ -303,10 +313,13 @@ pub(super) fn target_of(facts: &TransferFacts) -> Target {
     if facts.frozen.is_some() {
         return Target::Frozen;
     }
-    if facts.connected && facts.live == Some(facts.tab_host) {
-        Target::Host
+    if !(facts.connected && facts.live == Some(facts.tab_host)) {
+        return Target::Unavailable;
+    }
+    if facts.on_this_machine {
+        Target::Local
     } else {
-        Target::Unavailable
+        Target::Host
     }
 }
 
@@ -1211,6 +1224,10 @@ impl super::App {
         let saved = self.host_view(tab.host).map(|view| view.saved_id.as_str());
         TransferFacts {
             is_local: tab.is_local(),
+            on_this_machine: self
+                .hosts
+                .transport_at(tab.host)
+                .is_some_and(HostTransport::is_localhost),
             tab_live: self.tab_live(tab),
             frozen: self.paste_refusal_for(tab),
             connected: saved.is_some_and(|saved| {
@@ -1273,6 +1290,7 @@ mod tests {
     ) -> TransferFacts {
         TransferFacts {
             is_local,
+            on_this_machine: false,
             tab_live,
             frozen,
             connected,
@@ -1458,6 +1476,51 @@ mod tests {
             target_of(&facts(false, true, None, true, Some(host(5)), live)),
             Target::Unavailable,
             "a fresh incarnation is not the one this tab is keyed on"
+        );
+    }
+
+    /// The local session's tabs share this machine's filesystem, so a
+    /// drop pastes the real paths — a directory included, and no upload
+    /// cap — rather than copying them into the session's file store. The
+    /// paste still rides the session's connection, so every refusal a
+    /// remote host's tab gets, it gets too.
+    #[test]
+    fn a_tab_on_this_machines_session_is_a_local_target_while_it_is_served() {
+        let live = host(4);
+        let here = |facts: TransferFacts| TransferFacts {
+            on_this_machine: true,
+            ..facts
+        };
+        assert_eq!(
+            target_of(&here(facts(false, true, None, true, Some(live), live))),
+            Target::Local
+        );
+        assert_eq!(
+            target_of(&here(facts(
+                false,
+                true,
+                Some("frozen"),
+                true,
+                Some(live),
+                live
+            ))),
+            Target::Frozen
+        );
+        assert_eq!(
+            target_of(&here(facts(false, true, None, false, Some(live), live))),
+            Target::Unavailable
+        );
+        assert_eq!(
+            target_of(&here(facts(false, true, None, true, Some(host(5)), live))),
+            Target::Unavailable
+        );
+        assert_eq!(
+            route(
+                target_of(&here(facts(false, true, None, true, Some(live), live))),
+                vec![PathBuf::from("/tmp/a dir"), PathBuf::from("/tmp/b.png")],
+            ),
+            Route::PasteText("/tmp/a\\ dir\n/tmp/b.png".to_string()),
+            "the paths are pasted as they are, with nothing stat'ed or skipped"
         );
     }
 
