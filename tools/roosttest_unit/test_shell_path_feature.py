@@ -204,7 +204,11 @@ def first_prompt(argv: list[str], env: dict[str, str], cwd: str) -> dict[str, st
             pass
         os.waitpid(pid, 0)
         os.close(fd)
-    return read_vars(out.decode(errors="replace"))
+    text = out.decode(errors="replace")
+    found = read_vars(text)
+    if "PATH" not in found:
+        found["_output"] = text[-2000:]
+    return found
 
 
 RESET_RC = (
@@ -232,6 +236,10 @@ class StartupOrderTest(unittest.TestCase):
             "ROOST_CLAUDE_PLUGIN_DIR": PLUGIN,
             "CLAUDE_CODE_PLUGIN_DIRS": PLUGIN,
             "PATH": f"{BUNDLE_BIN}:/usr/bin:/bin",
+            # Debian/Ubuntu's global zshrc runs compinit, which can stop at
+            # an interactive question before the first prompt; the test is
+            # about the user's rc files, not the system's.
+            "skip_global_compinit": "1",
         }
 
     def assert_restored(self, found: dict[str, str]) -> None:
