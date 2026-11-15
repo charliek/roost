@@ -147,6 +147,9 @@ pub(crate) struct ProcessSample {
     pub(crate) incarnation: u64,
     pub(crate) foreground: Foreground,
     pub(crate) leader: Option<Leader>,
+    /// The leader read was a multiplexer's client or a remote session
+    /// ([`InFront::Relay`]), so there is no `leader`.
+    pub(crate) relayed: bool,
     pub(crate) liveness: Vec<(Stamp, Liveness)>,
 }
 
@@ -161,12 +164,16 @@ impl ProcessSample {
     pub(crate) fn read(
         incarnation: u64,
         mut foreground: impl FnMut() -> Foreground,
-        leader: impl FnOnce() -> Option<Leader>,
+        leader: impl FnOnce() -> Option<InFront>,
         liveness: impl Fn(&Stamp) -> Liveness,
         stamps: &[Stamp],
     ) -> Self {
         let before = foreground();
-        let leader = leader();
+        let (leader, relayed) = match leader() {
+            Some(InFront::Leader(leader)) => (Some(leader), false),
+            Some(InFront::Relay) => (None, true),
+            None => (None, false),
+        };
         let liveness = stamps
             .iter()
             .map(|stamp| (*stamp, liveness(stamp)))
@@ -180,6 +187,7 @@ impl ProcessSample {
                 Foreground::Unknown
             },
             leader,
+            relayed,
             liveness,
         }
     }
@@ -353,17 +361,26 @@ pub(crate) struct Leader {
     pub(crate) agent: Option<&'static str>,
 }
 
+/// What [`leader_in_front`] found leading the group in front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InFront {
+    Leader(Leader),
+    /// A multiplexer's client or a remote session
+    /// ([`process::never_stamped`]): whatever runs behind it is out of
+    /// reach, and outlives it.
+    Relay,
+}
+
 /// The leader of the group in front of `child`'s terminal, confirmed by
 /// [`same_leader`] on both sides of its name and argv reads. `None` when
-/// the shell's own group is in front, the leader can't be read or
-/// confirmed, or it is a multiplexer or a remote session
-/// ([`process::never_stamped`]).
+/// the shell's own group is in front, or the leader can't be read or
+/// confirmed.
 ///
 /// The agent is named by the first read: an `exec` between the reads
 /// (cursor-agent's launcher becoming node) keeps the stamp, and either
 /// name says the same.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn leader_in_front(child: u32) -> Option<Leader> {
+pub(crate) fn leader_in_front(child: u32) -> Option<InFront> {
     let leader = ForegroundLeader::find(child)?;
     let argv = if process::runs_a_script(&leader.before.comm) {
         leader.process.argv()
@@ -372,9 +389,9 @@ pub(crate) fn leader_in_front(child: u32) -> Option<Leader> {
     };
     let after = leader.confirmed()?;
     if process::never_stamped(&after.comm) {
-        return None;
+        return Some(InFront::Relay);
     }
-    Some(Leader {
+    Some(InFront::Leader(Leader {
         stamp: Stamp {
             pid: after.pid,
             start: after.start,
@@ -382,11 +399,11 @@ pub(crate) fn leader_in_front(child: u32) -> Option<Leader> {
             sid: after.session,
         },
         agent: process::identify(&leader.before.comm, argv.as_deref().unwrap_or_default()),
-    })
+    }))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn leader_in_front(_child: u32) -> Option<Leader> {
+pub(crate) fn leader_in_front(_child: u32) -> Option<InFront> {
     None
 }
 

@@ -25,6 +25,56 @@
       "expect": "today"
     },
     {
+      "name": "a-relayed-owner-stays-a-label-when-the-shell-takes-the-terminal-back-from-its-client",
+      "layer": "owner",
+      "stamp": null,
+      "relayed": true,
+      "fg": "shell",
+      "expect": "today"
+    },
+    {
+      "name": "a-relayed-owner-stays-a-label-while-another-job-is-in-front",
+      "layer": "owner",
+      "stamp": null,
+      "relayed": true,
+      "fg": {
+        "group": 900
+      },
+      "expect": "today"
+    },
+    {
+      "name": "a-relayed-owner-stays-a-label-when-nothing-is-known",
+      "layer": "owner",
+      "stamp": null,
+      "relayed": true,
+      "fg": "unknown",
+      "expect": "today"
+    },
+    {
+      "name": "relayed-records-drop-as-a-prompt-always-dropped-them",
+      "layer": "records",
+      "stamp": null,
+      "relayed": true,
+      "fg": "shell",
+      "expect": "today"
+    },
+    {
+      "name": "a-stamp-decides-whatever-relayed-says",
+      "layer": "owner",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "relayed": true,
+      "fg": "shell",
+      "expect": "park"
+    },
+    {
       "name": "unstamped-records-drop-as-a-prompt-always-dropped-them",
       "layer": "records",
       "stamp": null,

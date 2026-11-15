@@ -107,6 +107,13 @@ struct Followed<P> {
     /// group in front was asked for: what its process can be known to
     /// have reported. A later report may be another job's.
     seen_seq: u64,
+    /// No stamp, because the read for one found a multiplexer's client or
+    /// a remote session in front ([`process::never_stamped`]): the agent
+    /// runs behind it, and a mark does what it always did. Only a stamp
+    /// or the layer ending clears it. A claim keeps it: one whose read
+    /// finds only the shell in front can be the agent behind a detached
+    /// tmux starting another session (a compaction, a `/clear`).
+    relayed: bool,
 }
 
 impl<P> Default for Followed<P> {
@@ -122,6 +129,7 @@ impl<P> Default for Followed<P> {
             exit_code: None,
             agent: None,
             seen_seq: 0,
+            relayed: false,
         }
     }
 }
@@ -157,6 +165,7 @@ impl<P> Followed<P> {
         self.exit_code = None;
         self.agent = None;
         self.seen_seq = 0;
+        self.relayed = false;
     }
 
     /// Take `leader`'s stamp, read in `incarnation`'s spawn at `now` for a
@@ -169,6 +178,7 @@ impl<P> Followed<P> {
         // The leader stamped is the one in front.
         self.in_front = true;
         self.seen_seq = seq;
+        self.relayed = false;
     }
 
     fn has_a_sample_to_take(&self) -> bool {
@@ -233,7 +243,10 @@ impl<P> Followed<P> {
             Follow::Wanted => {
                 match &sample.leader {
                     Some(leader) => self.stamp_with(leader, sample.incarnation, seq, now),
-                    None => self.follow = Follow::Unstamped,
+                    None => {
+                        self.follow = Follow::Unstamped;
+                        self.relayed |= sample.relayed;
+                    }
                 }
                 None
             }
@@ -409,7 +422,9 @@ impl ProcessAxis {
     /// is the agent leaving.
     pub(crate) fn owner_changed(&mut self, agent: &AgentTabState) {
         if process::owner_follows_a_process(agent) {
+            let relayed = self.owner.relayed;
             self.owner.restart(Follow::Wanted);
+            self.owner.relayed = relayed;
             self.exit_pending = None;
             self.due = true;
         } else {
@@ -491,7 +506,12 @@ impl ProcessAxis {
     /// a process, and another group is in front.
     pub(crate) fn parks_records_at(&self, mark: PromptMark, fg: Foreground) -> bool {
         mark != PromptMark::OutputStart
-            && process::at_mark(Layer::Records, self.records.stamp(), fg) == MarkVerdict::Park
+            && process::at_mark(
+                Layer::Records,
+                self.records.stamp(),
+                self.records.relayed,
+                fg,
+            ) == MarkVerdict::Park
     }
 
     /// What a parking mark took off the records. A second mark while they
@@ -598,13 +618,19 @@ impl ProcessAxis {
         self.owner.at_mark(fg, exit_code);
         self.records.at_mark(fg, exit_code);
         self.hand_over(fg, agent);
-        if process::at_mark(Layer::Identity, self.identity.stamp(), fg) == MarkVerdict::Park {
+        if process::at_mark(
+            Layer::Identity,
+            self.identity.stamp(),
+            self.identity.relayed,
+            fg,
+        ) == MarkVerdict::Park
+        {
             self.due = true;
         }
         if !process::owner_follows_a_process(before) {
             return banner;
         }
-        match process::at_mark(Layer::Owner, self.owner.stamp(), fg) {
+        match process::at_mark(Layer::Owner, self.owner.stamp(), self.owner.relayed, fg) {
             MarkVerdict::Today => {}
             MarkVerdict::Release => {
                 *agent = process::released(agent);
@@ -939,6 +965,7 @@ mod tests {
             incarnation: 1,
             foreground,
             leader: leader.map(|stamp| Leader { stamp, agent: None }),
+            relayed: false,
             liveness: vec![(stamp(), liveness)],
         }
     }
@@ -1026,6 +1053,146 @@ mod tests {
 
         let after = mark(&mut axis, &agent, "D", Foreground::Shell);
         assert_eq!(after.ownership, agent.ownership);
+    }
+
+    /// A read with a multiplexer's client in front, as tmux's is while
+    /// the agent inside it claims.
+    fn relay_in_front() -> ProcessSample {
+        ProcessSample {
+            incarnation: 1,
+            foreground: Foreground::Group(800),
+            leader: None,
+            relayed: true,
+            liveness: Vec::new(),
+        }
+    }
+
+    fn claim(axis: &mut ProcessAxis, session: &str, read: &ProcessSample) -> AgentTabState {
+        let mut agent = owned("claude", AgentLifecycle::Working);
+        agent.ownership.as_mut().unwrap().session_id = session.into();
+        axis.owner_changed(&agent);
+        sampled(axis, &mut agent, read);
+        agent
+    }
+
+    #[test]
+    fn an_owner_whose_claim_found_the_shell_in_front_is_released_at_the_prompt() {
+        let mut axis = ProcessAxis::default();
+        let agent = claim(
+            &mut axis,
+            "s1",
+            &sample(Foreground::Shell, None, Liveness::Running),
+        );
+        assert_eq!(axis.owner.follow, Follow::Unstamped, "the precondition");
+
+        let after = mark(&mut axis, &agent, "D", Foreground::Shell);
+        assert_eq!(after.ownership, None, "#621");
+    }
+
+    /// tmux is in front when the agent inside it claims, so nothing is
+    /// stamped. A detach ends the tmux client and the shell takes the
+    /// terminal back, with the agent alive behind it: the `D` does what
+    /// it always did and the owner stays, so what the agent reports after
+    /// a reattach still matches it.
+    #[test]
+    fn an_owner_behind_a_multiplexer_outlives_its_client_leaving() {
+        let mut axis = ProcessAxis::default();
+        let agent = claim(&mut axis, "s1", &relay_in_front());
+        assert_eq!(axis.owner.stamp(), None, "a multiplexer is never stamped");
+        assert!(!axis.ticks(), "nothing to read on a tick");
+
+        let detached = mark(&mut axis, &agent, "D", Foreground::Shell);
+        assert_eq!(detached.ownership, agent.ownership, "the detach keeps it");
+        assert_eq!(detached.lifecycle, AgentLifecycle::Inactive, "today's");
+        assert_eq!(axis.wire(&detached, &ProgramStatusRecords::default()), None);
+
+        let reattached = mark(&mut axis, &detached, "C", Foreground::Group(800));
+        let detached_again = mark(&mut axis, &reattached, "D", Foreground::Shell);
+        assert_eq!(detached_again.ownership, agent.ownership);
+    }
+
+    /// The agent behind a detached tmux claims again under a new session
+    /// as it compacts: its read finds only the shell in front, which says
+    /// nothing of where the claim came from. It stays relayed, before
+    /// that read lands and after.
+    #[test]
+    fn a_claim_from_behind_a_detached_multiplexer_stays_relayed() {
+        let mut axis = ProcessAxis::default();
+        let agent = claim(&mut axis, "s1", &relay_in_front());
+        mark(&mut axis, &agent, "D", Foreground::Shell);
+
+        let mut compacted = owned("claude", AgentLifecycle::Inactive);
+        compacted.ownership.as_mut().unwrap().session_id = "s2".into();
+        axis.owner_changed(&compacted);
+        let before_its_read = mark(&mut axis, &compacted, "D", Foreground::Shell);
+        assert_eq!(before_its_read.ownership, compacted.ownership);
+
+        sampled(
+            &mut axis,
+            &mut compacted,
+            &sample(Foreground::Shell, None, Liveness::Running),
+        );
+        let after_its_read = mark(&mut axis, &compacted, "D", Foreground::Shell);
+        assert_eq!(after_its_read.ownership, compacted.ownership);
+    }
+
+    /// After a detach, an agent started at the tab's own shell claims, and
+    /// its read finds it in front: it is stamped, and the relay is over —
+    /// a later claim whose read finds the shell in front (a background
+    /// job's) is released at the prompt again, and a killed stamped agent
+    /// ends.
+    #[test]
+    fn a_claim_whose_agent_is_in_front_ends_the_relay() {
+        let mut axis = ProcessAxis::default();
+        let agent = claim(&mut axis, "s1", &relay_in_front());
+        mark(&mut axis, &agent, "D", Foreground::Shell);
+
+        let mut started = claim(
+            &mut axis,
+            "s2",
+            &sample(Foreground::Group(700), Some(stamp()), Liveness::Running),
+        );
+        assert_eq!(axis.owner.stamp(), Some(&stamp()));
+        started = mark(&mut axis, &started, "D", Foreground::Shell);
+        sampled(
+            &mut axis,
+            &mut started,
+            &sample(Foreground::Shell, None, Liveness::Gone),
+        );
+        assert_eq!(started.ownership, None, "the killed agent ends");
+
+        let mut axis = ProcessAxis::default();
+        let agent = claim(&mut axis, "s1", &relay_in_front());
+        mark(&mut axis, &agent, "D", Foreground::Shell);
+        claim(
+            &mut axis,
+            "s2",
+            &sample(Foreground::Group(700), Some(stamp()), Liveness::Running),
+        );
+        let in_the_background = claim(
+            &mut axis,
+            "s3",
+            &sample(Foreground::Shell, None, Liveness::Running),
+        );
+        let after = mark(&mut axis, &in_the_background, "D", Foreground::Shell);
+        assert_eq!(after.ownership, None, "#621 again");
+    }
+
+    /// A release ends the relay with the owner: the next claim, read with
+    /// the shell in front, is a background job's, and #621 applies.
+    #[test]
+    fn a_release_ends_the_relay() {
+        let mut axis = ProcessAxis::default();
+        let agent = claim(&mut axis, "s1", &relay_in_front());
+        axis.owner_changed(&process::released(&agent));
+
+        let in_the_background = claim(
+            &mut axis,
+            "s2",
+            &sample(Foreground::Shell, None, Liveness::Running),
+        );
+        let after = mark(&mut axis, &in_the_background, "D", Foreground::Shell);
+        assert_eq!(after.ownership, None);
     }
 
     #[test]
@@ -1628,6 +1795,7 @@ mod tests {
                 stamp: next,
                 agent: None,
             }),
+            relayed: false,
             liveness: vec![(stamp(), liveness)],
         }
     }
@@ -2025,6 +2193,7 @@ mod tests {
                 stamp: stamp(),
                 agent,
             }),
+            relayed: false,
             liveness: vec![(stamp(), liveness)],
         }
     }

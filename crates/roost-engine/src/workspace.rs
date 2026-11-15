@@ -8616,6 +8616,7 @@ mod tests {
                     incarnation: 1,
                     foreground,
                     leader: leader.map(|stamp| Leader { stamp, agent: None }),
+                    relayed: false,
                     liveness: request
                         .stamps
                         .iter()
@@ -8930,6 +8931,7 @@ mod tests {
                     incarnation: 1,
                     foreground: Foreground::Shell,
                     leader: None,
+                    relayed: false,
                     liveness: vec![(AGENT, Liveness::Gone)],
                 },
             );
@@ -9050,6 +9052,7 @@ mod tests {
                         stamp: AGENT,
                         agent: Some("cursor"),
                     }),
+                    relayed: false,
                     liveness: request
                         .stamps
                         .iter()
@@ -9157,6 +9160,7 @@ mod tests {
                         incarnation: 1,
                         foreground,
                         leader: None,
+                        relayed: false,
                         liveness: vec![(AGENT, liveness)],
                     },
                 );

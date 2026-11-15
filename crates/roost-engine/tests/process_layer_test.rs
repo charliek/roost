@@ -421,7 +421,7 @@ async fn without_marks_a_dead_programs_working_record_ends_on_the_tick() {
 async fn an_agent_named_by_its_process_shows_at_blur_and_goes_with_it() {
     let Some(rig) = Rig::new() else { return };
     let dir = tempfile::tempdir().unwrap();
-    let Some(command) = cursor_agent(dir.path()) else {
+    let Some(command) = named_sleeper(dir.path(), "cursor-agent") else {
         eprintln!("skipping the identity test: no way to run a cursor-agent here");
         return;
     };
@@ -454,9 +454,74 @@ async fn an_agent_named_by_its_process_shows_at_blur_and_goes_with_it() {
         .await;
 }
 
-/// A command that runs something Roost names `cursor`, made in `dir`.
-fn cursor_agent(dir: &std::path::Path) -> Option<String> {
-    let agent = dir.join("cursor-agent");
+/// An agent inside tmux claims while the tmux client has the terminal,
+/// so nothing is stamped. A detach ends the client and the shell takes
+/// the terminal back, with the agent alive behind the tmux server: the
+/// shell's `D` does what it always did, and the owner stays, so what the
+/// agent reports after a reattach still lands. The client here is a
+/// sleeper called `tmux`; a second tab's stamp is the fence, as in I3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_behind_a_multiplexer_outlives_its_client() {
+    let Some(rig) = Rig::new() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let Some(tmux) = named_sleeper(dir.path(), "tmux") else {
+        eprintln!("skipping the multiplexer test: no way to run a tmux here");
+        return;
+    };
+    let (relayed, relayed_shell) = rig.bash_tab().await;
+    let (fence, fence_shell) = rig.bash_tab().await;
+    assert!(relayed < fence, "the precondition: tab order is id order");
+
+    rig.type_line(relayed, &tmux).await;
+    wait_until("tmux leads the terminal, exec'd", || {
+        pid_of_job(relayed_shell).is_some_and(|job| comm_of(job) == "tmux")
+    })
+    .await;
+    rig.type_line(fence, "sleep 300").await;
+    wait_until("the fence's job leads its terminal", || {
+        pid_of_job(fence_shell).is_some()
+    })
+    .await;
+    rig.claim(relayed, AgentLifecycle::Working);
+    rig.claim(fence, AgentLifecycle::Working);
+    rig.wait(fence, "the fence's stamp", |tab| tab.process.is_some())
+        .await;
+    assert_eq!(
+        rig.workspace.tab(relayed).unwrap().process,
+        None,
+        "a multiplexer is never stamped"
+    );
+
+    signal(pid_of_job(relayed_shell).unwrap(), libc::SIGTERM);
+    rig.prompted(relayed, 2).await;
+    let listed = rig.workspace.tab(relayed).unwrap();
+    assert_eq!(
+        listed.ownership.as_ref().map(|owner| owner.source.as_str()),
+        Some("claude"),
+        "the detach keeps the owner"
+    );
+    assert_eq!(listed.agent_lifecycle, AgentLifecycle::Inactive, "today's");
+
+    let report = TabAgentReportParams {
+        session_id: format!("s-{relayed}"),
+        ..TabAgentReportParams::sessionless(
+            relayed,
+            "claude",
+            OwnershipAction::Preserve,
+            Some(AgentLifecycle::Working),
+        )
+    };
+    let (accepted, listed) = rig.workspace.agent_report(&report).expect("report");
+    assert!(accepted, "the agent's report after a reattach lands");
+    assert_eq!(listed.agent_lifecycle, AgentLifecycle::Working);
+}
+
+/// A command that runs a process called `name`, made in `dir`: Linux
+/// names a process after the path it ran as, so a copied `sleep` will
+/// do; macOS names it after its binary, and kills a copied system one, so
+/// there it is built with `cc`.
+fn named_sleeper(dir: &std::path::Path, name: &str) -> Option<String> {
+    let agent = dir.join(name);
     if cfg!(target_os = "linux") {
         let sleep = ["/bin/sleep", "/usr/bin/sleep"]
             .into_iter()

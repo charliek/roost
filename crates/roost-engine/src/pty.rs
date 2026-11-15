@@ -4283,9 +4283,12 @@ mod tests {
         let child = sup.sessions.lock().unwrap()[&tab_id].pid.unwrap();
         assert_eq!(sup.foreground(tab_id), Foreground::Shell);
         assert_eq!(
-            sup.sample_process(tab_id, true, &[])
-                .map(|sample| (sample.foreground, sample.leader)),
-            Some((Foreground::Shell, None)),
+            sup.sample_process(tab_id, true, &[]).map(|sample| (
+                sample.foreground,
+                sample.leader,
+                sample.relayed
+            )),
+            Some((Foreground::Shell, None, false)),
             "the shell's own group is never stamped"
         );
 
@@ -4306,6 +4309,7 @@ mod tests {
         };
         let sample = sup.sample_process(tab_id, true, &[]).expect("a sample");
         assert_eq!(sample.foreground, Foreground::Group(pgid));
+        assert!(!sample.relayed);
         let leader = sample.leader.expect("the job's leader is stamped");
         assert_eq!(leader.agent, None, "sleep is no agent");
         let stamp = leader.stamp;
@@ -4357,9 +4361,9 @@ mod tests {
             }
             assert_eq!(
                 sup.sample_process(tab_id, true, &[])
-                    .map(|sample| sample.leader),
-                Some(None),
-                "a multiplexer in front is never stamped"
+                    .map(|sample| (sample.leader, sample.relayed)),
+                Some((None, true)),
+                "a multiplexer in front is never stamped, and is read as one"
             );
         }
 

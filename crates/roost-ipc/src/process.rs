@@ -95,17 +95,23 @@ pub enum SampleVerdict {
 }
 
 /// [`MarkVerdict`] for `layer`, stamped with `stamp` or not, at a mark
-/// read with `fg` in front.
+/// read with `fg` in front. `relayed` says a layer with no stamp has none
+/// because a multiplexer or a remote session led the group in front when
+/// it was read for one ([`never_stamped`]); with a stamp, the stamp
+/// decides.
 ///
 /// A mark from the group the stamp belongs to is that program's own (DL-29
 /// rule c), so it does what it always did. A mark with another group in
 /// front parks rather than drops: a stopped or backgrounded agent is still
 /// alive. Only an owner with no stamp is released, and only when the shell
-/// itself is in front; with anything else in front, or nothing known, a
-/// mark does what it always did.
-pub fn at_mark(layer: Layer, stamp: Option<&Stamp>, fg: Foreground) -> MarkVerdict {
+/// itself is in front and the owner is not relayed: an agent behind tmux,
+/// screen or ssh outlives the client in front, and the shell taking the
+/// terminal back from that client — a detach — says nothing of the agent.
+/// With anything else in front, or nothing known, a mark does what it
+/// always did.
+pub fn at_mark(layer: Layer, stamp: Option<&Stamp>, relayed: bool, fg: Foreground) -> MarkVerdict {
     match (stamp, fg) {
-        (None, Foreground::Shell) if layer == Layer::Owner => MarkVerdict::Release,
+        (None, Foreground::Shell) if layer == Layer::Owner && !relayed => MarkVerdict::Release,
         (None, _) | (Some(_), Foreground::Unknown) => MarkVerdict::Today,
         (Some(stamp), Foreground::Group(pgid)) if pgid == stamp.pgid => MarkVerdict::Today,
         (Some(_), _) => MarkVerdict::Park,

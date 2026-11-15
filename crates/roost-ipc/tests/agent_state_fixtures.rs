@@ -53,13 +53,15 @@ enum FixtureFile {
     },
 }
 
-/// `at_mark(layer, stamp, fg)`.
+/// `at_mark(layer, stamp, relayed, fg)`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MarkCase {
     name: String,
     layer: Layer,
     stamp: Option<Stamp>,
+    #[serde(default)]
+    relayed: bool,
     fg: Foreground,
     expect: MarkVerdict,
 }
@@ -208,7 +210,7 @@ fn every_group_is_represented_and_non_trivial() {
         ("rank", 5),
         ("transitions", 18),
         ("shell_marks", 7),
-        ("process", 37),
+        ("process", 42),
     ]
     .into_iter()
     .collect();
@@ -347,7 +349,7 @@ fn every_agent_state_fixture_matches_the_rust_implementation() {
                 for case in marks {
                     cases += 1;
                     let at = format!("{file}[{}]", case.name);
-                    let got = at_mark(case.layer, case.stamp.as_ref(), case.fg);
+                    let got = at_mark(case.layer, case.stamp.as_ref(), case.relayed, case.fg);
                     check(&mut failures, &at, "at_mark", &got, &case.expect);
                 }
                 for case in samples {

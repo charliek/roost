@@ -146,9 +146,9 @@ strictly decreasing across `order_high_to_low`.
 ### `group: "process"`
 
 The process layer's two decisions, one table each. `marks` is
-`at_mark(layer, stamp, fg)` — what an `A`/`B`/`D` mark does to a layer
-beyond its own effect; `samples` is `on_sample(stamp, liveness, fg)` —
-what a read of a stamped process does.
+`at_mark(layer, stamp, relayed, fg)` — what an `A`/`B`/`D` mark does to a
+layer beyond its own effect; `samples` is `on_sample(stamp, liveness, fg)`
+— what a read of a stamped process does.
 
 ```json
 {
@@ -169,6 +169,10 @@ what a read of a stamped process does.
   its `park` is only a sample asked for.
 - `stamp` is `null` (nothing stamped) or the stamped process's
   `{pid, start, pgid, sid}`; `start` is `[seconds_or_ticks, micros]`.
+- `relayed` (optional, default `false`): the layer has no stamp because
+  a multiplexer or a remote session (tmux, screen, zellij, ssh, mosh) led
+  the group in front when it was read for one. With a stamp it changes
+  nothing.
 - `fg` is who has the terminal: `"shell"` (the tab's shell, back in
   front), `{"group": <pgid>}` (that group — the stamp's own, or another
   job's), or `"unknown"`.
@@ -179,8 +183,10 @@ what a read of a stamped process does.
 The corpus covers every cell: each layer with no stamp against each
 foreground, each with a stamp against the shell, its own group, another
 job and nothing known; and every liveness against every foreground for a
-stamped layer. Two rules are the point: only `gone` with the stamp's
-group out of front ends anything, and a stopped process always suspends.
+stamped layer. Three rules are the point: only `gone` with the stamp's
+group out of front ends anything, a stopped process always suspends, and
+a relayed owner is never released by a mark — a tmux detach puts the
+shell back in front while the agent lives on behind it.
 
 ### The `ownership` object
 

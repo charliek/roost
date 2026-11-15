@@ -478,6 +478,66 @@ def test_a_pipeline_keeps_its_owner_and_a_waiting_wrapper_ends_with_its_agent(la
         kill_group(wrapper)
 
 
+def tmux_client_in_front(shell: int) -> bool:
+    job = job_in_front(shell)
+    return job is not None and ps_field(job, "comm").startswith("tmux")
+
+
+def test_an_agent_behind_tmux_keeps_its_owner_across_a_detach(lane):
+    """An agent inside a real tmux claims while the tmux client has the
+    terminal, so nothing is stamped. A detach ends the client and the
+    shell takes the terminal back with the agent alive behind the tmux
+    server: the shell's `D` does what it always did, and the owner stays,
+    so what the agent reports after a reattach lands.
+
+    A bash tab opened after it, with a stamped job, is the fence that the
+    claim was read before the detach: the sampler applies what it read in
+    tab id order. Linux only, and tmux is optional: CI installs none, and
+    the PTY test with a process named `tmux` covers the rule there."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("the real-tmux case runs on Linux")
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        pytest.skip("tmux not found")
+    tab, shell = lane.integrated_tab("bash")
+    fence, fence_shell = lane.bash_tab()
+    assert tab < fence, "the precondition: tab order is id order"
+    home = tempfile.mkdtemp(prefix="rtmux-", dir="/tmp")
+    server = [tmux, "-S", os.path.join(home, "s")]
+    session = uuid.uuid4().hex
+    fenced = None
+    try:
+        lane.client.send(
+            tab, f"'{tmux}' -S '{home}/s' -f /dev/null new-session -s agent 'sleep 600'\n"
+        )
+        lane.client._wait(lambda: tmux_client_in_front(shell), 15.0, "the tmux client in front")
+        lane.client.agent_report(tab, "claude", "claim", session_id=session, lifecycle="working")
+        fenced = int(lane.stamped_job(fence, fence_shell)["pid"])
+        listed = lane.client.tab(tab)
+        assert "process" not in listed, listed
+        assert listed["ownership"]["session_id"] == session, listed
+
+        subprocess.run([*server, "detach-client", "-s", "agent"], check=True, timeout=15)
+        listed = lane.wait(
+            tab, "the shell's D after the detach", lambda t: t["shell_state"] == "at_prompt"
+        )
+        assert (listed.get("ownership") or {}).get("session_id") == session, listed
+        assert listed["agent_lifecycle"] == "inactive", listed
+
+        lane.client.send(tab, f"'{tmux}' -S '{home}/s' attach -t agent\n")
+        lane.client._wait(lambda: tmux_client_in_front(shell), 15.0, "the tmux client back")
+        reply = lane.client.agent_report(
+            tab, "claude", "preserve", session_id=session, lifecycle="working"
+        )
+        assert reply["accepted"] is True, reply
+        assert reply["tab"]["agent_lifecycle"] == "working", reply
+    finally:
+        subprocess.run([*server, "kill-server"], capture_output=True, timeout=15)
+        shutil.rmtree(home, ignore_errors=True)
+        if fenced is not None:
+            kill_group(fenced)
+
+
 SLEEPER = "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n"
 
 
