@@ -3673,6 +3673,7 @@ mod tests {
         &["session", "stop"],
         &["session", "status"],
         &["cli", "install"],
+        &["cli", "repair"],
         &["cli", "uninstall"],
         &["cli", "status"],
         &["host", "add", "--label", "l", "--target", "t"],

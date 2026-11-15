@@ -91,15 +91,18 @@ pub enum Slot {
     /// A link to `source`.
     Ours,
     /// A link into a bundle's `bin` that does not reach `source`: the app
-    /// moved, or it is another Roost's.
+    /// moved (`live` false, nothing is there), or it is another Roost's
+    /// that still runs (`live` true).
     Stale {
         target: PathBuf,
+        live: bool,
     },
     /// Not Roost's: never written, never removed.
     Foreign,
 }
 
-fn slot(link: &Path, source: &Path) -> Slot {
+/// What `link` is, judged against this Roost's `source`.
+pub fn slot(link: &Path, source: &Path) -> Slot {
     let meta = match std::fs::symlink_metadata(link) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Slot::Empty,
@@ -121,7 +124,10 @@ fn slot(link: &Path, source: &Path) -> Slot {
     let reaches = |path: &Path| std::fs::canonicalize(path).ok();
     match (reaches(link), reaches(source)) {
         (Some(resolved), Some(source)) if resolved == source => Slot::Ours,
-        _ => Slot::Stale { target },
+        (resolved, _) => Slot::Stale {
+            target,
+            live: resolved.is_some(),
+        },
     }
 }
 
@@ -129,8 +135,15 @@ fn slot(link: &Path, source: &Path) -> Slot {
 /// from, never the caller's `PATH`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
-    Installed { link: PathBuf },
-    Broken { link: PathBuf, target: PathBuf },
+    Installed {
+        link: PathBuf,
+    },
+    /// [`Slot::Stale`]'s link, `live` as there.
+    Broken {
+        link: PathBuf,
+        target: PathBuf,
+        live: bool,
+    },
     Absent,
 }
 
@@ -168,8 +181,8 @@ pub fn status(source: &Path, dirs: &[PathBuf]) -> Status {
         let link = dir.join(NAME);
         match slot(&link, source) {
             Slot::Ours => return Status::Installed { link },
-            Slot::Stale { target } if broken.is_none() => {
-                broken = Some(Status::Broken { link, target });
+            Slot::Stale { target, live } if broken.is_none() => {
+                broken = Some(Status::Broken { link, target, live });
             }
             Slot::Stale { .. } | Slot::Empty | Slot::Foreign => {}
         }
@@ -177,21 +190,31 @@ pub fn status(source: &Path, dirs: &[PathBuf]) -> Status {
     broken.unwrap_or(Status::Absent)
 }
 
+/// A link a Roost made that is not this Roost's.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Installed {
-    Created { link: PathBuf },
-    Repaired { link: PathBuf, was: PathBuf },
-    AlreadyThere { link: PathBuf },
+pub struct OtherLink {
+    pub link: PathBuf,
+    pub target: PathBuf,
+    /// [`Slot::Stale`]'s `live`.
+    pub live: bool,
 }
 
-impl Installed {
-    pub fn link(&self) -> &Path {
-        match self {
-            Self::Created { link } | Self::Repaired { link, .. } | Self::AlreadyThere { link } => {
-                link
-            }
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    Created,
+    Repaired { was: PathBuf },
+    AlreadyThere,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    pub link: PathBuf,
+    pub change: Change,
+    /// Links a Roost made in the directories before `link`'s, which this
+    /// install left as they are — in practice because Roost can't write
+    /// there. A live one is what a bare `roostctl` runs wherever its
+    /// directory comes first on `PATH`.
+    pub left: Vec<OtherLink>,
 }
 
 /// Why nothing was linked or unlinked. Each says what the user can do,
@@ -214,6 +237,13 @@ pub enum Refusal {
         source: PathBuf,
         links: Vec<PathBuf>,
     },
+    /// The link reaches another Roost that is still installed: only
+    /// [`Action::Repair`] points it here.
+    AnotherRoost {
+        source: PathBuf,
+        link: PathBuf,
+        target: PathBuf,
+    },
     NoDirectory {
         source: PathBuf,
     },
@@ -231,19 +261,20 @@ impl Refusal {
             Self::NoRoostctl
             | Self::NotBundled { .. }
             | Self::Translocated { .. }
+            | Self::AnotherRoost { .. }
             | Self::NoDirectory { .. } => None,
-            Self::Occupied { source, links } => links
-                .first()
-                .map(|link| format!("ln -sf {} {}", quote(source), quote(link))),
+            Self::Occupied { source, links } => {
+                links.first().map(|link| link_command(source, link))
+            }
             Self::Failed {
                 source,
                 link,
                 removing,
                 ..
             } => Some(if *removing {
-                format!("rm {}", quote(link))
+                remove_command(link)
             } else {
-                format!("ln -sf {} {}", quote(source), quote(link))
+                link_command(source, link)
             }),
         }
     }
@@ -269,6 +300,19 @@ impl std::fmt::Display for Refusal {
                 f,
                 "{} already exists and is not a link Roost made; Roost leaves it alone",
                 join_paths(links)
+            ),
+            Self::AnotherRoost {
+                source,
+                link,
+                target,
+            } => write!(
+                f,
+                "{} points at {}, another Roost's roostctl that is still installed, so Roost left \
+                 it alone; to point it at this one, choose Repair 'roostctl' Command\u{2026} or \
+                 run `{} cli repair`",
+                link.display(),
+                target.display(),
+                source.display()
             ),
             Self::NoDirectory { .. } => {
                 write!(f, "no directory to put the link in (HOME is not set)")
@@ -301,7 +345,22 @@ fn quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
 
-fn writable(dir: &Path) -> bool {
+fn link_command(source: &Path, link: &Path) -> String {
+    format!("ln -sf {} {}", quote(source), quote(link))
+}
+
+fn remove_command(link: &Path) -> String {
+    format!("rm {}", quote(link))
+}
+
+/// Several by-hand commands as one line, or `None` for none.
+fn commands(each: impl Iterator<Item = String>) -> Option<String> {
+    let all: Vec<String> = each.collect();
+    (!all.is_empty()).then(|| all.join(" && "))
+}
+
+/// Whether this user may create and remove entries in `dir`.
+pub fn writable(dir: &Path) -> bool {
     let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
         return false;
     };
@@ -309,10 +368,17 @@ fn writable(dir: &Path) -> bool {
     dir.is_dir() && unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
 }
 
-/// Point a link at `source`: repair a stale one where it is, else create
+fn dir_of(link: &Path) -> &Path {
+    link.parent().unwrap_or(Path::new("/"))
+}
+
+/// Point a link at `source`: repair a stale link where it is, else create
 /// one in the first directory that exists, is writable and is free — the
-/// last directory is created if it is missing.
-pub fn install(source: &Path, dirs: &[PathBuf]) -> Result<Installed, Refusal> {
+/// last directory is created if it is missing. A stale link in a directory
+/// Roost can't write is passed over like an occupied one, and named in
+/// [`Installed::left`]. A link that reaches another Roost still installed
+/// is re-pointed only when `repoint` says the user asked for that.
+pub fn install(source: &Path, dirs: &[PathBuf], repoint: bool) -> Result<Installed, Refusal> {
     let refuse_source = || source.to_path_buf();
     if bundle_bin_dir_of(source).is_none() {
         return Err(Refusal::NotBundled {
@@ -324,20 +390,60 @@ pub fn install(source: &Path, dirs: &[PathBuf]) -> Result<Installed, Refusal> {
             source: refuse_source(),
         });
     }
-    match status(source, dirs) {
-        Status::Installed { link } => return Ok(Installed::AlreadyThere { link }),
-        Status::Broken { link, target } => {
-            return match replace_link(source, &link) {
-                Ok(()) => Ok(Installed::Repaired { link, was: target }),
-                Err(error) => Err(Refusal::Failed {
-                    source: refuse_source(),
-                    link,
-                    removing: false,
-                    error: error.to_string(),
+    let slots: Vec<(PathBuf, Slot)> = dirs
+        .iter()
+        .map(|dir| {
+            let link = dir.join(NAME);
+            let found = slot(&link, source);
+            (link, found)
+        })
+        .collect();
+    let installed = |index: usize, change: Change| Installed {
+        link: slots[index].0.clone(),
+        change,
+        left: slots[..index]
+            .iter()
+            .filter_map(|(link, found)| match found {
+                Slot::Stale { target, live } => Some(OtherLink {
+                    link: link.clone(),
+                    target: target.clone(),
+                    live: *live,
                 }),
-            };
+                Slot::Empty | Slot::Ours | Slot::Foreign => None,
+            })
+            .collect(),
+    };
+    if let Some(index) = slots.iter().position(|(_, found)| *found == Slot::Ours) {
+        return Ok(installed(index, Change::AlreadyThere));
+    }
+    for (index, (link, found)) in slots.iter().enumerate() {
+        let Slot::Stale { target, live } = found else {
+            continue;
+        };
+        if !writable(dir_of(link)) {
+            continue;
         }
-        Status::Absent => {}
+        if *live && !repoint {
+            return Err(Refusal::AnotherRoost {
+                source: refuse_source(),
+                link: link.clone(),
+                target: target.clone(),
+            });
+        }
+        return match replace_link(source, link, found) {
+            Ok(()) => Ok(installed(
+                index,
+                Change::Repaired {
+                    was: target.clone(),
+                },
+            )),
+            Err(error) => Err(Refusal::Failed {
+                source: refuse_source(),
+                link: link.clone(),
+                removing: false,
+                error: error.to_string(),
+            }),
+        };
     }
     let Some(last) = dirs.len().checked_sub(1) else {
         return Err(Refusal::NoDirectory {
@@ -345,25 +451,41 @@ pub fn install(source: &Path, dirs: &[PathBuf]) -> Result<Installed, Refusal> {
         });
     };
     let mut occupied = Vec::new();
-    for (index, dir) in dirs.iter().enumerate() {
-        let link = dir.join(NAME);
-        if index < last && !writable(dir) {
+    for (index, (link, found)) in slots.iter().enumerate() {
+        if index < last && !writable(&dirs[index]) {
             continue;
         }
-        if slot(&link, source) != Slot::Empty {
-            occupied.push(link);
-            continue;
+        match found {
+            Slot::Empty => {}
+            Slot::Foreign => {
+                occupied.push(link.clone());
+                continue;
+            }
+            // Every stale link left by now is in a directory Roost can't
+            // write.
+            Slot::Ours | Slot::Stale { .. } => continue,
         }
-        let made =
-            std::fs::create_dir_all(dir).and_then(|()| std::os::unix::fs::symlink(source, &link));
+        let made = std::fs::create_dir_all(&dirs[index])
+            .and_then(|()| std::os::unix::fs::symlink(source, link));
         return made
-            .map(|()| Installed::Created { link: link.clone() })
+            .map(|()| installed(index, Change::Created))
             .map_err(|error| Refusal::Failed {
                 source: refuse_source(),
-                link,
+                link: link.clone(),
                 removing: false,
                 error: error.to_string(),
             });
+    }
+    if let Some((link, _)) = slots
+        .iter()
+        .find(|(_, found)| matches!(found, Slot::Stale { .. }))
+    {
+        return Err(Refusal::Failed {
+            source: refuse_source(),
+            link: link.clone(),
+            removing: false,
+            error: format!("Roost can't write to {}", dir_of(link).display()),
+        });
     }
     Err(Refusal::Occupied {
         source: refuse_source(),
@@ -371,52 +493,105 @@ pub fn install(source: &Path, dirs: &[PathBuf]) -> Result<Installed, Refusal> {
     })
 }
 
+/// Re-read `link` right before changing it, and refuse when it is no
+/// longer what `decided` saw: the user's own `roostctl` may have landed
+/// there since. This narrows that window to the gap between this read and
+/// the change; it cannot close it.
+fn unchanged(link: &Path, source: &Path, decided: &Slot) -> io::Result<()> {
+    if slot(link, source) == *decided {
+        Ok(())
+    } else {
+        Err(io::Error::other("it changed while Roost was working on it"))
+    }
+}
+
 /// Swap `link` for one to `source` with a rename, so there is no moment
 /// with no `roostctl` there.
-fn replace_link(source: &Path, link: &Path) -> io::Result<()> {
+fn replace_link(source: &Path, link: &Path, decided: &Slot) -> io::Result<()> {
     let dir = link.parent().ok_or(io::ErrorKind::InvalidInput)?;
     let staged = dir.join(format!(".{NAME}.roost-{}", std::process::id()));
     let _ = std::fs::remove_file(&staged);
     std::os::unix::fs::symlink(source, &staged)?;
-    std::fs::rename(&staged, link).inspect_err(|_| {
-        let _ = std::fs::remove_file(&staged);
-    })
+    unchanged(link, source, decided)
+        .and_then(|()| std::fs::rename(&staged, link))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&staged);
+        })
+}
+
+fn remove_link(link: &Path, source: &Path, decided: &Slot) -> io::Result<()> {
+    unchanged(link, source, decided)?;
+    std::fs::remove_file(link)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Uninstalled {
-    Removed { links: Vec<PathBuf> },
+    Removed {
+        links: Vec<PathBuf>,
+        /// The removed links that were not this Roost's.
+        others: Vec<OtherLink>,
+        /// Links a Roost made that are still there, and why.
+        failed: Vec<(PathBuf, String)>,
+    },
     NothingThere,
 }
 
 /// Remove every link in `dirs` that a Roost made — this one's and stale
-/// ones alike. The user's own `roostctl` stays.
+/// ones alike. The user's own `roostctl` stays. One that can't be removed
+/// is reported and the rest still go; only when none could is it a
+/// refusal.
 pub fn uninstall(source: &Path, dirs: &[PathBuf]) -> Result<Uninstalled, Refusal> {
-    let mut removed = Vec::new();
+    let mut links = Vec::new();
+    let mut others = Vec::new();
+    let mut failed = Vec::new();
     for dir in dirs {
         let link = dir.join(NAME);
-        if matches!(slot(&link, source), Slot::Ours | Slot::Stale { .. }) {
-            std::fs::remove_file(&link).map_err(|error| Refusal::Failed {
-                source: source.to_path_buf(),
-                link: link.clone(),
-                removing: true,
-                error: error.to_string(),
-            })?;
-            removed.push(link);
+        let found = slot(&link, source);
+        if !matches!(found, Slot::Ours | Slot::Stale { .. }) {
+            continue;
+        }
+        match remove_link(&link, source, &found) {
+            Ok(()) => {
+                if let Slot::Stale { target, live } = found {
+                    others.push(OtherLink {
+                        link: link.clone(),
+                        target,
+                        live,
+                    });
+                }
+                links.push(link);
+            }
+            Err(error) => failed.push((link, error.to_string())),
         }
     }
-    Ok(if removed.is_empty() {
-        Uninstalled::NothingThere
-    } else {
-        Uninstalled::Removed { links: removed }
-    })
+    if !links.is_empty() {
+        return Ok(Uninstalled::Removed {
+            links,
+            others,
+            failed,
+        });
+    }
+    match failed.into_iter().next() {
+        Some((link, error)) => Err(Refusal::Failed {
+            source: source.to_path_buf(),
+            link,
+            removing: true,
+            error,
+        }),
+        None => Ok(Uninstalled::NothingThere),
+    }
 }
 
 /// What a caller asks of [`act`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Status,
+    /// Link, or repair a link whose app is gone. A link that reaches
+    /// another Roost still installed is left alone.
     Install,
+    /// [`Action::Install`], and also point a link that reaches another
+    /// Roost still installed at this one: the user chose that.
+    Repair,
     Uninstall,
 }
 
@@ -425,6 +600,7 @@ impl Action {
         match name {
             "status" => Some(Self::Status),
             "install" => Some(Self::Install),
+            "repair" => Some(Self::Repair),
             "uninstall" => Some(Self::Uninstall),
             _ => None,
         }
@@ -439,6 +615,9 @@ pub struct Context<'a> {
     pub dirs: &'a [PathBuf],
     /// The caller's `PATH`, to say whether a new link's directory is on it.
     pub path_var: Option<&'a OsStr>,
+    /// Directories every new login shell has on `PATH` whatever the
+    /// caller's own says ([`login_path_dirs`]).
+    pub login_dirs: &'a [PathBuf],
     pub home: Option<&'a Path>,
 }
 
@@ -449,35 +628,69 @@ pub fn act(action: Action, context: Context<'_>) -> AppCliLinkResult {
     let source = context.source.unwrap_or(Path::new(""));
     let done = match (action, context.source) {
         (Action::Status, _) => Ok(Done::Status),
-        (Action::Install, None) => Err(Refusal::NoRoostctl),
-        (Action::Install, Some(source)) => install(source, context.dirs).map(Done::Installed),
+        (Action::Install | Action::Repair, None) => Err(Refusal::NoRoostctl),
+        (Action::Install, Some(source)) => {
+            install(source, context.dirs, false).map(Done::Installed)
+        }
+        (Action::Repair, Some(source)) => install(source, context.dirs, true).map(Done::Installed),
         (Action::Uninstall, _) => uninstall(source, context.dirs).map(Done::Uninstalled),
     };
     let after = status(source, context.dirs);
     let (outcome, message, command, path_line) = match done {
         Ok(Done::Status) => ("status", describe(&after), None, None),
         Ok(Done::Installed(installed)) => {
-            let link = installed.link();
-            let dir = link.parent().unwrap_or(Path::new("/"));
-            let path_line = (!on_path(dir, context.path_var)).then(|| path_line(dir, context.home));
-            let (outcome, verb) = match &installed {
-                Installed::Created { .. } => ("created", "Installed"),
-                Installed::Repaired { .. } => ("repaired", "Repaired"),
-                Installed::AlreadyThere { .. } => ("already_installed", "Already installed"),
+            let dir = dir_of(&installed.link);
+            let reachable =
+                on_path(dir, context.path_var) || context.login_dirs.iter().any(|on| on == dir);
+            let path_line = (!reachable).then(|| path_line(dir, context.home));
+            let (outcome, verb) = match &installed.change {
+                Change::Created => ("created", "Installed"),
+                Change::Repaired { .. } => ("repaired", "Repaired"),
+                Change::AlreadyThere => ("already_installed", "Already installed"),
             };
-            let message = format!(
+            let mut message = format!(
                 "{verb} 'roostctl': {} → {}",
-                link.display(),
+                installed.link.display(),
                 source.display()
             );
-            (outcome, message, None, path_line)
+            for other in &installed.left {
+                message.push_str(&format!(". {}", left_in_front(other, dir)));
+            }
+            let command = commands(installed.left.iter().map(|other| {
+                if other.live {
+                    link_command(source, &other.link)
+                } else {
+                    remove_command(&other.link)
+                }
+            }));
+            (outcome, message, command, path_line)
         }
-        Ok(Done::Uninstalled(Uninstalled::Removed { links })) => (
-            "removed",
-            format!("Uninstalled 'roostctl': removed {}", join_paths(&links)),
-            None,
-            None,
-        ),
+        Ok(Done::Uninstalled(Uninstalled::Removed {
+            links,
+            others,
+            failed,
+        })) => {
+            let mut message = format!("Uninstalled 'roostctl': removed {}", join_paths(&links));
+            for other in &others {
+                message.push_str(&format!(
+                    ". {} was {}",
+                    other.link.display(),
+                    if other.live {
+                        format!("another Roost's: it pointed at {}", other.target.display())
+                    } else {
+                        format!(
+                            "a link to {}, which no longer exists",
+                            other.target.display()
+                        )
+                    }
+                ));
+            }
+            for (link, error) in &failed {
+                message.push_str(&format!(". Could not remove {}: {error}", link.display()));
+            }
+            let command = commands(failed.iter().map(|(link, _)| remove_command(link)));
+            ("removed", message, command, None)
+        }
         Ok(Done::Uninstalled(Uninstalled::NothingThere)) => (
             "nothing_to_remove",
             "No 'roostctl' link to remove".to_string(),
@@ -509,16 +722,81 @@ enum Done {
     Uninstalled(Uninstalled),
 }
 
+/// A link an install left in a directory before `ours`.
+fn left_in_front(other: &OtherLink, ours: &Path) -> String {
+    let dir = dir_of(&other.link);
+    let mut text = if other.live {
+        format!(
+            "{} still points at {}, another Roost's roostctl, which a terminal whose PATH lists \
+             {} before {} runs instead",
+            other.link.display(),
+            other.target.display(),
+            dir.display(),
+            ours.display()
+        )
+    } else {
+        format!(
+            "{} still points at {}, which no longer exists",
+            other.link.display(),
+            other.target.display()
+        )
+    };
+    if !writable(dir) {
+        text.push_str(&format!(" (Roost can't write to {})", dir.display()));
+    }
+    text
+}
+
 fn describe(status: &Status) -> String {
     match status {
         Status::Installed { link } => format!("'roostctl' is installed at {}", link.display()),
-        Status::Broken { link, target } => format!(
-            "The 'roostctl' link at {} points at {}, which is not this Roost's",
+        Status::Broken { link, target, live } => format!(
+            "The 'roostctl' link at {} points at {}, {}",
             link.display(),
-            target.display()
+            target.display(),
+            if *live {
+                "another Roost's roostctl"
+            } else {
+                "which no longer exists"
+            }
         ),
         Status::Absent => "'roostctl' is not installed".to_string(),
     }
+}
+
+/// What a macOS login shell's `path_helper` puts on `PATH`: the lines of
+/// `/etc/paths`, then of each file in `/etc/paths.d` by name. A Roost
+/// opened from Finder or the Dock has launchd's `PATH`, which lacks them,
+/// but every new Terminal window has them. Empty off macOS.
+pub fn login_path_dirs() -> Vec<PathBuf> {
+    if cfg!(target_os = "macos") {
+        path_helper_dirs(Path::new("/etc"))
+    } else {
+        Vec::new()
+    }
+}
+
+/// [`login_path_dirs`] read from `etc`.
+pub fn path_helper_dirs(etc: &Path) -> Vec<PathBuf> {
+    let mut files = vec![etc.join("paths")];
+    if let Ok(entries) = std::fs::read_dir(etc.join("paths.d")) {
+        let mut more: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
+        more.sort();
+        files.extend(more);
+    }
+    files
+        .iter()
+        .filter_map(|file| std::fs::read_to_string(file).ok())
+        .flat_map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with('/'))
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Whether `dir` is an entry of `path_var`.
@@ -600,6 +878,39 @@ mod tests {
         roostctl
     }
 
+    fn made(link: &Path, change: Change) -> Installed {
+        Installed {
+            link: link.to_path_buf(),
+            change,
+            left: Vec::new(),
+        }
+    }
+
+    fn removed(links: &[PathBuf]) -> Uninstalled {
+        Uninstalled::Removed {
+            links: links.to_vec(),
+            others: Vec::new(),
+            failed: Vec::new(),
+        }
+    }
+
+    /// `dir` read-only until dropped, so a failed assertion still leaves
+    /// a temp root the test harness can delete.
+    struct ReadOnly<'a>(&'a Path);
+
+    impl<'a> ReadOnly<'a> {
+        fn new(dir: &'a Path) -> Self {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+            Self(dir)
+        }
+    }
+
+    impl Drop for ReadOnly<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
     #[test]
     fn a_bundle_bin_dir_is_told_by_its_shape() {
         assert!(is_bundle_bin_dir(Path::new(
@@ -663,8 +974,8 @@ mod tests {
 
         let link = world.system.join(NAME);
         assert_eq!(
-            install(&world.source, &world.dirs()),
-            Ok(Installed::Created { link: link.clone() })
+            install(&world.source, &world.dirs(), false),
+            Ok(made(&link, Change::Created))
         );
         assert_eq!(std::fs::read_link(&link).expect("link"), world.source);
         assert!(!world.user.exists(), "the user dir is not made when unused");
@@ -673,8 +984,8 @@ mod tests {
             Status::Installed { link: link.clone() }
         );
         assert_eq!(
-            install(&world.source, &world.dirs()),
-            Ok(Installed::AlreadyThere { link })
+            install(&world.source, &world.dirs(), false),
+            Ok(made(&link, Change::AlreadyThere))
         );
     }
 
@@ -683,8 +994,8 @@ mod tests {
         let world = World::new();
         let link = world.user.join(NAME);
         assert_eq!(
-            install(&world.source, &world.dirs()),
-            Ok(Installed::Created { link: link.clone() })
+            install(&world.source, &world.dirs(), false),
+            Ok(made(&link, Change::Created))
         );
         assert!(link.is_symlink());
     }
@@ -693,17 +1004,11 @@ mod tests {
     fn a_read_only_system_dir_is_passed_over() {
         let world = World::new();
         std::fs::create_dir_all(&world.system).expect("system");
-        std::fs::set_permissions(&world.system, std::fs::Permissions::from_mode(0o555))
-            .expect("chmod");
-        let result = install(&world.source, &world.dirs());
-        std::fs::set_permissions(&world.system, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod back");
-        assert_eq!(
-            result,
-            Ok(Installed::Created {
-                link: world.user.join(NAME)
-            })
-        );
+        let result = {
+            let _guard = ReadOnly::new(&world.system);
+            install(&world.source, &world.dirs(), false)
+        };
+        assert_eq!(result, Ok(made(&world.user.join(NAME), Change::Created)));
     }
 
     #[test]
@@ -714,7 +1019,7 @@ mod tests {
         for dir in [&world.system, &world.user] {
             std::fs::write(dir.join(NAME), "mine").expect("file");
         }
-        let refused = install(&world.source, &world.dirs()).expect_err("occupied");
+        let refused = install(&world.source, &world.dirs(), false).expect_err("occupied");
         assert!(matches!(refused, Refusal::Occupied { ref links, .. } if links.len() == 2));
         assert!(refused
             .command()
@@ -739,10 +1044,8 @@ mod tests {
         symlink(&dev, world.system.join(NAME)).expect("foreign");
 
         assert_eq!(
-            install(&world.source, &world.dirs()),
-            Ok(Installed::Created {
-                link: world.user.join(NAME)
-            })
+            install(&world.source, &world.dirs(), false),
+            Ok(made(&world.user.join(NAME), Change::Created))
         );
         assert_eq!(
             std::fs::read_link(world.system.join(NAME)).expect("kept"),
@@ -750,9 +1053,7 @@ mod tests {
         );
         assert_eq!(
             uninstall(&world.source, &world.dirs()),
-            Ok(Uninstalled::Removed {
-                links: vec![world.user.join(NAME)]
-            })
+            Ok(removed(&[world.user.join(NAME)]))
         );
         assert_eq!(
             std::fs::read_link(world.system.join(NAME)).expect("kept"),
@@ -774,15 +1075,13 @@ mod tests {
             status(&world.source, &world.dirs()),
             Status::Broken {
                 link: link.clone(),
-                target: gone.clone()
+                target: gone.clone(),
+                live: false,
             }
         );
         assert_eq!(
-            install(&world.source, &world.dirs()),
-            Ok(Installed::Repaired {
-                link: link.clone(),
-                was: gone
-            })
+            install(&world.source, &world.dirs(), false),
+            Ok(made(&link, Change::Repaired { was: gone }))
         );
         assert_eq!(std::fs::read_link(&link).expect("link"), world.source);
         let leftovers: Vec<_> = std::fs::read_dir(&world.user)
@@ -809,11 +1108,8 @@ mod tests {
         let world = World::new();
         std::fs::create_dir_all(&world.system).expect("system");
         std::fs::create_dir_all(&world.user).expect("user");
-        symlink(
-            world.root.join("Gone.app/Contents/Resources/bin/roostctl"),
-            world.system.join(NAME),
-        )
-        .expect("stale");
+        let gone = world.root.join("Gone.app/Contents/Resources/bin/roostctl");
+        symlink(&gone, world.system.join(NAME)).expect("stale");
         symlink(&world.source, world.user.join(NAME)).expect("ours");
         assert_eq!(
             status(&world.source, &world.dirs()),
@@ -824,7 +1120,13 @@ mod tests {
         assert_eq!(
             uninstall(&world.source, &world.dirs()),
             Ok(Uninstalled::Removed {
-                links: vec![world.system.join(NAME), world.user.join(NAME)]
+                links: vec![world.system.join(NAME), world.user.join(NAME)],
+                others: vec![OtherLink {
+                    link: world.system.join(NAME),
+                    target: gone,
+                    live: false,
+                }],
+                failed: Vec::new(),
             })
         );
         assert_eq!(status(&world.source, &world.dirs()), Status::Absent);
@@ -861,7 +1163,7 @@ mod tests {
         let world = World::new();
         let plain = world.root.join("usr/bin/roostctl");
         assert!(matches!(
-            install(&plain, &world.dirs()),
+            install(&plain, &world.dirs(), false),
             Err(Refusal::NotBundled { .. })
         ));
         assert!(!world.user.exists());
@@ -871,7 +1173,7 @@ mod tests {
     fn install_refuses_a_translocated_bundle() {
         let world = World::new();
         let moved = bundle(&world.root.join("AppTranslocation/X/d"), "Roost.app");
-        let refused = install(&moved, &world.dirs()).expect_err("translocated");
+        let refused = install(&moved, &world.dirs(), false).expect_err("translocated");
         assert!(matches!(refused, Refusal::Translocated { .. }));
         assert_eq!(refused.command(), None);
         assert!(!world.user.exists());
@@ -881,11 +1183,10 @@ mod tests {
     fn a_write_failure_hands_back_the_command_that_does_it_by_hand() {
         let world = World::new();
         std::fs::create_dir_all(&world.user).expect("user");
-        std::fs::set_permissions(&world.user, std::fs::Permissions::from_mode(0o555))
-            .expect("chmod");
-        let refused = install(&world.source, &world.dirs()).expect_err("read-only");
-        std::fs::set_permissions(&world.user, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod back");
+        let refused = {
+            let _guard = ReadOnly::new(&world.user);
+            install(&world.source, &world.dirs(), false).expect_err("read-only")
+        };
         assert_eq!(
             refused.command(),
             Some(format!(
@@ -905,6 +1206,7 @@ mod tests {
             source: Some(&world.source),
             dirs,
             path_var,
+            login_dirs: &[],
             home: Some(Path::new("/nowhere")),
         }
     }
@@ -989,14 +1291,17 @@ mod tests {
             .label(),
             "Uninstall 'roostctl' Command"
         );
-        assert_eq!(
-            Status::Broken {
-                link: PathBuf::from("/x"),
-                target: PathBuf::from("/y")
-            }
-            .label(),
-            "Repair 'roostctl' Command\u{2026}"
-        );
+        for live in [false, true] {
+            assert_eq!(
+                Status::Broken {
+                    link: PathBuf::from("/x"),
+                    target: PathBuf::from("/y"),
+                    live,
+                }
+                .label(),
+                "Repair 'roostctl' Command\u{2026}"
+            );
+        }
     }
 
     #[test]
@@ -1028,5 +1333,306 @@ mod tests {
         assert_eq!(find_on_path(Some(OsStr::new("relative"))), None);
         assert!(on_path(bin, Some(&path)));
         assert!(!on_path(&world.user, Some(&path)));
+    }
+
+    /// A stale link in a `/usr/local/bin` this user can't write — a link
+    /// made with `sudo`, say — is passed over for `~/.local/bin`, and the
+    /// result names it. Uninstall then removes what it can and names what
+    /// it can't.
+    #[test]
+    fn a_stale_link_roost_cannot_write_is_passed_over_and_named() {
+        let world = World::new();
+        std::fs::create_dir_all(&world.system).expect("system");
+        let gone = world.root.join("Old.app/Contents/Resources/bin/roostctl");
+        let stale = world.system.join(NAME);
+        symlink(&gone, &stale).expect("stale");
+        let left = OtherLink {
+            link: stale.clone(),
+            target: gone.clone(),
+            live: false,
+        };
+        let _guard = ReadOnly::new(&world.system);
+
+        assert_eq!(
+            install(&world.source, &world.dirs(), false),
+            Ok(Installed {
+                left: vec![left.clone()],
+                ..made(&world.user.join(NAME), Change::Created)
+            })
+        );
+        assert_eq!(std::fs::read_link(&stale).expect("kept"), gone);
+        assert_eq!(
+            status(&world.source, &world.dirs()),
+            Status::Installed {
+                link: world.user.join(NAME)
+            }
+        );
+        assert_eq!(
+            install(&world.source, &world.dirs(), false),
+            Ok(Installed {
+                left: vec![left],
+                ..made(&world.user.join(NAME), Change::AlreadyThere)
+            })
+        );
+
+        let Ok(Uninstalled::Removed {
+            links,
+            others,
+            failed,
+        }) = uninstall(&world.source, &world.dirs())
+        else {
+            panic!("a partial removal");
+        };
+        assert_eq!(links, vec![world.user.join(NAME)]);
+        assert_eq!(others, Vec::new());
+        assert_eq!(
+            failed.iter().map(|(link, _)| link).collect::<Vec<_>>(),
+            vec![&stale]
+        );
+        assert_eq!(std::fs::read_link(&stale).expect("kept"), gone);
+        let Err(refused) = uninstall(&world.source, &world.dirs()) else {
+            panic!("nothing it can remove is a refusal");
+        };
+        assert_eq!(refused.command(), Some(format!("rm '{}'", stale.display())));
+    }
+
+    /// With the user dir taken too, there is nowhere to go: the refusal
+    /// names the stale link and why Roost could not change it.
+    #[test]
+    fn a_stale_link_roost_cannot_write_with_nowhere_else_is_a_refusal() {
+        let world = World::new();
+        std::fs::create_dir_all(&world.system).expect("system");
+        std::fs::create_dir_all(&world.user).expect("user");
+        std::fs::write(world.user.join(NAME), "mine").expect("mine");
+        let stale = world.system.join(NAME);
+        symlink(
+            world.root.join("Old.app/Contents/Resources/bin/roostctl"),
+            &stale,
+        )
+        .expect("stale");
+        let refused = {
+            let _guard = ReadOnly::new(&world.system);
+            install(&world.source, &world.dirs(), false).expect_err("nowhere")
+        };
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "could not write {}: Roost can't write to {}",
+                stale.display(),
+                world.system.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(world.user.join(NAME)).expect("kept"),
+            "mine"
+        );
+    }
+
+    #[test]
+    fn act_says_what_a_link_it_could_not_change_means() {
+        let world = World::new();
+        let dirs = world.dirs();
+        let other = bundle(&world.root, "Roost-Iced.app");
+        std::fs::create_dir_all(&world.system).expect("system");
+        let stale = world.system.join(NAME);
+        symlink(&other, &stale).expect("other");
+        let _guard = ReadOnly::new(&world.system);
+
+        let created = act(Action::Install, context(&world, &dirs, None));
+        assert_eq!(created.outcome, "created");
+        assert!(
+            created.message.contains(&format!(
+                "{} still points at {}, another Roost's roostctl, which a terminal whose PATH \
+                 lists {} before {} runs instead (Roost can't write to {})",
+                stale.display(),
+                other.display(),
+                world.system.display(),
+                world.user.display(),
+                world.system.display()
+            )),
+            "{}",
+            created.message
+        );
+        assert_eq!(
+            created.command,
+            Some(format!(
+                "ln -sf '{}' '{}'",
+                world.source.display(),
+                stale.display()
+            ))
+        );
+
+        let removed = act(Action::Uninstall, context(&world, &dirs, None));
+        assert_eq!(
+            (removed.outcome.as_str(), removed.state.as_str()),
+            ("removed", "broken")
+        );
+        assert!(
+            removed
+                .message
+                .contains(&format!(". Could not remove {}: ", stale.display())),
+            "{}",
+            removed.message
+        );
+        assert_eq!(removed.command, Some(format!("rm '{}'", stale.display())));
+    }
+
+    /// `install` repairs a link whose app is gone without asking, but a
+    /// link to another Roost that still runs is that Roost's working
+    /// command: only `repair` re-points it.
+    #[test]
+    fn a_link_to_another_roost_still_installed_is_repointed_only_on_repair() {
+        let world = World::new();
+        let dirs = world.dirs();
+        let other = bundle(&world.root, "Roost-Iced.app");
+        std::fs::create_dir_all(&world.system).expect("system");
+        let link = world.system.join(NAME);
+        symlink(&other, &link).expect("other");
+        assert_eq!(
+            status(&world.source, &dirs),
+            Status::Broken {
+                link: link.clone(),
+                target: other.clone(),
+                live: true,
+            }
+        );
+
+        let refused = install(&world.source, &dirs, false).expect_err("another Roost");
+        assert_eq!(
+            refused,
+            Refusal::AnotherRoost {
+                source: world.source.clone(),
+                link: link.clone(),
+                target: other.clone(),
+            }
+        );
+        assert!(
+            refused
+                .to_string()
+                .ends_with(&format!("run `{} cli repair`", world.source.display())),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read_link(&link).expect("kept"), other);
+        assert!(!world.user.exists(), "no second link beside it");
+        let via_act = act(Action::Install, context(&world, &dirs, None));
+        assert_eq!(
+            (via_act.outcome.as_str(), via_act.state.as_str()),
+            ("refused", "broken")
+        );
+
+        let repaired = act(Action::Repair, context(&world, &dirs, None));
+        assert_eq!(
+            (repaired.outcome.as_str(), repaired.state.as_str()),
+            ("repaired", "installed")
+        );
+        assert_eq!(std::fs::read_link(&link).expect("link"), world.source);
+    }
+
+    #[test]
+    fn uninstall_names_each_link_that_was_another_roosts() {
+        let world = World::new();
+        let dirs = world.dirs();
+        let other = bundle(&world.root, "Roost-Iced.app");
+        let gone = world.root.join("Gone.app/Contents/Resources/bin/roostctl");
+        std::fs::create_dir_all(&world.system).expect("system");
+        std::fs::create_dir_all(&world.user).expect("user");
+        symlink(&other, world.system.join(NAME)).expect("other");
+        symlink(&gone, world.user.join(NAME)).expect("gone");
+
+        let removed = act(Action::Uninstall, context(&world, &dirs, None));
+        assert_eq!(removed.outcome, "removed");
+        assert_eq!(
+            removed.message,
+            format!(
+                "Uninstalled 'roostctl': removed {sys}, {user}. {sys} was another Roost's: it \
+                 pointed at {other}. {user} was a link to {gone}, which no longer exists",
+                sys = world.system.join(NAME).display(),
+                user = world.user.join(NAME).display(),
+                other = other.display(),
+                gone = gone.display(),
+            )
+        );
+        assert_eq!(removed.command, None);
+    }
+
+    /// Roost decides from what a slot held, and changes it a moment
+    /// later: a slot that turned into the user's own file in between is
+    /// left alone.
+    #[test]
+    fn a_slot_that_changed_after_the_decision_is_left_alone() {
+        let world = World::new();
+        std::fs::create_dir_all(&world.user).expect("user");
+        let link = world.user.join(NAME);
+        symlink(
+            world.root.join("Old.app/Contents/Resources/bin/roostctl"),
+            &link,
+        )
+        .expect("stale");
+        let decided = slot(&link, &world.source);
+        assert!(matches!(decided, Slot::Stale { live: false, .. }));
+        std::fs::remove_file(&link).expect("unlink");
+        std::fs::write(&link, "mine").expect("mine");
+
+        assert!(replace_link(&world.source, &link, &decided).is_err());
+        assert_eq!(std::fs::read_to_string(&link).expect("kept"), "mine");
+        assert!(remove_link(&link, &world.source, &decided).is_err());
+        assert_eq!(std::fs::read_to_string(&link).expect("kept"), "mine");
+        let names: Vec<_> = std::fs::read_dir(&world.user)
+            .expect("dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, vec![OsStr::new(NAME).to_os_string()]);
+    }
+
+    #[test]
+    fn path_helper_dirs_read_etc_paths_then_paths_d_by_name() {
+        let etc = tempfile::tempdir().expect("etc");
+        std::fs::write(etc.path().join("paths"), "/usr/local/bin\n/usr/bin\n\n").expect("paths");
+        std::fs::create_dir(etc.path().join("paths.d")).expect("paths.d");
+        std::fs::write(etc.path().join("paths.d/20-b"), "/opt/b\n").expect("b");
+        std::fs::write(etc.path().join("paths.d/10-a"), " /opt/a \nrelative\n").expect("a");
+        assert_eq!(
+            path_helper_dirs(etc.path()),
+            ["/usr/local/bin", "/usr/bin", "/opt/a", "/opt/b"]
+                .map(PathBuf::from)
+                .to_vec()
+        );
+        assert_eq!(
+            path_helper_dirs(&etc.path().join("none")),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    /// A Roost opened from Finder has launchd's `PATH`; a directory every
+    /// new login shell has (macOS's `/etc/paths`) is on `PATH` all the
+    /// same, so there is no line to add.
+    #[test]
+    fn a_directory_a_login_shell_has_needs_no_path_line() {
+        let world = World::new();
+        let dirs = world.dirs();
+        let launchd = OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin");
+        let login = [world.user.clone()];
+        let created = act(
+            Action::Install,
+            Context {
+                login_dirs: &login,
+                ..context(&world, &dirs, Some(launchd))
+            },
+        );
+        assert_eq!(created.outcome, "created");
+        assert_eq!(created.path_line, None);
+    }
+
+    #[test]
+    fn actions_parse_by_name() {
+        for (name, action) in [
+            ("status", Action::Status),
+            ("install", Action::Install),
+            ("repair", Action::Repair),
+            ("uninstall", Action::Uninstall),
+        ] {
+            assert_eq!(Action::parse(name), Some(action));
+        }
+        assert_eq!(Action::parse("force"), None);
     }
 }

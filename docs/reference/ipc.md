@@ -2493,9 +2493,10 @@ App-menu item are its callers in the window, and
 UI. Not gated.
 
 Request: `{"params": {"action": "status"}}`. `action` is `"status"`,
-`"install"` (which also repairs a link that points at an app that moved
-or at another Roost) or `"uninstall"`; anything else is
-`invalid-param`. Response:
+`"install"` (which also repairs a link whose app moved or was deleted),
+`"repair"` (`install`, and also re-point a link to another Roost that is
+still installed) or `"uninstall"`; anything else is `invalid-param`.
+Response:
 
 ```json
 {
@@ -2527,16 +2528,28 @@ or at another Roost) or `"uninstall"`; anything else is
   `"already_installed"`, `"removed"`, `"nothing_to_remove"` or
   `"refused"`. A refusal is a result, not an error: a `roostctl` that is
   not in a bundle, a bundle macOS is running from a temporary copy of
-  (App Translocation), or link directories that already hold a
-  `roostctl` that is not a link Roost made — which is never overwritten.
-  `command` is then the command that does it by hand, when there is one.
+  (App Translocation), link directories that already hold a `roostctl`
+  that is not a link Roost made — which is never overwritten — or, for
+  `install`, a link to another Roost that is still installed, which only
+  `repair` re-points.
+- A link a Roost made in a directory the user can't write (`/usr/local/bin`
+  owned by root, say) is passed over: `install` links from `~/.local/bin`
+  instead, and `message` names the link it left and what it means.
+  `uninstall` removes what it can and names what it couldn't.
+- `command` is the command that does by hand what Roost refused, or what
+  it left: re-point or remove a link it could not change, remove one it
+  could not remove.
 - `path_line` is the line that puts the link's directory on `PATH`
-  (`export PATH="$HOME/.local/bin:$PATH"`), present when the UI's own
-  `PATH` lacks it.
+  (`export PATH="$HOME/.local/bin:$PATH"`), present when neither the UI's
+  own `PATH` nor, on macOS, what a login shell adds through `/etc/paths`
+  and `/etc/paths.d` has it. A Roost opened from Finder has launchd's
+  short `PATH`, so it can't tell whether your shell adds `~/.local/bin`;
+  the card says so.
 
 Every action but `status` also shows its outcome in the window: a toast
-for a plain success, a card for a refusal or a `path_line`, with a
-button that copies the command or line. A UI that serves no window
+for a plain success, a card for a refusal, a `command` or a `path_line`,
+with a button that copies the line or command. The Repair… palette row
+and menu item ask first, then send `repair`. A UI that serves no window
 answers `internal: no UI attached`.
 
 ### Notification raise test ops (`app.notification_activate` / `app.last_activation`) *(test-only — gated)*

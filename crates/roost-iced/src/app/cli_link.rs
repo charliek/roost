@@ -68,34 +68,54 @@ pub(super) fn feedback(result: &AppCliLinkResult) -> Feedback {
                     .map(|command| ("Copy Command", CardAction::Copy(command))),
             })
         }
-        "created" | "repaired" | "already_installed" => match &result.path_line {
-            Some(line) => Feedback::Card(Card {
-                title: "'roostctl' Command Installed".into(),
-                body: format!(
-                    "{}.\n\nThat directory may not be on your shell's PATH. If a new terminal \
+        "created" | "repaired" | "already_installed" | "removed"
+            if result.path_line.is_some() || result.command.is_some() =>
+        {
+            let mut body = format!("{}.", result.message);
+            if let Some(line) = &result.path_line {
+                body.push_str(&format!(
+                    "\n\nThat directory may not be on your shell's PATH. If a new terminal \
                      can't find roostctl, add this line to ~/.zprofile (zsh) or \
-                     ~/.bash_profile (bash):\n{line}",
-                    result.message
-                ),
+                     ~/.bash_profile (bash):\n{line}"
+                ));
+            }
+            if let Some(command) = &result.command {
+                body.push_str(&format!(
+                    "\n\nTo change the link Roost left by hand, run:\n{command}"
+                ));
+            }
+            // The PATH line first: without it this Roost's link is not
+            // found at all.
+            let primary = match (&result.path_line, &result.command) {
+                (Some(line), _) => ("Copy Line", CardAction::Copy(line.clone())),
+                (None, Some(command)) => ("Copy Command", CardAction::Copy(command.clone())),
+                (None, None) => unreachable!("matched on one being there"),
+            };
+            Feedback::Card(Card {
+                title: if result.outcome == "removed" {
+                    "'roostctl' Command Uninstalled"
+                } else {
+                    "'roostctl' Command Installed"
+                }
+                .into(),
+                body,
                 dismiss: "Close",
-                primary: Some(("Copy Line", CardAction::Copy(line.clone()))),
-            }),
-            None => Feedback::Toast(result.message.clone()),
-        },
+                primary: Some(primary),
+            })
+        }
         _ => Feedback::Toast(result.message.clone()),
     }
 }
 
-/// The confirmation the Repair… row opens: what the link points at now,
-/// and what Repair points it at.
-pub(super) fn repair_card(result: &AppCliLinkResult) -> Card {
+/// The confirmation the Repair… row opens: what the link points at now
+/// (a status's message), and what Repair points it at.
+pub(super) fn repair_card(status: &AppCliLinkResult) -> Card {
     Card {
         title: "Repair the 'roostctl' Command".into(),
         body: format!(
-            "{} points at {}, which is not this Roost's roostctl. Repair points it at {}.",
-            result.link.as_deref().unwrap_or("The link"),
-            result.target.as_deref().unwrap_or("another app"),
-            result.source.as_deref().unwrap_or("this Roost's roostctl"),
+            "{}. Repair points it at {}.",
+            status.message,
+            status.source.as_deref().unwrap_or("this Roost's roostctl"),
         ),
         dismiss: "Cancel",
         primary: Some(("Repair", CardAction::Repair)),
@@ -156,7 +176,8 @@ impl App {
     }
 
     /// A palette row or the menu item: Repair confirms first; Install and
-    /// Uninstall act.
+    /// Uninstall act. A Repair row whose link mended itself meanwhile just
+    /// installs, which re-points nothing that works.
     pub(super) fn cli_link_requested(&mut self, id: &str) {
         match id {
             REPAIR_ROW_ID => {
@@ -197,7 +218,7 @@ impl App {
                 self.clipboard.start_next()
             }
             Some((_, CardAction::Repair)) => {
-                self.cli_link(Action::Install);
+                self.cli_link(Action::Repair);
                 UiTask::None
             }
             None => UiTask::None,
@@ -239,11 +260,13 @@ impl App {
 }
 
 /// [`cli_link::act`] with this process's own `roostctl`, directories,
-/// `PATH` and `HOME`.
+/// `PATH` and `HOME`. A Roost opened from Finder has launchd's `PATH`, so
+/// what a login shell adds counts as on `PATH` too.
 fn cli_link_act(action: Action) -> AppCliLinkResult {
     let source = roost_engine::process::roostctl().map(|found| found.path.as_path());
     let dirs = cli_link::dirs_from_env();
     let path_var = std::env::var_os("PATH");
+    let login_dirs = cli_link::login_path_dirs();
     let home = std::env::var_os("HOME").map(PathBuf::from);
     cli_link::act(
         action,
@@ -251,6 +274,7 @@ fn cli_link_act(action: Action) -> AppCliLinkResult {
             source,
             dirs: &dirs,
             path_var: path_var.as_deref(),
+            login_dirs: &login_dirs,
             home: home.as_deref(),
         },
     )
@@ -393,20 +417,60 @@ mod tests {
         let broken = AppCliLinkResult {
             state: "broken".into(),
             target: Some("/Old/Roost.app/Contents/Resources/bin/roostctl".into()),
+            message: "The 'roostctl' link at /usr/local/bin/roostctl points at \
+                      /Old/Roost.app/Contents/Resources/bin/roostctl, which no longer exists"
+                .into(),
             ..result("status")
         };
         let card = repair_card(&broken);
-        assert!(
-            card.body.contains("/usr/local/bin/roostctl"),
-            "{}",
-            card.body
-        );
-        assert!(card.body.contains("/Old/Roost.app"), "{}", card.body);
-        assert!(
-            card.body.contains("/Applications/Roost.app"),
-            "{}",
-            card.body
+        assert_eq!(
+            card.body,
+            "The 'roostctl' link at /usr/local/bin/roostctl points at \
+             /Old/Roost.app/Contents/Resources/bin/roostctl, which no longer exists. Repair \
+             points it at /Applications/Roost.app/Contents/Resources/bin/roostctl."
         );
         assert_eq!(card.buttons(), vec!["Cancel", "Repair"]);
+    }
+
+    /// A link Roost could not change, or could not remove, is something
+    /// the user has to act on: a card with the command, not a toast.
+    #[test]
+    fn a_success_with_a_command_is_a_card() {
+        let command = "rm '/usr/local/bin/roostctl'";
+        for (outcome, title) in [
+            ("created", "'roostctl' Command Installed"),
+            ("removed", "'roostctl' Command Uninstalled"),
+        ] {
+            let left = AppCliLinkResult {
+                command: Some(command.into()),
+                ..result(outcome)
+            };
+            let Feedback::Card(card) = feedback(&left) else {
+                panic!("a card for {outcome}");
+            };
+            assert_eq!(card.title, title);
+            assert!(
+                card.body.ends_with(&format!(
+                    "\n\nTo change the link Roost left by hand, run:\n{command}"
+                )),
+                "{}",
+                card.body
+            );
+            assert_eq!(
+                card.primary,
+                Some(("Copy Command", CardAction::Copy(command.into())))
+            );
+        }
+        let both = AppCliLinkResult {
+            command: Some(command.into()),
+            path_line: Some("export PATH=\"$HOME/.local/bin:$PATH\"".into()),
+            ..result("created")
+        };
+        let Feedback::Card(card) = feedback(&both) else {
+            panic!("a card");
+        };
+        assert!(card.body.contains("~/.zprofile"), "{}", card.body);
+        assert!(card.body.ends_with(command), "{}", card.body);
+        assert!(matches!(card.primary, Some(("Copy Line", _))));
     }
 }

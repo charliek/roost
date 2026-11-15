@@ -1607,8 +1607,9 @@ pub struct AppSecureInputResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppCliLinkParams {
-    /// `"status"`, `"install"` (which also repairs a broken link) or
-    /// `"uninstall"`.
+    /// `"status"`, `"install"` (which also repairs a link whose app is
+    /// gone), `"repair"` (which also re-points a link to another Roost
+    /// that is still installed) or `"uninstall"`.
     pub action: String,
 }
 
@@ -1638,7 +1639,8 @@ pub struct AppCliLinkResult {
     pub outcome: String,
     /// One sentence saying what happened, as the UI shows it.
     pub message: String,
-    /// The command that does it by hand, when Roost refused.
+    /// The command that does it by hand: what Roost refused, or what it
+    /// left — a link it could not change or remove.
     #[serde(default)]
     pub command: Option<String>,
     /// The line that puts the link's directory on `PATH`, when the

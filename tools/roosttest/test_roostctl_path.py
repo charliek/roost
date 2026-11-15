@@ -259,10 +259,48 @@ def test_a_file_that_is_not_roosts_is_never_overwritten(fake_bundle, bundled):
         shutil.rmtree(fake_bundle.links, ignore_errors=True)
 
 
+def test_a_link_to_another_roost_is_repointed_only_on_repair(fake_bundle, bundled):
+    """`install` leaves another Roost's working link alone and says how to
+    take it over; `repair` takes it over; `uninstall` names whose link it
+    removed."""
+    roost, _ = bundled
+    other = fake_bundle.outer_bin / "roostctl"
+    system = fake_bundle.links / "system"
+    system.mkdir(parents=True, exist_ok=True)
+    link = system / "roostctl"
+    os.symlink(other, link)
+    try:
+        refused = roost.call("app.cli_link", {"action": "install"})
+        assert (refused["outcome"], refused["state"]) == ("refused", "broken"), refused
+        assert refused["message"].endswith(f"run `{fake_bundle.roostctl} cli repair`"), refused
+        assert os.readlink(link) == str(other)
+        assert not (fake_bundle.links / "user").exists(), "no second link beside it"
+        roost._wait(lambda: dialog(roost).get("dialog") == "cli_link", 5.0, "the refusal card")
+        assert dialog(roost)["buttons"] == ["Close"]
+        roost.call("app.dialog_answer", {"action": "cancel"})
+
+        repaired = roost.call("app.cli_link", {"action": "repair"})
+        assert (repaired["outcome"], repaired["state"]) == ("repaired", "installed"), repaired
+        assert os.readlink(link) == str(fake_bundle.roostctl)
+        roost.call("app.dialog_answer", {"action": "cancel"})
+
+        os.remove(link)
+        os.symlink(other, link)
+        user = fake_bundle.links / "user"
+        user.mkdir(parents=True, exist_ok=True)
+        os.symlink(fake_bundle.roostctl, user / "roostctl")
+        removed = roost.call("app.cli_link", {"action": "uninstall"})
+        assert (removed["outcome"], removed["state"]) == ("removed", "absent"), removed
+        assert f"{link} was another Roost's: it pointed at {other}" in removed["message"], removed
+        assert not os.path.lexists(link)
+    finally:
+        shutil.rmtree(fake_bundle.links, ignore_errors=True)
+
+
 def test_an_unknown_action_is_an_invalid_param(fake_bundle, bundled):
     roost, _ = bundled
     with pytest.raises(RoostError) as refused:
-        roost.call("app.cli_link", {"action": "repair"})
+        roost.call("app.cli_link", {"action": "force"})
     assert refused.value.code == "invalid-param"
 
 

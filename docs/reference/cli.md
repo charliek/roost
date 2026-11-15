@@ -44,7 +44,7 @@ roostctl [--socket <PATH>] [--target <mac|linux|iced|session>] [--json] <COMMAND
 | `claude-hook` | Internal: invoked by Claude on each hook event (kept for settings files an earlier Roost wrote) |
 | `doctor` | Read-only diagnosis of the Roost integration (target, socket, shell, tab, agent hooks) |
 | `session start` / `stop` / `status` | Start, stop, or inspect the headless `roost-session` daemon |
-| `cli install` / `uninstall` / `status` | Link this `roostctl` onto `PATH` for terminals outside Roost (macOS), or take the link away |
+| `cli install` / `repair` / `uninstall` / `status` | Link this `roostctl` onto `PATH` for terminals outside Roost (macOS), or take the link away |
 | `rpc <op> [params]` | Call any IPC op directly by name, bypassing every named verb |
 | `skill` | Print the agent skill (`skills/roost/SKILL.md`), byte for byte as the plugin installs it |
 | `schema` | Print the wire's JSON Schema bundle (`docs/reference/api/roost-ipc.schema.json`), byte for byte |
@@ -187,7 +187,7 @@ it once. On macOS the command palette and the App menu have **Install
 shell ([below](#cli-subcommands)). It writes one symlink: in
 `/usr/local/bin` when that directory exists and you can write to it,
 otherwise in `~/.local/bin`, which it creates. No shell rc file is
-edited. When the link lands in a directory that is not on your `PATH`,
+edited. When the link lands in a directory that may not be on your `PATH`,
 Roost shows the one line to add to `~/.zprofile` (or `~/.bash_profile`),
 for example `export PATH="$HOME/.local/bin:$PATH"`. Hooks are
 unaffected either way: they run `$ROOST_AGENT_HOOK`, an absolute path.
@@ -991,6 +991,7 @@ thing through the same code.
 
 ```bash
 /Applications/Roost.app/Contents/Resources/bin/roostctl cli install
+/Applications/Roost.app/Contents/Resources/bin/roostctl cli repair
 roostctl cli status
 roostctl cli uninstall
 ```
@@ -1003,26 +1004,41 @@ is, and the command says to add its directory to `PATH` instead. It
 refuses while Roost runs from a temporary copy macOS made of an app it
 has not moved yet (App Translocation): move `Roost.app` to
 `/Applications` and open it from there first. When the link's directory
-is not on the current `PATH`, it prints the `export PATH=…` line to add.
+is neither on the current `PATH` nor, on macOS, added to every login
+shell's by `/etc/paths` or `/etc/paths.d`, it prints the `export PATH=…`
+line to add.
 
 A link Roost made is a symlink whose target is a `roostctl` inside some
-`<name>.app/Contents/Resources/bin`. `cli install` repairs one that
-points at an app that moved or at another Roost (`Roost-Iced.app`, say),
-and does nothing when the link already reaches this `roostctl`. Anything
+`<name>.app/Contents/Resources/bin`. `cli install` repairs one whose app
+moved or was deleted, and does nothing when the link already reaches
+this `roostctl`. A link to another Roost that is still installed (the
+installed `Roost.app`'s, when you run a dev `Roost-Iced.app`'s
+`roostctl`) is that Roost's working command, so `cli install` leaves it
+and says so; `cli repair` points it at this `roostctl` instead. Anything
 else named `roostctl` in those directories, a regular file or a link
 elsewhere, is never overwritten: install uses the other directory, or
 refuses and prints the `ln -sf …` command that does it by hand.
 
+A link Roost made in a directory you can't write (a root-owned
+`/usr/local/bin`, or a link made with `sudo`) is passed over the same
+way: install links from `~/.local/bin` and names the link it left. A
+live one is what a bare `roostctl` runs wherever its directory comes
+first on `PATH`; the command to re-point (or, for a dead one, remove) it
+by hand is printed with it.
+
 `cli uninstall` removes every link Roost made in the two directories,
-and only those. `cli status` says which of `installed`, `broken` or
-`absent` the directories hold. `roostctl doctor`'s `cli.on_path` check
-reports a link whose app is gone and a `PATH` whose `roostctl` is another
-binary; it repairs nothing.
+and only those, and names each one that was another Roost's. A link it
+can't remove is named, with the `rm` command, and the rest are still
+removed. `cli status` says which of `installed`, `broken` or `absent`
+the directories hold. `roostctl doctor`'s `cli.on_path` check reports a
+`PATH` whose `roostctl` is another binary, and notes a link whose app is
+gone; it repairs nothing.
 
 | Verb | Exit 0 | Exit 1 |
 |---|---|---|
-| `cli install` | linked, repaired, or already linked | refused (not in a bundle, translocated, every directory holds a `roostctl` that is not Roost's) or the write failed; the message carries the command that does it by hand |
-| `cli uninstall` | removed, or nothing to remove | a link could not be removed |
+| `cli install` | linked, repaired, or already linked | refused (not in a bundle, translocated, a link to another Roost still installed, every directory holds a `roostctl` that is not Roost's) or the write failed; the message carries what to do by hand |
+| `cli repair` | as `cli install`, re-pointing another Roost's link too | as `cli install`, but never for another Roost's link |
+| `cli uninstall` | removed at least one link, or nothing to remove | no link could be removed |
 | `cli status` | always | — |
 
 `--json` prints the [`app.cli_link`](ipc.md#appcli_link) result

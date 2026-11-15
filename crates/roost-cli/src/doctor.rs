@@ -775,10 +775,20 @@ pub struct Inputs {
     /// really lives.
     pub cli_on_path: Option<(PathBuf, Option<PathBuf>)>,
     /// A link Roost made in the `roostctl cli install` directories whose
-    /// target is gone: the link, and where it points. A link to another
-    /// Roost that is still there is not broken here; the `PATH` comparison
-    /// names it when it is the one a bare `roostctl` runs.
-    pub cli_dangling_link: Option<(PathBuf, PathBuf)>,
+    /// target is gone. A link to another Roost that is still there is not
+    /// broken here; the `PATH` comparison names it when it is the one a
+    /// bare `roostctl` runs.
+    pub cli_dangling_link: Option<DanglingLink>,
+}
+
+/// A link Roost made whose app is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DanglingLink {
+    pub link: PathBuf,
+    pub target: PathBuf,
+    /// Whether this user can write the link's directory, which is whether
+    /// `cli install` can repair the link where it is.
+    pub writable: bool,
 }
 
 /// What the old-path probe found, or why it did not run.
@@ -950,18 +960,33 @@ pub async fn collect(
         legacy_claude_settings_present,
         legacy_claude_alias_in_rc,
         old_sessions,
-        cli_dangling_link: match roost_ipc::cli_link::status(
+        cli_dangling_link: dangling_cli_link(
             cli_self.as_deref().unwrap_or(Path::new("")),
             &roost_ipc::cli_link::dirs_from_env(),
-        ) {
-            roost_ipc::cli_link::Status::Broken { link, target } if !target.exists() => {
-                Some((link, target))
-            }
-            _ => None,
-        },
+        ),
         cli_self,
         cli_on_path,
     }
+}
+
+/// The first link Roost made in `dirs` whose app is gone, and where it
+/// points — in any directory, not just the one `status` would name: a
+/// link to another Roost still installed can sit in front of it.
+fn dangling_cli_link(source: &Path, dirs: &[PathBuf]) -> Option<DanglingLink> {
+    dirs.iter().find_map(|dir| {
+        let link = dir.join(roost_ipc::cli_link::NAME);
+        match roost_ipc::cli_link::slot(&link, source) {
+            roost_ipc::cli_link::Slot::Stale {
+                target,
+                live: false,
+            } => Some(DanglingLink {
+                link,
+                target,
+                writable: roost_ipc::cli_link::writable(dir),
+            }),
+            _ => None,
+        }
+    })
 }
 
 /// Every session on an old path the gate lets this process look for.
@@ -1981,8 +2006,9 @@ pub fn evaluate(inputs: &Inputs) -> Report {
 
 /// Does a bare `roostctl` run this one (#261)? Every doc example and the
 /// agent skill call it by name. A link `roostctl cli install` made that
-/// no longer reaches a Roost is reported first: repair is the user's
-/// call, never doctor's.
+/// no longer reaches a Roost is named in the detail, never the verdict: a
+/// shell skips a dangling link on `PATH`, so it can't be what a bare
+/// `roostctl` runs. Repair is the user's call, never doctor's.
 fn cli_on_path_check(inputs: &Inputs) -> Check {
     const ID: &str = "cli.on_path";
     const TITLE: &str = "`roostctl` on PATH";
@@ -2004,19 +2030,7 @@ fn cli_on_path_check(inputs: &Inputs) -> Check {
     } else {
         format!("add {this}'s directory to PATH")
     };
-    if let Some((link, target)) = &inputs.cli_dangling_link {
-        return check(
-            ID,
-            TITLE,
-            Status::Warn,
-            format!(
-                "{} points at {}, which no longer exists; run `{this} cli install` to repair it",
-                redact_path(link),
-                redact_path(target)
-            ),
-        );
-    }
-    match &inputs.cli_on_path {
+    let mut verdict = match &inputs.cli_on_path {
         None => check(
             ID,
             TITLE,
@@ -2047,7 +2061,24 @@ fn cli_on_path_check(inputs: &Inputs) -> Check {
                     .unwrap_or_default()
             ),
         ),
+    };
+    if let Some(dangling) = &inputs.cli_dangling_link {
+        verdict.detail.push_str(&format!(
+            "; also, {} points at {}, which no longer exists: {}",
+            redact_path(&dangling.link),
+            redact_path(&dangling.target),
+            if dangling.writable {
+                format!("`{this} cli install` repairs it")
+            } else {
+                format!(
+                    "this user can't write to {}, so remove it by hand (`rm {}`)",
+                    redact_path(dangling.link.parent().unwrap_or(Path::new("/"))),
+                    redact_path(&dangling.link)
+                )
+            }
+        ));
     }
+    verdict
 }
 
 /// A session at a path this build doesn't use: it cannot be reached
@@ -4398,23 +4429,100 @@ mod tests {
         );
     }
 
+    /// A dangling link can't be what a bare `roostctl` runs: the `PATH`
+    /// comparison stays the verdict, and the link is a note on it.
     #[test]
-    fn cli_on_path_reports_a_broken_link_first() {
-        let broken = Inputs {
+    fn cli_on_path_notes_a_dangling_link_beside_the_path_verdict() {
+        let dangling = Some(DanglingLink {
+            link: PathBuf::from("/usr/local/bin/roostctl"),
+            target: PathBuf::from("/nonexistent/Old.app/Contents/Resources/bin/roostctl"),
+            writable: true,
+        });
+        let note = format!(
+            "; also, /usr/local/bin/roostctl points at \
+             /nonexistent/Old.app/Contents/Resources/bin/roostctl, which no longer exists: \
+             `{BUNDLED} cli install` repairs it"
+        );
+
+        let fine = Inputs {
             cli_self: Some(PathBuf::from(BUNDLED)),
-            cli_dangling_link: Some((
-                PathBuf::from("/usr/local/bin/roostctl"),
-                PathBuf::from("/nonexistent/Old.app/Contents/Resources/bin/roostctl"),
-            )),
+            cli_on_path: Some((PathBuf::from(BUNDLED), Some(PathBuf::from(BUNDLED)))),
+            cli_dangling_link: dangling.clone(),
             ..healthy()
         };
-        let c = find(&evaluate(&broken), "cli.on_path").clone();
+        let c = find(&evaluate(&fine), "cli.on_path").clone();
+        assert_eq!(c.status, Some(Status::Ok));
+        assert_eq!(c.detail, format!("{BUNDLED} is this roostctl{note}"));
+
+        let other = Inputs {
+            cli_self: Some(PathBuf::from(BUNDLED)),
+            cli_on_path: Some((
+                PathBuf::from("/opt/old/roostctl"),
+                Some(PathBuf::from("/opt/old/roostctl")),
+            )),
+            cli_dangling_link: dangling,
+            ..healthy()
+        };
+        let c = find(&evaluate(&other), "cli.on_path").clone();
         assert_eq!(c.status, Some(Status::Warn));
-        assert!(c.detail.contains("which no longer exists"), "{}", c.detail);
+        assert_eq!(
+            c.detail,
+            format!("a bare `roostctl` runs /opt/old/roostctl, not {BUNDLED}{note}")
+        );
+    }
+
+    /// `cli install` passes over a link in a directory it can't write, so
+    /// the note says to remove that one by hand instead.
+    #[test]
+    fn cli_on_path_says_how_to_remove_a_dangling_link_roost_cannot_write() {
+        let fine = Inputs {
+            cli_self: Some(PathBuf::from(BUNDLED)),
+            cli_on_path: Some((PathBuf::from(BUNDLED), Some(PathBuf::from(BUNDLED)))),
+            cli_dangling_link: Some(DanglingLink {
+                link: PathBuf::from("/usr/local/bin/roostctl"),
+                target: PathBuf::from("/nonexistent/Old.app/Contents/Resources/bin/roostctl"),
+                writable: false,
+            }),
+            ..healthy()
+        };
+        let c = find(&evaluate(&fine), "cli.on_path").clone();
+        assert_eq!(c.status, Some(Status::Ok));
         assert!(
-            c.detail.contains("cli install` to repair it"),
+            c.detail.ends_with(
+                "which no longer exists: this user can't write to /usr/local/bin, so remove it \
+                 by hand (`rm /usr/local/bin/roostctl`)"
+            ),
             "{}",
             c.detail
+        );
+    }
+
+    #[test]
+    fn a_dangling_link_behind_another_roosts_is_still_found() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let tmp = TmpDir::new("cli-dangling");
+        let root = std::fs::canonicalize(&tmp.0).unwrap();
+        let bin = |app: &str| root.join(app).join("Contents/Resources/bin");
+        let other = bin("Other.app").join("roostctl");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gone = bin("Gone.app").join("roostctl");
+        let dirs = [root.join("system"), root.join("user")];
+        for dir in &dirs {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let source = bin("Roost.app").join("roostctl");
+        assert_eq!(dangling_cli_link(&source, &dirs), None);
+        symlink(&other, dirs[0].join("roostctl")).unwrap();
+        symlink(&gone, dirs[1].join("roostctl")).unwrap();
+        assert_eq!(
+            dangling_cli_link(&source, &dirs),
+            Some(DanglingLink {
+                link: dirs[1].join("roostctl"),
+                target: gone,
+                writable: true,
+            })
         );
     }
 

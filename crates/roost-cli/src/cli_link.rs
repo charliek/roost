@@ -1,4 +1,4 @@
-//! `roostctl cli install|uninstall|status` — the `roostctl` link for
+//! `roostctl cli install|repair|uninstall|status` — the `roostctl` link for
 //! terminals outside Roost (#261), through the same
 //! `roost_ipc::cli_link::act` the UI's `app.cli_link` calls. Never dials
 //! a UI: it has to work with none running.
@@ -15,14 +15,18 @@ use crate::error::CliError;
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliCmd {
     /// Link this `roostctl` into /usr/local/bin (when it exists and you
-    /// can write to it) or ~/.local/bin, or repair a link a moved or
-    /// replaced Roost.app left behind. Only a `roostctl` inside an app
-    /// bundle has anything to link. Writes that one symlink and nothing
-    /// else — no shell rc file is edited.
+    /// can write to it) or ~/.local/bin, or repair a link whose Roost.app
+    /// moved or was deleted. Only a `roostctl` inside an app bundle has
+    /// anything to link. Writes that one symlink and nothing else — no
+    /// shell rc file is edited. A link to another Roost that is still
+    /// installed is left alone: that is `repair`.
     Install,
+    /// `install`, and also point a link that reaches another Roost still
+    /// installed (a dev Roost-Iced.app's, say) at this `roostctl`.
+    Repair,
     /// Remove the link `install` made, and any other link into a Roost
-    /// app bundle in those directories. A `roostctl` that is not such a
-    /// link is left alone.
+    /// app bundle in those directories, naming each one that was another
+    /// Roost's. A `roostctl` that is not such a link is left alone.
     Uninstall,
     /// Say what those directories hold.
     Status,
@@ -32,6 +36,7 @@ impl CliCmd {
     fn action(self) -> Action {
         match self {
             Self::Install => Action::Install,
+            Self::Repair => Action::Repair,
             Self::Uninstall => Action::Uninstall,
             Self::Status => Action::Status,
         }
@@ -44,6 +49,7 @@ pub fn run(cmd: CliCmd, json: bool) -> Result<i32, CliError> {
         .and_then(|exe| std::fs::canonicalize(exe).ok());
     let dirs = cli_link::dirs_from_env();
     let path_var = std::env::var_os("PATH");
+    let login_dirs = cli_link::login_path_dirs();
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let result = cli_link::act(
         cmd.action(),
@@ -51,6 +57,7 @@ pub fn run(cmd: CliCmd, json: bool) -> Result<i32, CliError> {
             source: source.as_deref(),
             dirs: &dirs,
             path_var: path_var.as_deref(),
+            login_dirs: &login_dirs,
             home: home.as_deref(),
         },
     );
@@ -84,6 +91,9 @@ fn write_text(out: &mut impl Write, result: &AppCliLinkResult) -> std::io::Resul
             "That directory is not on PATH here. Add this line to ~/.zprofile (zsh) or \
              ~/.bash_profile (bash), then open a new terminal:\n  {line}"
         )?;
+    }
+    if let Some(command) = &result.command {
+        writeln!(out, "To change the link Roost left by hand:\n  {command}")?;
     }
     Ok(())
 }
@@ -122,6 +132,27 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(hinted).unwrap();
         assert!(text.ends_with(&format!("  {line}\n")), "{text}");
+    }
+
+    /// A link Roost left in place comes with the command that changes it.
+    #[test]
+    fn the_text_adds_a_left_links_command() {
+        let mut out = Vec::new();
+        write_text(
+            &mut out,
+            &AppCliLinkResult {
+                command: Some("rm '/usr/local/bin/roostctl'".into()),
+                ..result("created")
+            },
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.ends_with(
+                "To change the link Roost left by hand:\n  rm '/usr/local/bin/roostctl'\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
