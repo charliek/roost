@@ -147,7 +147,9 @@ reasoning.
   that needs one
   ([DL-24](decision-history.md#dl-24-no-supervisor-artifact-a-session-comes-up-on-demand-2026-09-08)).
 - **The local backend is the user's choice**
-  ([DL-27](decision-history.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14)).
+  ([DL-27](decision-history.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14)),
+  until in-process local tabs are removed (decided 2026-11-14, not
+  scheduled).
 - **Local Unix sockets only, with a same-UID check.** A remote host is
   reached over SSH, never through a listener
   ([DL-3](decision-history.md#dl-3-unix-domain-socket-not-tcp)).
@@ -191,7 +193,9 @@ reasoning.
   seams, not in a second app. The accepted cost: an iced canvas gives
   VoiceOver almost nothing.
 - **No daemon unless the tabs should outlive the window.** The
-  in-process backend is one process with no daemon to supervise.
+  in-process backend is one process with no daemon to supervise. This
+  changes when in-process local tabs are removed (decided 2026-11-14, not
+  scheduled): every local tab then runs on a session.
 - **`roost-session` is the daemon when one is wanted.** The same engine,
   the same op set, on this machine or another. Nothing starts it at boot.
 - **JSON, not gRPC.** The control plane is small. Newline-delimited JSON
@@ -322,9 +326,12 @@ fonts in the left panel. Pursued later. Note:
 `discovery/text-rendering.md`.
 
 **Sessions everywhere.** Sessions as the normal backend on every
-machine, so a tab can be picked up from any screen. Flipping the
-default for existing setups is #480; retiring in-process tabs is a later
-question. Notes: `discovery/sessions-everywhere.md`, and HS-4e
+machine, so a tab can be picked up from any screen. #480 (still open)
+tracked flipping the default for existing setups; on 2026-11-14 Charlie
+decided instead to remove in-process local tabs in one release, not yet
+scheduled, and that release closes #480 (`discovery/in-process-removal.md`).
+Notes:
+`discovery/sessions-everywhere.md`, and HS-4e
 porcelain in `discovery/host-sessions-roadmap.md`.
 
 **Roost mobile past the prototype.** A notification inbox, Share to
@@ -380,7 +387,7 @@ its record there and a row here, in the PR that builds it.
 | [24](decision-history.md#dl-24-no-supervisor-artifact-a-session-comes-up-on-demand-2026-09-08) | No supervisor artifact | 2026-09-08 | Current | Sessions start when a client needs one. |
 | [25](decision-history.md#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08) | Raw input open to every same-UID client | 2026-09-08 | Superseded (DL-26, 31) | Open input still holds. |
 | [26](decision-history.md#dl-26-there-is-no-lease-2026-09-12) | There is no lease | 2026-09-12 | Current | Effects fan out; each client decides. Since protocol 5. |
-| [27](decision-history.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14) | The local backend is a user's choice | 2026-09-14 | Current | Fresh installs start on `session`; #480 is open. |
+| [27](decision-history.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14) | The local backend is a user's choice | 2026-09-14 | Current | Fresh installs start on `session`. To be superseded: in-process tabs will be removed (decided 2026-11-14, not scheduled). |
 | [28](decision-history.md#dl-28-roost-iced-becomes-the-recommended-mac-install-for-agent-driving-users-2026-09-19-pending) | Roost-Iced recommended on Mac | 2026-09-19 | Superseded (DL-33) | `Roost.app` is iced. |
 | [29](decision-history.md#dl-29-program-status-is-a-fourth-per-tab-axis-composed-above-the-hook-layer-2026-10-28) | Program status above the hook layer | 2026-10-28 | Current | OSC 7501 decides mid-turn; hooks keep identity. |
 | [30](decision-history.md#dl-30-one-osc-133-parser-per-sink-terminal-2026-10-28) | One OSC 133 parser per sink terminal | 2026-10-28 | Current | libghostty's stream feeds both layers. |

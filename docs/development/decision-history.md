@@ -926,7 +926,7 @@ for the shipped mechanics.
 
 ### DL-27: the local backend is a user's choice, not a default flip (2026-09-14)
 
-Status (2026-11-08): **Current.** Flipping the default for existing setups is open ([#480](https://github.com/charliek/roost/issues/480)).
+Status (2026-11-14): **Current, to be superseded.** Instead of flipping the default for existing setups ([#480](https://github.com/charliek/roost/issues/480)), Charlie decided on 2026-11-14 to remove in-process local tabs entirely in one release, with no `--ephemeral` mode. That release is not yet scheduled; until it ships, this record describes the product. See `discovery/in-process-removal.md`.
 
 Plan 063 (R9, [#426](https://github.com/charliek/roost/issues/426)) gives
 `local-backend = in-process | session` a switch, not a flip. Every

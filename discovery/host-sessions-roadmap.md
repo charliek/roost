@@ -64,6 +64,10 @@ toolchain move — putting the snapshot API in reach.
    incrementality: if host sessions prove out, flipping local to a
    session backend is a later, explicit product decision (HS-5), not
    a side effect.
+   **Amended (plan 063, DL-27; 2026-11-14):** fresh installs start on
+   `session` since plan 063, and the HS-5 decision is made: in-process
+   local tabs are removed in one release, with no flip-first step and no
+   `--ephemeral` mode. It is not yet scheduled; see [`in-process-removal.md`](in-process-removal.md).
 3. **Snapshot-first payload.** The attach payload is
    `ghostty-snapshot` (plan 032 landed the API; plan 034 / PR #371
    shipped the `roost-vt` wrapper). The wire stays kind-tagged
@@ -398,8 +402,8 @@ Herdr/tmux as the host runtime; splits; web; iOS (Android first — D1's
 mobile amendment keeps iOS possible but unbuilt); disk scrollback
 persistence (secrets — Herdr ships it off-by-default for a reason;
 revisit only post-HS-4); screen-manifest agent detection (own track);
-Swift host backend; flipping the local default (HS-5 is a placeholder
-decision point, not scheduled work).
+Swift host backend; flipping the local default (HS-5 is decided, as removing in-process
+local tabs on 2026-11-14, but not scheduled work; see [`in-process-removal.md`](in-process-removal.md)).
 
 ### D11 — Hosts UX
 
@@ -1029,7 +1033,13 @@ manual-only validation. The release itself also carries the standing
 live ritual: the shed L1–L4 reconnect checklist and the Mac→shed
 criterion, re-run against the release build.
 
-### HS-5 — Local default flip: switch shipped (plan 063); default flip for existing setups pending
+### HS-5 — Local default flip: switch shipped (plan 063); superseded by removing in-process local tabs (decided 2026-11-14, not scheduled)
+
+**Superseded 2026-11-14:** Charlie decided to remove in-process local tabs
+in one release instead of flipping the default, with no `--ephemeral`
+mode. The release is not yet scheduled. See
+[`in-process-removal.md`](in-process-removal.md). HS-5 is done when that
+lands.
 
 Plan 063 (R9, [#426](https://github.com/charliek/roost/issues/426))
 shipped the `local-backend = in-process | session` config key, two
@@ -1041,7 +1051,7 @@ runs the same sequence over a hand-edited key found sitting on a
 populated in-process workspace. A genuinely fresh install (no
 `state.json`, no `config.conf`) already starts on `session`.
 
-What HS-5 originally asked — launching every install as a client of a
+As written before 2026-11-14: what HS-5 originally asked — launching every install as a client of a
 local session **by default**, `--ephemeral` as the escape hatch — is
 still not scheduled: existing setups keep defaulting to `in-process`
 this release, by deliberate owner decision (plan 063 §1). Flipping that
