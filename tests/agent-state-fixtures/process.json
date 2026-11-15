@@ -1,0 +1,460 @@
+{
+  "group": "process",
+  "marks": [
+    {
+      "name": "an-unstamped-owner-is-released-when-the-shell-takes-the-terminal-back-621",
+      "layer": "owner",
+      "stamp": null,
+      "fg": "shell",
+      "expect": "release"
+    },
+    {
+      "name": "an-unstamped-owner-stays-a-label-while-another-job-is-in-front",
+      "layer": "owner",
+      "stamp": null,
+      "fg": {
+        "group": 900
+      },
+      "expect": "today"
+    },
+    {
+      "name": "an-unstamped-owner-stays-a-label-when-nothing-is-known",
+      "layer": "owner",
+      "stamp": null,
+      "fg": "unknown",
+      "expect": "today"
+    },
+    {
+      "name": "unstamped-records-drop-as-a-prompt-always-dropped-them",
+      "layer": "records",
+      "stamp": null,
+      "fg": "shell",
+      "expect": "today"
+    },
+    {
+      "name": "unstamped-records-drop-whoever-is-in-front",
+      "layer": "records",
+      "stamp": null,
+      "fg": {
+        "group": 900
+      },
+      "expect": "today"
+    },
+    {
+      "name": "unstamped-records-drop-when-nothing-is-known",
+      "layer": "records",
+      "stamp": null,
+      "fg": "unknown",
+      "expect": "today"
+    },
+    {
+      "name": "a-stamped-owner-parks-when-the-shell-takes-the-terminal-back",
+      "layer": "owner",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "fg": "shell",
+      "expect": "park"
+    },
+    {
+      "name": "a-mark-from-the-stamped-group-is-its-own-as-claude-s-screen-reader-marks-are",
+      "layer": "owner",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "fg": {
+        "group": 700
+      },
+      "expect": "today"
+    },
+    {
+      "name": "a-stamped-owner-parks-while-another-job-is-in-front",
+      "layer": "owner",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "fg": {
+        "group": 900
+      },
+      "expect": "park"
+    },
+    {
+      "name": "a-stamped-owner-takes-today-s-mark-when-nothing-is-known",
+      "layer": "owner",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "fg": "unknown",
+      "expect": "today"
+    },
+    {
+      "name": "stamped-records-park-when-the-shell-takes-the-terminal-back",
+      "layer": "records",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "fg": "shell",
+      "expect": "park"
+    },
+    {
+      "name": "a-mark-from-the-stamped-records-own-group-drops-them",
+      "layer": "records",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "fg": {
+        "group": 700
+      },
+      "expect": "today"
+    },
+    {
+      "name": "stamped-records-park-while-another-job-is-in-front",
+      "layer": "records",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "fg": {
+        "group": 900
+      },
+      "expect": "park"
+    },
+    {
+      "name": "stamped-records-take-today-s-mark-when-nothing-is-known",
+      "layer": "records",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "fg": "unknown",
+      "expect": "today"
+    }
+  ],
+  "samples": [
+    {
+      "name": "a-running-process-brought-back-from-the-background-restores",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "running",
+      "fg": "shell",
+      "expect": "restore"
+    },
+    {
+      "name": "a-running-process-in-front-restores-what-was-parked",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "running",
+      "fg": {
+        "group": 700
+      },
+      "expect": "restore"
+    },
+    {
+      "name": "a-running-process-behind-another-job-keeps-its-last-state",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "running",
+      "fg": {
+        "group": 900
+      },
+      "expect": "restore"
+    },
+    {
+      "name": "a-running-process-with-nothing-known-about-the-front-keeps",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "running",
+      "fg": "unknown",
+      "expect": "keep"
+    },
+    {
+      "name": "a-stopped-process-with-the-shell-in-front-is-suspended",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "stopped",
+      "fg": "shell",
+      "expect": "suspend"
+    },
+    {
+      "name": "a-stopped-process-whose-group-is-in-front-is-suspended",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "stopped",
+      "fg": {
+        "group": 700
+      },
+      "expect": "suspend"
+    },
+    {
+      "name": "a-stopped-process-behind-another-job-is-suspended",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "stopped",
+      "fg": {
+        "group": 900
+      },
+      "expect": "suspend"
+    },
+    {
+      "name": "a-stopped-process-is-suspended-whatever-is-known-about-the-front",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "stopped",
+      "fg": "unknown",
+      "expect": "suspend"
+    },
+    {
+      "name": "a-gone-process-with-the-shell-back-in-front-ends-its-layer",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "gone",
+      "fg": "shell",
+      "expect": "end"
+    },
+    {
+      "name": "a-gone-leader-whose-group-still-has-the-terminal-keeps-its-layer",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "gone",
+      "fg": {
+        "group": 700
+      },
+      "expect": "keep"
+    },
+    {
+      "name": "a-gone-process-whose-group-left-the-front-ends-its-layer",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "gone",
+      "fg": {
+        "group": 900
+      },
+      "expect": "end"
+    },
+    {
+      "name": "a-gone-process-with-nothing-known-about-the-front-keeps",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "gone",
+      "fg": "unknown",
+      "expect": "keep"
+    },
+    {
+      "name": "an-unreadable-process-keeps-with-the-shell-in-front",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "unknown",
+      "fg": "shell",
+      "expect": "keep"
+    },
+    {
+      "name": "an-unreadable-process-keeps-with-its-group-in-front",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "unknown",
+      "fg": {
+        "group": 700
+      },
+      "expect": "keep"
+    },
+    {
+      "name": "an-unreadable-process-keeps-behind-another-job",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "unknown",
+      "fg": {
+        "group": 900
+      },
+      "expect": "keep"
+    },
+    {
+      "name": "an-unreadable-process-keeps-when-nothing-is-known",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "liveness": "unknown",
+      "fg": "unknown",
+      "expect": "keep"
+    },
+    {
+      "name": "an-unstamped-layer-is-never-ended-by-a-sample",
+      "stamp": null,
+      "liveness": "gone",
+      "fg": "shell",
+      "expect": "keep"
+    },
+    {
+      "name": "an-unstamped-layer-is-never-suspended-by-a-sample",
+      "stamp": null,
+      "liveness": "stopped",
+      "fg": {
+        "group": 900
+      },
+      "expect": "keep"
+    },
+    {
+      "name": "an-unstamped-layer-has-nothing-to-restore",
+      "stamp": null,
+      "liveness": "running",
+      "fg": "unknown",
+      "expect": "keep"
+    }
+  ]
+}

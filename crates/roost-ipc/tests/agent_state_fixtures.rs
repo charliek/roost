@@ -18,6 +18,9 @@ use roost_ipc::agent::{
     AgentTabState, AttentionEffect, ShellState, TabAgentReportParams,
 };
 use roost_ipc::messages::TabState;
+use roost_ipc::process::{
+    at_mark, on_sample, Foreground, Layer, Liveness, MarkVerdict, SampleVerdict, Stamp,
+};
 
 fn fixtures_dir() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -44,6 +47,32 @@ enum FixtureFile {
     ShellMarks {
         cases: Vec<ShellMarkCase>,
     },
+    Process {
+        marks: Vec<MarkCase>,
+        samples: Vec<SampleCase>,
+    },
+}
+
+/// `at_mark(layer, stamp, fg)`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarkCase {
+    name: String,
+    layer: Layer,
+    stamp: Option<Stamp>,
+    fg: Foreground,
+    expect: MarkVerdict,
+}
+
+/// `on_sample(stamp, liveness, fg)`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SampleCase {
+    name: String,
+    stamp: Option<Stamp>,
+    liveness: Liveness,
+    fg: Foreground,
+    expect: SampleVerdict,
 }
 
 #[derive(Deserialize)]
@@ -179,6 +208,7 @@ fn every_group_is_represented_and_non_trivial() {
         ("rank", 5),
         ("transitions", 18),
         ("shell_marks", 7),
+        ("process", 30),
     ]
     .into_iter()
     .collect();
@@ -190,6 +220,7 @@ fn every_group_is_represented_and_non_trivial() {
             FixtureFile::Rank { cases, .. } => ("rank", cases.len()),
             FixtureFile::Transitions { cases } => ("transitions", cases.len()),
             FixtureFile::ShellMarks { cases } => ("shell_marks", cases.len()),
+            FixtureFile::Process { marks, samples } => ("process", marks.len() + samples.len()),
         };
         *found.entry(group).or_default() += n;
     }
@@ -310,6 +341,20 @@ fn every_agent_state_fixture_matches_the_rust_implementation() {
                         &after.ownership.is_some(),
                         &e.owner_retained,
                     );
+                }
+            }
+            FixtureFile::Process { marks, samples } => {
+                for case in marks {
+                    cases += 1;
+                    let at = format!("{file}[{}]", case.name);
+                    let got = at_mark(case.layer, case.stamp.as_ref(), case.fg);
+                    check(&mut failures, &at, "at_mark", &got, &case.expect);
+                }
+                for case in samples {
+                    cases += 1;
+                    let at = format!("{file}[{}]", case.name);
+                    let got = on_sample(case.stamp.as_ref(), case.liveness, case.fg);
+                    check(&mut failures, &at, "on_sample", &got, &case.expect);
                 }
             }
         }

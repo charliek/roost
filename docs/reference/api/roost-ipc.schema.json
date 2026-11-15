@@ -140,6 +140,16 @@
             }
           ]
         },
+        "process": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TabProcess"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "program_status": {
           "anyOf": [
             {
@@ -2604,6 +2614,20 @@
       ],
       "type": "object"
     },
+    "ProcessState": {
+      "oneOf": [
+        {
+          "enum": [
+            "running"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "suspended",
+          "type": "string"
+        }
+      ]
+    },
     "ProgramStatusKind": {
       "enum": [
         "permission",
@@ -4140,6 +4164,16 @@
           "format": "int32",
           "type": "integer"
         },
+        "process": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TabProcess"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "program_status": {
           "anyOf": [
             {
@@ -4939,6 +4973,30 @@
       "required": [
         "tab_id",
         "password_input"
+      ],
+      "type": "object"
+    },
+    "TabProcess": {
+      "properties": {
+        "agent": {
+          "default": "",
+          "type": "string"
+        },
+        "pid": {
+          "type": "string"
+        },
+        "since": {
+          "default": 0,
+          "format": "int64",
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/ProcessState"
+        }
+      },
+      "required": [
+        "state",
+        "pid"
       ],
       "type": "object"
     },

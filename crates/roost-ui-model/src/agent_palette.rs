@@ -349,27 +349,9 @@ pub fn compose_title(project: &str, name: &str) -> String {
     notification_inbox::compose_title(project, name)
 }
 
-/// A human-friendly name for an ownership `source` (plan 046 §3.7,
-/// W7). Matched against the five adapters' own `SOURCE` constants in
-/// `crates/roost-agent/src/*.rs` — spelled out here rather than
-/// imported, since `roost-agent` parses hook JSON and has no reason to
-/// depend on this crate's rendering, or vice versa.
-///
-/// `source` is an open string by design (AD-8): a third-party adapter
-/// that isn't one of the five renders **verbatim** rather than being
-/// hidden or mislabeled, so this table can never gate whether an
-/// agent's row appears — only how its name is spelled. Pinned by
-/// `tests/agent-display-name-fixtures/`.
-pub fn agent_display_name(source: &str) -> &str {
-    match source {
-        "claude" => "Claude Code",
-        "codex" => "Codex",
-        "opencode" => "OpenCode",
-        "grok" => "Grok",
-        "cursor" => "Cursor",
-        other => other,
-    }
-}
+/// A human-friendly name for an ownership `source`; see
+/// [`roost_ipc::agent::source_label`], which the engine's banners share.
+pub use roost_ipc::agent::source_label as agent_display_name;
 
 /// The colour role of one segment of the git-metrics column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,6 +565,7 @@ mod tests {
             password_input: false,
             dropped_reports: None,
             program_status: None,
+            process: None,
         }
     }
 

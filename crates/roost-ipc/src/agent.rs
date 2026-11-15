@@ -599,6 +599,28 @@ pub fn starts_a_new_process(owner: &Ownership, report: &TabAgentReportParams) ->
         && report.metadata.get(START_SOURCE_KEY).map(String::as_str) == Some("startup")
 }
 
+/// A human-friendly name for an ownership `source` (plan 046 §3.7, W7):
+/// the agents palette's row label and the name a banner about the agent
+/// carries, one table for both. Matched against the adapters' own `SOURCE`
+/// constants in `crates/roost-agent/src/*.rs`, spelled out here rather
+/// than imported, since `roost-agent` parses hook JSON and has no reason
+/// to be a dependency of the wire crate.
+///
+/// `source` is an open string by design (AD-8): a third-party adapter
+/// renders **verbatim** rather than being hidden or mislabeled, so this
+/// table can never gate whether an agent shows up, only how its name is
+/// spelled. Pinned by `tests/agent-display-name-fixtures/`.
+pub fn source_label(source: &str) -> &str {
+    match source {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
+        "grok" => "Grok",
+        "cursor" => "Cursor",
+        other => other,
+    }
+}
+
 pub fn is_agent_source(source: &str) -> bool {
     !source.is_empty() && source != SOURCE_MANUAL && source != SOURCE_LEGACY
 }

@@ -528,16 +528,17 @@ def test_set_hook_active_alias_still_claims_and_releases(roost, project):
     not TEST_MODE,
     reason="feeding OSC 133 / OSC 9 needs ROOST_TEST_MODE=1 in the UI's launch env",
 )
-def test_prompt_mark_deactivates_a_dead_agent_and_reopens_raw_osc(roost, project):
+def test_prompt_mark_releases_a_dead_agent_and_reopens_raw_osc(roost, project):
     """The failsafe that stops a killed agent muting a tab forever.
 
     An agent claims the tab and goes `working`, which suppresses raw OSC
     9/99/777 (the agent reports its own attention, so a wrapper shell
     echoing OSC 9 would double-notify). If that agent is then killed,
     nothing releases ownership — so the shell reaching a prompt does it:
-    an OSC 133 `D` sets lifecycle `inactive` while KEEPING ownership as a
-    label, which makes derivation fall through to the shell axis and
-    re-opens raw OSC in the same move."""
+    an OSC 133 `D` with the shell itself back in front of its terminal
+    releases the owner (#621; the claim, made with the shell in front,
+    stamped no process), which makes derivation fall through to the
+    shell axis and re-opens raw OSC in the same move."""
     tab = agent_tab(roost, project)
     roost.agent_report(tab, "claude", "claim", session_id="sess-failsafe",
                        lifecycle="working")
@@ -553,10 +554,9 @@ def test_prompt_mark_deactivates_a_dead_agent_and_reopens_raw_osc(roost, project
     roost.wait_lifecycle(tab, "inactive")
     assert not roost.has_notification(tab), "raw OSC must be suppressed under a live agent"
 
-    # Ownership survives as a label; only the lifecycle dropped.
-    owner = roost.ownership(tab)
-    assert owner is not None and owner["source"] == "claude", owner
-    assert roost.hook_active(tab) is True
+    # The shell is in front, so the dead agent's ownership goes too.
+    assert roost.ownership(tab) is None, roost.tab(tab)
+    assert roost.hook_active(tab) is False
     # Derivation now falls through to the shell axis.
     assert roost.shell_state(tab) == "at_prompt"
     assert roost.tab(tab)["state"] == "none"

@@ -361,8 +361,9 @@ def test_effective_lifecycle_pin_via_osc133_marks(roost, project):
     ownership with NO lifecycle (raw stays `inactive`), so the row reads
     off the *shell* axis until the agent actually reports a turn — an
     agent that just claimed a tab and is running a foreground process
-    shows "Working", and a dead agent's tab reaching a prompt (the OSC
-    133 `A`/`D` failsafe) shows "Idle", exactly like the tab pill."""
+    shows "Working". The shell reaching a prompt with itself in front of
+    its terminal (the OSC 133 `A`/`D` failsafe) means that agent is gone:
+    its owner is released (#621) and the row goes with it."""
     tab = agent_tab(roost, project)  # bare bash, no shell integration of its own
     row_id = f"agent:{tab}"
     roost.agent_report(tab, _agent_source("eff"), "claim", session_id="sess-eff")
@@ -375,8 +376,12 @@ def test_effective_lifecycle_pin_via_osc133_marks(roost, project):
 
     roost.tab_feed_pty_bytes(tab, b"\x1b]133;A\x07")
     roost.wait_shell_state(tab, "at_prompt")
-    row = roost.wait_palette_row_field("agents", row_id, "agent.status_text", "Idle")
-    assert row["agent"]["effective_lifecycle"] == "inactive", row["agent"]
+    assert roost.ownership(tab) is None, roost.tab(tab)
+    roost._wait(
+        lambda: roost.palette_row("agents", row_id) is None,
+        5.0,
+        f"tab {tab}'s Agents row to go",
+    )
 
 
 # ---------------------------------------------------------------------------

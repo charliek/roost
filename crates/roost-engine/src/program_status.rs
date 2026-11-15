@@ -14,11 +14,14 @@ use roost_ipc::agent::{
 };
 use roost_ipc::format_chars::is_format;
 use roost_ipc::messages::TabState;
+use roost_ipc::process::Foreground;
 pub use roost_ipc::program_status::{app_label, DecidedBy};
 use roost_ipc::program_status::{
     ProgramStatusKind, ProgramStatusRecordView, ProgramStatusReport, ProgramStatusState,
     ProgramStatusSummary, PromptMark, StatusEvent,
 };
+
+use crate::process_axis::ProcessAxis;
 
 /// Child records a tab keeps beside its root. The root is always accepted.
 pub const MAX_CHILDREN: usize = 255;
@@ -289,6 +292,27 @@ impl ProgramStatusRecords {
         events: impl IntoIterator<Item = StatusEvent>,
         now_ms: i64,
     ) -> StatusApplied {
+        self.apply_with_process(
+            agent,
+            &mut ProcessAxis::default(),
+            Foreground::Unknown,
+            events,
+            now_ms,
+        )
+    }
+
+    /// [`Self::apply`] with the tab's process layer beside the hook layer:
+    /// each prompt mark also reaches `process`, after its own effect and
+    /// read with `fg` in front, so a mark's release or park lands at its
+    /// byte like everything else.
+    pub(crate) fn apply_with_process(
+        &mut self,
+        agent: &mut AgentTabState,
+        process: &mut ProcessAxis,
+        fg: Foreground,
+        events: impl IntoIterator<Item = StatusEvent>,
+        now_ms: i64,
+    ) -> StatusApplied {
         let mut applied = StatusApplied::default();
         let mut before = compose(agent, self).lifecycle;
         for event in events {
@@ -296,9 +320,11 @@ impl ProgramStatusRecords {
                 StatusEvent::Report(report) => self.report(&report, now_ms, &mut applied),
                 StatusEvent::Prompt(mark) => {
                     self.prompt(mark);
+                    let unmarked = agent.clone();
                     if let Some(next) = agent::apply_shell_mark(agent, osc133_body(mark)) {
                         *agent = next;
                     }
+                    process.at_mark(mark, &unmarked, agent, fg);
                 }
                 StatusEvent::Notification { title, body } => {
                     applied.notifications.push(PlacedNotification {

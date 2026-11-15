@@ -208,6 +208,7 @@ impl HostMirror {
                     tab.state = data.state;
                     tab.hook_active = data.hook_active;
                     tab.program_status = data.program_status.clone();
+                    tab.process = data.process.clone();
                 });
             }
             ops::EVENT_PROJECT_CREATED => {
@@ -438,6 +439,7 @@ mod tests {
             password_input: false,
             dropped_reports: None,
             program_status: None,
+            process: None,
         }
     }
 
@@ -694,6 +696,37 @@ mod tests {
         assert_eq!(tab.agent_lifecycle, AgentLifecycle::Working);
         assert_eq!(tab.state, TabState::Running);
         assert!(tab.hook_active);
+    }
+
+    /// `process` rides `agent_report.changed` like `program_status`: an
+    /// event with it sets the mirror's copy, and one without it clears it.
+    #[test]
+    fn an_agent_report_sets_and_clears_the_stamped_process() {
+        let mut mirror = mirror();
+        let changed = |process: Option<serde_json::Value>| {
+            let mut data = serde_json::json!({
+                "tab_id": "10",
+                "shell_state": "at_prompt",
+                "agent_lifecycle": "inactive",
+                "state": "none",
+                "hook_active": true,
+            });
+            if let Some(process) = process {
+                data["process"] = process;
+            }
+            event(ops::EVENT_AGENT_REPORT_CHANGED, data)
+        };
+        mirror.apply_event(&changed(Some(serde_json::json!({
+            "state": "suspended", "agent": "claude", "pid": "48213", "since": 1
+        }))));
+        let process = mirror.tab(10).unwrap().process.clone().expect("set");
+        assert_eq!(
+            (process.state, process.pid),
+            (roost_ipc::process::ProcessState::Suspended, 48_213)
+        );
+
+        mirror.apply_event(&changed(None));
+        assert_eq!(mirror.tab(10).unwrap().process, None, "cleared");
     }
 
     /// Plan 083 B-2/B-3: a host mirror runs no hook path of its own; it

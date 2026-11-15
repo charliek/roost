@@ -911,6 +911,7 @@ fn every_workspace_event_has_a_wire_name() {
         password_input: false,
         dropped_reports: None,
         program_status: None,
+        process: None,
     };
     let project = Project {
         id: 1,
@@ -1022,6 +1023,7 @@ fn every_workspace_event_has_a_wire_name() {
                 tab_id: 5,
                 agent: agent.clone(),
                 program_status: None,
+                process: None,
             },
             ops::EVENT_AGENT_REPORT_CHANGED,
             vec![
@@ -1089,6 +1091,7 @@ fn every_workspace_event_has_a_wire_name() {
         tab_id: 5,
         agent: agent.clone(),
         program_status: None,
+        process: None,
     })
     .expect("agent_report.changed");
     assert_eq!(agent_event.data["state"], serde_json::json!("needs_input"));
@@ -1107,6 +1110,7 @@ fn every_workspace_event_has_a_wire_name() {
         tab_id: 5,
         agent,
         program_status: Some(status),
+        process: None,
     })
     .expect("agent_report.changed");
     assert_eq!(agent_event.data["state"], serde_json::json!("running"));

@@ -4219,6 +4219,7 @@ mod tests {
             password_input: false,
             dropped_reports: None,
             program_status: None,
+            process: None,
         }
     }
 
@@ -4906,6 +4907,7 @@ mod switch_tests {
             password_input: false,
             dropped_reports: None,
             program_status: None,
+            process: None,
         }
     }
 
@@ -5827,6 +5829,7 @@ mod migration_tests {
                     password_input: false,
                     dropped_reports: None,
                     program_status: None,
+                    process: None,
                 })
                 .collect(),
         }

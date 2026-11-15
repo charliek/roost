@@ -4090,6 +4090,7 @@ mod tests {
             password_input: false,
             dropped_reports: None,
             program_status: None,
+            process: None,
         }
     }
 

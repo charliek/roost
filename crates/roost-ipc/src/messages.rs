@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 
 use crate::agent::{AgentLifecycle, AgentTabState, DroppedReports, Ownership, ShellState};
 use crate::local_route::LocalBackendMode;
+use crate::process::TabProcess;
 use crate::program_status::ProgramStatusSummary;
 
 // ============================================================================
@@ -117,6 +118,15 @@ pub struct Tab {
         deserialize_with = "lenient_program_status"
     )]
     pub program_status: Option<ProgramStatusSummary>,
+    /// The stamped process behind the tab's agent state; see
+    /// [`TabProcess`]. Present while one is stamped. Decoded leniently,
+    /// like `program_status`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_process"
+    )]
+    pub process: Option<TabProcess>,
 }
 
 impl Tab {
@@ -2665,6 +2675,14 @@ pub struct AgentReportChangedEvent {
         deserialize_with = "lenient_program_status"
     )]
     pub program_status: Option<ProgramStatusSummary>,
+    /// `Tab.process` after this change. Absent means no process is stamped
+    /// any more, so a mirror assigns it unconditionally.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_process"
+    )]
+    pub process: Option<TabProcess>,
 }
 
 // ============================================================================
@@ -3654,6 +3672,16 @@ where
 /// An unknown state, kind or `decided_by` reads the whole summary as
 /// absent: the shape and its enums are open (ipc-compatibility.md).
 fn lenient_program_status<'de, D>(deserializer: D) -> Result<Option<ProgramStatusSummary>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// An unknown `state` reads the whole object as absent: the value is open
+/// (ipc-compatibility.md).
+fn lenient_process<'de, D>(deserializer: D) -> Result<Option<TabProcess>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -5422,6 +5450,7 @@ mod tests {
             password_input: false,
             dropped_reports: None,
             program_status: None,
+            process: None,
         };
         round_trip(&t);
         let json = serde_json::to_string(&t).unwrap();
@@ -5507,6 +5536,7 @@ mod tests {
             password_input: false,
             dropped_reports: None,
             program_status: None,
+            process: None,
         };
         let value = serde_json::to_value(&tab).unwrap();
         for key in ["shell_state", "agent_lifecycle"] {
@@ -5561,6 +5591,7 @@ mod tests {
             state: TabState::NeedsInput,
             hook_active: true,
             program_status: None,
+            process: None,
         };
         round_trip(&ev);
         let json = serde_json::to_string(&ev).unwrap();

@@ -17,9 +17,10 @@ use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result};
 use roost_ipc::messages::{Project, Tab, TabOpenParams};
+use roost_ipc::process::Foreground;
 use roost_ipc::session_launch::FirstProject;
-use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, Notify};
 
 use crate::opener::{restore_opener, TabOpener};
 use crate::program_status::RawOscAuthority;
@@ -404,6 +405,83 @@ impl LocalClient {
             Arc::downgrade(&self.supervisor),
             reports,
         ));
+    }
+}
+
+impl LocalClient {
+    /// Start the process layer (#621): install the probe a prompt mark
+    /// asks who has its tab's terminal, and a sampler that reads a tab's
+    /// processes whenever its layer asks — an agent's claim, a hook
+    /// report, a mark that parked, a `C` on a stamped tab, a focus — and
+    /// applies what it read under the workspace lock.
+    ///
+    /// Call from inside a Tokio runtime. Only the call that installs the
+    /// probe starts a sampler, so it is idempotent per workspace. The
+    /// sampler reads on a blocking thread with no lock held, holds the
+    /// workspace and the supervisor weakly, and ends once either is gone.
+    pub fn watch_processes(&self) {
+        let probed = Arc::downgrade(&self.supervisor);
+        let installed = self.workspace.set_foreground_probe(Box::new(move |tab_id| {
+            probed.upgrade().map_or(Foreground::Unknown, |supervisor| {
+                supervisor.foreground(tab_id)
+            })
+        }));
+        if !installed {
+            return;
+        }
+        tokio::spawn(sample_processes(
+            Arc::downgrade(&self.workspace),
+            Arc::downgrade(&self.supervisor),
+            self.workspace.process_wake(),
+        ));
+    }
+}
+
+/// [`LocalClient::watch_processes`]'s sampler: every request the tabs'
+/// process layers made since it last woke, read off the lock, applied
+/// under it. A sample of a spawn the tab no longer has is dropped, as a
+/// stale password report is.
+async fn sample_processes(
+    workspace: Weak<Workspace>,
+    supervisor: Weak<PtySupervisor>,
+    wake: Arc<Notify>,
+) {
+    loop {
+        wake.notified().await;
+        let (Some(workspace), Some(supervisor)) = (workspace.upgrade(), supervisor.upgrade())
+        else {
+            return;
+        };
+        let requests = workspace.take_process_requests();
+        if requests.is_empty() {
+            continue;
+        }
+        let reader = Arc::clone(&supervisor);
+        let read = tokio::task::spawn_blocking(move || {
+            requests
+                .into_iter()
+                .filter_map(|request| {
+                    reader
+                        .sample_process(request.tab_id, request.stamp_wanted, &request.stamps)
+                        .map(|sample| (request, sample))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        let samples = match read {
+            Ok(samples) => samples,
+            Err(error) => {
+                tracing::warn!(%error, "a process-layer read failed");
+                continue;
+            }
+        };
+        for (request, sample) in samples {
+            if supervisor.incarnation(request.tab_id) == Some(sample.incarnation) {
+                workspace.apply_process_sample(&request, &sample);
+            } else {
+                tracing::debug!(tab_id = request.tab_id, "dropping a stale process sample");
+            }
+        }
     }
 }
 

@@ -196,6 +196,7 @@ pub fn envelope(event: &WorkspaceEvent) -> Option<EventEnvelope> {
             tab_id,
             agent,
             program_status,
+            process,
         } => (
             ops::EVENT_AGENT_REPORT_CHANGED,
             to_value(AgentReportChangedEvent {
@@ -206,6 +207,7 @@ pub fn envelope(event: &WorkspaceEvent) -> Option<EventEnvelope> {
                 state: roost_ipc::program_status::effective(agent, program_status.as_ref()),
                 hook_active: roost_ipc::agent::is_live(agent),
                 program_status: program_status.clone(),
+                process: process.clone(),
             }),
         ),
         WorkspaceEvent::NotificationFired {
