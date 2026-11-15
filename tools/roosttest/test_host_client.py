@@ -4134,7 +4134,7 @@ def test_a_session_tabs_suspended_agent_reads_suspended_through_the_mirror(host,
                 project, cwd=str(host.env.launch_cwd), cols=80, rows=24, argv=argv
             )
 
-        lane = Lane("session", session, open_tab)
+        lane = Lane("session", session, str(host.env.socket), open_tab)
         tab, shell = lane.bash_tab()
         pid = int(lane.stamped_record(tab, shell)["pid"])
         key = wait_until(

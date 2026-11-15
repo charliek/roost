@@ -92,6 +92,11 @@ impl ParkedRecords {
     pub(crate) fn is_empty(&self) -> bool {
         self.records.is_empty() && !self.root_unprompted
     }
+
+    /// A `working` or `blocked` record was set aside.
+    pub(crate) fn holds_live(&self) -> bool {
+        !self.records.is_empty()
+    }
 }
 
 /// The deciding record, with the app it inherits.
@@ -352,14 +357,16 @@ impl ProgramStatusRecords {
     /// End what a program that is gone left on the tab, as a prompt mark
     /// would: its live records, and the root's say. With `upto`, only
     /// records reported by then are its; a later one belongs to whatever
-    /// runs in front now.
-    pub(crate) fn end(&mut self, upto: Option<u64>) {
+    /// runs in front now. Answers whether it took a live record.
+    pub(crate) fn end(&mut self, upto: Option<u64>) -> bool {
         let ours = |record: &Record| upto.is_none_or(|seq| record.updated_seq <= seq);
+        let before = self.records.len();
         self.records
             .retain(|_, record| !(is_live(record.state) && ours(record)));
         if self.records.get(ROOT).is_none_or(ours) {
             self.root_prompted = true;
         }
+        self.records.len() != before
     }
 
     /// Apply one ordered batch from the tab's authoritative terminal to the
@@ -415,7 +422,9 @@ impl ProgramStatusRecords {
                     if let Some(next) = agent::apply_shell_mark(agent, osc133_body(mark)) {
                         *agent = next;
                     }
-                    process.at_mark(mark, &unmarked, agent, fg);
+                    applied
+                        .banners
+                        .extend(process.at_mark(mark, &unmarked, agent, fg));
                 }
                 StatusEvent::Notification { title, body } => {
                     applied.notifications.push(PlacedNotification {
@@ -479,7 +488,7 @@ impl ProgramStatusRecords {
                     self.records.remove(ROOT);
                 }
             }
-            PromptMark::PromptStart | PromptMark::InputStart | PromptMark::CommandEnd => {
+            PromptMark::PromptStart | PromptMark::InputStart | PromptMark::CommandEnd { .. } => {
                 self.records.retain(|_, record| !is_live(record.state));
                 self.root_prompted = true;
             }
@@ -808,7 +817,7 @@ fn from_vt(events: Vec<roost_vt::TerminalEvent>) -> Vec<StatusEvent> {
                 VtMark::PromptStart => PromptMark::PromptStart,
                 VtMark::InputStart => PromptMark::InputStart,
                 VtMark::OutputStart => PromptMark::OutputStart,
-                VtMark::CommandEnd => PromptMark::CommandEnd,
+                VtMark::CommandEnd { exit_code } => PromptMark::CommandEnd { exit_code },
             }),
             TerminalEvent::Notification { title, body } => {
                 StatusEvent::Notification { title, body }
@@ -824,7 +833,7 @@ fn osc133_body(mark: PromptMark) -> &'static str {
         PromptMark::PromptStart => "A",
         PromptMark::InputStart => "B",
         PromptMark::OutputStart => "C",
-        PromptMark::CommandEnd => "D",
+        PromptMark::CommandEnd { .. } => "D",
     }
 }
 
@@ -922,7 +931,7 @@ mod tests {
         ("A", PromptMark::PromptStart),
         ("B", PromptMark::InputStart),
         ("C", PromptMark::OutputStart),
-        ("D", PromptMark::CommandEnd),
+        ("D", PromptMark::CommandEnd { exit_code: None }),
     ];
 
     fn mark(body: &str) -> PromptMark {
@@ -2022,9 +2031,9 @@ mod tests {
             p(PromptMark::OutputStart),
             claude(S::Done),
             claude(S::Done),
-            p(PromptMark::CommandEnd),
+            p(PromptMark::CommandEnd { exit_code: None }),
             p(PromptMark::OutputStart),
-            p(PromptMark::CommandEnd),
+            p(PromptMark::CommandEnd { exit_code: None }),
             claude(S::Idle),
             report(S::Working, "", "claude-code", "Again"),
             report(S::Blocked, "job/1", "", "job one"),
@@ -2303,7 +2312,10 @@ mod tests {
             TerminalEvent::Prompt(VtMark::PromptStart),
             TerminalEvent::Prompt(VtMark::InputStart),
             TerminalEvent::Prompt(VtMark::OutputStart),
-            TerminalEvent::Prompt(VtMark::CommandEnd),
+            TerminalEvent::Prompt(VtMark::CommandEnd { exit_code: None }),
+            TerminalEvent::Prompt(VtMark::CommandEnd {
+                exit_code: Some(137),
+            }),
             TerminalEvent::Notification {
                 title: "Build".into(),
                 body: "done".into(),
@@ -2323,7 +2335,10 @@ mod tests {
                 StatusEvent::Prompt(PromptMark::PromptStart),
                 StatusEvent::Prompt(PromptMark::InputStart),
                 StatusEvent::Prompt(PromptMark::OutputStart),
-                StatusEvent::Prompt(PromptMark::CommandEnd),
+                StatusEvent::Prompt(PromptMark::CommandEnd { exit_code: None }),
+                StatusEvent::Prompt(PromptMark::CommandEnd {
+                    exit_code: Some(137)
+                }),
                 StatusEvent::Notification {
                     title: "Build".into(),
                     body: "done".into(),

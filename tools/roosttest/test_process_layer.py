@@ -12,28 +12,39 @@ records come from `tab.feed_pty_bytes` while its job is in front, so the
 stamp is the job's; `Tab.process` names the job, so the test kills
 exactly that process.
 
+The exit-banner cases (E10–E12) run Roost's own shell integration, which
+prints `D;<exit status>`, sourced by hand into a bash or zsh that read no
+startup files, and read the banners off the tab's event stream.
+
 Condition waits only.
 """
 
 from __future__ import annotations
 
+import errno
 import os
 import re
+import shutil
 import signal
 import subprocess
+import tempfile
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import pytest
 import session as sessionlib
+import ui
 from client import Roost
-from test_program_status import osc7501
+from eventstream import EventStream
+from test_program_status import next_for_tab, osc7501
 from util import BARE_SHELL_ARGV, wait_tab_attached
 
 COLS, ROWS = 80, 24
 MARKS = r"""PROMPT_COMMAND='printf "\033]133;D\007"'"""
 PID = re.compile(r"SHELL_PID_(\d+)_")
+INTEGRATION = Path(__file__).resolve().parents[2] / "crates/roost-engine/resources/shell-integration"
 
 
 @dataclass
@@ -43,6 +54,7 @@ class Lane:
 
     name: str
     client: Roost
+    events_socket: str
     open_tab: Callable[[list[str]], int]
 
     def wait(self, tab: int, what: str, done: Callable[[dict], bool]) -> dict:
@@ -62,6 +74,17 @@ class Lane:
         shell = self.shell_pid(tab, MARKS + "; ")
         self.wait(tab, "the first D mark", lambda t: t["shell_state"] == "at_prompt")
         return tab, shell
+
+    def integrated_tab(self, shell: str) -> tuple[int, int]:
+        """A bash or zsh tab with Roost's own shell integration sourced, so
+        every prompt prints `D;<exit status>`, and its shell's pid. The
+        shell read no startup files: the integration's are the only prompt
+        hooks."""
+        argv = BARE_SHELL_ARGV if shell == "bash" else [shell_binary(shell), "-f"]
+        tab = self.open_tab(argv)
+        pid = self.shell_pid(tab, f". '{INTEGRATION / f'roost.{shell}'}'; ")
+        self.wait(tab, "the integration's first D mark", lambda t: t["shell_state"] == "at_prompt")
+        return tab, pid
 
     def sh_tab(self) -> tuple[int, int]:
         """A `/bin/sh` tab, which prints no prompt marks at all (dash on
@@ -111,11 +134,13 @@ class Lane:
         assert (process["state"], process["agent"]) == ("running", "claude"), process
         return process
 
-    def stamped_record(self, tab: int, shell: int, app: str = "codex") -> dict:
-        """A `sleep` job in front of `shell` reporting OSC 7501 `working`
-        as `app`, with no hooks: the records decide the tab, and are
-        stamped with the job. `Tab.process`."""
-        job = self.in_front(tab, shell, "sleep 300")
+    def stamped_record(
+        self, tab: int, shell: int, app: str = "codex", command: str = "sleep 300"
+    ) -> dict:
+        """`command` in front of `shell` reporting OSC 7501 `working` as
+        `app`, with no hooks: the records decide the tab, and are stamped
+        with the job. `Tab.process`."""
+        job = self.in_front(tab, shell, command)
         self.client.tab_feed_pty_bytes(tab, osc7501(state="working", app=app))
         listed = self.wait(tab, "the record's stamp", lambda t: "process" in t)
         process = listed["process"]
@@ -154,7 +179,7 @@ def _session_lane():
                     project, cwd=str(env.launch_cwd), cols=COLS, rows=ROWS, argv=argv
                 )
 
-            yield Lane("session", client, open_tab)
+            yield Lane("session", client, str(env.socket), open_tab)
             client.call("session.stop")
     finally:
         env.teardown()
@@ -169,7 +194,18 @@ def _iced_lane(roost: Roost, project: int):
         wait_tab_attached(roost, tab)
         return tab
 
-    yield Lane("iced", roost, open_tab)
+    yield Lane("iced", roost, str(ui.socket_path("iced")), open_tab)
+
+
+def shell_binary(name: str) -> str:
+    """`name` on PATH. Missing, it skips locally and fails under CI."""
+    path = shutil.which(name)
+    if path is None:
+        message = f"{name} not found; needed to run Roost's {name} integration"
+        if os.environ.get("CI"):
+            pytest.fail(message)
+        pytest.skip(message)
+    return path
 
 
 def ps_field(pid: int, field: str) -> str:
@@ -439,3 +475,149 @@ def test_a_pipeline_keeps_its_owner_and_a_waiting_wrapper_ends_with_its_agent(la
         assert "process" not in listed, listed
     finally:
         kill_group(wrapper)
+
+
+# ---------------------------------------------------------------------------
+# Exit codes and the exit banner
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fifo():
+    """A FIFO a job blocks reading until the test answers it."""
+    directory = tempfile.mkdtemp(prefix="rpl-")
+    path = os.path.join(directory, "code")
+    os.mkfifo(path)
+    try:
+        yield path
+    finally:
+        os.unlink(path)
+        os.rmdir(directory)
+
+
+def exits_with_what_it_reads(fifo: str) -> str:
+    """A job that exits with the code the test writes to `fifo`."""
+    return f"""sh -c 'read code < {fifo}; exit "$code"'"""
+
+
+def answer(lane: Lane, fifo: str, code: int) -> None:
+    """Write `code` to the job blocked reading `fifo`, once it has the
+    FIFO open."""
+
+    def written() -> bool:
+        try:
+            fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as error:
+            if error.errno == errno.ENXIO:
+                return False
+            raise
+        with os.fdopen(fd, "w") as writer:
+            writer.write(f"{code}\n")
+        return True
+
+    lane.client._wait(written, 15.0, f"the job reading {fifo}")
+
+
+def ended(listed: dict) -> bool:
+    """The stamped agent is gone and the shell is back at its prompt: its
+    `D`, and with it any banner the end owed, has been applied."""
+    return (
+        "process" not in listed
+        and listed.get("ownership") is None
+        and listed["state"] == "none"
+        and listed["shell_state"] == "at_prompt"
+    )
+
+
+def banners_until(
+    lane: Lane, stream: EventStream, tab: int, fence: int, sentinel: str
+) -> tuple[list[tuple[str, str]], int]:
+    """The banners `tab` raised since `fence`, up to a raw OSC 9 `sentinel`
+    the tab's shell prints now, and the fence after it. Nothing mutes the
+    sentinel once the agent is gone or suspended."""
+    lane.client.send(tab, f"printf '\\033]9;{sentinel}\\007'\n")
+    banners = []
+    while True:
+        banner, fence, _ = next_for_tab(stream, "notification.fired", tab, fence)
+        if sentinel in (banner["title"], banner["body"]):
+            return banners, fence
+        banners.append((banner["title"], banner["body"]))
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+def test_an_agent_that_exits_with_an_error_raises_one_banner(lane, shell, fifo):
+    """E10: an agent's job exits by itself, first with 0 and then with 3,
+    in a tab nobody is watching. The integration's `D` reports each code,
+    and only the failure raises a banner: `exited (3)`, under the agent's
+    name. In bash the agent is a hook owner (Claude), in zsh a 7501
+    record (Codex)."""
+    tab, pid = lane.integrated_tab(shell)
+    lane.open_tab(BARE_SHELL_ARGV)  # the active one, so `tab` is not watched
+    with EventStream(lane.events_socket) as stream:
+        fence = stream.subscribe()
+        for code in (0, 3):
+            job = exits_with_what_it_reads(fifo)
+            if shell == "bash":
+                lane.stamped_job(tab, pid, job)
+            else:
+                lane.stamped_record(tab, pid, "codex", job)
+            answer(lane, fifo, code)
+            lane.wait(tab, f"the end of the job that exited {code}", ended)
+        banners, _ = banners_until(lane, stream, tab, fence, "e10-done")
+    name = "Claude Code" if shell == "bash" else "Codex"
+    assert banners == [(name, "exited (3)")], banners
+
+
+def test_a_killed_agent_banners_once_and_a_suspended_one_never(lane):
+    """E11: Ctrl-Z stops the agent, and its shell's `D` reports 128 +
+    `SIGTSTP`: a stop, not an exit. Killed while stopped (`kill -9 %1`),
+    the agent ends with no banner, since no `D` reported how it died. An
+    agent stopped, resumed with `fg` and then SIGKILLed ends with the one
+    banner its `D`'s 137 calls for, `killed (SIGKILL)`."""
+    tab, pid = lane.integrated_tab("bash")
+    lane.open_tab(BARE_SHELL_ARGV)  # the active one, so `tab` is not watched
+
+    def suspend() -> None:
+        lane.client.send(tab, b"\x1a")
+        lane.wait(
+            tab,
+            "the suspended agent",
+            lambda t: t.get("process", {}).get("state") == "suspended",
+        )
+
+    with EventStream(lane.events_socket) as stream:
+        fence = stream.subscribe()
+        lane.stamped_job(tab, pid)
+        suspend()
+        lane.client.send(tab, "kill -9 %1\n")
+        lane.wait(tab, "the end of the stopped agent", ended)
+        stopped, fence = banners_until(lane, stream, tab, fence, "e11-stopped")
+        assert stopped == [], stopped
+
+        agent = int(lane.stamped_job(tab, pid)["pid"])
+        suspend()
+        lane.client.send(tab, "fg\n")
+        lane.wait(tab, "the agent working again", lambda t: t["agent_lifecycle"] == "working")
+        os.kill(agent, signal.SIGKILL)
+        lane.wait(tab, "the end of the killed agent", ended)
+        killed, _ = banners_until(lane, stream, tab, fence, "e11-killed")
+    assert killed == [("Claude Code", "killed (SIGKILL)")], killed
+
+
+def test_without_exit_codes_an_end_raises_no_banner(lane):
+    """E12: `/bin/sh` prints no marks, so no code says how the agent
+    ended. The tick still ends it, and raises nothing: without a code,
+    Roost cannot tell a crash from a normal exit."""
+    tab, shell = lane.sh_tab()
+    lane.open_tab(BARE_SHELL_ARGV)  # the active one, so `tab` is not watched
+    with EventStream(lane.events_socket) as stream:
+        fence = stream.subscribe()
+        agent = int(lane.stamped_job(tab, shell)["pid"])
+        os.kill(agent, signal.SIGKILL)
+        lane.wait(
+            tab,
+            "the tick's end",
+            lambda t: t.get("ownership") is None and "process" not in t,
+        )
+        banners, _ = banners_until(lane, stream, tab, fence, "e12-done")
+    assert banners == [], banners

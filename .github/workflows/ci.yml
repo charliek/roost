@@ -128,7 +128,8 @@ jobs:
               # The production identity's Sparkle key and its release check.
               - 'mac/keys/**'
               - 'mac/scripts/verify-sparkle-key.sh'
-              # test_osc7_emitters.py sources them in real bash and zsh.
+              # test_osc7_emitters.py and test_osc133_exit_codes.py source
+              # them in real bash and zsh.
               - 'crates/roost-engine/resources/shell-integration/**'
             # Inputs of harness-unit's own tests only (test_release_dry_run.py reads
             # release.yml through tools/release/dry_run.py; test_agent_status_capture.py
@@ -319,7 +320,8 @@ jobs:
         with:
           persist-credentials: false
       - name: Install zsh
-        # test_osc7_emitters.py runs the zsh integration in real zsh.
+        # test_osc7_emitters.py and test_osc133_exit_codes.py run the zsh
+        # integration in real zsh.
         run: command -v zsh >/dev/null || sudo linux/scripts/ci-apt-install.sh zsh
       - name: Functional harness target contract
         run: python3 -m unittest discover -s tools/roosttest_unit -v

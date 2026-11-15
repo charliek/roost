@@ -1181,7 +1181,13 @@ mod tests {
         // chunk's program-status batch, ahead of the chunk's OSC actions.
         let mut authority = client
             .workspace
-            .apply_program_status(tab_id, vec![StatusEvent::Prompt(PromptMark::CommandEnd)], 0)
+            .apply_program_status(
+                tab_id,
+                vec![StatusEvent::Prompt(PromptMark::CommandEnd {
+                    exit_code: None,
+                })],
+                0,
+            )
             .unwrap();
         assert!(client.workspace.tab(tab_id).unwrap().hook_active);
         client.apply_osc(tab_id, 9, "Build done", &mut authority);
@@ -1226,7 +1232,7 @@ mod tests {
             shell(&client),
             (ShellState::ForegroundProcess, TabState::Running)
         );
-        mark(PromptMark::CommandEnd);
+        mark(PromptMark::CommandEnd { exit_code: None });
         assert_eq!(shell(&client), (ShellState::AtPrompt, TabState::None));
 
         client.apply_osc(tab_id, 133, "C", &mut RawOscAuthority::default());

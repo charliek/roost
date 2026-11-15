@@ -653,7 +653,12 @@ async fn a_lone_prompt_mark_reaches_a_subscriber_and_a_repeat_does_not() {
 
     for (step, prompt_mark, shell, state) in [
         (0, PromptMark::OutputStart, "foreground_process", "running"),
-        (1, PromptMark::CommandEnd, "at_prompt", "none"),
+        (
+            1,
+            PromptMark::CommandEnd { exit_code: None },
+            "at_prompt",
+            "none",
+        ),
     ] {
         mark(prompt_mark);
         title(format!("after {step}"));

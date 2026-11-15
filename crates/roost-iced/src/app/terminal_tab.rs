@@ -2025,7 +2025,7 @@ mod tests {
                 events.as_slice(),
                 [
                     StatusEvent::Report(report),
-                    StatusEvent::Prompt(PromptMark::CommandEnd),
+                    StatusEvent::Prompt(PromptMark::CommandEnd { exit_code: Some(0) }),
                 ] if report.state == ProgramStatusState::Working && report.app == "pi"
             ),
             "{events:?}"

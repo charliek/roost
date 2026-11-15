@@ -56,7 +56,11 @@ pub enum PromptMark {
     PromptStart,
     InputStart,
     OutputStart,
-    CommandEnd,
+    /// `exit_code` is the command's status, when the shell sent one
+    /// (`133;D;<code>`).
+    CommandEnd {
+        exit_code: Option<i32>,
+    },
 }
 
 /// What the status sink receives, in callback order.
@@ -155,6 +159,7 @@ fn progress_from_sys(raw: i8) -> Option<u8> {
 fn mark_from_sys(
     kind: sys::GhosttySemanticPromptKind,
     prompt_kind: sys::GhosttySemanticPromptPromptKind,
+    exit_code: Option<i32>,
 ) -> Option<PromptMark> {
     match kind {
         sys::GhosttySemanticPromptKind_GHOSTTY_SEMANTIC_PROMPT_PROMPT_START
@@ -170,7 +175,7 @@ fn mark_from_sys(
             Some(PromptMark::OutputStart)
         }
         sys::GhosttySemanticPromptKind_GHOSTTY_SEMANTIC_PROMPT_COMMAND_END => {
-            Some(PromptMark::CommandEnd)
+            Some(PromptMark::CommandEnd { exit_code })
         }
         _ => None,
     }
@@ -240,15 +245,19 @@ unsafe fn read_report(raw: *const sys::GhosttyTerminalProgramStatus) -> Option<T
 ///
 /// As for [`read_report`].
 unsafe fn read_mark(raw: *const sys::GhosttyTerminalSemanticPrompt) -> Option<TerminalEvent> {
-    // SAFETY: the struct covers v1. Only the two integer fields are read,
-    // so its `bool` is never materialized.
-    let (kind, prompt_kind) = unsafe {
+    // SAFETY: the struct covers v1. Only integer fields are read, and
+    // `has_exit_code` as the byte it is, so its `bool` is never
+    // materialized.
+    let (kind, prompt_kind, has_exit_code, exit_code) = unsafe {
         (
             ptr::read_unaligned(&raw const (*raw).kind),
             ptr::read_unaligned(&raw const (*raw).prompt_kind),
+            ptr::read_unaligned((&raw const (*raw).has_exit_code).cast::<u8>()),
+            ptr::read_unaligned(&raw const (*raw).exit_code),
         )
     };
-    mark_from_sys(kind, prompt_kind).map(TerminalEvent::Prompt)
+    let exit_code = (has_exit_code != 0).then_some(exit_code);
+    mark_from_sys(kind, prompt_kind, exit_code).map(TerminalEvent::Prompt)
 }
 
 /// # Safety
@@ -456,8 +465,47 @@ mod tests {
         send(&event(v1));
         assert_eq!(
             take(&sink),
-            vec![TerminalEvent::Prompt(PromptMark::CommandEnd)]
+            vec![TerminalEvent::Prompt(PromptMark::CommandEnd {
+                exit_code: None
+            })]
         );
+    }
+
+    /// U17: a v1 struct carries `D`'s exit code, and one whose
+    /// `has_exit_code` is false carries none, whatever `exit_code` holds.
+    #[test]
+    fn a_command_end_reads_its_exit_code_only_when_it_has_one() {
+        let (ctx, sink) = ctx_with_sink();
+        let v1 = std::mem::size_of::<sys::GhosttyTerminalSemanticPrompt>();
+        let event = |has_exit_code, exit_code| sys::GhosttyTerminalSemanticPrompt {
+            size: v1,
+            kind: sys::GhosttySemanticPromptKind_GHOSTTY_SEMANTIC_PROMPT_COMMAND_END,
+            has_exit_code,
+            exit_code,
+            ..Default::default()
+        };
+        for (has, code, expected) in [
+            (true, 137, Some(137)),
+            (true, 0, Some(0)),
+            (true, -1, Some(-1)),
+            (false, 137, None),
+        ] {
+            // SAFETY: as in `call`.
+            unsafe {
+                semantic_prompt_trampoline(
+                    ptr::null_mut(),
+                    ptr::from_ref(&ctx).cast_mut().cast(),
+                    &event(has, code),
+                );
+            }
+            assert_eq!(
+                take(&sink),
+                vec![TerminalEvent::Prompt(PromptMark::CommandEnd {
+                    exit_code: expected
+                })],
+                "has_exit_code {has}, exit_code {code}"
+            );
+        }
     }
 
     #[test]

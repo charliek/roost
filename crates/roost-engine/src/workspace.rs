@@ -2443,20 +2443,30 @@ impl Workspace {
     }
 
     /// Apply what the sampler read for `request` to its tab's process
-    /// layer and hook owner. A tab that is gone is not an error: the
+    /// layer and hook owner, raising the exit banner an end owes unless
+    /// the tab is being watched. A tab that is gone is not an error: the
     /// sample was read off the lock, and the row can close meanwhile.
     pub(crate) fn apply_process_sample(&self, request: &SampleRequest, sample: &ProcessSample) {
         let mut inner = self.inner.lock().unwrap();
+        let watched = inner.tab_is_being_watched(request.tab_id);
         let Some(row) = inner.tabs.get_mut(&request.tab_id) else {
             return;
         };
         let mut next_agent = row.agent.clone();
         let mut records = row.program_status.clone();
         let mut process = row.process.clone();
-        let ended =
+        let mut ended =
             process.apply_sample(request, sample, &mut next_agent, &mut records, unix_now());
         let wake = process.is_due();
-        let events = replace_axes(row, next_agent, records, process);
+        let mut events = replace_axes(row, next_agent, records, process);
+        if let Some(banner) = ended.banner.take().filter(|_| !watched) {
+            let title = if banner.title.is_empty() {
+                row.title.clone()
+            } else {
+                banner.title
+            };
+            events.extend(raise_notification(row, title, banner.body));
+        }
         if events.is_empty() {
             drop(inner);
         } else {
@@ -4988,7 +4998,7 @@ mod tests {
         let (ws, tid) = agent_ws();
         shell_mark(&ws, tid, PromptMark::OutputStart);
         assert_eq!(ws.tab(tid).unwrap().state, TabState::Running);
-        shell_mark(&ws, tid, PromptMark::CommandEnd);
+        shell_mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
         assert_eq!(ws.tab(tid).unwrap().state, TabState::None);
     }
 
@@ -5010,7 +5020,7 @@ mod tests {
             .unwrap());
         assert!(!ws.tab(tid).unwrap().has_notification);
 
-        shell_mark(&ws, tid, PromptMark::CommandEnd);
+        shell_mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
         let tab = ws.tab(tid).unwrap();
         assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
         assert!(tab.hook_active, "ownership survives as a label");
@@ -5593,7 +5603,7 @@ mod tests {
             .unwrap());
         assert!(!ws.tab(tid).unwrap().has_notification);
 
-        shell_mark(&ws, tid, PromptMark::CommandEnd);
+        shell_mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
         assert!(ws
             .raise_attention(
                 tid,
@@ -8173,8 +8183,14 @@ mod tests {
                 .unwrap());
             ws.clear_notification(tid, None).unwrap();
 
-            ws.apply_program_status(tid, vec![StatusEvent::Prompt(PromptMark::CommandEnd)], LATE)
-                .unwrap();
+            ws.apply_program_status(
+                tid,
+                vec![StatusEvent::Prompt(PromptMark::CommandEnd {
+                    exit_code: None,
+                })],
+                LATE,
+            )
+            .unwrap();
             assert_eq!(ws.tab(tid).unwrap().program_status, None);
             assert!(ws
                 .raise_attention(
@@ -8289,7 +8305,7 @@ mod tests {
             let (ws, tid) = owned_ws(AgentLifecycle::Working);
             shell_mark(&ws, tid, PromptMark::OutputStart);
             let mut rx = ws.subscribe();
-            shell_mark(&ws, tid, PromptMark::CommandEnd);
+            shell_mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
             let events = drain(&mut rx);
             assert_eq!(state_changes(&events), vec![TabState::None], "{events:?}");
             assert_eq!(
@@ -8307,7 +8323,10 @@ mod tests {
             assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
 
             let mut versioned = ws.subscribe_versioned();
-            for mark in [PromptMark::CommandEnd, PromptMark::PromptStart] {
+            for mark in [
+                PromptMark::CommandEnd { exit_code: None },
+                PromptMark::PromptStart,
+            ] {
                 shell_mark(&ws, tid, mark);
             }
             assert!(
@@ -8345,7 +8364,7 @@ mod tests {
             for mark in [
                 PromptMark::PromptStart,
                 PromptMark::InputStart,
-                PromptMark::CommandEnd,
+                PromptMark::CommandEnd { exit_code: None },
             ] {
                 let (ws, tid) = owned_ws(AgentLifecycle::Working);
                 let mut rx = ws.subscribe();
@@ -8638,7 +8657,7 @@ mod tests {
                 assert!(claim(&ws, tid, "s1", AgentLifecycle::Working));
                 *probe.lock().unwrap() = fg;
                 let mut rx = ws.subscribe();
-                mark(&ws, tid, PromptMark::CommandEnd);
+                mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
 
                 let tab = ws.tab(tid).unwrap();
                 assert_eq!(tab.ownership.is_none(), released, "{fg:?}");
@@ -8661,7 +8680,7 @@ mod tests {
             let (ws, tid, probe) = probed_ws();
             ws.set_tab_state(tid, TabState::Running).unwrap();
             *probe.lock().unwrap() = Foreground::Shell;
-            mark(&ws, tid, PromptMark::CommandEnd);
+            mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
             let owner = ws.tab(tid).unwrap().ownership.expect("kept");
             assert_eq!(owner.source, SOURCE_MANUAL);
             assert!(
@@ -8703,7 +8722,7 @@ mod tests {
         fn a_suspended_agent_keeps_its_owner_and_comes_back_on_fg() {
             let (ws, tid, probe) = stamped_claude();
             *probe.lock().unwrap() = Foreground::Shell;
-            mark(&ws, tid, PromptMark::CommandEnd);
+            mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
             let tab = ws.tab(tid).unwrap();
             assert_eq!(
                 tab.ownership.as_ref().map(|o| o.source.as_str()),
@@ -8743,7 +8762,7 @@ mod tests {
         fn a_killed_stamped_agent_is_released_by_the_sample_after_the_mark() {
             let (ws, tid, probe) = stamped_claude();
             *probe.lock().unwrap() = Foreground::Shell;
-            mark(&ws, tid, PromptMark::CommandEnd);
+            mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
             assert!(
                 ws.tab(tid).unwrap().ownership.is_some(),
                 "parked, not released"
@@ -8786,7 +8805,7 @@ mod tests {
         fn a_new_claude_beside_a_suspended_one_takes_the_tab() {
             let (ws, tid, probe) = stamped_claude();
             *probe.lock().unwrap() = Foreground::Shell;
-            mark(&ws, tid, PromptMark::CommandEnd);
+            mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
             sample(&ws, Foreground::Shell, None, Liveness::Stopped);
             mark(&ws, tid, PromptMark::OutputStart);
 
@@ -8923,7 +8942,7 @@ mod tests {
         fn a_suspended_7501_agent_shows_suspended_and_comes_back() {
             let (ws, tid, probe) = stamped_codex();
             *probe.lock().unwrap() = Foreground::Shell;
-            mark(&ws, tid, PromptMark::CommandEnd);
+            mark(&ws, tid, PromptMark::CommandEnd { exit_code: None });
             sample(&ws, Foreground::Shell, None, Liveness::Stopped);
             let tab = ws.tab(tid).unwrap();
             assert_eq!(tab.state, TabState::None);
@@ -8997,6 +9016,99 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![tid]
             );
+        }
+
+        fn fired(rx: &mut broadcast::Receiver<WorkspaceEvent>) -> Vec<(String, String)> {
+            drain(rx)
+                .into_iter()
+                .filter_map(|event| match event {
+                    WorkspaceEvent::NotificationFired { title, body, .. } => Some((title, body)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The tick's read, as the sampler applies it.
+        fn tick(ws: &Workspace, foreground: Foreground, liveness: Liveness) {
+            for request in ws.take_process_requests(true) {
+                ws.apply_process_sample(
+                    &request,
+                    &ProcessSample {
+                        incarnation: 1,
+                        foreground,
+                        leader: None,
+                        liveness: vec![(AGENT, liveness)],
+                    },
+                );
+            }
+        }
+
+        /// U19, for a hook owner: a Claude killed mid-turn raises one
+        /// `killed (SIGKILL)` banner under its name, whether the sample
+        /// that ends it comes before the shell's `D` or after it.
+        #[test]
+        fn a_killed_working_owner_raises_one_exit_banner_whatever_the_order() {
+            let killed = vec![("Claude Code".to_owned(), "killed (SIGKILL)".to_owned())];
+            let d_137 = PromptMark::CommandEnd {
+                exit_code: Some(137),
+            };
+
+            let (ws, tid, fg) = stamped_claude();
+            let mut rx = ws.subscribe();
+            *fg.lock().unwrap() = Foreground::Shell;
+            mark(&ws, tid, d_137);
+            assert!(fired(&mut rx).is_empty(), "the D alone ends nothing");
+            sample(&ws, Foreground::Shell, None, Liveness::Gone);
+            assert_eq!(ws.tab(tid).unwrap().ownership, None);
+            assert_eq!(fired(&mut rx), killed, "D first");
+            assert!(ws.tab(tid).unwrap().has_notification);
+
+            let (ws, tid, fg) = stamped_claude();
+            let mut rx = ws.subscribe();
+            tick(&ws, Foreground::Shell, Liveness::Gone);
+            assert_eq!(ws.tab(tid).unwrap().ownership, None);
+            assert!(fired(&mut rx).is_empty(), "the code is the D's");
+            *fg.lock().unwrap() = Foreground::Shell;
+            mark(&ws, tid, d_137);
+            assert_eq!(fired(&mut rx), killed, "sample first");
+        }
+
+        /// The banner is a notification like any other: a tab being
+        /// watched raises none. Nor does an agent that was not working
+        /// or blocked when it died, or one that exited 0.
+        #[test]
+        fn a_watched_idle_or_successful_agent_raises_no_exit_banner() {
+            for (lifecycle, code, watched) in [
+                (AgentLifecycle::Working, 137, true),
+                (AgentLifecycle::Finished, 137, false),
+                (AgentLifecycle::Inactive, 1, false),
+                (AgentLifecycle::Working, 0, false),
+            ] {
+                let (ws, tid, fg) = probed_ws();
+                mark(&ws, tid, PromptMark::OutputStart);
+                assert!(claim(&ws, tid, "s1", lifecycle));
+                sample(
+                    &ws,
+                    Foreground::Group(AGENT.pgid),
+                    Some(AGENT),
+                    Liveness::Running,
+                );
+                ws.set_window_focused(watched);
+                let mut rx = ws.subscribe();
+                *fg.lock().unwrap() = Foreground::Shell;
+                mark(
+                    &ws,
+                    tid,
+                    PromptMark::CommandEnd {
+                        exit_code: Some(code),
+                    },
+                );
+                sample(&ws, Foreground::Shell, None, Liveness::Gone);
+                let case = format!("{lifecycle:?} {code} watched={watched}");
+                assert_eq!(ws.tab(tid).unwrap().ownership, None, "{case}");
+                assert!(fired(&mut rx).is_empty(), "{case}");
+                assert!(!ws.tab(tid).unwrap().has_notification, "{case}");
+            }
         }
     }
 }
