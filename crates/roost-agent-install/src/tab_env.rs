@@ -495,6 +495,9 @@ struct Probe {
     /// The last `claude` found, looked up again when it is gone: a
     /// session outlives an install.
     claude: Option<PathBuf>,
+    /// Whether this process has logged that the probe waits for Claude's
+    /// config dir.
+    waiting_logged: bool,
 }
 
 type Locate = Box<dyn Fn() -> Option<PathBuf> + Send + Sync>;
@@ -530,9 +533,9 @@ impl TabEnv {
             .ok()?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let path = std::env::var_os("PATH");
-        let claude_config = std::env::var_os("CLAUDE_CONFIG_DIR")
-            .map(PathBuf::from)
-            .or_else(|| home.as_ref().map(|home| home.join(".claude")));
+        let claude_config = crate::Home::from_env()
+            .ok()
+            .map(|home| home.agent_dir(Agent::Claude).to_path_buf());
         let tab_env = TabEnv::new(
             dir,
             roost_ui_model::config::config_path(),
@@ -571,6 +574,7 @@ impl TabEnv {
                 at: None,
                 running: None,
                 claude: None,
+                waiting_logged: false,
             }),
             answered: Condvar::new(),
         }))
@@ -684,18 +688,26 @@ impl TabEnv {
     /// dir there is no cached server policy either; a managed-settings
     /// file is still read at each spawn. Nothing is marked fresh, so the
     /// first spawn after Claude's first run probes.
+    ///
+    /// The config dir is judged from this process's environment. A
+    /// `CLAUDE_CONFIG_DIR` set only in a shell's startup file, which a
+    /// Roost started from the desktop never sees, with no `~/.claude`
+    /// beside it, leaves the probe waiting, so a policy that only Claude's
+    /// server settings carry goes unseen. The wait is logged once.
     fn refresh_if_stale(&self) {
         {
             let mut probe = self.lock();
             if probe.running.is_some() || probe.at.is_some_and(|at| at.elapsed() < PROBE_TTL) {
                 return;
             }
-            if !self
-                .0
-                .claude_config
-                .as_ref()
-                .is_some_and(|dir| dir.is_dir())
-            {
+            let config = self.0.claude_config.as_deref();
+            if !config.is_some_and(Path::is_dir) {
+                if !std::mem::replace(&mut probe.waiting_logged, true) {
+                    tracing::info!(
+                        config_dir = ?config,
+                        "Claude has not run here; its policy probe waits for its config dir"
+                    );
+                }
                 return;
             }
             probe.running = Some(Instant::now());
@@ -1383,6 +1395,7 @@ mod tests {
             );
             let probe = world.tab_env.lock();
             assert!(probe.running.is_none() && probe.at.is_none());
+            assert!(probe.waiting_logged, "the wait is logged");
         }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(read_policy_record(&world.tab_env.0.dir).is_none());

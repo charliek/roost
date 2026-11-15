@@ -300,7 +300,12 @@ on macOS), Claude's cached server settings, and `claude plugin list
 check waits until Claude has run on the machine (`~/.claude`, or
 `$CLAUDE_CONFIG_DIR`, exists), because Claude's first run writes its
 config and Roost would otherwise create it for someone who only
-installed Claude. If the policy
+installed Claude. Roost reads `$CLAUDE_CONFIG_DIR` from its own
+environment, so one set only in your shell's startup file isn't seen
+by a Roost started from the desktop. With no `~/.claude` either, that
+check keeps waiting, and a policy that reaches you only through Claude's
+server settings goes unseen; `roost.log` says once that it is waiting.
+If the policy
 is there, Roost leaves Claude's variable out, so Claude starts normally,
 and its status still shows over OSC 7501. Doctor names the policy and
 where it was found; switch Claude Code off under Agent Integration… to
