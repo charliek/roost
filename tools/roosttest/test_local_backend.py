@@ -4250,3 +4250,194 @@ def test_a_clipboard_image_pasted_into_a_session_tab_is_a_file_on_this_machine(
     finally:
         with contextlib.suppress(RoostError):
             roost.clipboard_write("system", "")
+
+
+# ---------------------------------------------------------------------------
+# 20. A local session lost without a word is started again
+# ---------------------------------------------------------------------------
+#
+# `kill -9`, not `roostctl session stop`: a stop says `session.stopping`,
+# which ends the connection on purpose (the notice in section 15). A
+# killed session says nothing, and before this the window redialed its
+# dead socket for ever with nothing on screen.
+
+
+def session_pid(lane: Lane) -> int:
+    """The daemon behind the slot's socket, by the kernel's own record of
+    who holds the socket lock — never the pid written in the file, which
+    outlives a killed holder."""
+    lock = lane.env.socket.parent / "roost.lock"
+    st = lock.stat()
+    ident = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}"
+    for line in Path("/proc/locks").read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 6 and fields[1] == "FLOCK" and fields[5] == ident:
+            return int(fields[4])
+    raise AssertionError(f"nothing holds {lock}")
+
+
+def kill_the_session(lane: Lane) -> str:
+    """SIGKILL the slot's session; the id it had."""
+    killed = running_session_id()
+    assert killed is not None, "no session to kill"
+    pid = session_pid(lane)
+    os.kill(pid, signal.SIGKILL)
+    wait_until(
+        lambda: not sessionlib.pid_alive(pid),
+        scaled_timeout(30.0),
+        f"the killed session (pid {pid}) to exit",
+    )
+    return killed
+
+
+def kept(projects: list[dict]) -> list[tuple]:
+    """What a restarted session reopens: each project's name and cwd, and
+    its tabs' cwds and title locks, in order. Not the titles a running
+    shell gives itself, which a fresh one has yet to give."""
+    return [
+        (
+            p["name"],
+            p["cwd"],
+            tuple((t["cwd"], bool(t.get("user_titled"))) for t in p["tabs"]),
+        )
+        for p in projects
+    ]
+
+
+def test_a_killed_local_session_is_started_again_with_its_layout(lane: Lane):
+    """The window starts a new session on its own, the layout comes back
+    as fresh shells in the same directories, and the window shows a tab of
+    the new session again — attached, not a frozen frame."""
+    roost = session_ui(lane)
+    with lane.session() as c:
+        project = c.create_project(name="kept", cwd="/usr")
+        c.set_title(c.open_tab(project, cwd="/var"), "pinned")
+    before = kept(lane.session_projects())
+    marked = session_tab_ids(lane)[0]
+    printed = token()
+    with lane.session() as c:
+        c.send(marked, f"echo {printed}\n")
+        wait_until(
+            lambda: printed in c.dump_text(marked),
+            scaled_timeout(30.0),
+            "the token to reach the shell",
+        )
+
+    killed = kill_the_session(lane)
+
+    wait_until(
+        lambda: running_session_id() not in (None, killed),
+        scaled_timeout(60.0),
+        "the window to start a new session",
+    )
+    wait_until(
+        lambda: local_band(roost)["state"] == "connected",
+        scaled_timeout(60.0),
+        "the slot to connect to it",
+    )
+    assert kept(lane.session_projects()) == before
+    tabs = session_tab_ids(lane)
+    with lane.session() as c:
+        for tab in tabs:
+            has_a_live_pty(c, tab)
+        dumped = c.dump(tabs[0], scrollback=200)
+    history = "\n".join(dumped.get("scrollback_text", []) + dumped["rows_text"])
+    assert printed not in history, "a restarted session's tabs are fresh shells"
+    wait_until(
+        lambda: selected(roost)[1] in tabs,
+        scaled_timeout(60.0),
+        "the window to show a tab of the new session",
+    )
+    attached(roost, selected(roost)[1])
+
+
+#: `MAX_RESPAWNS` (`crates/roost-iced/src/host_conn/task.rs`): how many
+#: times in a row a lost session is started again before the window
+#: gives up on it.
+MAX_RESPAWNS = 3
+
+
+class SessionLink:
+    """`ROOST_SESSION_BIN` for a UI, as a symlink a case can re-point
+    while that UI runs — renamed into place, so a launch never finds it
+    half-written."""
+
+    def __init__(self) -> None:
+        self.path = _ROOT / "session-link"
+        self.point_at(str(sessionlib.session_binary()))
+
+    def point_at(self, target: str) -> None:
+        swap = _ROOT / "session-link.swap"
+        swap.unlink(missing_ok=True)
+        swap.symlink_to(target)
+        os.replace(swap, self.path)
+
+    def env(self) -> dict[str, str]:
+        return {"ROOST_SESSION_BIN": str(self.path), **SHORT_CONFIRM}
+
+
+def never_serving_session(launches: Path) -> str:
+    """A `roost-session` whose `start` says it is ready and then serves
+    nothing, writing a line to `launches` each time it is started."""
+    stub = _ROOT / "never-serving-session"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"if [ \"$1\" = start ]; then echo start >> '{launches}'; fi\n"
+        'echo "ready pid=$$"\n'
+    )
+    stub.chmod(0o755)
+    return str(stub)
+
+
+def test_a_local_session_that_cannot_be_started_again_says_so(lane: Lane):
+    """Killed, and the binary it would be started from now dies on start:
+    the window does not loop on it. It settles, says so in the terminal
+    area the way a launch that cannot start does, and "Try again" brings
+    it back once the binary runs again."""
+    link = SessionLink()
+    roost = session_ui(lane, extra_env=link.env())
+    slot = local_band(roost)["saved_id"]
+
+    link.point_at(crashing_session()["ROOST_SESSION_BIN"])
+    kill_the_session(lane)
+
+    shown = shown_notice(roost, "the window to say it cannot start the session again")
+    notice = shown["terminal"]
+    assert notice["kind"] == CANNOT_START, notice
+    assert notice["message"] == CANNOT_START_MESSAGE, notice
+    assert (notice["detail"] or "").startswith(f"{EXITED_EARLY}. "), notice
+    host = roost.host_status(slot)["hosts"][0]
+    assert host["state"] == "disconnected", host
+    assert host.get("retry") is None, f"a settled slot schedules nothing: {host}"
+    assert running_session_id() is None
+
+    link.point_at(str(sessionlib.session_binary()))
+    roost.notice_answer(CANNOT_START, slot, shown["generation"], "reconnect")
+    wait_until(
+        lambda: local_band(roost)["state"] == "connected",
+        scaled_timeout(60.0),
+        "Try again to start the session",
+    )
+
+
+def test_a_local_session_that_never_comes_back_is_given_up_on(lane: Lane):
+    """A session started again that never comes up is started again only
+    so often: exactly `MAX_RESPAWNS` launches, then the window settles and
+    says it could not restart it, instead of launching on every rung of
+    the redial ladder for ever."""
+    link = SessionLink()
+    roost = session_ui(lane, extra_env=link.env())
+    launches = _ROOT / "never-serving-launches"
+    launches.unlink(missing_ok=True)
+    link.point_at(never_serving_session(launches))
+    kill_the_session(lane)
+
+    shown = shown_notice(roost, "the window to give up on the session")
+    notice = shown["terminal"]
+    assert notice["kind"] == CANNOT_START, notice
+    assert (notice["detail"] or "").startswith("roost-session could not be restarted. "), notice
+    slot = local_band(roost)["saved_id"]
+    host = roost.host_status(slot)["hosts"][0]
+    assert host.get("retry") is None, host
+    assert f"started again {MAX_RESPAWNS} times" in (host.get("detail") or ""), host
+    assert launches.read_text().splitlines() == ["start"] * MAX_RESPAWNS
