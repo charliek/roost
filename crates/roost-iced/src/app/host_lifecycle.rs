@@ -59,6 +59,11 @@ pub(super) fn reconnect_due(
 ///   (`spawn_gate`), so it starts nothing again either.
 /// * A backend switch in flight owns everything that lands on the slot,
 ///   and a seeded respawn would add a project its replay never made.
+/// * So does the launch's migration (plan 063 §D5) while it is parked
+///   waiting for the slot to connect: the slot was dialed unseeded for
+///   it, and a respawn before that connect would seed the empty session
+///   under the replay. Until then a lost slot redials, as a slot that
+///   never connects always has (`arm_pending_migration`).
 /// * An action holding the host — Restart Session, an update — stops and
 ///   starts that session itself; a respawn beside it would start one the
 ///   action never agreed to.
@@ -68,6 +73,7 @@ pub(super) fn respawn_host(
     mode: LocalBackendMode,
     policy: host_verbs::VerbPolicy,
     switching: bool,
+    migration_parked: bool,
     slot: Option<&str>,
     claimed: impl FnOnce(&str) -> bool,
 ) -> Option<&str> {
@@ -75,6 +81,7 @@ pub(super) fn respawn_host(
         || mode != LocalBackendMode::Session
         || !policy.localhost_surface
         || switching
+        || migration_parked
     {
         return None;
     }
@@ -341,7 +348,7 @@ mod tests {
     /// The slot's session is started again only where it is this
     /// window's own tabs — `session` mode, a build that spawns at all —
     /// and only while nothing else is deciding what runs there: a switch,
-    /// an action holding the host, a quit.
+    /// the launch's parked migration, an action holding the host, a quit.
     #[test]
     fn only_the_slot_under_session_with_nothing_else_moving_it_is_started_again() {
         let full = host_verbs::VerbPolicy::current();
@@ -349,7 +356,7 @@ mod tests {
             localhost_surface: false,
         };
         let respawn = |exit, mode, policy, switching, slot, claimed: bool| {
-            respawn_host(exit, mode, policy, switching, slot, |_| claimed)
+            respawn_host(exit, mode, policy, switching, false, slot, |_| claimed)
         };
         let session = LocalBackendMode::Session;
         let running = ExitState::Running;
@@ -377,6 +384,11 @@ mod tests {
             respawn(running, session, full, true, Some("h1"), false),
             None,
             "a switch owns what lands on the slot"
+        );
+        assert_eq!(
+            respawn_host(running, session, full, false, true, Some("h1"), |_| false),
+            None,
+            "the launch's migration owns the slot's first landing"
         );
         assert_eq!(
             respawn(running, session, full, false, Some("h1"), true),

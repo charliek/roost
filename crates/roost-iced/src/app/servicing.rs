@@ -3532,7 +3532,8 @@ impl App {
     /// place decides between them: a caller that parked
     /// `CreateAfterConnect` gets its project unconditionally, and every
     /// purpose that *seeds* gets one only if the host came up holding
-    /// nothing.
+    /// nothing and is not the slot a parked launch migration is about to
+    /// replay onto ([`local_backend::ConnectPurpose::creates_on_landing`]).
     ///
     /// The emptiness is read here rather than carried, and it is a
     /// different question from §D6's `became_empty_by_delete`: a host
@@ -3553,11 +3554,11 @@ impl App {
             .hosts
             .mirror(incarnation)
             .is_some_and(|mirror| mirror.read().projects.is_empty());
-        let create = match purpose {
-            local_backend::ConnectPurpose::CreateAfterConnect => true,
-            purpose => purpose.seeds() && empty,
-        };
-        if !create {
+        let replay_parked = self.pending_migration.is_some()
+            && self
+                .local_slot_view()
+                .is_some_and(|slot| slot.saved_id == saved_id);
+        if !purpose.creates_on_landing(empty, replay_parked) {
             return UiTask::None;
         }
         tracing::info!(host = %saved_id, ?purpose, "creating a project on a host that just connected");
@@ -3683,6 +3684,7 @@ impl App {
             self.local_backend,
             host_verbs::VerbPolicy::current(),
             self.switch_in_flight(),
+            self.pending_migration.is_some(),
             slot,
             |saved_id| self.host_actions.claimed(saved_id),
         );

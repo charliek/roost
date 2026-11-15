@@ -4441,3 +4441,48 @@ def test_a_local_session_that_never_comes_back_is_given_up_on(lane: Lane):
     assert host.get("retry") is None, host
     assert f"started again {MAX_RESPAWNS} times" in (host.get("detail") or ""), host
     assert launches.read_text().splitlines() == ["start"] * MAX_RESPAWNS
+
+
+#: `BACKOFF_BASE` in milliseconds: the longest the slot's first redial
+#: rung can be armed for. A rung armed for longer is a later one, so the
+#: retry after the first rung has been decided by then.
+FIRST_RUNG_MS = int(LOCALHOST_FIRST_REDIAL_S * 1000)
+
+
+def test_a_launch_migration_whose_session_never_came_up_is_not_started_seeded(lane: Lane):
+    """§D5's launch migration dials the slot unseeded and parks until it
+    connects. A session that never came up for it is not started again on
+    a redial rung: a respawn seeds, and its first project would land beside
+    the replay. The slot redials instead, and once a session answers, the
+    migration lands exactly the source."""
+    roost = lane.start("in-process")
+    want = with_cwds(migration_layout(roost))
+    ui.quit(lane.target)
+
+    lane.write_config("session")
+    assert running_session_id() is None, "the launch must be what starts it"
+    link = SessionLink()
+    launches = _ROOT / "never-serving-launches"
+    launches.unlink(missing_ok=True)
+    link.point_at(never_serving_session(launches))
+    roost = lane.restart(extra_env=link.env())
+    assert roost.identify()["local_backend"] == "session"
+    slot = local_band(roost)["saved_id"]
+
+    def a_later_rung() -> bool:
+        retry = roost.host_status(slot)["hosts"][0].get("retry") or {}
+        return retry.get("delay_ms", 0) > FIRST_RUNG_MS
+
+    wait_until(a_later_rung, scaled_timeout(60.0), "the slot to redial past its first rung")
+    assert launches.read_text().splitlines() == ["start"], (
+        "only the launch's own unseeded dial starts a session while the migration is parked"
+    )
+
+    started = lane.env.start_daemonized(ROOST_SESSION_NO_SEED="1")
+    assert started.verdict.kind == "ready", started
+    lane.pid = started.verdict.pid
+    migrated(lane, roost)
+    assert with_cwds(lane.session_projects()) == want, (
+        "the migration landed on the session alone, with nothing seeded beside it"
+    )
+    assert launches.read_text().splitlines() == ["start"]
