@@ -219,6 +219,22 @@ def test_a_tab_opened_through_a_real_bridge_has_exactly_its_ssh_identity(env):
     stop(env, daemon)
 
 
+def test_a_session_tab_names_the_roostctl_beside_the_daemon(env):
+    """Every tab gets `ROOST_ROOSTCTL` (#261): a session's is the
+    `roostctl` beside its own binary, resolved at start, whatever an
+    enclosing Roost exported. A daemon outside an app bundle leaves `PATH`
+    as it was."""
+    sibling = env.binary.parent / "roostctl"
+    if not os.access(sibling, os.X_OK):
+        pytest.skip(f"no roostctl beside {env.binary}")
+    path = "/usr/bin:/bin"
+    daemon = serve(env, PATH=path, ROOST_ROOSTCTL="/outer/Roost.app/Contents/Resources/bin/roostctl")
+    environ = tab_environ(env, daemon, open_bare(env))
+    assert environ.get("ROOST_ROOSTCTL") == os.path.realpath(sibling)
+    assert environ.get("PATH") == path
+    stop(env, daemon)
+
+
 # ---------------------------------------------------------------------------
 # 2–3. A local opener's values, exactly
 # ---------------------------------------------------------------------------
