@@ -1601,6 +1601,52 @@ pub struct AppSecureInputResult {
     pub password_input: bool,
 }
 
+/// `app.cli_link` request: read, make or remove the `roostctl` link for
+/// terminals outside Roost (#261). Not gated: the palette row and the
+/// macOS menu item are its callers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppCliLinkParams {
+    /// `"status"`, `"install"` (which also repairs a broken link) or
+    /// `"uninstall"`.
+    pub action: String,
+}
+
+/// What `app.cli_link` (and `roostctl cli … --json`) found or did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AppCliLinkResult {
+    /// The link directories after the action: `"installed"` (a link to
+    /// this Roost's `roostctl`), `"broken"` (a link into an app bundle
+    /// that no longer reaches it) or `"absent"`.
+    pub state: String,
+    /// The palette row's and menu item's label for `state`.
+    pub label: String,
+    /// The link `state` is about, or `null` when absent.
+    #[serde(default)]
+    pub link: Option<String>,
+    /// Where a broken link points.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// This Roost's `roostctl`, or `null` when it has none.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Whether `source` is inside an app bundle — the only `roostctl`
+    /// a link is offered for.
+    pub bundled: bool,
+    /// `"status"`, `"created"`, `"repaired"`, `"already_installed"`,
+    /// `"removed"`, `"nothing_to_remove"` or `"refused"`.
+    pub outcome: String,
+    /// One sentence saying what happened, as the UI shows it.
+    pub message: String,
+    /// The command that does it by hand, when Roost refused.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// The line that puts the link's directory on `PATH`, when the
+    /// caller's `PATH` lacks it.
+    #[serde(default)]
+    pub path_line: Option<String>,
+}
+
 /// `app.notification_activate` request: a click on the desktop banner for
 /// `tab_id`, put where a real click lands, carrying `token` as the
 /// notification server's spec 1.2 `ActivationToken` would. Gated on
@@ -4813,6 +4859,11 @@ pub mod ops {
     /// answers on every OS, all `false` off macOS.
     pub const APP_SECURE_INPUT: &str = "app.secure_input";
 
+    /// Read, make or remove the `roostctl` link in `/usr/local/bin` or
+    /// `~/.local/bin` (#261) — the first op that writes outside Roost's
+    /// own directories, and only that one symlink.
+    pub const APP_CLI_LINK: &str = "app.cli_link";
+
     /// Test-only reads and presses of a row's right-click menu (plan 073
     /// D9): list it, run one item through the dispatcher a click
     /// reaches, or show it on screen. Same gate and the same "test seam,
@@ -6649,6 +6700,26 @@ mod tests {
         assert_eq!(cleared, r#"{"label":null}"#);
         let bad = r#"{"extra":"x"}"#;
         assert!(serde_json::from_str::<AppDockBadgeParams>(bad).is_err());
+    }
+
+    #[test]
+    fn app_cli_link_round_trips() {
+        round_trip(&AppCliLinkParams {
+            action: "install".into(),
+        });
+        round_trip(&AppCliLinkResult {
+            state: "installed".into(),
+            label: "Uninstall 'roostctl' Command".into(),
+            link: Some("/usr/local/bin/roostctl".into()),
+            target: None,
+            source: Some("/Applications/Roost.app/Contents/Resources/bin/roostctl".into()),
+            bundled: true,
+            outcome: "created".into(),
+            message: "Installed".into(),
+            command: None,
+            path_line: None,
+        });
+        assert!(serde_json::from_str::<AppCliLinkParams>(r#"{"action":"x","extra":1}"#).is_err());
     }
 
     #[test]

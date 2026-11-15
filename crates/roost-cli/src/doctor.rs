@@ -216,6 +216,7 @@ const DOC_TARGETS: &[(&str, Doc)] = &[
         "session.old_path",
         doc!("reference/paths", "session-profile"),
     ),
+    ("cli.on_path", doc!("reference/cli", "where-roostctl-lives")),
 ];
 
 fn docs_for(check_id: &str) -> Option<&'static str> {
@@ -767,6 +768,14 @@ pub struct Inputs {
     /// D-A5), behind the same fail-closed gate as everything else that
     /// looks for them.
     pub old_sessions: OldSessionProbe,
+
+    /// This `roostctl`, canonical.
+    pub cli_self: Option<PathBuf>,
+    /// The first `roostctl` on `PATH`, as `PATH` spells it, and where it
+    /// really lives.
+    pub cli_on_path: Option<(PathBuf, Option<PathBuf>)>,
+    /// What the `roostctl cli install` directories hold.
+    pub cli_link: roost_ipc::cli_link::Status,
 }
 
 /// What the old-path probe found, or why it did not run.
@@ -816,6 +825,9 @@ impl Default for Inputs {
             legacy_claude_settings_present: false,
             legacy_claude_alias_in_rc: false,
             old_sessions: OldSessionProbe::NotProbed("not collected".into()),
+            cli_self: None,
+            cli_on_path: None,
+            cli_link: roost_ipc::cli_link::Status::Absent,
         }
     }
 }
@@ -874,6 +886,15 @@ pub async fn collect(
         .map(|home| legacy_claude_alias_present(&home, zdotdir.as_deref()))
         .unwrap_or(false);
 
+    let cli_self = std::env::current_exe()
+        .ok()
+        .and_then(|exe| std::fs::canonicalize(exe).ok());
+    let cli_on_path =
+        roost_ipc::cli_link::find_on_path(std::env::var_os("PATH").as_deref()).map(|found| {
+            let resolved = std::fs::canonicalize(&found).ok();
+            (found, resolved)
+        });
+
     let env_agent_hook = non_empty_env("ROOST_AGENT_HOOK");
     let env_resources_dir = non_empty_env("ROOST_RESOURCES_DIR");
     let resources_script = shipped_script_path(
@@ -926,6 +947,12 @@ pub async fn collect(
         legacy_claude_settings_present,
         legacy_claude_alias_in_rc,
         old_sessions,
+        cli_link: roost_ipc::cli_link::status(
+            cli_self.as_deref().unwrap_or(Path::new("")),
+            &roost_ipc::cli_link::dirs_from_env(),
+        ),
+        cli_self,
+        cli_on_path,
     }
 }
 
@@ -1932,7 +1959,91 @@ pub fn evaluate(inputs: &Inputs) -> Report {
                 "session.old_path",
                 vec![old_path_check(inputs)],
             ),
+            section(
+                "cli",
+                "Command line",
+                "process",
+                Kind::Check,
+                "cli.on_path",
+                vec![cli_on_path_check(inputs)],
+            ),
         ],
+    }
+}
+
+/// Does a bare `roostctl` run this one (#261)? Every doc example and the
+/// agent skill call it by name. A link `roostctl cli install` made that
+/// no longer reaches a Roost is reported first: repair is the user's
+/// call, never doctor's.
+fn cli_on_path_check(inputs: &Inputs) -> Check {
+    const ID: &str = "cli.on_path";
+    const TITLE: &str = "`roostctl` on PATH";
+    let Some(own) = inputs.cli_self.as_deref() else {
+        return check(
+            ID,
+            TITLE,
+            Status::Skipped,
+            "this roostctl's own path does not resolve, so there is nothing to compare with",
+        );
+    };
+    let this = redact_path(own);
+    let bundled = roost_ipc::cli_link::bundle_bin_dir_of(own).is_some();
+    let fix = if bundled {
+        format!(
+            "run `{this} cli install`, or choose Install 'roostctl' Command in Roost's command \
+             palette or app menu"
+        )
+    } else {
+        format!("add {this}'s directory to PATH")
+    };
+    if let roost_ipc::cli_link::Status::Broken { link, target } = &inputs.cli_link {
+        let why = if target.exists() {
+            "another app's roostctl"
+        } else {
+            "which no longer exists"
+        };
+        return check(
+            ID,
+            TITLE,
+            Status::Warn,
+            format!(
+                "{} points at {}, {why}; run `{this} cli install` to repair it",
+                redact_path(link),
+                redact_path(target)
+            ),
+        );
+    }
+    match &inputs.cli_on_path {
+        None => check(
+            ID,
+            TITLE,
+            Status::Warn,
+            format!("no roostctl on PATH, so a bare `roostctl` is not found; {fix}"),
+        ),
+        Some((found, resolved)) if resolved.as_deref() == Some(own) => check(
+            ID,
+            TITLE,
+            Status::Ok,
+            if found == own {
+                format!("{} is this roostctl", redact_path(found))
+            } else {
+                format!("{} → {this}, this roostctl", redact_path(found))
+            },
+        ),
+        Some((found, resolved)) => check(
+            ID,
+            TITLE,
+            Status::Warn,
+            format!(
+                "a bare `roostctl` runs {}{}, not {this}",
+                redact_path(found),
+                resolved
+                    .as_deref()
+                    .filter(|resolved| *resolved != found.as_path())
+                    .map(|resolved| format!(" (→ {})", redact_path(resolved)))
+                    .unwrap_or_default()
+            ),
+        ),
     }
 }
 
@@ -4193,8 +4304,115 @@ mod tests {
                 "/home/roost/.config/roost/claude-settings.json",
             )),
             claude_settings: SettingsProbe::Absent,
+            cli_self: Some(PathBuf::from("/opt/roost/bin/roostctl")),
+            cli_on_path: Some((
+                PathBuf::from("/opt/roost/bin/roostctl"),
+                Some(PathBuf::from("/opt/roost/bin/roostctl")),
+            )),
             ..Inputs::default()
         }
+    }
+
+    const BUNDLED: &str = "/Applications/Roost.app/Contents/Resources/bin/roostctl";
+
+    #[test]
+    fn cli_on_path_is_ok_when_a_bare_roostctl_runs_this_one() {
+        let direct = find(&evaluate(&healthy()), "cli.on_path").clone();
+        assert_eq!(direct.status, Some(Status::Ok));
+        assert_eq!(direct.detail, "/opt/roost/bin/roostctl is this roostctl");
+
+        let linked = Inputs {
+            cli_self: Some(PathBuf::from(BUNDLED)),
+            cli_on_path: Some((
+                PathBuf::from("/usr/local/bin/roostctl"),
+                Some(PathBuf::from(BUNDLED)),
+            )),
+            ..healthy()
+        };
+        let c = find(&evaluate(&linked), "cli.on_path").clone();
+        assert_eq!(c.status, Some(Status::Ok));
+        assert!(
+            c.detail.starts_with("/usr/local/bin/roostctl → "),
+            "{}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn cli_on_path_warns_naming_both_when_path_runs_another() {
+        let other = Inputs {
+            cli_self: Some(PathBuf::from(BUNDLED)),
+            cli_on_path: Some((
+                PathBuf::from("/usr/local/bin/roostctl"),
+                Some(PathBuf::from("/opt/old/roostctl")),
+            )),
+            ..healthy()
+        };
+        let c = find(&evaluate(&other), "cli.on_path").clone();
+        assert_eq!(c.status, Some(Status::Warn));
+        assert!(c.detail.contains("/usr/local/bin/roostctl"), "{}", c.detail);
+        assert!(c.detail.contains("/opt/old/roostctl"), "{}", c.detail);
+        assert!(c.detail.contains(BUNDLED), "{}", c.detail);
+        assert!(c
+            .docs_url
+            .is_some_and(|url| url.ends_with("#where-roostctl-lives")));
+    }
+
+    #[test]
+    fn cli_on_path_warns_when_missing_and_points_a_bundle_at_the_action() {
+        let missing = Inputs {
+            cli_self: Some(PathBuf::from(BUNDLED)),
+            cli_on_path: None,
+            ..healthy()
+        };
+        let c = find(&evaluate(&missing), "cli.on_path").clone();
+        assert_eq!(c.status, Some(Status::Warn));
+        assert!(
+            c.detail.contains(&format!("`{BUNDLED} cli install`")),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("Install 'roostctl' Command"),
+            "{}",
+            c.detail
+        );
+        assert!(c
+            .docs_url
+            .is_some_and(|url| url.ends_with("#where-roostctl-lives")));
+
+        let plain = Inputs {
+            cli_on_path: None,
+            ..healthy()
+        };
+        let c = find(&evaluate(&plain), "cli.on_path").clone();
+        assert_eq!(c.status, Some(Status::Warn));
+        assert!(
+            c.detail
+                .contains("add /opt/roost/bin/roostctl's directory to PATH"),
+            "{}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn cli_on_path_reports_a_broken_link_first() {
+        let broken = Inputs {
+            cli_self: Some(PathBuf::from(BUNDLED)),
+            cli_link: roost_ipc::cli_link::Status::Broken {
+                link: PathBuf::from("/usr/local/bin/roostctl"),
+                target: PathBuf::from("/nonexistent/Old.app/Contents/Resources/bin/roostctl"),
+            },
+            ..healthy()
+        };
+        let c = find(&evaluate(&broken), "cli.on_path").clone();
+        assert_eq!(c.status, Some(Status::Warn));
+        assert!(c.detail.contains("which no longer exists"), "{}", c.detail);
+        assert!(
+            c.detail.contains("cli install` to repair it"),
+            "{}",
+            c.detail
+        );
     }
 
     fn find<'a>(report: &'a Report, id: &str) -> &'a Check {
@@ -4235,7 +4453,7 @@ mod tests {
     }
 
     /// The fixed inventory (§3.7): 31 checks + 8 observations.
-    const CHECK_COUNT: usize = 41;
+    const CHECK_COUNT: usize = 42;
 
     // ------------------------------------------------- applicability (AC 7)
 
@@ -6243,6 +6461,7 @@ mod tests {
         ("claude", "claude.hook_events"),
         ("agents", "agent.hook_binary"),
         ("session", "session.old_path"),
+        ("cli", "cli.on_path"),
     ];
 
     fn section_of<'a>(report: &'a Report, id: &str) -> &'a Section {
@@ -6526,6 +6745,24 @@ mod tests {
                 "session",
                 Some(Status::Warn),
                 "session.old_path",
+            ),
+            ("cli ok", healthy(), "cli", Some(Status::Ok), "cli.on_path"),
+            (
+                "cli skipped",
+                Inputs::default(),
+                "cli",
+                Some(Status::Skipped),
+                "cli.on_path",
+            ),
+            (
+                "cli warn",
+                Inputs {
+                    cli_on_path: None,
+                    ..healthy()
+                },
+                "cli",
+                Some(Status::Warn),
+                "cli.on_path",
             ),
         ];
 
@@ -7027,6 +7264,7 @@ mod tests {
             ("agent.opencode.wired", "OpenCode — wired"),
             ("agent.opencode.owning", "OpenCode — owning a tab"),
             ("session.old_path", "Session at an old path"),
+            ("cli.on_path", "`roostctl` on PATH"),
         ];
         assert_eq!(EXPECTED.len(), CHECK_COUNT);
         // Every fixture the suite has, so a check whose title differs

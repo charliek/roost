@@ -316,6 +316,11 @@ pub(super) enum HostDialog {
     /// reason: nothing has been written yet, and a file changing behind
     /// the card must not rewrite the question mid-read.
     AgentHooks(super::agent_hooks_dialog::AgentHooksDraft),
+    /// What came of the `roostctl` link (#261) when the user has
+    /// something to do — a line to add, a command to run by hand — or
+    /// Repair's consent: a link that points elsewhere is re-pointed only
+    /// on request.
+    CliLink(super::cli_link::Card),
 }
 
 impl HostDialog {
@@ -330,7 +335,8 @@ impl HostDialog {
             | Self::ConfirmRestart { .. }
             | Self::ConfirmSwitch { .. }
             | Self::Bootstrap(_)
-            | Self::AgentHooks(_) => None,
+            | Self::AgentHooks(_)
+            | Self::CliLink(_) => None,
         }
     }
 
@@ -344,7 +350,8 @@ impl HostDialog {
             | Self::ConfirmStop { .. }
             | Self::ConfirmRestart { .. }
             | Self::ConfirmSwitch { .. }
-            | Self::Bootstrap(_) => None,
+            | Self::Bootstrap(_)
+            | Self::CliLink(_) => None,
         }
     }
 }

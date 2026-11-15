@@ -2481,6 +2481,64 @@ Answered by the iced UI on every OS. Off macOS every field is `false`:
 Secure Keyboard Entry does not exist there, and the
 `toggle_secure_input` action does nothing.
 
+### `app.cli_link`
+
+Read, make or remove the `roostctl` link for terminals outside Roost
+(#261): one symlink, in `/usr/local/bin` when that directory exists and
+the user can write to it, otherwise in `~/.local/bin`, to the `roostctl`
+in this UI's app bundle. The first op that writes outside Roost's own
+directories, and it writes only that link. The macOS palette row and
+App-menu item are its callers in the window, and
+[`roostctl cli`](cli.md#cli-subcommands) runs the same code without a
+UI. Not gated.
+
+Request: `{"params": {"action": "status"}}`. `action` is `"status"`,
+`"install"` (which also repairs a link that points at an app that moved
+or at another Roost) or `"uninstall"`; anything else is
+`invalid-param`. Response:
+
+```json
+{
+  "state": "installed",
+  "label": "Uninstall 'roostctl' Command",
+  "link": "/usr/local/bin/roostctl",
+  "target": null,
+  "source": "/Applications/Roost.app/Contents/Resources/bin/roostctl",
+  "bundled": true,
+  "outcome": "created",
+  "message": "Installed 'roostctl': /usr/local/bin/roostctl → /Applications/Roost.app/Contents/Resources/bin/roostctl",
+  "command": null,
+  "path_line": null
+}
+```
+
+- `state` is what the link directories hold **after** the action, read
+  from the links themselves and never from any `PATH`: `"installed"` (a
+  link reaching `source`), `"broken"` (a link into some app bundle's
+  `Contents/Resources/bin` that does not) or `"absent"`. `link` is the
+  link it is about and `target` where a broken one points.
+- `label` is the row's and menu item's title for `state`: *Install
+  'roostctl' Command*, *Repair 'roostctl' Command…* or *Uninstall
+  'roostctl' Command*.
+- `source` is this UI's own `roostctl` (`null` when it has none), and
+  `bundled` whether it sits in an app bundle — only then is there
+  anything to link, and only then does macOS show the row.
+- `outcome` is `"status"`, `"created"`, `"repaired"`,
+  `"already_installed"`, `"removed"`, `"nothing_to_remove"` or
+  `"refused"`. A refusal is a result, not an error: a `roostctl` that is
+  not in a bundle, a bundle macOS is running from a temporary copy of
+  (App Translocation), or link directories that already hold a
+  `roostctl` that is not a link Roost made — which is never overwritten.
+  `command` is then the command that does it by hand, when there is one.
+- `path_line` is the line that puts the link's directory on `PATH`
+  (`export PATH="$HOME/.local/bin:$PATH"`), present when the UI's own
+  `PATH` lacks it.
+
+Every action but `status` also shows its outcome in the window: a toast
+for a plain success, a card for a refusal or a `path_line`, with a
+button that copies the command or line. A UI that serves no window
+answers `internal: no UI attached`.
+
 ### Notification raise test ops (`app.notification_activate` / `app.last_activation`) *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**

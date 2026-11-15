@@ -69,6 +69,9 @@ pub(crate) enum MenuEvent {
     /// gate it is the updater's own `canCheckForUpdates`
     /// ([`sync_update_item`]).
     CheckForUpdates,
+    /// The App menu's `roostctl` item (#261): Install, Repair… or
+    /// Uninstall, whichever its title says now.
+    CliLink,
 }
 
 /// Which surface currently owns the keyboard, as far as the menu bar
@@ -375,6 +378,9 @@ struct MainMenu {
     /// The App menu's "Secure Keyboard Entry", kept for
     /// [`sync_secure_input_state`].
     secure_input: Option<Retained<NSMenuItem>>,
+    /// The App menu's `roostctl` item, kept for [`sync_cli_link_item`].
+    /// Built only for a Roost whose `roostctl` is in its own bundle.
+    cli_link: Option<Retained<NSMenuItem>>,
     /// Indexed by the item's tag.
     events: Vec<MenuEvent>,
     /// Tags below this belong to the static menus and never move. A
@@ -440,12 +446,13 @@ pub(crate) fn install(
     app_name: &str,
     keybindings: &HashMap<Accel, KeybindAction>,
     feed: EngineFeedSender,
+    cli_link: Option<&str>,
 ) -> bool {
     if MENU.with(|cell| cell.borrow().is_some()) {
         return false;
     }
     suppress_appkit_full_screen_item();
-    let menu = build(mtm, app_name, keybindings, feed);
+    let menu = build(mtm, app_name, keybindings, feed, cli_link);
     let app = NSApplication::sharedApplication(mtm);
     app.setMainMenu(Some(&menu.root));
     app.setHelpMenu(Some(&menu.help));
@@ -530,6 +537,17 @@ pub(crate) fn sync_secure_input_state(_mtm: MainThreadMarker, manual: bool) {
     });
 }
 
+/// Retitle the `roostctl` item to what the link directories hold now.
+pub(crate) fn sync_cli_link_item(_mtm: MainThreadMarker, title: &str) {
+    MENU.with(|cell| {
+        let slot = cell.borrow();
+        let Some(item) = slot.as_ref().and_then(|menu| menu.cli_link.as_ref()) else {
+            return;
+        };
+        item.setTitle(&NSString::from_str(title));
+    });
+}
+
 /// Push the app's keyboard route onto the live menu.
 ///
 /// Two different mechanisms, because they answer two different questions:
@@ -597,6 +615,7 @@ fn build(
     app_name: &str,
     keybindings: &HashMap<Accel, KeybindAction>,
     feed: EngineFeedSender,
+    cli_link: Option<&str>,
 ) -> MainMenu {
     // SAFETY: `init` on a freshly allocated instance of our own class.
     let target: Retained<MenuTarget> = unsafe { msg_send![MenuTarget::alloc(mtm), init] };
@@ -609,6 +628,7 @@ fn build(
         view: submenu(mtm, "View"),
         fullscreen: None,
         secure_input: None,
+        cli_link: None,
         events: Vec::new(),
         static_events: 0,
         gated: Vec::new(),
@@ -643,6 +663,17 @@ fn build(
         Some(("Settings\u{2026}", KeybindAction::OpenConfig)),
         keybindings,
     );
+    if let Some(title) = cli_link {
+        let item = plain_item(mtm, title);
+        bind_event(&mut menu, &item, MenuEvent::CliLink);
+        app_menu.addItem(&item);
+        menu.gated.push(GatedItem {
+            item: item.clone(),
+            palette_toggle: false,
+            clipboard_equivalent: None,
+        });
+        menu.cli_link = Some(item);
+    }
     menu.secure_input = add_action_item(
         mtm,
         &mut menu,
@@ -1130,6 +1161,7 @@ fn menu_event_wire_name(event: &MenuEvent) -> String {
         MenuEvent::Action(action) => action.to_wire_name(),
         MenuEvent::Quit => "quit".into(),
         MenuEvent::CheckForUpdates => "check_for_updates".into(),
+        MenuEvent::CliLink => "cli_link".into(),
         // Wire names, so the key renders as the form a client speaks —
         // bare for the local instance, qualified for any other.
         MenuEvent::SelectProject(project) => format!("select_project:{project}"),

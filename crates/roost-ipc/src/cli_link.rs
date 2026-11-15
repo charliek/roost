@@ -18,6 +18,8 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
+use crate::messages::AppCliLinkResult;
+
 pub const NAME: &str = "roostctl";
 
 /// The preferred link directory, used when it exists and this user can
@@ -410,6 +412,115 @@ pub fn uninstall(source: &Path, dirs: &[PathBuf]) -> Result<Uninstalled, Refusal
     })
 }
 
+/// What a caller asks of [`act`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Status,
+    Install,
+    Uninstall,
+}
+
+impl Action {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "status" => Some(Self::Status),
+            "install" => Some(Self::Install),
+            "uninstall" => Some(Self::Uninstall),
+            _ => None,
+        }
+    }
+}
+
+/// The caller's view of the world, for [`act`].
+#[derive(Debug, Clone, Copy)]
+pub struct Context<'a> {
+    /// The `roostctl` to link, or `None` when this Roost has none.
+    pub source: Option<&'a Path>,
+    pub dirs: &'a [PathBuf],
+    /// The caller's `PATH`, to say whether a new link's directory is on it.
+    pub path_var: Option<&'a OsStr>,
+    pub home: Option<&'a Path>,
+}
+
+/// Run `action` and say what came of it: the one entry point
+/// `app.cli_link`, its palette row and menu item, and `roostctl cli` all
+/// call.
+pub fn act(action: Action, context: Context<'_>) -> AppCliLinkResult {
+    let source = context.source.unwrap_or(Path::new(""));
+    let done = match (action, context.source) {
+        (Action::Status, _) => Ok(Done::Status),
+        (Action::Install, None) => Err(Refusal::NoRoostctl),
+        (Action::Install, Some(source)) => install(source, context.dirs).map(Done::Installed),
+        (Action::Uninstall, _) => uninstall(source, context.dirs).map(Done::Uninstalled),
+    };
+    let after = status(source, context.dirs);
+    let (outcome, message, command, path_line) = match done {
+        Ok(Done::Status) => ("status", describe(&after), None, None),
+        Ok(Done::Installed(installed)) => {
+            let link = installed.link();
+            let dir = link.parent().unwrap_or(Path::new("/"));
+            let path_line = (!on_path(dir, context.path_var)).then(|| path_line(dir, context.home));
+            let (outcome, verb) = match &installed {
+                Installed::Created { .. } => ("created", "Installed"),
+                Installed::Repaired { .. } => ("repaired", "Repaired"),
+                Installed::AlreadyThere { .. } => ("already_installed", "Already installed"),
+            };
+            let message = format!(
+                "{verb} 'roostctl': {} → {}",
+                link.display(),
+                source.display()
+            );
+            (outcome, message, None, path_line)
+        }
+        Ok(Done::Uninstalled(Uninstalled::Removed { links })) => (
+            "removed",
+            format!("Uninstalled 'roostctl': removed {}", join_paths(&links)),
+            None,
+            None,
+        ),
+        Ok(Done::Uninstalled(Uninstalled::NothingThere)) => (
+            "nothing_to_remove",
+            "No 'roostctl' link to remove".to_string(),
+            None,
+            None,
+        ),
+        Err(refusal) => ("refused", refusal.to_string(), refusal.command(), None),
+    };
+    AppCliLinkResult {
+        state: after.as_str().into(),
+        label: after.label().into(),
+        link: after.link().map(|link| link.display().to_string()),
+        target: match &after {
+            Status::Broken { target, .. } => Some(target.display().to_string()),
+            Status::Installed { .. } | Status::Absent => None,
+        },
+        source: context.source.map(|source| source.display().to_string()),
+        bundled: context.source.and_then(bundle_bin_dir_of).is_some(),
+        outcome: outcome.into(),
+        message,
+        command,
+        path_line,
+    }
+}
+
+enum Done {
+    Status,
+    Installed(Installed),
+    Uninstalled(Uninstalled),
+}
+
+fn describe(status: &Status) -> String {
+    match status {
+        Status::Installed { link } => format!("'roostctl' is installed at {}", link.display()),
+        Status::Broken { link, target } => format!(
+            "The 'roostctl' link at {} points at {}, which is not this Roost's",
+            link.display(),
+            target.display()
+        ),
+        Status::Absent => "'roostctl' is not installed".to_string(),
+    }
+}
+
 /// Whether `dir` is an entry of `path_var`.
 pub fn on_path(dir: &Path, path_var: Option<&OsStr>) -> bool {
     path_var.is_some_and(|path| std::env::split_paths(path).any(|entry| entry == dir))
@@ -783,6 +894,89 @@ mod tests {
                 world.user.join(NAME).display()
             ))
         );
+    }
+
+    fn context<'a>(
+        world: &'a World,
+        dirs: &'a [PathBuf],
+        path_var: Option<&'a OsStr>,
+    ) -> Context<'a> {
+        Context {
+            source: Some(&world.source),
+            dirs,
+            path_var,
+            home: Some(Path::new("/nowhere")),
+        }
+    }
+
+    #[test]
+    fn act_reports_each_outcome_with_the_state_after_it() {
+        let world = World::new();
+        let dirs = world.dirs();
+        let status = act(Action::Status, context(&world, &dirs, None));
+        assert_eq!(
+            (status.state.as_str(), status.outcome.as_str()),
+            ("absent", "status")
+        );
+        assert_eq!(status.label, "Install 'roostctl' Command");
+        assert!(status.bundled);
+
+        let created = act(Action::Install, context(&world, &dirs, None));
+        assert_eq!(
+            (created.state.as_str(), created.outcome.as_str()),
+            ("installed", "created")
+        );
+        assert_eq!(created.label, "Uninstall 'roostctl' Command");
+        assert_eq!(
+            created.link.as_deref(),
+            Some(world.user.join(NAME).to_str().unwrap())
+        );
+        assert_eq!(
+            created.path_line.as_deref(),
+            Some(format!("export PATH=\"{}:$PATH\"", world.user.display()).as_str()),
+            "the user dir is not on an empty PATH"
+        );
+
+        let on = std::env::join_paths([&world.user]).unwrap();
+        let again = act(Action::Install, context(&world, &dirs, Some(&on)));
+        assert_eq!(again.outcome, "already_installed");
+        assert_eq!(again.path_line, None, "the directory is on this PATH");
+
+        let removed = act(Action::Uninstall, context(&world, &dirs, None));
+        assert_eq!(
+            (removed.state.as_str(), removed.outcome.as_str()),
+            ("absent", "removed")
+        );
+        let none = act(Action::Uninstall, context(&world, &dirs, None));
+        assert_eq!(none.outcome, "nothing_to_remove");
+    }
+
+    #[test]
+    fn act_hands_a_refusal_its_command() {
+        let world = World::new();
+        std::fs::create_dir_all(&world.user).unwrap();
+        std::fs::write(world.user.join(NAME), "mine").unwrap();
+        let dirs = vec![world.user.clone()];
+        let refused = act(Action::Install, context(&world, &dirs, None));
+        assert_eq!(
+            (refused.state.as_str(), refused.outcome.as_str()),
+            ("absent", "refused")
+        );
+        assert!(refused
+            .command
+            .as_deref()
+            .is_some_and(|c| c.starts_with("ln -sf ")));
+
+        let none = act(
+            Action::Install,
+            Context {
+                source: None,
+                ..context(&world, &dirs, None)
+            },
+        );
+        assert_eq!(none.outcome, "refused");
+        assert!(!none.bundled);
+        assert_eq!(none.source, None);
     }
 
     #[test]

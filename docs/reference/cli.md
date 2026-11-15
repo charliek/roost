@@ -44,6 +44,7 @@ roostctl [--socket <PATH>] [--target <mac|linux|iced|session>] [--json] <COMMAND
 | `claude-hook` | Internal: invoked by Claude on each hook event (kept for settings files an earlier Roost wrote) |
 | `doctor` | Read-only diagnosis of the Roost integration (target, socket, shell, tab, agent hooks) |
 | `session start` / `stop` / `status` | Start, stop, or inspect the headless `roost-session` daemon |
+| `cli install` / `uninstall` / `status` | Link this `roostctl` onto `PATH` for terminals outside Roost (macOS), or take the link away |
 | `rpc <op> [params]` | Call any IPC op directly by name, bypassing every named verb |
 | `skill` | Print the agent skill (`skills/roost/SKILL.md`), byte for byte as the plugin installs it |
 | `schema` | Print the wire's JSON Schema bundle (`docs/reference/api/roost-ipc.schema.json`), byte for byte |
@@ -162,19 +163,38 @@ For more information, try '--help'.
 ### Where `roostctl` lives
 
 `roostctl` ships next to the UI, but the two platforms put it in
-different places — only one is on `PATH`:
+different places:
 
 | Platform | Path | On `PATH`? |
 |---|---|---|
 | **Linux (`.deb`)** | `/usr/bin/roostctl` | ✅ yes |
-| **macOS, `Roost.app` (`.dmg`)** | `Roost.app/Contents/Resources/bin/roostctl` (inside the bundle) | ❌ no — a Finder-launched app gets a minimal `PATH` |
+| **macOS, `Roost.app` (`.dmg`)** | `Roost.app/Contents/Resources/bin/roostctl` (inside the bundle) | inside Roost's own tabs, yes; elsewhere only once you link it |
 
-For your own shell on macOS, symlink it onto `PATH` once
-(`ln -s /Applications/Roost.app/Contents/Resources/bin/roostctl
-/usr/local/bin/roostctl`). **Provider scripts don't
-need to** — Roost sets `ROOST_ROOSTCTL` to the absolute path of its own
-`roostctl` when it runs them, so `"${ROOST_ROOSTCTL:-roostctl}"` is
-portable across both platforms. See [Extending Roost](../guides/extending.md#opening-tabs-from-activate).
+**Inside a Roost tab** a bare `roostctl` works on both platforms. Every
+tab gets `ROOST_ROOSTCTL`, the absolute path of the `roostctl` that
+belongs to the Roost serving it, and when that `roostctl` sits in the app
+bundle, the bundle's `Contents/Resources/bin` goes first on the tab's
+`PATH`. A login shell's `path_helper` or an rc file that rebuilds `PATH`
+would push it back down, so the shell integration's
+[`path` feature](../guides/cwd-tracking.md#feature-flags) puts it in
+front again at the first prompt. A Linux tab's `PATH` is left as it is:
+`/usr/bin` is already on it. A tab on a remote host gets the
+`roostctl` of that host, if it has one.
+
+**Outside Roost** (Terminal.app, iTerm, an SSH session into the Mac), link
+it once. On macOS the command palette and the App menu have **Install
+'roostctl' Command**, and `roostctl cli install` does the same from a
+shell ([below](#cli-subcommands)). It writes one symlink: in
+`/usr/local/bin` when that directory exists and you can write to it,
+otherwise in `~/.local/bin`, which it creates. No shell rc file is
+edited. When the link lands in a directory that is not on your `PATH`,
+Roost shows the one line to add to `~/.zprofile` (or `~/.bash_profile`),
+for example `export PATH="$HOME/.local/bin:$PATH"`. Hooks are
+unaffected either way: they run `$ROOST_AGENT_HOOK`, an absolute path.
+
+Scripts that run in a Roost tab or as a [provider](../guides/extending.md#opening-tabs-from-activate)
+can use `"${ROOST_ROOSTCTL:-roostctl}"` to work whether or not the link
+exists.
 
 With more than one Roost running (an installed `Roost.app` and a dev
 `Roost-Iced.app`, say), `roostctl` can't auto-detect which one you
@@ -921,7 +941,10 @@ so exit 0 means **a session answered**, not merely that a process was
 launched — both a fresh start and confirming an already-running session
 print their identity and exit 0; either verdict that never gets
 confirmed exits 1. The daemon binary is located next to `roostctl`
-first, then on `PATH`; `ROOST_SESSION_BIN` overrides the search
+first (next to the file a linked `roostctl` points at, too), then on
+`PATH`, skipping an app bundle's `Contents/Resources/bin` there: a Roost
+tab puts its own bundle's first, and that daemon is for that bundle's
+`roostctl`, not another build's. `ROOST_SESSION_BIN` overrides the search
 outright (used by tests and a from-source `cargo run`).
 
 `session stop` calls [`session.stop`](ipc.md#sessionstop) and prints
@@ -957,6 +980,54 @@ stops it only if that id still answers when the stop is sent. See
 | `session start` | a session confirmed serving (fresh or already-running) | spawn failed, or no session answered `session.identify` within the confirm window | — |
 | `session stop` | stopped, or already not running | a socket exists but never answered, or the reap timed out; with `--old-path`, a socket that is not an old-path candidate, this build's own socket, or a session that reports no id | — |
 | `session status` | a session answered; identity printed | a socket exists but would not answer | no session is running |
+
+## `cli` subcommands
+
+Link this `roostctl` onto `PATH` for terminals outside Roost, or take the
+link away (#261). They read and write that one symlink and never dial a
+UI, so they work with nothing running. The UI's palette row and App-menu
+item (macOS) and the [`app.cli_link`](ipc.md#appcli_link) op do the same
+thing through the same code.
+
+```bash
+/Applications/Roost.app/Contents/Resources/bin/roostctl cli install
+roostctl cli status
+roostctl cli uninstall
+```
+
+`cli install` links `roostctl` from `/usr/local/bin` if that directory
+exists and you can write to it, otherwise from `~/.local/bin` (created if
+missing). It only links a `roostctl` that sits in an app bundle's
+`Contents/Resources/bin`; anywhere else it is already installed where it
+is, and the command says to add its directory to `PATH` instead. It
+refuses while Roost runs from a temporary copy macOS made of an app it
+has not moved yet (App Translocation): move `Roost.app` to
+`/Applications` and open it from there first. When the link's directory
+is not on the current `PATH`, it prints the `export PATH=…` line to add.
+
+A link Roost made is a symlink whose target is a `roostctl` inside some
+`<name>.app/Contents/Resources/bin`. `cli install` repairs one that
+points at an app that moved or at another Roost (`Roost-Iced.app`, say),
+and does nothing when the link already reaches this `roostctl`. Anything
+else named `roostctl` in those directories, a regular file or a link
+elsewhere, is never overwritten: install uses the other directory, or
+refuses and prints the `ln -sf …` command that does it by hand.
+
+`cli uninstall` removes every link Roost made in the two directories,
+and only those. `cli status` says which of `installed`, `broken` or
+`absent` the directories hold. `roostctl doctor`'s `cli.on_path` check
+reports a broken link and a `PATH` whose `roostctl` is another binary;
+neither verb runs on its own.
+
+| Verb | Exit 0 | Exit 1 |
+|---|---|---|
+| `cli install` | linked, repaired, or already linked | refused (not in a bundle, translocated, every directory holds a `roostctl` that is not Roost's) or the write failed; the message carries the command that does it by hand |
+| `cli uninstall` | removed, or nothing to remove | a link could not be removed |
+| `cli status` | always | — |
+
+`--json` prints the [`app.cli_link`](ipc.md#appcli_link) result
+(`state`, `label`, `link`, `target`, `source`, `bundled`, `outcome`,
+`message`, `command`, `path_line`).
 
 ## `host` subcommands
 
@@ -1080,14 +1151,14 @@ roostctl doctor --color=always
 |---|---|---|---|
 | `--tab` | int | `$ROOST_TAB_ID` / the UI's active tab | Inspect this tab instead. Doctor reads the env var itself rather than through the parse every other `--tab` command shares, so an unparsable `$ROOST_TAB_ID` becomes a diagnostic (`env.tab_id: fail`) instead of exit 2 `usage` |
 | `--json` | flag | `false` | Machine-readable report (the global flag; see [JSON output](#json-output)) |
-| `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 41 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
+| `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 42 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
 | `--color` | `auto` \| `always` \| `never` | `auto` | Colorize the text output. `auto` enables color only when stdout is a TTY, `NO_COLOR` is unset **or empty**, and `TERM` is not `dumb`; `always` bypasses all three checks; `never` always disables. Per <https://no-color.org/>, `NO_COLOR=` (present but empty) does **not** disable — only a non-empty value does. Ignored by `--json` |
 
 Doctor diagnoses the Roost any other verb would dial: from inside a local
 session tab, that is the window that owns the session, and `ui.target` names
 both ([Inside a session tab](#inside-a-session-tab)).
 
-The report is seven sections. Each declares one of three scopes: **process**
+The report is eight sections. Each declares one of three scopes: **process**
 (the shell/process that invoked doctor), **ui** (the Roost instance doctor
 reached), **tab** (the selected tab) — a *process* fact is never used to
 judge a *tab* fact unless the selected tab is doctor's own tab.
@@ -1100,6 +1171,7 @@ judge a *tab* fact unless the selected tab is doctor's own tab.
 | `tab` | tab | Which tab is selected — the one check in the section, and it can fail if a `--tab`/`$ROOST_TAB_ID` no longer exists — then, for that tab, its four agent axes (shell state, agent lifecycle, attention, ownership), the state derived from them, whether raw OSC 9/99/777 is currently suppressed, and the agent reports the tab's server has dropped (how many, the latest, and a note when the latest was dropped while no agent owned the tab and that agent doesn't own it now: if it is still running, it has lost the tab). Those seven are observations, not verdicts. |
 | `session` | process | Is a session running at a socket path this build no longer uses (`session.old_path`)? A warn names each one and the `session stop --old-path` fix; skipped, saying why, where the probe may not run (an override or test mode is in effect) |
 | `claude` | process (`claude.observed` is tab-scoped) | Is `claude` on `PATH`, does `~/.claude/settings.json` parse, is any Roost hook command still in it (Claude connects through the tab environment, so one left there doubles every event, and doctor says how to remove it), has this tab actually seen a Claude hook fire? Doctor never asks for Roost's hooks in that file — see the `agents` section below for how each agent is connected |
+| `cli` | process | Does a bare `roostctl` on `PATH` run this `roostctl` (`cli.on_path`)? A warn names both paths when `PATH` finds another one, says how to [link it](#cli-subcommands) when there is none, and reports a `roostctl` link that points at an app that is gone or another Roost's |
 | `agents` | process (the `owning` checks are tab-scoped) | Is `$ROOST_AGENT_HOOK` set and executable from this tab; per agent (claude, codex, grok, cursor, opencode), is Roost's hook entry present and at the current integration version, and does that source currently own a tab on this UI; for codex, does its `trusted_hash` on disk match what codex would compute; is a legacy `~/.config/roost/claude-settings.json` or shell alias still lying around? See the [Agent integration](../guides/agents.md) guide |
 
 Every entry carries a stable `id` (`env.tab_id`, `ui.socket`,
@@ -1158,7 +1230,7 @@ something to say with nothing running — only the tab-scoped `owning`
 checks and `agent.hook_binary` (which needs to be inside a tab at all)
 come back `skipped` here.
 
-`-v` prints all 41 entries grouped by section, with the status column
+`-v` prints all 42 entries grouped by section, with the status column
 blank for `null`-status observations (not for `skipped` — that word
 still prints, because it *is* a status) and a doc link under every
 `fail`/`warn`. Same capture, `-v`, trimmed with `[…]` to the sections
@@ -1236,7 +1308,7 @@ anything fail" from the check list), and every entry's stable `id`,
 observations, one of `ok`/`warn`/`fail`/`skipped` for checks. That's the
 shape to script against; the text output's column widths are not.
 `--json` is also unaffected by `-v` and `--color`: it always carries all
-41 entries and never contains a color escape, regardless of either
+42 entries and never contains a color escape, regardless of either
 flag.
 
 ## Environment
@@ -1245,7 +1317,7 @@ flag.
 |---|---|
 | `ROOST_SOCKET` | Override the UI socket the CLI dials. In a local session tab it names the session, and a verb goes to the window that owns it instead ([Inside a session tab](#inside-a-session-tab)) |
 | `ROOST_TAB_ID` | Default tab id when `--tab` is not given. A command that changes a tab refuses without one of the two ([why](#which-tab-a-command-acts-on)) |
-| `ROOST_ROOSTCTL` | Set by the UI for provider scripts: absolute path to its own `roostctl`. Best-effort — may be absent if the UI can't resolve its bundled/sibling CLI, so scripts keep the `"${ROOST_ROOSTCTL:-roostctl}"` fallback (see [Where `roostctl` lives](#where-roostctl-lives)) |
+| `ROOST_ROOSTCTL` | Set by the UI (or `roost-session`) on every tab and for provider scripts: absolute path to its own `roostctl`, found beside its executable, in its app bundle's `Contents/Resources/bin`, or on `PATH` (never in another app bundle's `bin`). Absent when none resolves, and an inherited value is then removed, so scripts keep the `"${ROOST_ROOSTCTL:-roostctl}"` fallback (see [Where `roostctl` lives](#where-roostctl-lives)) |
 | `ROOST_AGENT_HOOK` | Set by the UI (or `roost-session`) on every tab: absolute path of the `roostctl` (or `roost-session`) that understands `agent-hook <agent>`. Every hook entry Roost installs into an agent's config reads this indirectly through a shell fallback rather than calling `roostctl` directly, which is what keeps the installed command host-independent — see [Agent integration](../guides/agents.md#inert-outside-roost). Resolved the same sibling → bundled-`Resources/bin` → `PATH` ladder as `ROOST_ROOSTCTL`; omitted, like that variable, when nothing resolves |
 | `ROOST_DEBUG` | If set, `claude-hook` and `agent-hook` write failure messages to stderr |
 | `ROOST_AGENT_HOOKS_FORCE` | Set to `1` to let `agent ensure`/`install`/`uninstall` write real dotfiles while `ROOST_TEST_MODE=1` is also set — without it, the agent-hooks install engine refuses to run at all under `ROOST_TEST_MODE=1`, belt and braces against a test writing into a real machine's dotfiles |
@@ -1253,7 +1325,7 @@ flag.
 | `ROOST_SESSION_SOCKET_DIR` | Absolute directory holding the session's socket (`<dir>/roost.sock`), replacing the default under the passwd home, for `session start\|stop\|status` and `--target session`. See [`paths.md`](paths.md#session-socket-override) |
 | `ROOST_SSH_BIN` | Overrides the `ssh` binary a host's SSH transport execs (default: `ssh` on `PATH`) — read by `host add --verify` against an SSH target and by the UI's own tunnel. See [`paths.md`](paths.md#ssh-scratch-directories). |
 
-`ROOST_SOCKET` / `ROOST_TAB_ID` / `ROOST_AGENT_HOOK` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac` / `linux` / `iced`) — see [Paths & Environment](paths.md). `roostctl` reads `ROOST_BUNDLE_PROFILE` too, as the env-var form of `--target`; an unrecognized value is a hard error there ("unknown ROOST_BUNDLE_PROFILE value … expected `mac`, `linux`, or `iced`") rather than the UI's warn-and-fall-back. `--target` alone additionally accepts `session` (#475) — `ROOST_BUNDLE_PROFILE=session` is one of the values that hard error names as unrecognized, by design: a session is reachable only explicitly.
+`ROOST_SOCKET` / `ROOST_TAB_ID` / `ROOST_AGENT_HOOK` / `ROOST_ROOSTCTL` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac` / `linux` / `iced`) — see [Paths & Environment](paths.md). `roostctl` reads `ROOST_BUNDLE_PROFILE` too, as the env-var form of `--target`; an unrecognized value is a hard error there ("unknown ROOST_BUNDLE_PROFILE value … expected `mac`, `linux`, or `iced`") rather than the UI's warn-and-fall-back. `--target` alone additionally accepts `session` (#475) — `ROOST_BUNDLE_PROFILE=session` is one of the values that hard error names as unrecognized, by design: a session is reachable only explicitly.
 
 ## Exit codes
 
