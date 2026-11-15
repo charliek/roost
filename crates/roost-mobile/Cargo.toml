@@ -30,7 +30,7 @@ anyhow = { workspace = true }
 base64 = "0.22"
 # The bridge runtime, codec and Dart stream sinks. Pinned to the version of
 # the installed flutter_rust_bridge_codegen and the Dart package in mobile/.
-flutter_rust_bridge = "=2.13.0-beta.5"
+flutter_rust_bridge = "=2.14.0-beta.2"
 futures = { workspace = true }
 getrandom = { workspace = true }
 serde = { version = "1", features = ["derive"] }
