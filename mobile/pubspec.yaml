@@ -15,7 +15,7 @@ dependencies:
   flutter_riverpod: ^3.3.1
   # The Rust core's bindings (lib/src/rust/). Pinned to the version of
   # flutter_rust_bridge_codegen and of the crate in crates/roost-mobile.
-  flutter_rust_bridge: 2.13.0-beta.5
+  flutter_rust_bridge: 2.13.0
   # Where RoostApp keeps hosts.json and client_id.
   path_provider: ^2.1.5
   # Builds crates/roost-mobile through cargokit.
