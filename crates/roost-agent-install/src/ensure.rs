@@ -29,7 +29,9 @@
 use std::path::PathBuf;
 
 use roost_agent::{Agent, ALL_AGENTS};
-use roost_ui_model::config::{AgentHooks, AgentIntegration, ConfigLock, RoostConfig};
+use roost_ui_model::config::{
+    AgentHooks, AgentIntegration, AgentSwitches, ConfigLock, RoostConfig,
+};
 
 use crate::command::INTEGRATION_VERSION;
 use crate::error::{AgentError, AgentSkip, AgentWarning, InstallError, SkipReason};
@@ -630,25 +632,33 @@ pub fn install(
     finish(home, record, outcome, Notice::Caller, &lock)
 }
 
-/// Take Roost's entries back out of exactly these agents, and narrow the
-/// `agent-hooks` key to match.
+/// Take Roost's entries back out of exactly these agents, narrow the
+/// `agent-hooks` key to match, and switch the file agents among them off
+/// in `agent-integration`, or the next start would wire them again.
 ///
 /// Narrowing is the mirror of [`install`]'s union, with one asymmetry:
 /// an unanswered key (`ask`) is left unanswered rather than rewritten as
 /// "everything except this one", which would be a consent the user never
 /// gave. Uninstalling *every* agent is the exception — that is an answer,
 /// and it is written as `off` so the dialog does not come back asking
-/// again.
+/// again. An agent connected without a file keeps its switch: it has no
+/// entries for an uninstall to be about.
 pub fn uninstall(home: &Home, agents: &[Agent], guard: Guard) -> Result<Outcome, InstallError> {
     guard.check()?;
     let lock = home.config_lock()?;
+    let by_file: Vec<Agent> = agents
+        .iter()
+        .copied()
+        .filter(|agent| home.wires_by_file(*agent))
+        .collect();
+    let switched = switch_off(home, &by_file, &lock)?;
     let current = read_hooks(home)?;
     let wrote = match narrowed(&current, agents) {
         Some(narrowed) => write_hooks(home, &current, &narrowed, &lock)?,
         None => false,
     };
     let (mut record, mut outcome) = start(home)?;
-    outcome.wrote |= wrote;
+    outcome.wrote |= wrote || switched;
     for agent in agents {
         unwire_one(home, *agent, guard, &mut record, &mut outcome);
     }
@@ -800,6 +810,28 @@ fn switch_on(home: &Home, agents: &[Agent], lock: &ConfigLock) -> Result<bool, I
     if agents.iter().all(|agent| switches.on(*agent)) {
         return Ok(false);
     }
+    let mut tokens = tokens_without(switches, agents);
+    tokens.extend(agents.iter().map(|agent| agent.source().to_string()));
+    write_integration(home, &tokens.join(", "), lock)
+}
+
+/// [`switch_on`]'s mirror. Each agent is written as `-name` even where
+/// that is its default: an empty value reads as an absent key, which
+/// hands the decision back to a legacy `agent-hooks` answer.
+fn switch_off(home: &Home, agents: &[Agent], lock: &ConfigLock) -> Result<bool, InstallError> {
+    let switches = crate::retire::switches(home)?;
+    if agents.iter().all(|agent| !switches.on(*agent)) {
+        return Ok(false);
+    }
+    let mut tokens = tokens_without(switches, agents);
+    tokens.extend(agents.iter().map(|agent| format!("-{}", agent.source())));
+    write_integration(home, &tokens.join(", "), lock)
+}
+
+/// `agent-integration`'s tokens, with none naming `agents`. An absent
+/// key starts from the legacy answer, as the retire's carry-over would
+/// spell it.
+fn tokens_without(switches: AgentSwitches, agents: &[Agent]) -> Vec<String> {
     let base = match switches.integration {
         Some(integration) => Some(integration),
         None if crate::retire::answered(&switches) => {
@@ -807,7 +839,7 @@ fn switch_on(home: &Home, agents: &[Agent], lock: &ConfigLock) -> Result<bool, I
         }
         None => None,
     };
-    let mut tokens: Vec<String> = match base {
+    match base {
         None => Vec::new(),
         Some(AgentIntegration::Off) => {
             let none = AgentHooks::Allow {
@@ -821,9 +853,7 @@ fn switch_on(home: &Home, agents: &[Agent], lock: &ConfigLock) -> Result<bool, I
             .filter(|(name, _)| Agent::parse(name).is_none_or(|agent| !agents.contains(&agent)))
             .map(|(name, on)| if on { name } else { format!("-{name}") })
             .collect(),
-    };
-    tokens.extend(agents.iter().map(|agent| agent.source().to_string()));
-    write_integration(home, &tokens.join(", "), lock)
+    }
 }
 
 /// `hooks` widened by `agents`, in [`ALL_AGENTS`] order.
@@ -1130,15 +1160,6 @@ mod tests {
         let (known, unknown) = resolve_names(["codex", "Cursor", "gemini", "codex"]);
         assert_eq!(known, vec![Agent::Codex, Agent::Cursor]);
         assert_eq!(unknown, vec!["gemini"]);
-    }
-
-    /// gx shares grok's file and reports as grok; it is not a name of
-    /// its own, so naming it has to be visible rather than silent.
-    #[test]
-    fn a_name_no_agent_answers_to_is_unknown() {
-        let (known, unknown) = resolve_names(["gx"]);
-        assert!(known.is_empty());
-        assert_eq!(unknown, vec!["gx"]);
     }
 
     fn a_home(root: &std::path::Path) -> Home {

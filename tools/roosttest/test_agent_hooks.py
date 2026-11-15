@@ -1000,6 +1000,31 @@ def test_agent_install_and_uninstall_move_the_key(tmp_path):
     assert jail.read_record() == {}
 
 
+def test_agent_uninstall_cursor_switches_it_off_for_the_next_start(tmp_path):
+    """Cursor's switch lives in `agent-integration`, which the next
+    start's retire narrows `agent-hooks` to. An uninstall that took the
+    file out but left the switch on was undone by the next `ensure`."""
+    jail = Jail(tmp_path, agent_hooks=None)
+
+    installed = run_agent(jail, "install", "cursor")
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    assert jail.read_integration() == "cursor", jail.read_integration()
+    hooks = jail.agent_dirs["cursor"] / "hooks.json"
+    assert "ROOST_AGENT_HOOK" in hooks.read_text()
+
+    removed = run_agent(jail, "uninstall", "cursor")
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert jail.read_integration() == "-cursor", jail.read_integration()
+
+    restarted = run_agent(jail, "ensure", "--startup", "--json")
+    assert restarted.returncode == 0, restarted.stdout + restarted.stderr
+    assert not hooks.exists() or "ROOST_AGENT_HOOK" not in hooks.read_text(), (
+        "the next start wired Cursor again"
+    )
+    status = {row["agent"]: row for row in json.loads(run_agent(jail, "status", "--json").stdout)}
+    assert status["cursor"]["on"] is False, status["cursor"]
+
+
 def test_a_config_warning_never_lands_on_the_json_channel(tmp_path):
     """`--json` is decoded by the Mac app; a diagnostic must not precede it.
 

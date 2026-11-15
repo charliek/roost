@@ -274,15 +274,7 @@ mod tests {
     /// `assets/opencode/roost-agent-state.js` as it forwards.
     #[test]
     fn every_captured_payload_names_its_own_event() {
-        for agent in [
-            "claude",
-            "grok",
-            "gx",
-            "gx-gate",
-            "gx-failure",
-            "codex",
-            "cursor",
-        ] {
+        for agent in ["claude", "grok", "codex", "cursor"] {
             let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures")
                 .join(format!("{agent}.jsonl"));

@@ -1585,7 +1585,7 @@ Request:
 | `severity` | `"info"` \| `"warn"` \| `"error"` | defaults to `"info"`. Carried on the model now so a later policy revision can have `failed` interrupt regardless of focus; v1's notification policy does not yet consult it |
 | `title` / `body` | string | required when `attention == "set"` (`invalid-param` if missing), ignored otherwise |
 | `detail` | string | free-form reason for the report (`"permission_prompt"`, `"background_tasks:2"`, an error name…); recorded onto the ownership record when non-empty |
-| `metadata` | map<string, string> | **open extension channel** — the one field a client may extend without coordinating with the server. The params struct carries `#[serde(deny_unknown_fields)]` per the strict-server convention above, so a new *named* field on this op is a **request-schema change**, not an additive one: an older UI or `roost-session` answers `unknown-field` and drops the whole report, attention included. `lifecycle_if` was added that way in plan 046 — both server implementations changed together, and `protocol_version` did not move because `roostctl` and the UI ship as one build. Anything an adapter can express as data belongs in `metadata` instead. Adapter-stamped keys already in use, and the `<product>.` prefix rule for a key owned by one product, are documented in the agents guide ([`agents.md#gx`](../guides/agents.md#gx)) |
+| `metadata` | map<string, string> | **open extension channel** — the one field a client may extend without coordinating with the server. The params struct carries `#[serde(deny_unknown_fields)]` per the strict-server convention above, so a new *named* field on this op is a **request-schema change**, not an additive one: an older UI or `roost-session` answers `unknown-field` and drops the whole report, attention included. `lifecycle_if` was added that way in plan 046 — both server implementations changed together, and `protocol_version` did not move because `roostctl` and the UI ship as one build. Anything an adapter can express as data belongs in `metadata` instead. Adapter-stamped keys already in use, and the `<product>.` prefix rule for a key owned by one product, are documented in the agents guide ([`agents.md#metadata-keys`](../guides/agents.md#metadata-keys)) |
 
 `ownership_action` semantics, enforced under one lock so the check and
 the mutation can't race a concurrent report:
@@ -1601,9 +1601,22 @@ the mutation can't race a concurrent report:
   `ROOST_TAB_ID`, and honoring it would evict the owner and then
   release the tab out from under it. The same `source` under a new
   `session_id` still supersedes, since that is the agent switching
-  sessions itself. `manual` and `legacy` claims always supersede. A tab
-  whose shell has no integration (`shell_state: "unknown"`) never
-  treats a claim as nested.
+  sessions itself, with one exception: a `claude` claim whose
+  `metadata.source` is `"startup"` (Claude's `SessionStart` source) is a
+  new Claude process, such as a `claude -p` run from a tool call, and is
+  nested too. `clear`, `resume` and `compact` still supersede. `manual`
+  and `legacy` claims always supersede. A tab whose shell has no
+  integration (`shell_state: "unknown"`) never treats a claim as nested
+  by these rules.
+
+  While a `working` or `blocked` [program-status](#tabprogram_status-osc-7501)
+  record of the owner's own agent decides the tab, that record, not
+  `agent_lifecycle`, says the owner is mid-turn: a `claude` claim with
+  `metadata.source = "startup"` and a new `session_id` is dropped as
+  `nested_claim` when the shell is in `foreground_process`. An `idle`
+  or `done` record does not count. Only a prompt mark ends a live
+  record, so with no shell integration a Claude killed mid-turn would
+  otherwise refuse every Claude started after it.
 * **`preserve`** requires the report's `(source, session_id)` to match
   the current owner; a mismatch is dropped (see `accepted` below).
   `detail`/`metadata` **merge** onto the existing owner rather than
@@ -3890,7 +3903,7 @@ Response:
 
 **Only a file agent is raised.** A host connects every other agent through the tab environment or the agent's own OSC 7501 reports: it is on wherever the host never answered, and an answer given on the host stands, so naming one writes neither its switch nor its config file and comes back as `"no file needed"`. (The same call still wires a file agent the host already allows whose file needs it.) A file agent (today only Cursor) is switched on in the host's `agent-integration`, every other answer there kept, and added to its `agent-hooks` shadow, then wired. Both keys, because the host's next session start narrows the shadow to `agent-integration` and retires the file of any agent that key leaves off.
 
-**This op only ever raises the switches, never lowers them (plan 064 §3.3).** The file agents in `agents` are unioned into whatever the host already says — `off`, unanswered, or a narrower list — and the union is what gets wired. There is no wire spelling of "off" or "narrow this" here: a client whose own `agent-hooks` is `off`, or unconfigured, has no allow-list to raise a host with, so it sends this op **not at all**. Switching an agent off on a host stays a deliberate, local act, run by hand on the host itself: `roostctl agent set <list|off> --local`, or an edit of its `agent-integration`. `roostctl agent uninstall cursor` takes the file out but leaves the switch on, so the host's next start and ensure put it back. `removed` is therefore always empty from this op; the field stays on the reply shape because [`agent.set_hooks`](#agentset_hooks) — an explicit local set, not a raise — can populate it for the *local* machine.
+**This op only ever raises the switches, never lowers them (plan 064 §3.3).** The file agents in `agents` are unioned into whatever the host already says — `off`, unanswered, or a narrower list — and the union is what gets wired. There is no wire spelling of "off" or "narrow this" here: a client whose own `agent-hooks` is `off`, or unconfigured, has no allow-list to raise a host with, so it sends this op **not at all**. Switching an agent off on a host stays a deliberate, local act, run by hand on the host itself: `roostctl agent set <list|off> --local`, or an edit of its `agent-integration`. `roostctl agent uninstall cursor` run there takes the file out and switches Cursor off too. `removed` is therefore always empty from this op; the field stays on the reply shape because [`agent.set_hooks`](#agentset_hooks) — an explicit local set, not a raise — can populate it for the *local* machine.
 
 `agents` must be non-empty and carry no blank element; both are `invalid-param`. **A name the host does not recognise is not** — it comes back as `{"agent": "gemini", "reason": "unknown"}` in `skipped`, and the names the host *does* know are wired. [Protocol equality](#versioning) pins one wire generation, not one agent set: a newer Roost can ship an adapter inside the same generation, so refusing the whole raise on an unfamiliar name is what would keep a newly supported agent switched off forever. A list with **no** recognised name at all is a successful, empty run — everything `skipped`, `wired` empty, nothing written, including the key. `skipped[].reason` remains free text for the client to show or log verbatim. `client` is required — it is recorded as `by` in the host's state record, which is what makes two clients of one host tellable apart.
 

@@ -1,24 +1,22 @@
-//! One case per row of plan 046 §3.1's grok/gx table and plan 051's
+//! One case per row of plan 046 §3.1's grok table and plan 051's
 //! `Stop`-gate / `StopFailure` rules, plus the malformed-input edges
 //! every adapter is required to survive.
 //!
-//! `PermissionDenied` and `PostToolUseFailure` have not been observed in
-//! either probe (auto-approve was on, no tool failed); those two are
-//! pinned here by synthetic payloads alone. `StopFailure` now has a
-//! fixture (`gx-failure.jsonl`) — the payload shapes it does not carry
-//! are still synthetic.
+//! `PermissionDenied`, `PostToolUseFailure`, the `Stop` gate and
+//! `StopFailure` have not been observed in the grok probe (auto-approve
+//! was on, no tool failed, no gate was set); those are pinned here by
+//! synthetic payloads alone.
 
 use roost_agent::grok::{grok_event_to_reports, GROK_HOOK_EVENTS, SOURCE};
 use roost_ipc::agent::{
-    apply_report, validate_report, AgentLifecycle, AgentTabState, AttentionOp, OwnershipAction,
-    Severity, TabAgentReportParams,
+    validate_report, AgentLifecycle, AttentionOp, OwnershipAction, Severity, TabAgentReportParams,
 };
 use serde_json::{json, Value};
 
 const TAB: i64 = 7;
 
-/// Every grok/gx payload carries this key (verified across all 53
-/// fixture records between the two agents) — every helper below adds it
+/// Every grok payload carries this key (verified across every record of
+/// the grok fixture) — every helper below adds it
 /// so a hand-built payload passes the adapter's own gate the same way a
 /// real one does.
 fn grok(fields: Value) -> Value {
@@ -169,7 +167,7 @@ fn other_notification_types_leave_lifecycle_unchanged() {
     assert_eq!(report.detail, "something_else");
 }
 
-/// The first fire, spelled the way a real gx payload spells it.
+/// The first fire, spelled the way a real grok payload spells it.
 #[test]
 fn stop_without_background_tasks_finishes() {
     let report = only(
@@ -234,7 +232,7 @@ fn a_session_end_stop_fire_changes_nothing() {
         assert_eq!(report.lifecycle_if, None, "{reason}");
         assert_eq!(report.attention, AttentionOp::Preserve, "{reason}");
         assert_eq!(report.detail, format!("stop:{reason}"));
-        // gx omits both arrays on this fire; nothing may be stamped.
+        // grok omits both arrays on this fire; nothing may be stamped.
         assert!(report.metadata.is_empty(), "{reason}");
     }
 }
@@ -309,10 +307,11 @@ fn stop_failure_maps_to_failed() {
     assert_eq!(report.detail, "rate_limit");
 }
 
-/// gx emits only the camelCase spelling; the snake key never exists in
-/// a real payload, which is why the body used to be the bare fallback.
+/// grok emits only the camelCase spelling; the snake key never exists
+/// in a real payload, which is why the body used to be the bare
+/// fallback.
 #[test]
-fn stop_failure_carries_gxs_camelcase_error_details() {
+fn stop_failure_carries_the_camelcase_error_details() {
     let report = only(
         "StopFailure",
         &grok(json!({
@@ -360,7 +359,7 @@ fn stop_failure_prefers_the_snake_spelling_when_both_are_present() {
     assert_eq!(report.body, "snake");
 }
 
-/// gx fires this immediately before the `StopFailure` for the same turn,
+/// grok fires this immediately before the `StopFailure` for the same turn,
 /// which carries the same text with the right severity.
 #[test]
 fn an_agent_error_notification_is_silent() {
@@ -456,8 +455,6 @@ fn malformed_payloads_do_not_panic() {
         grok(json!({ "session_id": "s-1", "reason": 7, "stopHookActive": "true" })),
         grok(json!({ "session_id": "s-1", "reason": [], "stopHookActive": 1 })),
         grok(json!({ "session_id": "s-1", "reason": "", "errorDetails": 42 })),
-        grok(json!({ "session_id": "s-1", "gxRemote": {} })),
-        grok(json!({ "session_id": "s-1", "gxRemote": ["x"] })),
     ];
     for event in GROK_HOOK_EVENTS {
         for payload in &payloads {
@@ -476,135 +473,10 @@ fn every_report_carries_source_grok_and_the_payload_session_id() {
         "message": "m",
         "notificationType": "idle_prompt",
         "error": "overloaded",
-        "gxRemote": "http://127.0.0.1:2421",
     }));
     for event in GROK_HOOK_EVENTS {
         let report = only(event, &payload);
         assert_eq!(report.source, "grok", "{event}");
         assert_eq!(report.session_id, "s-42", "{event}");
-        assert_eq!(
-            report.metadata["gx.remote"], "http://127.0.0.1:2421",
-            "{event}"
-        );
     }
-}
-
-// ---------------------------------------------------------------------
-// §3.3 (plan 051) — the `gx.remote` metadata key
-// ---------------------------------------------------------------------
-
-/// A token-free loopback base URL is stamped unchanged; anything else —
-/// absent, empty, non-string, `https`, a non-loopback host, a userinfo,
-/// a missing/zero/out-of-range port, or trailing path/query/fragment —
-/// leaves the key absent, with no other effect on the report.
-#[test]
-fn gx_remote_is_stamped_only_for_a_token_free_loopback_base_url() {
-    let rejected = [
-        json!(null),
-        json!(""),
-        json!(42),
-        json!(true),
-        json!("https://127.0.0.1:2421"),
-        json!("http://10.0.0.5:2421"),
-        json!("http://127.0.0.1:2421/"),
-        json!("http://127.0.0.1:2421?token=x"),
-        json!("http://127.0.0.1:2421#f"),
-        json!("http://user@127.0.0.1:2421"),
-        json!("http://127.0.0.1"),
-        json!("http://127.0.0.1:0"),
-        json!("http://127.0.0.1:70000"),
-        json!("http://localhost:2421/x"),
-    ];
-    for value in rejected {
-        let report = only(
-            "PreToolUse",
-            &grok(json!({ "session_id": "s-1", "gxRemote": value.clone() })),
-        );
-        assert!(
-            !report.metadata.contains_key("gx.remote"),
-            "{value} must not be stamped"
-        );
-    }
-    // Missing entirely, as opposed to present-but-null/empty above.
-    let report = only("PreToolUse", &grok(json!({ "session_id": "s-1" })));
-    assert!(!report.metadata.contains_key("gx.remote"));
-
-    let accepted = [
-        "http://127.0.0.1:2421",
-        "http://localhost:2421",
-        "http://[::1]:2421",
-        "http://127.0.0.1:65535",
-    ];
-    for value in accepted {
-        let report = only(
-            "PreToolUse",
-            &grok(json!({ "session_id": "s-1", "gxRemote": value })),
-        );
-        assert_eq!(report.metadata["gx.remote"], value, "{value}");
-    }
-}
-
-/// The lane binds asynchronously, so `gxRemote` can appear partway
-/// through a session. Driven through [`apply_report`] rather than just
-/// inspecting each report's own metadata, because "still present" after
-/// a report that carries no `gxRemote` is a claim about the *merged
-/// server state*, not about the adapter: a `Preserve` report's empty
-/// metadata means "says nothing about it", so the key survives; only a
-/// fresh `Claim` (a new `SessionStart`) replaces the whole map and
-/// resets it — the only "delete" that exists for this key.
-#[test]
-fn gx_remote_appears_mid_session_and_resets_only_on_a_new_claim() {
-    let mut state = AgentTabState::default();
-    const NOW: i64 = 1_757_000_000;
-
-    let apply = |state: &AgentTabState, event: &str, payload: &Value| {
-        let reports = grok_event_to_reports(event, payload, TAB);
-        assert_eq!(reports.len(), 1, "{event}");
-        let report = &reports[0];
-        validate_report(report).expect("every emitted report must be valid");
-        apply_report(state, report, NOW).state
-    };
-
-    // SessionStart without gxRemote: key absent.
-    state = apply(
-        &state,
-        "SessionStart",
-        &grok(json!({ "session_id": "s-1", "source": "new" })),
-    );
-    assert_eq!(
-        state.ownership.as_ref().unwrap().metadata.get("gx.remote"),
-        None
-    );
-
-    // PreToolUse with it: present.
-    state = apply(
-        &state,
-        "PreToolUse",
-        &grok(json!({
-            "session_id": "s-1",
-            "gxRemote": "http://127.0.0.1:2421",
-        })),
-    );
-    assert_eq!(
-        state.ownership.as_ref().unwrap().metadata["gx.remote"],
-        "http://127.0.0.1:2421"
-    );
-
-    // PostToolUse without it: still present (merge-only).
-    state = apply(&state, "PostToolUse", &grok(json!({ "session_id": "s-1" })));
-    assert_eq!(
-        state.ownership.as_ref().unwrap().metadata["gx.remote"],
-        "http://127.0.0.1:2421"
-    );
-
-    // A new SessionStart (a Claim) without it: absent again.
-    state = apply(
-        &state,
-        "SessionStart",
-        &grok(json!({ "session_id": "s-2", "source": "new" })),
-    );
-    assert_eq!(
-        state.ownership.as_ref().unwrap().metadata.get("gx.remote"),
-        None
-    );
 }

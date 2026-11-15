@@ -83,9 +83,9 @@ const text = (value) =>
 // `String(new URL("http://127.0.0.1:4096"))` is
 // `"http://127.0.0.1:4096/"`. Roost's validator wants the bare origin,
 // and a consumer concatenates `/session` onto whatever it is given, so
-// the single canonical shape is settled here rather than by loosening a
-// validator shared with `gx.remote` — otherwise a perfectly reachable
-// external server is dropped and its session degrades to status-only.
+// the single canonical shape is settled here rather than by loosening
+// Roost's loopback validator — otherwise a perfectly reachable external
+// server is dropped and its session degrades to status-only.
 const announced = (value) => {
   const raw = text(typeof value === "string" ? value : String(value ?? ""));
   if (!raw || !raw.endsWith("/")) return raw;

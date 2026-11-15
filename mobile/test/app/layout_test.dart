@@ -24,7 +24,7 @@ void main() {
       await tester.tap(byKey('host-card-devbox'));
       await tester.pumpAndSettle();
       expect(byKey('compact-projects'), findsOneWidget);
-      expect(find.text('grok-build'), findsOneWidget);
+      expect(find.text('craze'), findsOneWidget);
       expect(
         find.text('1702/2417 passed'),
         findsOneWidget,

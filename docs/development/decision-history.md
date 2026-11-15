@@ -218,7 +218,7 @@ records.]*
 
 ### DL-14: Ownership is a label, not a suppression switch (2026-07-27)
 
-Status (2026-11-08): **Current, amended in place** by plan 052 and on 2026-10-10; both amendments are in the text below.
+Status (2026-11-14): **Current, amended in place** by plan 052, on 2026-10-10 and on 2026-11-14; the amendments are in the text below.
 
 Ownership identity is the **pair** `(source, session_id)`, not
 `session_id` alone — two agents could otherwise collide on an opaque
@@ -243,6 +243,15 @@ under a foreground process is a *nested* agent the owner is running,
 which inherited `ROOST_TAB_ID`, and it is dropped. The shell axis,
 not a timestamp, makes that call, so AD-3 stands. See
 [`tab.agent_report`](../reference/ipc.md#tabagent_report).)
+(Amended 2026-11-14, #623: a claim from the owner's own source is
+nested too when it is a new Claude process, a `claude` claim whose
+start source, `metadata.source`, is `startup`, such as a `claude -p` run
+from a tool call. While the owner's own `working` or `blocked` OSC 7501
+record decides the tab, that record says the owner is mid-turn, since
+the hook lifecycle is held then; the foreground process is still
+required, since only a prompt mark ends a record. `clear`, `resume`
+and `compact` still supersede, and so does a `claude -p --resume`;
+herdr draws the same line.)
 
 Raw-OSC suppression (dropping OSC 9/99/777 while a live agent owns the
 tab) is the **one exception that gets a real failsafe**, because it's
@@ -1303,6 +1312,53 @@ one terminal in a tab. Lifting the non-goal does not schedule splits: they
 are a possible future feature, behind the other directions under discovery.
 Until a plan lands, a tab is one terminal. This amends the
 [non-goals](vision.md#non-goals) the same way DL-34 did.
+
+### DL-36: Roost connects agents without writing their configs (2026-11-08)
+
+Status (2026-11-14): **Current.** Built in #719 (merged 2026-11-11); gx
+support was removed in the cleanup after it. Not yet released.
+
+Decided by Charlie on 2026-11-08 (`discovery/agent-integration.md`, key
+questions 1 to 9 and 15). It replaces plan 064's consent model, which
+had no DL: Roost wired every agent by merging hook entries into the
+agent's own config files, once the user said yes.
+
+- **Nothing written by default.** Claude Code gets Roost's hooks and
+  skill from a plugin folder Roost owns, named in
+  `CLAUDE_CODE_PLUGIN_DIRS`; OpenCode gets its plugin from
+  `OPENCODE_CONFIG_CONTENT`. Both are merged into the tab's environment
+  beside the user's own values, so nothing is written under `~/.claude`
+  or `~/.config/opencode`. Claude Code older than 2.1.280 ignores the
+  variable and is not supported.
+- **Codex and Grok report over OSC 7501 only.** Roost installs nothing
+  for them. A Codex approval banner reads "Needs your input" rather than
+  naming the tool until Codex sends it, which Charlie accepted: the
+  Agents panel and the palette update, show status and are clickable
+  without hooks.
+- **Cursor stays a file opt-in, unchecked.** cursor-agent reads its
+  turn-end hook only from `~/.cursor/hooks.json`. The startup card
+  appears only when Cursor is installed and unanswered; every other
+  agent is on with no question, and each has an off switch.
+- **One key.** `agent-integration` records departures from the
+  defaults. `agent-hooks` is narrowed to the file agents, a shadow that
+  keeps an older Roost on the same machine from putting entries back.
+- **The retire.** Entries an older release wrote are removed once,
+  automatically, and only where Roost can prove it wrote them, each
+  changed file backed up first. Anything else is left in place and
+  reported, and an entry that comes back is reported, not removed again.
+  A `roostctl agent uninstall` is the explicit, looser removal.
+- **Claude's plugin policy.** Where an organization's
+  `disableSideloadFlags` would make Claude exit with the variable set,
+  Roost detects it and leaves Claude's variable out. It never works
+  around the policy.
+- **gx is dropped.** Charlie's grok fork is unmaintained and does not
+  speak 7501, so its fixtures, its `gx.remote` metadata key and every
+  mention in the docs are gone. Grok's hook adapter stays only for a
+  `roost.json` an older release wrote, until the retire removes it.
+
+**Rejected:** a shell function that adds Roost's flags to `codex`, or
+to `claude` under the plugin policy; Claude's `--settings` and `--file`
+fallbacks; keeping Codex's hooks for the tool name.
 
 ## Direction {: #direction-under-evaluation }
 

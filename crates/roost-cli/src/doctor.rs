@@ -1642,13 +1642,8 @@ const MAX_KEY_CHARS: usize = 40;
 /// Metadata keys whose values are safe to print. Everything else prints
 /// its length only — `session_title` is derived from the user's own
 /// prompt, and any adapter can invent new keys.
-const METADATA_VALUE_ALLOWLIST: [&str; 5] = [
-    "model",
-    "source",
-    "background_tasks",
-    "session_crons",
-    "gx.remote",
-];
+const METADATA_VALUE_ALLOWLIST: [&str; 4] =
+    ["model", "source", "background_tasks", "session_crons"];
 
 /// Keys whose value is printable only while it still passes the shape its
 /// producer promised. `tab.agent_report` takes arbitrary metadata and
@@ -1659,7 +1654,7 @@ const METADATA_VALUE_ALLOWLIST: [&str; 5] = [
 /// prints. Anything failing it falls back to the generic length.
 fn revalidated(key: &str, value: &str) -> Option<bool> {
     match key {
-        "server_url" | "gx.remote" => Some(roost_agent::loopback_base_url(value)),
+        "server_url" => Some(roost_agent::loopback_base_url(value)),
         _ => None,
     }
 }
@@ -3361,13 +3356,18 @@ fn agent_wired_check(inputs: &Inputs, agent: Agent) -> Check {
         );
     }
     let (status, detail) = match (row.entries_on_disk, row.wired, row.up_to_date) {
-        (false, None, _) => (
-            Status::Warn,
+        (false, None, _) if !row.on => (
+            Status::Skipped,
             format!(
-                "present, not wired — run `roostctl agent install {}` (or check `agent-hooks` \
-                 in config.conf)",
+                "present, switched off: {} is opt-in, since Roost connects it by writing its \
+                 hooks file — Agent Integration… or `roostctl agent install {}` turns it on",
+                roost_ui_model::agent_palette::agent_display_name(agent.source()),
                 agent.source()
             ),
+        ),
+        (false, None, _) => (
+            Status::Warn,
+            "present and switched on, but not wired — run `roostctl agent ensure`".to_string(),
         ),
         (false, Some(v), _) => (
             Status::Warn,
@@ -3429,8 +3429,14 @@ fn no_file_detail(row: &AgentInstallStatus, policy: Option<&ClaudePolicy>) -> (S
             ),
         );
     }
+    let delivery_kind = roost_agent_install::Delivery::of(row.agent);
     let mut delivery = if row.on {
-        crate::agent_install::delivery_phrase(roost_agent_install::Delivery::of(row.agent))
+        crate::agent_install::delivery_phrase(delivery_kind).to_string()
+    } else if delivery_kind == roost_agent_install::Delivery::Osc7501 {
+        // The switch is recorded, but nothing reads it for an agent that
+        // reports over 7501 on its own.
+        "switched off in agent-integration, but it still reports over OSC 7501: Roost does not \
+         ignore it yet"
             .to_string()
     } else {
         "switched off in agent-integration (Agent Integration… to turn it on)".to_string()
@@ -3515,8 +3521,9 @@ fn hook_binary_check(inputs: &Inputs) -> Check {
             ID,
             TITLE,
             Status::Fail,
-            "ROOST_AGENT_HOOK is unset inside this tab — every installed agent hook falls back \
-             to its inert branch (empty JSON, exit 0), so nothing reaches Roost",
+            "ROOST_AGENT_HOOK is unset inside this tab — every Roost agent hook (the Claude and \
+             OpenCode plugins, Cursor's entry) falls back to its inert branch (empty JSON, exit \
+             0), so nothing reaches Roost",
         ),
         Some(path) if inputs.env_agent_hook_executable => check(
             ID,
@@ -3538,7 +3545,9 @@ fn hook_binary_check(inputs: &Inputs) -> Check {
 
 /// Expected vs present `trusted_hash`, per event codex has a Roost
 /// handler wired for right now. Codex-only: it is the one agent whose
-/// trust store can drift independently of the handler it guards.
+/// trust store can drift independently of the handler it guards. Codex
+/// reports over OSC 7501, so a Roost handler is there only by an explicit
+/// `agent install codex` or as a retire leftover.
 fn agent_codex_trust_check(inputs: &Inputs) -> Check {
     const ID: &str = "agent.codex.trust";
     const TITLE: &str = "Codex — trust hash";
@@ -3546,7 +3555,12 @@ fn agent_codex_trust_check(inputs: &Inputs) -> Check {
         return check(ID, TITLE, Status::Warn, redact(err));
     }
     if inputs.agent_codex_trust.is_empty() {
-        return check(ID, TITLE, Status::Skipped, "nothing wired for codex yet");
+        return check(
+            ID,
+            TITLE,
+            Status::Skipped,
+            "no Roost hook in Codex's config, so nothing to trust: Codex reports over OSC 7501",
+        );
     }
     let drifted: Vec<&str> = inputs
         .agent_codex_trust
@@ -3575,8 +3589,9 @@ fn agent_codex_trust_check(inputs: &Inputs) -> Check {
         TITLE,
         Status::Fail,
         format!(
-            "trusted_hash drift for {} — codex will ask to review the hook again; run \
-             `roostctl agent ensure`",
+            "trusted_hash drift for {} — codex will ask to review the hook again; `roostctl \
+             agent install codex` re-trusts it, or `roostctl agent uninstall codex` removes it \
+             (Codex reports over OSC 7501 without it)",
             drifted.join(", ")
         ),
     )
@@ -3664,8 +3679,8 @@ fn agent_claude_legacy_settings_check(inputs: &Inputs) -> Check {
         }
         (true, true) => format!(
             "~/.config/roost/claude-settings.json still exists and a shell rc still passes \
-             `--settings` at it — so every Claude hook event is delivered twice once agent \
-             hooks are also wired into ~/.claude/settings.json. Remove both: {REMOVE_FILE}, and \
+             `--settings` at it — so every Claude hook event is delivered twice in a Roost tab, \
+             once from that file and once from Roost's plugin. Remove both: {REMOVE_FILE}, and \
              {REMOVE_ALIAS}"
         ),
         (true, false) => format!(
@@ -5585,17 +5600,12 @@ mod tests {
         metadata.insert("model".to_string(), "claude-opus-5".to_string());
         metadata.insert("session_title".to_string(), "fix the \x07 bug".to_string());
         metadata.insert("x".repeat(200), "whatever".to_string());
-        metadata.insert("gx.remote".to_string(), "http://127.0.0.1:2421".to_string());
         metadata.insert(
             "server_url".to_string(),
             "http://127.0.0.1:41234".to_string(),
         );
         let out = redact_metadata(&metadata);
         assert!(out.contains("model=claude-opus-5"), "{out}");
-        assert!(
-            out.contains("gx.remote=http://127.0.0.1:2421"),
-            "an allowlisted key must print verbatim: {out}"
-        );
         assert!(
             out.contains("server_url=http://127.0.0.1:41234"),
             "a loopback URL is not a secret and is what makes the \
@@ -7938,11 +7948,54 @@ mod tests {
         );
         assert_eq!(unknown.status, Some(Status::Ok));
         assert!(unknown.detail.contains("timed out"), "{}", unknown.detail);
+
+        // Nothing reads a 7501 agent's switch yet, so doctor does not say
+        // it is off as if that stopped it.
+        let grok_off = detail(&inputs(Agent::Grok, false, None), "agent.grok.wired");
+        assert_eq!(grok_off.status, Some(Status::Ok));
+        assert!(
+            grok_off.detail.contains("still reports over OSC 7501"),
+            "{}",
+            grok_off.detail
+        );
+    }
+
+    /// Cursor is opt-in and off by default: an unwired Cursor that is
+    /// switched off is the user's choice, not something to fix.
+    #[test]
+    fn a_switched_off_cursor_is_not_a_warning() {
+        let inputs = |on| Inputs {
+            agent_status: vec![AgentInstallStatus {
+                on,
+                ..make_agent_status(Agent::Cursor, true, false, None, false, None, vec![])
+            }],
+            ..healthy()
+        };
+        let off = find(&evaluate(&inputs(false)), "agent.cursor.wired").clone();
+        assert_eq!(off.status, Some(Status::Skipped));
+        assert!(off.detail.contains("opt-in"), "{}", off.detail);
+        assert!(
+            off.detail.contains("`roostctl agent install cursor`"),
+            "{}",
+            off.detail
+        );
+        assert!(!off.detail.contains("agent-hooks"), "{}", off.detail);
+
+        let on = find(&evaluate(&inputs(true)), "agent.cursor.wired").clone();
+        assert_eq!(on.status, Some(Status::Warn));
+        assert!(
+            on.detail.contains("`roostctl agent ensure`"),
+            "{}",
+            on.detail
+        );
     }
 
     #[test]
     fn agent_codex_trust_check_covers_every_status() {
-        assert_status(&evaluate(&healthy()), "agent.codex.trust", Status::Skipped);
+        let none = find(&evaluate(&healthy()), "agent.codex.trust").clone();
+        assert_eq!(none.status, Some(Status::Skipped));
+        assert!(none.detail.contains("OSC 7501"), "{}", none.detail);
+        assert!(!none.detail.contains("wired"), "{}", none.detail);
 
         let errored = Inputs {
             agent_codex_trust_error: Some("hooks.json: not valid UTF-8".into()),
@@ -7980,6 +8033,11 @@ mod tests {
         let c = find(&evaluate(&drifted), "agent.codex.trust").clone();
         assert_eq!(c.status, Some(Status::Fail));
         assert!(c.detail.contains("SessionStart"), "{}", c.detail);
+        assert!(
+            c.detail.contains("`roostctl agent install codex`"),
+            "ensure no longer touches Codex: {}",
+            c.detail
+        );
         assert!(
             !c.detail.contains("Stop,"),
             "only the drifted event: {}",

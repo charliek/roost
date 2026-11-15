@@ -372,18 +372,18 @@ class FakeCore implements RoostCore {
       ),
       _FakeProject(
         id: 2,
-        name: 'grok-build',
-        cwd: '~/projects/grok-build',
+        name: 'craze',
+        cwd: '~/projects/craze',
         tabs: [
           _FakeTab(
               const TabView(
                 id: 21,
-                title: 'gx · leader fix',
-                cwd: '~/projects/grok-build',
+                title: 'craze · acp fix',
+                cwd: '~/projects/craze',
                 agent: AgentBadge.working,
                 statusText: 'running · 14m',
               ),
-              cwd: '~/projects/grok-build',
+              cwd: '~/projects/craze',
             )
             ..shell.write(
               '● Reading crates/leader/src/lib.rs\n',
@@ -393,10 +393,10 @@ class FakeCore implements RoostCore {
             const TabView(
               id: 22,
               title: 'zsh',
-              cwd: '~/projects/grok-build',
+              cwd: '~/projects/craze',
               agent: AgentBadge.idle,
             ),
-            cwd: '~/projects/grok-build',
+            cwd: '~/projects/craze',
           )..shell.prompt(),
         ],
       ),
