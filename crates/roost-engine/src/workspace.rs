@@ -2415,7 +2415,8 @@ impl Workspace {
                 if tick {
                     row.process.request_tick();
                 }
-                row.process.take_request(*tab_id, &row.program_status)
+                row.process
+                    .take_request(*tab_id, &row.program_status, &row.agent)
             })
             .collect()
     }
@@ -2427,9 +2428,8 @@ impl Workspace {
         inner.tabs.values().any(|row| row.process.ticks())
     }
 
-    /// Ask `tab_id`'s process layer for a sample, where it has something
-    /// to read: a session's viewer came or went, which is the only focus
-    /// a session sees.
+    /// Ask `tab_id`'s process layer for a sample or a look: a session's
+    /// viewer came or went, which is the only focus a session sees.
     #[cfg(feature = "server-vt")]
     pub(crate) fn request_process_sample(&self, tab_id: i64) {
         let wake = self
@@ -2483,6 +2483,19 @@ impl Workspace {
             tracing::info!(
                 tab_id = request.tab_id,
                 "the program's process is gone and its group left the terminal; ended its live records"
+            );
+        }
+        if let Some(agent) = ended.named {
+            tracing::debug!(
+                tab_id = request.tab_id,
+                agent,
+                "named the agent in front by its process"
+            );
+        }
+        if ended.identity {
+            tracing::debug!(
+                tab_id = request.tab_id,
+                "the agent named by its process is gone"
             );
         }
         if wake {
@@ -3078,13 +3091,14 @@ impl Default for Workspace {
 type Selection = (i64, i64);
 
 impl Inner {
-    /// Ask each of `tab_ids`' process layers for a sample, where it has
-    /// something to read. Answers whether any asked.
+    /// Someone looked at each of `tab_ids`: ask its process layer for a
+    /// sample, or a look for an agent in front to name
+    /// ([`ProcessAxis::request_look`]). Answers whether any asked.
     fn request_process_samples(&mut self, tab_ids: &[i64]) -> bool {
         let mut asked = false;
         for tab_id in tab_ids {
             if let Some(row) = self.tabs.get_mut(tab_id) {
-                asked |= row.process.request_sample();
+                asked |= row.process.request_look(&row.agent);
             }
         }
         asked
@@ -8563,7 +8577,7 @@ mod tests {
         use roost_ipc::process::{Liveness, ProcessState, Stamp};
         use roost_ipc::program_status::PromptMark;
 
-        use crate::foreground::ProcessSample;
+        use crate::foreground::{Leader, ProcessSample};
 
         const T: i64 = 1_793_158_450_000;
         const AGENT: Stamp = Stamp {
@@ -8601,7 +8615,7 @@ mod tests {
                 let sample = ProcessSample {
                     incarnation: 1,
                     foreground,
-                    leader,
+                    leader: leader.map(|stamp| Leader { stamp, agent: None }),
                     liveness: request
                         .stamps
                         .iter()
@@ -9015,6 +9029,112 @@ mod tests {
                     .map(|request| request.tab_id)
                     .collect::<Vec<_>>(),
                 vec![tid]
+            );
+        }
+
+        /// What the sampler would apply for every request now due, with
+        /// `named` the leader in front of tab `at` — cursor-agent — and the
+        /// shell in front of every other.
+        fn look(ws: &Workspace, at: i64, liveness: Liveness) -> Vec<i64> {
+            let requests = ws.take_process_requests(false);
+            for request in &requests {
+                let in_front = request.tab_id == at;
+                let sample = ProcessSample {
+                    incarnation: 1,
+                    foreground: if in_front {
+                        Foreground::Group(AGENT.pgid)
+                    } else {
+                        Foreground::Shell
+                    },
+                    leader: in_front.then_some(Leader {
+                        stamp: AGENT,
+                        agent: Some("cursor"),
+                    }),
+                    liveness: request
+                        .stamps
+                        .iter()
+                        .map(|stamp| (*stamp, liveness))
+                        .collect(),
+                };
+                ws.apply_process_sample(request, &sample);
+            }
+            requests.iter().map(|request| request.tab_id).collect()
+        }
+
+        /// U22: an agent no one owns and no record names is looked for
+        /// when its tab gains or loses the focus, never on the tick; once
+        /// named, it is on the wire, ticked, and ends by the same rule as
+        /// any stamp.
+        #[test]
+        fn an_agent_named_by_its_process_is_found_at_blur_and_ends_like_any_stamp() {
+            let (ws, tid, fg) = probed_ws();
+            let project = ws.tab(tid).unwrap().project_id;
+            let other = ws
+                .open_tab(project, "/", "", true, TabOpener::None)
+                .unwrap()
+                .id;
+            ws.focus_tab(tid).unwrap();
+            look(&ws, 0, Liveness::Running);
+            assert_eq!(ws.tab(tid).unwrap().process, None);
+
+            assert!(
+                ws.take_process_requests(true).is_empty(),
+                "the tick never looks, whatever runs in front"
+            );
+            assert!(!ws.holds_process_stamps());
+
+            let mut rx = ws.subscribe();
+            ws.focus_tab(other).unwrap();
+            assert!(
+                look(&ws, tid, Liveness::Running).contains(&tid),
+                "the blurred tab is looked at"
+            );
+            let tab = ws.tab(tid).unwrap();
+            let process = tab.process.clone().expect("named");
+            assert_eq!(
+                (process.agent.as_str(), process.pid, process.state),
+                ("cursor", AGENT.pid, ProcessState::Running)
+            );
+            assert_eq!(tab.ownership, None, "no owner is made up");
+            assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
+            assert!(drain(&mut rx).iter().any(|event| matches!(
+                event,
+                WorkspaceEvent::AgentChanged { process: Some(process), .. }
+                    if process.agent == "cursor"
+            )));
+            assert!(ws.holds_process_stamps());
+            assert_eq!(
+                ws.take_process_requests(true)
+                    .iter()
+                    .map(|request| request.tab_id)
+                    .collect::<Vec<_>>(),
+                vec![tid],
+                "a named agent is ticked"
+            );
+
+            *fg.lock().unwrap() = Foreground::Shell;
+            mark(&ws, tid, PromptMark::CommandEnd { exit_code: Some(0) });
+            sample(&ws, Foreground::Shell, None, Liveness::Gone);
+            assert_eq!(ws.tab(tid).unwrap().process, None);
+            assert!(drain(&mut rx)
+                .iter()
+                .any(|event| matches!(event, WorkspaceEvent::AgentChanged { process: None, .. })));
+            assert!(!ws.holds_process_stamps());
+        }
+
+        /// A session's viewer coming or going is its focus: on a tab
+        /// nothing follows, it looks for an agent in front.
+        #[cfg(feature = "server-vt")]
+        #[test]
+        fn a_viewer_coming_or_going_looks_for_an_agent() {
+            use crate::tab_task::ServerVtWorkspace;
+            let (ws, tid, _) = probed_ws();
+            assert!(ws.take_process_requests(false).is_empty());
+            ws.tab_viewers_changed(tid);
+            assert_eq!(look(&ws, tid, Liveness::Running), vec![tid]);
+            assert_eq!(
+                ws.tab(tid).unwrap().process.map(|process| process.agent),
+                Some("cursor".to_owned())
             );
         }
 

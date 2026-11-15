@@ -498,7 +498,7 @@ async fn sample(
             .into_iter()
             .filter_map(|request| {
                 reader
-                    .sample_process(request.tab_id, request.stamp_wanted, &request.stamps)
+                    .sample_process(request.tab_id, request.leader_wanted, &request.stamps)
                     .map(|sample| (request, sample))
             })
             .collect::<Vec<_>>()

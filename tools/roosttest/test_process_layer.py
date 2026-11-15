@@ -27,6 +27,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -475,6 +476,123 @@ def test_a_pipeline_keeps_its_owner_and_a_waiting_wrapper_ends_with_its_agent(la
         assert "process" not in listed, listed
     finally:
         kill_group(wrapper)
+
+
+SLEEPER = "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n"
+
+
+def named_agent(directory: str, name: str) -> str:
+    """A command running something Roost names by its process, made in
+    `directory`: a binary called `name`. Linux names a process after the
+    path it ran as, so a copied `sleep` will do; macOS names it after the
+    binary, and kills a copied system one, so it is a sleeper built with
+    `cc` — or, with no compiler, `node` running `<name>/index.js`, as
+    cursor-agent's own launcher runs its script."""
+    agent = os.path.join(directory, name)
+    if sys.platform.startswith("linux"):
+        shutil.copy(shutil.which("sleep") or "/bin/sleep", agent)
+        return f"'{agent}' 300"
+    cc = shutil.which("cc")
+    if cc is not None:
+        subprocess.run([cc, "-x", "c", "-o", agent, "-"], input=SLEEPER, text=True, check=True)
+        return f"'{agent}'"
+    node = shutil.which("node")
+    if node is None:
+        message = "neither cc nor node found; macOS names a process after its binary"
+        if os.environ.get("CI"):
+            pytest.fail(message)
+        pytest.skip(message)
+    script = os.path.join(directory, name, "index.js")
+    os.makedirs(os.path.dirname(script))
+    with open(script, "w") as handle:
+        handle.write("setTimeout(() => {}, 300000);\n")
+    return f"'{node}' '{script}'"
+
+
+def exec_d(pid: int) -> bool:
+    """`pid` runs its own program, not the shell it was forked from."""
+    return os.path.basename(ps_field(pid, "comm")) not in ("", "bash", "sh")
+
+
+def test_an_agent_named_by_its_process_alone_shows_running_and_goes_with_it(lane, tmp_path):
+    """E13: an agent no hook claims and no record names — cursor-agent
+    with no hooks, Codex at its sign-in screen — is named by its process
+    once someone looks at its tab: here, the focus moving off it. The tab
+    gains `process` with that name and an Agents row reading Running, with
+    no owner made up; once the process is killed and the shell has the
+    terminal back, both go."""
+    command = named_agent(str(tmp_path), "cursor-agent")
+    tab, shell = lane.bash_tab()
+    other = lane.open_tab(BARE_SHELL_ARGV)
+    lane.client.focus(tab)
+    job = lane.in_front(tab, shell, command)
+    lane.client._wait(lambda: exec_d(job), 15.0, f"job {job} to exec")
+
+    lane.client.focus(other)
+    listed = lane.wait(tab, "the agent named", lambda t: "process" in t)
+    process = listed["process"]
+    assert (process["agent"], process["state"], int(process["pid"])) == (
+        "cursor",
+        "running",
+        job,
+    ), process
+    assert listed.get("ownership") is None, listed
+    if lane.name == "iced":
+        row = lane.client.wait_palette_row_field(
+            "agents", f"agent:{tab}", "agent.status_text", "Running"
+        )
+        assert row["agent"]["agent"] == "Cursor", row
+        assert row["agent"]["effective_lifecycle"] == "inactive", row
+
+    os.kill(job, signal.SIGKILL)
+    listed = lane.wait(tab, "the agent gone", lambda t: "process" not in t)
+    assert listed.get("ownership") is None, listed
+    if lane.name == "iced":
+        lane.client._wait(
+            lambda: agent_row(lane, tab) is None, 5.0, f"tab {tab}'s Agents row to go"
+        )
+
+
+def test_a_7501_agent_that_clears_as_it_stops_reads_suspended_by_its_process(lane, tmp_path):
+    """Codex clears its own OSC 7501 status as it stops, so a Ctrl-Z
+    leaves its records nothing to set aside; its process's name still
+    names it. Once the shell's `D` has the terminal back, the read it asks
+    for finds the process stopped and the tab reads `codex` suspended,
+    with the Agents row Suspended; after `fg` the tick finds it running,
+    and once it is killed, `process` goes."""
+    tab, shell = lane.bash_tab()
+    lane.open_tab(BARE_SHELL_ARGV)  # the active one, so `tab` is not watched
+    job = lane.in_front(tab, shell, named_agent(str(tmp_path), "codex"))
+    lane.client._wait(lambda: exec_d(job), 15.0, f"job {job} to exec")
+    lane.client.tab_feed_pty_bytes(tab, osc7501(state="working", app="codex"))
+    listed = lane.wait(tab, "the record's stamp", lambda t: "process" in t)
+    assert int(listed["process"]["pid"]) == job, listed
+
+    lane.client.tab_feed_pty_bytes(tab, osc7501(state="clear", app="codex"))
+    lane.client.send(tab, b"\x1a")
+    listed = lane.wait(
+        tab,
+        "the agent suspended, named by its process",
+        lambda t: t.get("process", {}).get("state") == "suspended",
+    )
+    assert (listed["process"]["agent"], int(listed["process"]["pid"])) == ("codex", job), listed
+    assert listed["state"] == "none", listed
+    assert "program_status" not in listed, listed
+    if lane.name == "iced":
+        row = lane.client.wait_palette_row_field(
+            "agents", f"agent:{tab}", "agent.status_text", "Suspended"
+        )
+        assert row["agent"]["agent"] == "Codex", row
+
+    lane.client.send(tab, "fg\n")
+    lane.wait(
+        tab,
+        "the agent running again",
+        lambda t: t.get("process", {}).get("state") == "running",
+    )
+
+    os.kill(job, signal.SIGKILL)
+    lane.wait(tab, "the agent gone", lambda t: "process" not in t)
 
 
 # ---------------------------------------------------------------------------

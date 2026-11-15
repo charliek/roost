@@ -48,6 +48,29 @@
       "expect": "today"
     },
     {
+      "name": "an-unstamped-identity-is-never-released-by-a-mark",
+      "layer": "identity",
+      "stamp": null,
+      "fg": "shell",
+      "expect": "today"
+    },
+    {
+      "name": "an-unstamped-identity-takes-today-s-mark-whoever-is-in-front",
+      "layer": "identity",
+      "stamp": null,
+      "fg": {
+        "group": 900
+      },
+      "expect": "today"
+    },
+    {
+      "name": "an-unstamped-identity-takes-today-s-mark-when-nothing-is-known",
+      "layer": "identity",
+      "stamp": null,
+      "fg": "unknown",
+      "expect": "today"
+    },
+    {
       "name": "a-stamped-owner-parks-when-the-shell-takes-the-terminal-back",
       "layer": "owner",
       "stamp": {
@@ -163,6 +186,70 @@
     {
       "name": "stamped-records-take-today-s-mark-when-nothing-is-known",
       "layer": "records",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "fg": "unknown",
+      "expect": "today"
+    },
+    {
+      "name": "a-stamped-identity-parks-when-the-shell-takes-the-terminal-back",
+      "layer": "identity",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "fg": "shell",
+      "expect": "park"
+    },
+    {
+      "name": "a-mark-from-the-stamped-identity-s-own-group-is-today-s",
+      "layer": "identity",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "fg": {
+        "group": 700
+      },
+      "expect": "today"
+    },
+    {
+      "name": "a-stamped-identity-parks-while-another-job-is-in-front",
+      "layer": "identity",
+      "stamp": {
+        "pid": 700,
+        "start": [
+          12345,
+          0
+        ],
+        "pgid": 700,
+        "sid": 500
+      },
+      "fg": {
+        "group": 900
+      },
+      "expect": "park"
+    },
+    {
+      "name": "a-stamped-identity-takes-today-s-mark-when-nothing-is-known",
+      "layer": "identity",
       "stamp": {
         "pid": 700,
         "start": [

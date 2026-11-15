@@ -208,7 +208,7 @@ fn every_group_is_represented_and_non_trivial() {
         ("rank", 5),
         ("transitions", 18),
         ("shell_marks", 7),
-        ("process", 30),
+        ("process", 37),
     ]
     .into_iter()
     .collect();

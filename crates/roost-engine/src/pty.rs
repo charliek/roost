@@ -1169,7 +1169,7 @@ impl PtySupervisor {
     }
 
     /// One read of `tab_id`'s processes for its process layer: who has the
-    /// terminal, the leader in front when `stamp_wanted`, and whether each
+    /// terminal, the leader in front when `leader_wanted`, and whether each
     /// of `stamps` still runs. `None` when the tab has no PTY, or its
     /// child was reaped during the read.
     ///
@@ -1179,7 +1179,7 @@ impl PtySupervisor {
     pub(crate) fn sample_process(
         &self,
         tab_id: i64,
-        stamp_wanted: bool,
+        leader_wanted: bool,
         stamps: &[Stamp],
     ) -> Option<ProcessSample> {
         let (child, latch, fd, incarnation, runs_a_shell) = {
@@ -1199,8 +1199,8 @@ impl PtySupervisor {
             .and_then(|fd| process_reads::terminal_pgrp(fd.as_fd()))
             .or_else(|| process_reads::tpgid_of(child));
         let foreground = process_reads::foreground_of(pgrp, child, runs_a_shell);
-        let leader = stamp_wanted
-            .then(|| process_reads::stamp_leader(child))
+        let leader = leader_wanted
+            .then(|| process_reads::leader_in_front(child))
             .flatten();
         let liveness = stamps
             .iter()
@@ -4081,7 +4081,9 @@ mod tests {
         };
         let sample = sup.sample_process(tab_id, true, &[]).expect("a sample");
         assert_eq!(sample.foreground, Foreground::Group(pgid));
-        let stamp = sample.leader.expect("the job's leader is stamped");
+        let leader = sample.leader.expect("the job's leader is stamped");
+        assert_eq!(leader.agent, None, "sleep is no agent");
+        let stamp = leader.stamp;
         assert_eq!(
             (stamp.pid, stamp.pgid, stamp.sid),
             (pgid, pgid, i64::from(child))
@@ -4144,6 +4146,94 @@ mod tests {
         }
         assert_eq!(sup.foreground(tab_id), Foreground::Unknown);
         assert_eq!(sup.sample_process(tab_id, true, &[]), None);
+    }
+
+    /// The leader in front is named by its process: a binary called
+    /// `cursor-agent`, and `node` running a script under a `cursor-agent`
+    /// directory, read through its argv (when node is installed).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_leader_in_front_is_named_by_its_process() {
+        if !shell_present("bash") {
+            eprintln!("skipping the identity test: bash not found on PATH");
+            return;
+        }
+        let sup = Arc::new(PtySupervisor::new());
+        let tab_id = 537;
+        let _hang_up = crate::application::HangUp(sup.clone(), vec![tab_id]);
+        let argv = ["bash", "--norc", "--noprofile", "-i"].map(String::from);
+        let mut rx = sup
+            .spawn(
+                tab_id,
+                "/tmp",
+                &argv,
+                80,
+                24,
+                std::path::Path::new("/tmp/roost-identity-test.sock"),
+                &TabOpener::None,
+            )
+            .expect("spawn bash");
+        let mut seen = Vec::new();
+        wait_for_output(&mut rx, &mut seen, &[b"$ ", b"# "]).await;
+        let jobs = tempfile::tempdir().unwrap();
+        let named = |job: String| {
+            let sup = sup.clone();
+            async move {
+                sup.write(tab_id, format!("( exec {job} )\n").into_bytes())
+                    .await
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let agent = loop {
+                    if let Some(leader) = sup
+                        .sample_process(tab_id, true, &[])
+                        .and_then(|sample| sample.leader)
+                        .filter(|leader| leader.agent.is_some())
+                    {
+                        break leader.agent;
+                    }
+                    assert!(Instant::now() < deadline, "{job} was never named");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                sup.write(tab_id, b"\x03".to_vec()).await.unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while sup.foreground(tab_id) != Foreground::Shell {
+                    assert!(Instant::now() < deadline, "the shell never came back");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                agent
+            }
+        };
+
+        match crate::foreground::sleeper_named(jobs.path(), "cursor-agent") {
+            Some(agent) => assert_eq!(
+                named(format!("'{}' 30", agent.display())).await,
+                Some("cursor")
+            ),
+            None => eprintln!("skipping the native half: no sleep to copy or cc to build one"),
+        }
+        match which_node() {
+            Some(node) => {
+                let script = jobs.path().join("share/cursor-agent/versions/1/index.js");
+                std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+                std::fs::write(&script, "setTimeout(() => {}, 30000);\n").unwrap();
+                assert_eq!(
+                    named(format!(
+                        "'{}' --no-warnings '{}'",
+                        node.display(),
+                        script.display()
+                    ))
+                    .await,
+                    Some("cursor")
+                );
+            }
+            None => eprintln!("skipping the node half: node not found on PATH"),
+        }
+    }
+
+    fn which_node() -> Option<std::path::PathBuf> {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join("node"))
+            .find(|path| path.is_file())
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

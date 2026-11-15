@@ -242,6 +242,16 @@ mod tests {
             "process": {"state": "running", "agent": "", "pid": "48213", "since": 1},
         })));
         assert_eq!(unnamed.agent, AgentBadge::None);
+
+        let named = tab(&wire_tab(json!({
+            "process": {"state": "running", "agent": "cursor", "pid": "48213", "since": 1},
+        })));
+        assert_eq!(
+            named.agent,
+            AgentBadge::Idle,
+            "an agent only its process names"
+        );
+        assert_eq!(named.status_text.as_deref(), Some("Running"));
     }
 
     #[test]

@@ -54,12 +54,14 @@ pub enum Foreground {
 }
 
 /// The state a stamp covers. The owner is the hook owner; the records
-/// are the tab's live OSC 7501 records.
+/// are the tab's live OSC 7501 records; the identity is an agent known
+/// only by its process's name ([`identify`]), which neither reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Layer {
     Owner,
     Records,
+    Identity,
 }
 
 /// What an `A`, `B` or `D` mark does to a layer, beyond the mark's own
@@ -172,6 +174,104 @@ pub fn never_stamped(comm: &str) -> bool {
     )
 }
 
+/// What a process's short name says it is: `(comm, agent)`.
+const NAMED: [(&str, &str); 7] = [
+    ("claude", "claude"),
+    ("codex", "codex"),
+    ("opencode", "opencode"),
+    ("cursor-agent", "cursor"),
+    ("grok", "grok"),
+    ("crush", "crush"),
+    ("pi", "pi"),
+];
+
+/// The directories an agent's script is installed under — an npm
+/// package's, or cursor-agent's own — that name it: `(dir, agent)`. Only
+/// names no ordinary path is likely to hold; a short one like `pi` names
+/// an agent only as the script's own name.
+const PACKAGES: [(&str, &str); 5] = [
+    ("claude-code", "claude"),
+    ("codex", "codex"),
+    ("opencode", "opencode"),
+    ("opencode-ai", "opencode"),
+    ("cursor-agent", "cursor"),
+];
+
+/// Options after which a runtime runs no script file: code or a module
+/// named on the command line, or stdin.
+const NO_SCRIPT: [&str; 7] = ["-", "-c", "-m", "-e", "-p", "--eval", "--print"];
+
+/// Whether a process named `comm` runs a script whose name says what it
+/// is, so [`identify`] needs its argv.
+///
+/// Node 24 names its main thread `MainThread`, and Linux reports a
+/// process's name as its main thread's: that is how node reads there,
+/// cursor-agent's bundled node included.
+pub fn runs_a_script(comm: &str) -> bool {
+    matches!(
+        comm,
+        "node" | "MainThread" | "bun" | "deno" | "python" | "Python"
+    ) || comm.strip_prefix("python3").is_some_and(|version| {
+        version.is_empty()
+            || version
+                .strip_prefix('.')
+                .is_some_and(|minor| !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// The agent a process is, by name: its short name `comm`, or, for a
+/// runtime ([`runs_a_script`]), the script its `argv` (as spawned,
+/// `argv[0]` first) names first — the script's own name less its
+/// extension, else the nearest directory above it that
+/// [`PACKAGES`] lists. The name is a hook `source`, or the `app` of an
+/// agent that has none.
+///
+/// Display only: what a process is never decides whether it ends.
+pub fn identify<S: AsRef<str>>(comm: &str, argv: &[S]) -> Option<&'static str> {
+    if let Some(&(_, agent)) = NAMED.iter().find(|(name, _)| *name == comm) {
+        return Some(agent);
+    }
+    if !runs_a_script(comm) {
+        return None;
+    }
+    let script = std::path::Path::new(script_of(comm, argv)?);
+    let stem = script.file_stem().and_then(|stem| stem.to_str());
+    if let Some(&(_, agent)) = NAMED.iter().find(|(name, _)| Some(*name) == stem) {
+        return Some(agent);
+    }
+    script
+        .parent()?
+        .iter()
+        .rev()
+        .filter_map(|dir| dir.to_str())
+        .find_map(|dir| {
+            PACKAGES
+                .iter()
+                .find(|(name, _)| *name == dir)
+                .map(|&(_, agent)| agent)
+        })
+}
+
+/// The script a runtime named `comm` runs: its first argument that is
+/// not an option, past `bun run` or `deno run`. `None` when an option
+/// says it runs no file.
+fn script_of<'a, S: AsRef<str>>(comm: &str, argv: &'a [S]) -> Option<&'a str> {
+    let mut subcommand = matches!(comm, "bun" | "deno");
+    for arg in argv.iter().skip(1).map(AsRef::as_ref) {
+        if NO_SCRIPT.contains(&arg) {
+            return None;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        if std::mem::take(&mut subcommand) && arg == "run" {
+            continue;
+        }
+        return Some(arg);
+    }
+    None
+}
+
 /// `Tab.process`: the stamped process behind a tab's agent state.
 ///
 /// Present while a layer holds a stamp. `state` is an open value: a client
@@ -179,7 +279,8 @@ pub fn never_stamped(comm: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabProcess {
     pub state: ProcessState,
-    /// The agent the stamped layer belongs to: the hook owner's `source`.
+    /// The agent the stamped layer belongs to: the records' `app`, the
+    /// hook owner's `source`, or what [`identify`] calls the process.
     /// Empty when no name is known.
     #[serde(default)]
     pub agent: String,
@@ -253,6 +354,131 @@ mod tests {
             "claude", "codex", "node", "sleep", "bash", "sshd", "tmux2", "",
         ] {
             assert!(!never_stamped(comm), "{comm}");
+        }
+    }
+
+    /// U20: the identity table, by a process's short name and, for a
+    /// runtime, by the script it runs.
+    #[test]
+    fn an_agent_is_named_by_its_process_name_or_its_script() {
+        let none: [&str; 0] = [];
+        for (comm, agent) in [
+            ("claude", "claude"),
+            ("codex", "codex"),
+            ("opencode", "opencode"),
+            ("cursor-agent", "cursor"),
+            ("grok", "grok"),
+            ("crush", "crush"),
+            ("pi", "pi"),
+        ] {
+            assert_eq!(identify(comm, &none), Some(agent), "{comm}");
+        }
+        for (comm, argv, agent) in [
+            (
+                "node",
+                &["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js"][..],
+                Some("codex"),
+            ),
+            (
+                "node",
+                &[
+                    "node",
+                    "/home/u/.local/share/mise/installs/node/lts/bin/codex",
+                    "-m",
+                    "x",
+                ],
+                Some("codex"),
+            ),
+            (
+                "node",
+                &[
+                    "node",
+                    "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                ],
+                Some("claude"),
+            ),
+            ("node", &["node", "/usr/local/bin/claude"], Some("claude")),
+            (
+                "node",
+                &["node", "/opt/node_modules/opencode-ai/bin/index.mjs"],
+                Some("opencode"),
+            ),
+            (
+                "bun",
+                &["bun", "/opt/opencode/bin/opencode.cjs"],
+                Some("opencode"),
+            ),
+            // cursor-agent's launcher is bash, then `exec -a "$0"` node,
+            // which Linux names `MainThread`.
+            (
+                "MainThread",
+                &[
+                    "/home/u/.local/bin/cursor-agent",
+                    "--use-system-ca",
+                    "/home/u/.local/share/cursor-agent/versions/2026.11.05-86047df/index.js",
+                ],
+                Some("cursor"),
+            ),
+            (
+                "bun",
+                &["bun", "run", "/x/node_modules/@openai/codex/bin/codex.js"],
+                Some("codex"),
+            ),
+            ("deno", &["deno", "run", "-A", "/x/codex.ts"], Some("codex")),
+            (
+                "python3.12",
+                &["python3.12", "-u", "/opt/bin/codex.py"],
+                Some("codex"),
+            ),
+            // npx is npm: the agent is its child, not the leader.
+            ("node", &["node", "/usr/bin/npx", "@openai/codex"], None),
+            ("npm exec @opena", &["npm exec @openai/codex"], None),
+            ("python3", &["python3", "-m", "codex"], None),
+            ("python3", &["python3", "-c", "import codex"], None),
+            ("node", &["node", "-e", "require('/x/codex.js')"], None),
+            ("node", &["node"], None),
+            ("node", &["node", "/srv/app/server.js"], None),
+            ("node", &["node", "/home/pi/server.js"], None),
+            ("node", &["node", "/home/u/grok/server.js"], None),
+            // Linux keeps 15 bytes of a name: a longer one is not a prefix
+            // match.
+            ("opencode-deskto", &["opencode-desktop"], None),
+            ("claude-code-hel", &["claude-code-helper"], None),
+            // Only a runtime's argv is read.
+            (
+                "sleep",
+                &["sleep", "/x/node_modules/@openai/codex/bin/codex.js"],
+                None,
+            ),
+        ] {
+            assert_eq!(identify(comm, argv), agent, "{comm} {argv:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_runtime_runs_a_script() {
+        for comm in [
+            "node",
+            "MainThread",
+            "bun",
+            "deno",
+            "python",
+            "Python",
+            "python3",
+            "python3.12",
+        ] {
+            assert!(runs_a_script(comm), "{comm}");
+        }
+        for comm in [
+            "nodejs",
+            "python2",
+            "python3-config",
+            "python3.",
+            "python3.x",
+            "claude",
+            "",
+        ] {
+            assert!(!runs_a_script(comm), "{comm}");
         }
     }
 

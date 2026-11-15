@@ -140,13 +140,13 @@ pub(crate) fn liveness(_stamp: &Stamp) -> Liveness {
 }
 
 /// One read of a tab's processes for its process layer: the spawn it
-/// read, who had the terminal, the leader a wanted stamp found, and each
-/// stamp's [`Liveness`].
+/// read, who had the terminal, the leader in front when a stamp was
+/// wanted or an agent looked for, and each stamp's [`Liveness`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessSample {
     pub(crate) incarnation: u64,
     pub(crate) foreground: Foreground,
-    pub(crate) leader: Option<Stamp>,
+    pub(crate) leader: Option<Leader>,
     pub(crate) liveness: Vec<(Stamp, Liveness)>,
 }
 
@@ -311,29 +311,91 @@ impl ForegroundLeader {
     }
 }
 
-/// The [`Stamp`] a layer that just became live takes: the leader of the
-/// group in front of `child`'s terminal, confirmed by [`same_leader`] on
-/// both sides of its name read. `None` when the shell's own group is in
-/// front, the leader can't be read or confirmed, or it is a multiplexer or
-/// a remote session ([`process::never_stamped`]).
+/// The leader in front of a tab's terminal, as [`leader_in_front`] read
+/// it: the [`Stamp`] a layer that just became live takes, and the agent
+/// its name says it is ([`process::identify`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Leader {
+    pub(crate) stamp: Stamp,
+    pub(crate) agent: Option<&'static str>,
+}
+
+/// The leader of the group in front of `child`'s terminal, confirmed by
+/// [`same_leader`] on both sides of its name and argv reads. `None` when
+/// the shell's own group is in front, the leader can't be read or
+/// confirmed, or it is a multiplexer or a remote session
+/// ([`process::never_stamped`]).
+///
+/// The agent is named by the first read: an `exec` between the reads
+/// (cursor-agent's launcher becoming node) keeps the stamp, and either
+/// name says the same.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn stamp_leader(child: u32) -> Option<Stamp> {
+pub(crate) fn leader_in_front(child: u32) -> Option<Leader> {
     let leader = ForegroundLeader::find(child)?;
+    let argv = if process::runs_a_script(&leader.before.comm) {
+        leader.process.argv()
+    } else {
+        None
+    };
     let after = leader.confirmed()?;
     if process::never_stamped(&after.comm) {
         return None;
     }
-    Some(Stamp {
-        pid: after.pid,
-        start: after.start,
-        pgid: after.pgrp,
-        sid: after.session,
+    Some(Leader {
+        stamp: Stamp {
+            pid: after.pid,
+            start: after.start,
+            pgid: after.pgrp,
+            sid: after.session,
+        },
+        agent: process::identify(&leader.before.comm, argv.as_deref().unwrap_or_default()),
     })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn stamp_leader(_child: u32) -> Option<Stamp> {
+pub(crate) fn leader_in_front(_child: u32) -> Option<Leader> {
     None
+}
+
+/// How much of `/proc/<pid>/cmdline` is read: the script a runtime runs
+/// is among its first few arguments.
+#[cfg(target_os = "linux")]
+const ARGV_MAX_BYTES: usize = 16 * 1024;
+
+/// argv from `/proc/<pid>/cmdline`: NUL-terminated strings, cut off at
+/// whatever was read.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cmdline(bytes: &[u8]) -> Vec<String> {
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    bytes
+        .split(|&byte| byte == 0)
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect()
+}
+
+/// argv from `KERN_PROCARGS2`: a native-endian `int` argc, the executable's
+/// path, NUL padding, then argc NUL-terminated strings (the environment
+/// follows them).
+#[cfg(any(target_os = "macos", test))]
+fn parse_procargs2(bytes: &[u8]) -> Option<Vec<String>> {
+    let argc = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
+    let argc = usize::try_from(argc).ok()?;
+    let rest = &bytes[4..];
+    let rest = &rest[rest.iter().position(|&byte| byte == 0)?..];
+    let mut rest = &rest[rest.iter().position(|&byte| byte != 0)?..];
+    let mut argv = Vec::new();
+    while argv.len() < argc && !rest.is_empty() {
+        let end = rest
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(rest.len());
+        argv.push(String::from_utf8_lossy(&rest[..end]).into_owned());
+        rest = rest.get(end + 1..).unwrap_or_default();
+    }
+    Some(argv)
 }
 
 /// Current working directory of `pid`. Linux reads `/proc/<pid>/cwd`;
@@ -421,6 +483,47 @@ fn proc_stamp(pid: u32) -> Option<ProcStamp> {
     }
 }
 
+/// A binary called `name` in `dir` that sleeps whatever its arguments,
+/// for a test that needs a process named `name`. Linux names a process
+/// after the path it ran as, so a copied `sleep` will do; macOS names it
+/// after the binary and kills a copied system one, so there it is built
+/// with `cc`. `None` when neither is at hand.
+#[cfg(test)]
+pub(crate) fn sleeper_named(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let path = dir.join(name);
+    if cfg!(target_os = "linux") {
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|sleep| std::path::Path::new(sleep).exists())?;
+        std::fs::copy(sleep, &path).ok()?;
+        return Some(path);
+    }
+    build_sleeper(&path).then_some(path)
+}
+
+/// Build a binary at `path` that pauses forever, with `cc`.
+#[cfg(test)]
+fn build_sleeper(path: &std::path::Path) -> bool {
+    use std::io::Write;
+    let Ok(mut cc) = std::process::Command::new("cc")
+        .args(["-x", "c", "-o"])
+        .arg(path)
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    let wrote = cc
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(SLEEPER.as_bytes()).is_ok());
+    cc.wait().is_ok_and(|status| status.success()) && wrote
+}
+
+#[cfg(test)]
+const SLEEPER: &str = "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n";
+
 /// `pid`'s short name, for a test waiting on an `exec`.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn comm_of(pid: u32) -> Option<String> {
@@ -456,24 +559,37 @@ impl LeaderProc {
     }
 
     fn stamp(&self) -> Option<ProcStamp> {
+        proc_read_starts("stat");
+        parse_proc_stat(&std::io::read_to_string(self.open_at(c"stat")?).ok()?)
+    }
+
+    fn argv(&self) -> Option<Vec<String>> {
+        use std::io::Read;
+
+        proc_read_starts("cmdline");
+        let mut bytes = Vec::new();
+        self.open_at(c"cmdline")?
+            .take(ARGV_MAX_BYTES as u64)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        Some(parse_cmdline(&bytes))
+    }
+
+    /// `name` in this process's `/proc` directory, opened for reading.
+    fn open_at(&self, name: &std::ffi::CStr) -> Option<std::fs::File> {
         use std::os::fd::FromRawFd;
 
-        proc_read_starts("stat");
         // SAFETY: `self.0` is an open directory fd for the whole call,
-        // and the name is a NUL-terminated literal.
+        // and `name` is NUL-terminated.
         let fd = unsafe {
             libc::openat(
                 self.0.as_raw_fd(),
-                c"stat".as_ptr(),
+                name.as_ptr(),
                 libc::O_RDONLY | libc::O_CLOEXEC,
             )
         };
-        if fd < 0 {
-            return None;
-        }
         // SAFETY: `openat` just returned this fd, and nothing else owns it.
-        let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        parse_proc_stat(&std::io::read_to_string(file).ok()?)
+        (fd >= 0).then(|| unsafe { std::fs::File::from_raw_fd(fd) })
     }
 
     fn cwd(&self) -> Option<String> {
@@ -602,7 +718,59 @@ impl LeaderProc {
     fn cwd(&self) -> Option<String> {
         cwd_of_pid(self.0)
     }
+
+    /// `KERN_PROCARGS2`, which answers only for this user's processes.
+    ///
+    /// The buffer is `KERN_ARGMAX` long, as `ps` sizes it: the kernel
+    /// copies the top of the process's argument area, so a shorter one
+    /// would hold the end of its environment rather than its argv.
+    fn argv(&self) -> Option<Vec<String>> {
+        use std::ptr::null_mut;
+
+        proc_read_starts("argv");
+        let pid = libc::c_int::try_from(self.0).ok()?;
+        let mut argmax: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: `mib` names two levels, `argmax` is writable for `size`
+        // bytes, and nothing is written to the kernel (`newp` is null).
+        let failed = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&raw mut argmax).cast(),
+                &mut size,
+                null_mut(),
+                0,
+            )
+        } != 0;
+        let argmax = usize::try_from(argmax).ok().filter(|_| !failed)?;
+        let mut buf = vec![0u8; argmax.min(ARGMAX_CEILING)];
+        let mut size = buf.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: as above, with `buf` writable for `size` bytes.
+        let failed = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr().cast(),
+                &mut size,
+                null_mut(),
+                0,
+            )
+        } != 0;
+        if failed {
+            return None;
+        }
+        buf.truncate(size);
+        parse_procargs2(&buf)
+    }
 }
+
+/// A bound on the `KERN_ARGMAX` buffer, against an absurd answer. macOS
+/// says 1 MiB.
+#[cfg(target_os = "macos")]
+const ARGMAX_CEILING: usize = 8 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -1038,5 +1206,59 @@ mod tests {
             "kill(1, 0) is EPERM for a user, success for root: neither is gone"
         );
         assert_ne!(liveness(&stamp), Liveness::Gone);
+    }
+
+    #[test]
+    fn a_cmdline_reads_as_its_nul_separated_arguments() {
+        assert_eq!(
+            parse_cmdline(b"node\0--use-system-ca\0/x/index.js\0"),
+            ["node", "--use-system-ca", "/x/index.js"]
+        );
+        assert_eq!(parse_cmdline(b"cut\0off"), ["cut", "off"]);
+        assert_eq!(parse_cmdline(b"\0"), Vec::<String>::new());
+        assert_eq!(parse_cmdline(b""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn procargs2_reads_argc_arguments_past_the_executable_path() {
+        let mut bytes = 3i32.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(b"/usr/local/bin/node\0\0\0\0");
+        bytes.extend_from_slice(b"node\0--use-system-ca\0/x/index.js\0HOME=/u\0PATH=/bin\0");
+        assert_eq!(
+            parse_procargs2(&bytes),
+            Some(vec![
+                "node".to_owned(),
+                "--use-system-ca".to_owned(),
+                "/x/index.js".to_owned()
+            ]),
+            "the environment after argv is not argv"
+        );
+
+        let mut short = 5i32.to_ne_bytes().to_vec();
+        short.extend_from_slice(b"/bin/sleep\0sleep\0");
+        assert_eq!(
+            parse_procargs2(&short),
+            Some(vec!["sleep".to_owned()]),
+            "an argc past the end reads what there is"
+        );
+        assert_eq!(parse_procargs2(&[1, 0]), None);
+        assert_eq!(parse_procargs2(&(-1i32).to_ne_bytes()), None);
+    }
+
+    /// The argv a leader's name is judged with, read from a real process:
+    /// `/proc/<pid>/cmdline` through the leader's own directory on Linux,
+    /// `KERN_PROCARGS2` on macOS.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_processs_argv_reads_as_it_was_spawned() {
+        let agent = Child::sh("exec sleep 31");
+        wait_until("sh became sleep", || {
+            proc_stamp(agent.pid()).is_some_and(|found| found.comm == "sleep")
+        });
+        let process = LeaderProc::open(agent.pid()).expect("open the process");
+        assert_eq!(
+            process.argv(),
+            Some(vec!["sleep".to_owned(), "31".to_owned()])
+        );
     }
 }

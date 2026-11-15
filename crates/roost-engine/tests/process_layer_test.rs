@@ -411,6 +411,86 @@ async fn without_marks_a_dead_programs_working_record_ends_on_the_tick() {
     assert_eq!(listed.program_status, None);
 }
 
+/// I7: an agent no hook claims and no record names — cursor-agent with
+/// no hooks — is named by its process once its tab loses the focus, and
+/// goes with its process. The agent is a binary called `cursor-agent`: a
+/// copied `sleep` on Linux, where a process is named after the path it
+/// ran as, and on macOS, which names it after the binary and kills a
+/// copied system one, a sleeper built with `cc`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_named_by_its_process_shows_at_blur_and_goes_with_it() {
+    let Some(rig) = Rig::new() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let Some(command) = cursor_agent(dir.path()) else {
+        eprintln!("skipping the identity test: no way to run a cursor-agent here");
+        return;
+    };
+    let (tab, shell) = rig.bash_tab().await;
+    let (other, _) = rig.bash_tab().await;
+    rig.workspace.focus_tab(tab).unwrap();
+
+    rig.type_line(tab, &command).await;
+    wait_until("the agent leads the terminal, exec'd", || {
+        pid_of_job(shell).is_some_and(|job| !matches!(comm_of(job).as_str(), "" | "bash" | "sh"))
+    })
+    .await;
+    assert_eq!(
+        rig.workspace.tab(tab).unwrap().process,
+        None,
+        "the precondition: nothing has looked"
+    );
+    rig.workspace.focus_tab(other).unwrap();
+    let listed = rig
+        .wait(tab, "the agent named", |tab| tab.process.is_some())
+        .await;
+    let process = listed.process.unwrap();
+    assert_eq!(process.agent, "cursor");
+    assert_eq!(process.state, ProcessState::Running);
+    assert_eq!(Some(process.pid), pid_of_job(shell), "the job in front");
+    assert_eq!(listed.ownership, None, "no owner is made up");
+
+    signal(process.pid, libc::SIGKILL);
+    rig.wait(tab, "the agent gone", |tab| tab.process.is_none())
+        .await;
+}
+
+/// A command that runs something Roost names `cursor`, made in `dir`.
+fn cursor_agent(dir: &std::path::Path) -> Option<String> {
+    let agent = dir.join("cursor-agent");
+    if cfg!(target_os = "linux") {
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|sleep| std::path::Path::new(sleep).exists())?;
+        std::fs::copy(sleep, &agent).ok()?;
+    } else {
+        let mut cc = std::process::Command::new("cc")
+            .args(["-x", "c", "-o"])
+            .arg(&agent)
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        std::io::Write::write_all(
+            &mut cc.stdin.take()?,
+            b"#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
+        )
+        .ok()?;
+        cc.wait().ok()?.success().then_some(())?;
+    }
+    Some(format!("'{}' 300", agent.display()))
+}
+
+/// `pid`'s name by `ps`, less any directory (macOS's `ps` prints the
+/// path).
+fn comm_of(pid: i64) -> String {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .unwrap_or_default();
+    out.rsplit('/').next().unwrap_or_default().to_owned()
+}
+
 /// Read the tab's output until `needle` shows, and answer what was read.
 async fn wait_for_text(
     output: &mut tokio::sync::broadcast::Receiver<roost_engine::PtyOutputEvent>,

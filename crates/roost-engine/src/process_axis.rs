@@ -1,7 +1,8 @@
 //! A tab's process layer (#621, #519): which process its hook owner, and
 //! the program-status records that decide it, are stamped with; what a
 //! prompt mark parked while that process was not in front; and whether it
-//! is stopped.
+//! is stopped. A tab neither names has a third layer: an agent known only
+//! by its process's name, found when someone looks at the tab.
 //!
 //! Pure apart from the reads the sampler hands in
 //! ([`crate::foreground::ProcessSample`]); what the evidence decides is
@@ -10,7 +11,7 @@
 //! reads a process itself: marks see only the foreground group a probe
 //! read before the lock, and samples run on the sampler task.
 //!
-//! The two layers are followed alike, each with an epoch. Every time a
+//! The layers are followed alike, each with an epoch. Every time a
 //! layer starts over — an owner claimed or released, records that start
 //! or stop deciding the tab, an end — its epoch moves on and what it
 //! parked is dropped, so a sample requested for one, or state parked
@@ -22,7 +23,7 @@ use roost_ipc::process::{
 };
 use roost_ipc::program_status::{app_label, PromptMark};
 
-use crate::foreground::ProcessSample;
+use crate::foreground::{Leader, ProcessSample};
 use crate::program_status::{Banner, ParkedRecords, ProgramStatusRecords};
 
 /// One tab's process layer. Not persisted, like the hook state it follows.
@@ -34,12 +35,42 @@ pub(crate) struct ProcessAxis {
     /// The process behind the program-status records while they decide
     /// the tab; what it parks is what a mark took off the records.
     records: Followed<ParkedRecords>,
+    /// An agent in front of a tab that no owner claims and no records
+    /// decide, named by [`process::identify`] (cursor-agent with no hooks,
+    /// Codex at its sign-in screen). It has nothing to park: it only
+    /// shows, running or suspended, until its process is gone.
+    identity: Followed<()>,
+    /// Whether the identity layer is on the wire. One a look found shows
+    /// at once; one handed over from records that left ([`Left`]) shows
+    /// only once a read says its process stopped or runs on, so a program
+    /// that cleared its status as it exited never flashes a row.
+    identity_shown: bool,
+    /// The records' named stamp, kept from when they stopped deciding by
+    /// their program's own word until the next mark.
+    left: Option<Left>,
     /// The sampler has something to read for this tab.
     due: bool,
+    /// The sample due looks for an agent in front, to name: someone looked
+    /// at a tab nothing on it follows.
+    discover: bool,
     /// The title of an exit banner owed to the next `D`: a sample found a
     /// busy process gone after the shell took the terminal back from it,
     /// but before the shell printed the `D` that carries its exit code.
     exit_pending: Option<String>,
+}
+
+/// Records that stopped deciding by their program's own word — a
+/// `clear`, or a prompt mark of its own — while stamped with a process
+/// [`process::identify`] names. Codex clears its status as it stops, so a
+/// `Ctrl-Z` leaves its records nothing to park; if the next mark is the
+/// shell taking the terminal back, the stamp passes to the identity layer,
+/// unshown, and the read that mark asks for says whether the program is
+/// stopped, in the background, or gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Left {
+    stamp: Stamp,
+    agent: &'static str,
+    incarnation: u64,
 }
 
 /// One layer's process, and what a mark set aside while it was not in
@@ -64,6 +95,9 @@ struct Followed<P> {
     /// from the process, until the process stops or runs again: a stop's
     /// code (128 + `SIGTSTP`) is not an exit.
     exit_code: Option<i32>,
+    /// What the stamped process's name said it is, read with the stamp.
+    /// Display only: nothing it follows ends by it.
+    agent: Option<&'static str>,
 }
 
 impl<P> Default for Followed<P> {
@@ -77,6 +111,7 @@ impl<P> Default for Followed<P> {
             incarnation: 0,
             in_front: false,
             exit_code: None,
+            agent: None,
         }
     }
 }
@@ -110,10 +145,31 @@ impl<P> Followed<P> {
         self.suspended = false;
         self.in_front = false;
         self.exit_code = None;
+        self.agent = None;
+    }
+
+    /// Take `leader`'s stamp, read in `incarnation`'s spawn at `now`.
+    fn stamp_with(&mut self, leader: &Leader, incarnation: u64, now: i64) {
+        self.follow = Follow::Stamped(leader.stamp);
+        self.agent = leader.agent;
+        self.incarnation = incarnation;
+        self.since = now;
+        // The leader stamped is the one in front.
+        self.in_front = true;
     }
 
     fn has_a_sample_to_take(&self) -> bool {
         matches!(self.follow, Follow::Wanted | Follow::Stamped(_))
+    }
+
+    /// This layer's stamp as records that leave hand it on, when its
+    /// process has a name.
+    fn left(&self) -> Option<Left> {
+        Some(Left {
+            stamp: *self.stamp()?,
+            agent: self.agent?,
+            incarnation: self.incarnation,
+        })
     }
 
     fn set_suspended(&mut self, suspended: bool, now: i64) {
@@ -155,11 +211,10 @@ impl<P> Followed<P> {
         match self.follow {
             Follow::Off | Follow::Unstamped => None,
             Follow::Wanted => {
-                self.follow = sample.leader.map_or(Follow::Unstamped, Follow::Stamped);
-                self.incarnation = sample.incarnation;
-                self.since = now;
-                // The leader stamped is the one in front.
-                self.in_front = sample.leader.is_some();
+                match &sample.leader {
+                    Some(leader) => self.stamp_with(leader, sample.incarnation, now),
+                    None => self.follow = Follow::Unstamped,
+                }
                 None
             }
             Follow::Stamped(_) if sample.incarnation != self.incarnation => {
@@ -168,6 +223,7 @@ impl<P> Followed<P> {
                 self.suspended = false;
                 self.in_front = false;
                 self.exit_code = None;
+                self.agent = None;
                 None
             }
             Follow::Stamped(stamp) => {
@@ -186,8 +242,15 @@ impl<P> Followed<P> {
         }
     }
 
+    /// `Tab.process` for this layer, named `agent`, else what its process's
+    /// name says.
     fn wire(&self, agent: String) -> Option<TabProcess> {
         let stamp = self.stamp()?;
+        let agent = if agent.is_empty() {
+            self.agent.unwrap_or_default().to_owned()
+        } else {
+            agent
+        };
         Some(TabProcess {
             state: if self.suspended {
                 ProcessState::Suspended
@@ -207,10 +270,14 @@ pub(crate) struct SampleRequest {
     pub(crate) tab_id: i64,
     owner_epoch: u64,
     records_epoch: u64,
+    identity_epoch: u64,
     /// The records' report count when the sample was asked for: what an
     /// end may take is what was reported by then.
     records_seq: u64,
-    pub(crate) stamp_wanted: bool,
+    /// Read the leader in front: a layer wants its stamp, or `discover`.
+    pub(crate) leader_wanted: bool,
+    /// Look for an agent in front to name.
+    discover: bool,
     pub(crate) stamps: Vec<Stamp>,
 }
 
@@ -220,7 +287,10 @@ pub(crate) struct SampleRequest {
 pub(crate) struct Ended {
     pub(crate) owner: bool,
     pub(crate) records: bool,
+    pub(crate) identity: bool,
     pub(crate) banner: Option<Banner>,
+    /// The agent a look found in front and named.
+    pub(crate) named: Option<&'static str>,
 }
 
 /// What one sample's end knows of the process it ended, layer by layer,
@@ -310,7 +380,9 @@ fn signal_name(signal: i32) -> Option<&'static str> {
 impl ProcessAxis {
     /// The owner changed: a claim or a release a report made, or a release
     /// this layer made. An agent's claim wants a stamp; anything else
-    /// leaves the tab unstamped.
+    /// leaves the tab unstamped. Either way an agent named only by its
+    /// process is no longer one: an owner names the tab now, and a release
+    /// is the agent leaving.
     pub(crate) fn owner_changed(&mut self, agent: &AgentTabState) {
         if process::owner_follows_a_process(agent) {
             self.owner.restart(Follow::Wanted);
@@ -319,22 +391,64 @@ impl ProcessAxis {
         } else {
             self.owner.restart(Follow::Off);
         }
+        self.identity.restart(Follow::Off);
+        self.left = None;
     }
 
     /// Ask for a sample, when there is a stamp to take or to read.
     /// Answers whether it asked.
     pub(crate) fn request_sample(&mut self) -> bool {
-        if !self.owner.has_a_sample_to_take() && !self.records.has_a_sample_to_take() {
+        if ![
+            self.owner.has_a_sample_to_take(),
+            self.records.has_a_sample_to_take(),
+            self.identity.has_a_sample_to_take(),
+        ]
+        .contains(&true)
+        {
             return false;
         }
         self.due = true;
         true
     }
 
+    /// Someone looked at the tab — a focus moved onto it or off it, a
+    /// session's viewer came or went, a command started. Ask for a sample
+    /// when there is a stamp to take or to read; on a tab that nothing
+    /// follows and no one owns (`agent`), look for an agent in front to
+    /// name instead. Answers whether it asked.
+    pub(crate) fn request_look(&mut self, agent: &AgentTabState) -> bool {
+        if self.request_sample() {
+            return true;
+        }
+        if !self.discoverable(agent) {
+            return false;
+        }
+        self.discover = true;
+        self.due = true;
+        true
+    }
+
+    /// Whether an agent in front would be named by its process alone: no
+    /// owner, and nothing followed.
+    fn discoverable(&self, agent: &AgentTabState) -> bool {
+        agent.ownership.is_none()
+            && [
+                &self.owner.follow,
+                &self.records.follow,
+                &self.identity.follow,
+            ]
+            .iter()
+            .all(|follow| **follow == Follow::Off)
+    }
+
     /// Whether the tick reads this tab: it holds a stamp, and with it
-    /// whatever it parked.
+    /// whatever it parked. A tab that holds none is never looked at on a
+    /// tick, whatever runs in front of it; nor is an unshown identity,
+    /// which the mark that handed it over asked a read for.
     pub(crate) fn ticks(&self) -> bool {
-        self.owner.stamp().is_some() || self.records.stamp().is_some()
+        self.owner.stamp().is_some()
+            || self.records.stamp().is_some()
+            || (self.identity_shown && self.identity.stamp().is_some())
     }
 
     /// Ask for the tick's sample, when [`Self::ticks`]. Answers whether it
@@ -363,7 +477,8 @@ impl ProcessAxis {
     /// A park that took nothing holds nothing. Codex clears its own status
     /// as it stops, often in the read that carries the shell's `D`; had
     /// the clear come a read earlier, the records would have stopped
-    /// deciding and the layer ended before the mark, so it ends here too.
+    /// deciding and the layer ended before the mark, so it ends here too,
+    /// and what names a stopped Codex is its process ([`Left`]).
     pub(crate) fn park_records(&mut self, parked: ParkedRecords) {
         if parked.is_empty() {
             return;
@@ -380,10 +495,15 @@ impl ProcessAxis {
         match (live, self.records.follow) {
             (true, Follow::Off) => {
                 self.records.restart(Follow::Wanted);
+                self.identity.restart(Follow::Off);
+                self.left = None;
                 self.exit_pending = None;
                 self.due = true;
             }
             (false, Follow::Wanted | Follow::Unstamped | Follow::Stamped(_)) => {
+                if self.identity.follow == Follow::Off {
+                    self.left = self.records.left();
+                }
                 self.records.restart(Follow::Off);
             }
             _ => {}
@@ -393,10 +513,12 @@ impl ProcessAxis {
     /// An OSC 133 mark, with `before` the hook state before the mark's own
     /// effect and `agent` the state after it, read with `fg` in front.
     ///
-    /// A `C` on a stamped tab asks for a sample: a `fg` is one. An `A`,
-    /// `B` or `D` notes who has the terminal, and the code of the `D` that
-    /// took it from a stamped process, then applies [`process::at_mark`]'s
-    /// verdict to the owner. Answers the exit banner owed to this `D`.
+    /// A `C` asks for a look ([`Self::request_look`]): on a stamped tab a
+    /// `fg` is one. An `A`, `B` or `D` notes who has the terminal, and the
+    /// code of the `D` that took it from a stamped process, then applies
+    /// [`process::at_mark`]'s verdict to the owner, and asks after an agent
+    /// named by its process alone once it is not in front. Answers the
+    /// exit banner owed to this `D`.
     pub(crate) fn at_mark(
         &mut self,
         mark: PromptMark,
@@ -407,9 +529,13 @@ impl ProcessAxis {
         let exit_code = match mark {
             PromptMark::OutputStart => {
                 self.exit_pending = None;
-                if self.ticks() {
-                    self.due = true;
+                // A command starts: no later mark is about the program
+                // that left.
+                self.left = None;
+                if !self.identity_shown && self.identity.stamp().is_some() {
+                    self.identity.restart(Follow::Off);
                 }
+                self.request_look(agent);
                 return None;
             }
             PromptMark::CommandEnd { exit_code } => exit_code,
@@ -426,6 +552,10 @@ impl ProcessAxis {
         };
         self.owner.at_mark(fg, exit_code);
         self.records.at_mark(fg, exit_code);
+        self.hand_over(fg, agent);
+        if process::at_mark(Layer::Identity, self.identity.stamp(), fg) == MarkVerdict::Park {
+            self.due = true;
+        }
         if !process::owner_follows_a_process(before) {
             return banner;
         }
@@ -445,30 +575,83 @@ impl ProcessAxis {
         banner
     }
 
-    /// The sample this tab is due, if any, clearing the flag.
+    /// At an `A`, `B` or `D` read with `fg` in front: records that left
+    /// ([`Left`]) — before this mark, or in its own read, leaving it
+    /// nothing to park — pass their stamp to the identity layer, unshown,
+    /// with a read asked for, once the shell or another job has the
+    /// terminal and nothing else names the tab. A mark from the program's
+    /// own group keeps them for the next; one with no one known in front
+    /// forgets them.
+    fn hand_over(&mut self, fg: Foreground, agent: &AgentTabState) {
+        let left_in_this_read = self
+            .records
+            .stamp()
+            .filter(|stamp| {
+                self.records.parked.is_none()
+                    && process::at_mark(Layer::Records, Some(stamp), fg) == MarkVerdict::Park
+            })
+            .and_then(|_| self.records.left());
+        let Some(left) = left_in_this_read.or_else(|| self.left.take()) else {
+            return;
+        };
+        match fg {
+            Foreground::Group(pgid) if pgid == left.stamp.pgid => {
+                self.left = Some(left);
+                return;
+            }
+            Foreground::Unknown => return,
+            Foreground::Shell | Foreground::Group(_) => {}
+        }
+        if agent.ownership.is_some() || self.identity.follow != Follow::Off {
+            return;
+        }
+        self.identity.restart(Follow::Stamped(left.stamp));
+        self.identity.agent = Some(left.agent);
+        self.identity.incarnation = left.incarnation;
+        self.identity_shown = false;
+        self.due = true;
+    }
+
+    /// The sample this tab is due, if any, clearing the flag. A look asked
+    /// for while nothing was followed is dropped if something is now, or
+    /// the tab is owned (`agent`).
     pub(crate) fn take_request(
         &mut self,
         tab_id: i64,
         records: &ProgramStatusRecords,
+        agent: &AgentTabState,
     ) -> Option<SampleRequest> {
         if !std::mem::take(&mut self.due) {
             return None;
         }
-        let stamp_wanted =
-            self.owner.follow == Follow::Wanted || self.records.follow == Follow::Wanted;
-        let mut stamps: Vec<Stamp> = self.owner.stamp().into_iter().copied().collect();
-        if let Some(stamp) = self.records.stamp().filter(|stamp| !stamps.contains(stamp)) {
-            stamps.push(*stamp);
+        let discover = std::mem::take(&mut self.discover) && self.discoverable(agent);
+        let leader_wanted = discover
+            || self.owner.follow == Follow::Wanted
+            || self.records.follow == Follow::Wanted;
+        let mut stamps: Vec<Stamp> = Vec::new();
+        for stamp in [
+            self.owner.stamp(),
+            self.records.stamp(),
+            self.identity.stamp(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !stamps.contains(stamp) {
+                stamps.push(*stamp);
+            }
         }
-        if !stamp_wanted && stamps.is_empty() {
+        if !leader_wanted && stamps.is_empty() {
             return None;
         }
         Some(SampleRequest {
             tab_id,
             owner_epoch: self.owner.epoch,
             records_epoch: self.records.epoch,
+            identity_epoch: self.identity.epoch,
             records_seq: records.seq(),
-            stamp_wanted,
+            leader_wanted,
+            discover,
             stamps,
         })
     }
@@ -562,7 +745,56 @@ impl ProcessAxis {
         if ended.owner || ended.records {
             ended.banner = self.exit_banner(gone, agent.shell, sample.foreground);
         }
+        self.apply_identity(request, sample, agent, now, &mut ended);
         ended
+    }
+
+    /// What `sample` does to an agent named by its process alone: it
+    /// suspends, runs again and ends as any stamped layer does — though
+    /// with nothing parked, and no banner, since it was never seen to do
+    /// anything — and a look finds one to name.
+    fn apply_identity(
+        &mut self,
+        request: &SampleRequest,
+        sample: &ProcessSample,
+        agent: &AgentTabState,
+        now: i64,
+        ended: &mut Ended,
+    ) {
+        match self.identity.verdict(request.identity_epoch, sample, now) {
+            None | Some(SampleVerdict::Keep) => {}
+            Some(verdict @ (SampleVerdict::Restore | SampleVerdict::Suspend)) => {
+                if !std::mem::replace(&mut self.identity_shown, true) {
+                    self.identity.since = now;
+                }
+                self.identity
+                    .set_suspended(verdict == SampleVerdict::Suspend, now);
+            }
+            Some(SampleVerdict::End) => {
+                self.identity.restart(Follow::Off);
+                ended.identity = true;
+            }
+        }
+        // A stamp from another spawn: forgotten, and the next look may
+        // name what runs there now.
+        if self.identity.follow == Follow::Unstamped {
+            self.identity.restart(Follow::Off);
+        }
+        if !request.discover
+            || request.identity_epoch != self.identity.epoch
+            || !self.discoverable(agent)
+        {
+            return;
+        }
+        if let Some(leader) = sample
+            .leader
+            .as_ref()
+            .filter(|leader| leader.agent.is_some())
+        {
+            self.identity.stamp_with(leader, sample.incarnation, now);
+            self.identity_shown = true;
+            ended.named = leader.agent;
+        }
     }
 
     /// The banner an end raises: a process that was working or blocked
@@ -588,7 +820,8 @@ impl ProcessAxis {
 
     /// `Tab.process` for a tab whose hook state is `agent` and whose
     /// records are `records`: the records' process while they follow one,
-    /// since they decide what the tab shows, else the owner's.
+    /// since they decide what the tab shows, else the owner's, else an
+    /// agent named by its process alone.
     pub(crate) fn wire(
         &self,
         agent: &AgentTabState,
@@ -601,13 +834,19 @@ impl ProcessAxis {
             };
             return self.records.wire(app);
         }
-        self.owner.wire(
-            agent
-                .ownership
-                .as_ref()
-                .map(|owner| owner.source.clone())
-                .unwrap_or_default(),
-        )
+        if self.owner.stamp().is_some() {
+            return self.owner.wire(
+                agent
+                    .ownership
+                    .as_ref()
+                    .map(|owner| owner.source.clone())
+                    .unwrap_or_default(),
+            );
+        }
+        if !self.identity_shown {
+            return None;
+        }
+        self.identity.wire(String::new())
     }
 }
 
@@ -645,7 +884,7 @@ mod tests {
         ProcessSample {
             incarnation: 1,
             foreground,
-            leader,
+            leader: leader.map(|stamp| Leader { stamp, agent: None }),
             liveness: vec![(stamp(), liveness)],
         }
     }
@@ -655,9 +894,9 @@ mod tests {
         let mut axis = ProcessAxis::default();
         axis.owner_changed(agent);
         let request = axis
-            .take_request(1, &ProgramStatusRecords::default())
+            .take_request(1, &ProgramStatusRecords::default(), agent)
             .expect("a claim asks for a stamp");
-        assert!(request.stamp_wanted);
+        assert!(request.leader_wanted);
         let mut agent = agent.clone();
         axis.apply_sample(
             &request,
@@ -694,7 +933,9 @@ mod tests {
 
     fn sampled(axis: &mut ProcessAxis, agent: &mut AgentTabState, sample: &ProcessSample) {
         let mut records = ProgramStatusRecords::default();
-        let request = axis.take_request(1, &records).expect("a sample is due");
+        let request = axis
+            .take_request(1, &records, agent)
+            .expect("a sample is due");
         axis.apply_sample(&request, sample, agent, &mut records, NOW + 5);
     }
 
@@ -784,7 +1025,7 @@ mod tests {
         mark(&mut axis, &working, "D", Foreground::Shell);
         let mut none = ProgramStatusRecords::default();
         let stale = axis
-            .take_request(1, &none)
+            .take_request(1, &none, &working)
             .expect("the park asked for a sample");
 
         // A new Claude's SessionStart: inactive, under another session.
@@ -829,7 +1070,9 @@ mod tests {
         let mut axis = stamped(&agent);
         let mut none = ProgramStatusRecords::default();
         axis.request_sample();
-        let stale = axis.take_request(1, &none).expect("a sample is due");
+        let stale = axis
+            .take_request(1, &none, &agent)
+            .expect("a sample is due");
 
         agent.ownership.as_mut().unwrap().session_id = "s2".into();
         axis.owner_changed(&agent);
@@ -952,7 +1195,7 @@ mod tests {
 
         fn request(&mut self) -> SampleRequest {
             self.axis
-                .take_request(1, &self.records)
+                .take_request(1, &self.records, &self.agent)
                 .expect("a sample is due")
         }
 
@@ -1485,5 +1728,411 @@ mod tests {
         for tab in [&d_first, &sample_first] {
             assert!(tab.banners.is_empty(), "{:?}", tab.banners);
         }
+    }
+
+    // The identity layer: an agent named by its process alone.
+
+    /// A sample whose leader in front is `agent`, by its process's name.
+    fn named(
+        foreground: Foreground,
+        agent: Option<&'static str>,
+        liveness: Liveness,
+    ) -> ProcessSample {
+        ProcessSample {
+            incarnation: 1,
+            foreground,
+            leader: Some(Leader {
+                stamp: stamp(),
+                agent,
+            }),
+            liveness: vec![(stamp(), liveness)],
+        }
+    }
+
+    impl Tab {
+        fn look(&mut self) -> bool {
+            self.axis.request_look(&self.agent)
+        }
+    }
+
+    /// A tab nobody owns, with cursor-agent in front: looked at, named.
+    fn named_cursor() -> Tab {
+        let mut tab = Tab::new();
+        assert!(tab.look());
+        tab.sample(&named(
+            Foreground::Group(700),
+            Some("cursor"),
+            Liveness::Running,
+        ));
+        let process = tab.process().expect("named");
+        assert_eq!(
+            (process.agent.as_str(), process.pid, process.state),
+            ("cursor", 700, ProcessState::Running)
+        );
+        tab
+    }
+
+    /// U22, in the axis: nothing reads a tab no layer follows until
+    /// someone looks at it — not the tick — and a look reads the leader
+    /// in front, to name.
+    #[test]
+    fn an_agent_in_front_is_named_when_someone_looks_and_not_before() {
+        let mut tab = Tab::new();
+        assert!(!tab.axis.request_tick(), "the tick never looks");
+        assert!(!tab.axis.is_due());
+
+        assert!(tab.look());
+        let request = tab.request();
+        assert!(request.discover && request.leader_wanted);
+        assert!(request.stamps.is_empty());
+        tab.apply(
+            &request,
+            &named(Foreground::Group(700), Some("cursor"), Liveness::Running),
+        );
+        assert_eq!(
+            tab.process().map(|process| process.agent),
+            Some("cursor".to_owned())
+        );
+        assert!(tab.axis.ticks(), "a named agent is stamped, so ticked");
+        assert_eq!(
+            tab.agent.lifecycle,
+            AgentLifecycle::Inactive,
+            "never a lifecycle"
+        );
+    }
+
+    /// A named agent stops, runs again and ends with its process, as any
+    /// stamp does — and raises no banner, holding nothing it was doing.
+    #[test]
+    fn a_named_agent_suspends_runs_again_and_ends_with_its_process() {
+        let mut tab = named_cursor();
+        let state = |tab: &Tab| tab.process().map(|process| process.state);
+
+        tab.mark(end(128 + libc::SIGTSTP), Foreground::Shell);
+        assert!(tab.axis.is_due(), "a mark with the shell in front asks");
+        tab.sample(&sample(Foreground::Shell, None, Liveness::Stopped));
+        assert_eq!(state(&tab), Some(ProcessState::Suspended));
+
+        tab.mark(PromptMark::OutputStart, Foreground::Unknown);
+        tab.sample(&sample(Foreground::Group(700), None, Liveness::Running));
+        assert_eq!(state(&tab), Some(ProcessState::Running));
+
+        tab.mark(end(137), Foreground::Shell);
+        let ended = tab.sample(&sample(Foreground::Shell, None, Liveness::Gone));
+        assert!(ended.identity);
+        assert_eq!(tab.process(), None);
+        assert!(!tab.axis.ticks());
+        assert!(tab.banners.is_empty(), "{:?}", tab.banners);
+    }
+
+    /// A mark from the named agent's own group is its own, and asks for
+    /// nothing; a gone process whose group is still in front keeps.
+    #[test]
+    fn a_named_agent_keeps_while_its_group_has_the_terminal() {
+        let mut tab = named_cursor();
+        tab.mark(end(0), Foreground::Group(700));
+        assert!(!tab.axis.is_due());
+        tab.axis.request_tick();
+        tab.sample(&sample(Foreground::Group(700), None, Liveness::Gone));
+        assert!(tab.process().is_some());
+    }
+
+    /// An owner, records that decide, or anything already followed name
+    /// the tab: a look there names nothing, and the owner's own name
+    /// stands over its process's.
+    #[test]
+    fn a_look_names_nothing_on_a_tab_something_else_names() {
+        let mut claimed = Tab::new();
+        claimed.agent = owned("claude", AgentLifecycle::Working);
+        claimed.axis.owner_changed(&claimed.agent);
+        assert!(claimed.look(), "the owner's wanted stamp");
+        let request = claimed.request();
+        assert!(!request.discover);
+        claimed.apply(
+            &request,
+            &named(Foreground::Group(700), Some("codex"), Liveness::Running),
+        );
+        assert_eq!(
+            claimed.process().map(|process| process.agent),
+            Some("claude".to_owned()),
+            "the owner's source, not its process's name"
+        );
+
+        let mut manual = Tab::new();
+        manual.agent = owned("manual", AgentLifecycle::Working);
+        manual.axis.owner_changed(&manual.agent);
+        assert!(!manual.look(), "an owner of any kind names the tab");
+
+        let mut reporting = Tab::new();
+        reporting.feed(
+            [report("", "codex", ProgramStatusState::Working)],
+            Foreground::Unknown,
+        );
+        reporting.look();
+        assert!(!reporting.request().discover);
+    }
+
+    /// A claim, or records that start deciding, take over from a named
+    /// agent: it is no longer the one naming the tab, whichever lands
+    /// first — before the look's sample, or after it.
+    #[test]
+    fn a_claim_or_a_record_takes_over_from_a_named_agent() {
+        let mut tab = named_cursor();
+        tab.agent = owned("cursor", AgentLifecycle::Working);
+        tab.axis.owner_changed(&tab.agent);
+        assert_eq!(tab.process(), None, "the owner waits for its own stamp");
+        tab.sample(&sample(
+            Foreground::Group(700),
+            Some(stamp()),
+            Liveness::Running,
+        ));
+        assert_eq!(
+            tab.process().map(|process| process.agent),
+            Some("cursor".to_owned())
+        );
+        assert!(tab.axis.identity.stamp().is_none());
+
+        let mut tab = named_cursor();
+        tab.feed(
+            [report("", "codex", ProgramStatusState::Working)],
+            Foreground::Unknown,
+        );
+        assert!(tab.axis.identity.stamp().is_none());
+
+        let mut tab = Tab::new();
+        tab.look();
+        let stale = tab.request();
+        tab.agent = owned("claude", AgentLifecycle::Inactive);
+        tab.axis.owner_changed(&tab.agent);
+        tab.apply(
+            &stale,
+            &named(Foreground::Group(700), Some("claude"), Liveness::Running),
+        );
+        assert!(
+            tab.axis.identity.stamp().is_none(),
+            "a claim between the look and its sample wins"
+        );
+    }
+
+    /// A look that finds no agent in front — the shell, or a program the
+    /// table does not name — stamps nothing, and the next look reads
+    /// again.
+    #[test]
+    fn a_look_that_names_nothing_stamps_nothing() {
+        let mut tab = Tab::new();
+        for found in [
+            sample(Foreground::Shell, None, Liveness::Running),
+            named(Foreground::Group(700), None, Liveness::Running),
+        ] {
+            assert!(tab.look());
+            tab.sample(&found);
+            assert_eq!(tab.process(), None);
+            assert!(!tab.axis.ticks());
+        }
+    }
+
+    /// A command starting is someone looking: the `C` asks.
+    #[test]
+    fn a_c_mark_looks_for_an_agent() {
+        let mut tab = Tab::new();
+        tab.mark(PromptMark::OutputStart, Foreground::Unknown);
+        assert!(tab.request().discover);
+    }
+
+    /// A stamped layer the records' `app` or the owner's `source` leave
+    /// unnamed takes its process's name.
+    #[test]
+    fn an_unnamed_layer_takes_its_processs_name() {
+        for (app, want) in [("", "codex"), ("claude-code", "claude-code")] {
+            let mut tab = Tab::new();
+            tab.feed(
+                [report("", app, ProgramStatusState::Working)],
+                Foreground::Unknown,
+            );
+            tab.sample(&named(
+                Foreground::Group(700),
+                Some("codex"),
+                Liveness::Running,
+            ));
+            assert_eq!(
+                tab.process().map(|process| process.agent),
+                Some(want.to_owned()),
+                "app {app:?}"
+            );
+        }
+    }
+
+    /// U21: no end reads what a process is called. An owner and records
+    /// stamped with no name, the right one, or a wrong one go through the
+    /// same suspend, resume and end.
+    #[test]
+    fn an_end_never_reads_what_the_process_is_called() {
+        let trace = |name: Option<&'static str>| {
+            let mut tab = Tab::new();
+            tab.agent = owned("claude", AgentLifecycle::Working);
+            tab.axis.owner_changed(&tab.agent);
+            tab.feed(
+                [report("", "claude-code", ProgramStatusState::Working)],
+                Foreground::Group(700),
+            );
+            tab.sample(&named(Foreground::Group(700), name, Liveness::Running));
+            let mut seen = Vec::new();
+            let mut step = |tab: &mut Tab, ended: Option<Ended>| {
+                seen.push((
+                    tab.shows(),
+                    tab.agent.ownership.is_some(),
+                    tab.process().map(|process| process.state),
+                    ended.map(|ended| (ended.owner, ended.records, ended.banner)),
+                ));
+            };
+            step(&mut tab, None);
+            tab.mark(end(128 + libc::SIGTSTP), Foreground::Shell);
+            let ended = tab.sample(&sample(Foreground::Shell, None, Liveness::Stopped));
+            step(&mut tab, Some(ended));
+            tab.mark(PromptMark::OutputStart, Foreground::Group(700));
+            let ended = tab.sample(&sample(Foreground::Group(700), None, Liveness::Running));
+            step(&mut tab, Some(ended));
+            tab.mark(end(137), Foreground::Shell);
+            let ended = tab.sample(&sample(Foreground::Shell, None, Liveness::Gone));
+            step(&mut tab, Some(ended));
+            seen
+        };
+        let unnamed = trace(None);
+        assert!(
+            unnamed
+                .last()
+                .is_some_and(|(_, owned, process, ended)| !owned
+                    && process.is_none()
+                    && ended
+                        .as_ref()
+                        .is_some_and(|(owner, records, _)| *owner && *records)),
+            "the precondition: it ends: {unnamed:?}"
+        );
+        assert_eq!(trace(Some("claude")), unnamed);
+        assert_eq!(trace(Some("codex")), unnamed);
+    }
+
+    /// A Codex working in front, its records stamped with a process its
+    /// name says is Codex.
+    fn named_codex() -> Tab {
+        let mut tab = Tab::new();
+        tab.feed(
+            [report("", "codex", ProgramStatusState::Working)],
+            Foreground::Unknown,
+        );
+        tab.sample(&named(
+            Foreground::Group(700),
+            Some("codex"),
+            Liveness::Running,
+        ));
+        assert_eq!(
+            tab.process().map(|process| process.agent),
+            Some("codex".to_owned())
+        );
+        tab
+    }
+
+    /// Codex clears its own status, in the read before the shell's `D` or
+    /// in the `D`'s own; the `D` is the shell taking the terminal back.
+    fn clear_then_d(tab: &mut Tab, code: i32, split: bool) {
+        let clear = report("", "codex", ProgramStatusState::Clear);
+        let d = StatusEvent::Prompt(end(code));
+        if split {
+            tab.feed([clear], Foreground::Unknown);
+            tab.feed([d], Foreground::Shell);
+        } else {
+            tab.feed([clear, d], Foreground::Shell);
+        }
+    }
+
+    /// Codex clears its status as it stops, so its `Ctrl-Z` leaves its
+    /// records nothing to park, but its process's name still names it:
+    /// the stamp passes to the identity layer, and once the read the `D`
+    /// asks for finds it stopped, the tab reads `codex` suspended, however
+    /// the bytes were split. `fg` brings it back running, and its next
+    /// report hands the tab back to its records.
+    #[test]
+    fn a_named_program_that_clears_as_it_stops_reads_suspended_however_the_read_splits() {
+        for split in [false, true] {
+            let mut tab = named_codex();
+            clear_then_d(&mut tab, 128 + libc::SIGTSTP, split);
+            assert_eq!(tab.process(), None, "unshown until read; split: {split}");
+            assert!(tab.axis.is_due(), "split: {split}");
+            tab.sample(&sample(Foreground::Shell, None, Liveness::Stopped));
+            assert_eq!(
+                tab.process()
+                    .map(|process| (process.agent, process.state, process.since)),
+                Some(("codex".to_owned(), ProcessState::Suspended, NOW + 5)),
+                "split: {split}"
+            );
+            assert_eq!(tab.shows(), AgentLifecycle::Inactive);
+            assert!(tab.axis.ticks());
+
+            tab.mark(PromptMark::OutputStart, Foreground::Group(700));
+            tab.sample(&sample(Foreground::Group(700), None, Liveness::Running));
+            assert_eq!(
+                tab.process().map(|process| process.state),
+                Some(ProcessState::Running)
+            );
+            tab.feed(
+                [report("", "codex", ProgramStatusState::Working)],
+                Foreground::Unknown,
+            );
+            assert!(tab.axis.identity.stamp().is_none(), "its records again");
+            assert_eq!(tab.shows(), AgentLifecycle::Working);
+        }
+    }
+
+    /// The same clear as Codex exits: the read the `D` asks for finds it
+    /// gone, and the tab never showed a row for it in between.
+    #[test]
+    fn a_named_program_that_clears_as_it_exits_never_shows() {
+        for split in [false, true] {
+            let mut tab = named_codex();
+            clear_then_d(&mut tab, 0, split);
+            assert_eq!(tab.process(), None, "split: {split}");
+            assert!(!tab.axis.ticks(), "an unshown identity is not ticked");
+            let ended = tab.sample(&sample(Foreground::Shell, None, Liveness::Gone));
+            assert!(ended.identity, "split: {split}");
+            assert_eq!(tab.process(), None);
+            assert!(tab.axis.identity.stamp().is_none());
+            assert!(tab.banners.is_empty(), "{:?}", tab.banners);
+        }
+    }
+
+    /// Records that left pass their stamp on only at the shell's own mark:
+    /// a mark from the program's group keeps them for the next, a command
+    /// starting forgets them, and an owner names the tab instead.
+    #[test]
+    fn records_that_left_pass_on_only_at_the_shells_mark() {
+        let clear = || report("", "codex", ProgramStatusState::Clear);
+
+        let mut own = named_codex();
+        own.feed([clear()], Foreground::Unknown);
+        own.mark(PromptMark::PromptStart, Foreground::Group(700));
+        assert!(own.axis.identity.stamp().is_none());
+        own.mark(end(128 + libc::SIGTSTP), Foreground::Shell);
+        assert!(own.axis.identity.stamp().is_some());
+
+        let mut started = named_codex();
+        started.feed([clear()], Foreground::Unknown);
+        started.mark(PromptMark::OutputStart, Foreground::Unknown);
+        started.mark(end(0), Foreground::Shell);
+        assert!(started.axis.identity.stamp().is_none());
+
+        let mut owned_tab = named_codex();
+        owned_tab.agent = owned("codex", AgentLifecycle::Working);
+        owned_tab.axis.owner_changed(&owned_tab.agent);
+        owned_tab.sample(&named(
+            Foreground::Group(700),
+            Some("codex"),
+            Liveness::Running,
+        ));
+        clear_then_d(&mut owned_tab, 128 + libc::SIGTSTP, false);
+        assert!(
+            owned_tab.agent.ownership.is_some(),
+            "the precondition: a stamped owner parks, and stays"
+        );
+        assert!(owned_tab.axis.identity.stamp().is_none());
     }
 }
