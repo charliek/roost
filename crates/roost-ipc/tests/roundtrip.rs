@@ -905,6 +905,53 @@ fn the_process_vectors_decode_into_their_typed_shapes() {
     assert_eq!(data.process, None, "an older server's event reads as none");
 }
 
+/// One-back decode (E8). v0.1.x's `Tab`, `Project`,
+/// `TabListResult` and `AgentReportChangedEvent` are today's less the
+/// `process` field, with the same attributes: none denies an unknown key.
+/// So this build meeting a key it has never heard of, in place of
+/// `process`, is what a v0.1.x client meets in these vectors — and it
+/// decodes everything else exactly as from a server with nothing stamped.
+#[test]
+fn a_decoder_that_predates_process_reads_the_process_vectors() {
+    fn renamed(mut value: serde_json::Value, pointer: &str) -> serde_json::Value {
+        let holder = value
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the object holding `process`");
+        let process = holder.remove("process").expect("a process to rename");
+        holder.insert("process_from_a_newer_build".into(), process);
+        value
+    }
+    fn dropped(mut value: serde_json::Value, pointer: &str) -> serde_json::Value {
+        value
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the object holding `process`")
+            .remove("process");
+        value
+    }
+
+    for name in [
+        "tab.list.process.response.json",
+        "tab.list.process_suspended.response.json",
+    ] {
+        let result = vector(name)["result"].clone();
+        let tab = "/projects/0/tabs/0";
+        let unknown: TabListResult = serde_json::from_value(renamed(result.clone(), tab))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let none: TabListResult = serde_json::from_value(dropped(result, tab)).unwrap();
+        assert_eq!(unknown, none, "{name}");
+        assert_eq!(unknown.projects[0].tabs[0].title, "claude", "{name}");
+    }
+
+    let data = vector("agent_report.changed.process.event.json")["data"].clone();
+    let unknown: AgentReportChangedEvent =
+        serde_json::from_value(renamed(data.clone(), "")).expect("the event decodes");
+    let none: AgentReportChangedEvent = serde_json::from_value(dropped(data, "")).unwrap();
+    assert_eq!(unknown, none);
+    assert_eq!(unknown.state, TabState::None);
+}
+
 /// `process.state` is an open value: one this build can't read reads the
 /// whole object as absent, on a tab and on the event, and never costs the
 /// client the tab or the event.
