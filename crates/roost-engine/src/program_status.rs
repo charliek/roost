@@ -71,6 +71,29 @@ pub struct ProgramStatusRecords {
     cap_warned: bool,
 }
 
+/// What a prompt mark took off a tab while the program its records follow
+/// was stopped or in the background (the process layer, #519): its live
+/// records, and the root's say over the tab. [`ProgramStatusRecords::restore`]
+/// puts them back once the program runs again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParkedRecords {
+    records: Vec<(String, Record)>,
+    /// The tab's report count when they were taken: a root reported since
+    /// is someone else's, and then nothing comes back.
+    seq: u64,
+    /// No prompt mark had followed the root yet, so it decided the tab.
+    root_unprompted: bool,
+    /// The deciding record's app when they were taken.
+    pub(crate) app: String,
+}
+
+impl ParkedRecords {
+    /// Nothing to bring back: no live record, and no root that decided.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.records.is_empty() && !self.root_unprompted
+    }
+}
+
 /// The deciding record, with the app it inherits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordView<'a> {
@@ -277,6 +300,68 @@ impl ProgramStatusRecords {
         self.deciding().is_some()
     }
 
+    /// The deciding record's app, inherited along its id.
+    pub(crate) fn deciding_app(&self) -> Option<&str> {
+        self.deciding().map(|view| view.app)
+    }
+
+    pub(crate) fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Do to the records what a prompt mark does — drop the live ones and
+    /// end the root's say — and hand back what that took.
+    pub(crate) fn park(&mut self) -> ParkedRecords {
+        let app = self.deciding_app().unwrap_or_default().to_owned();
+        let root_unprompted = self.records.contains_key(ROOT) && !self.root_prompted;
+        let (live, kept) = std::mem::take(&mut self.records)
+            .into_iter()
+            .partition(|(_, record)| is_live(record.state));
+        self.records = kept;
+        self.root_prompted = true;
+        ParkedRecords {
+            records: live.into_iter().collect(),
+            seq: self.seq,
+            root_unprompted,
+            app,
+        }
+    }
+
+    /// Put back what [`Self::park`] took, unless the tab has moved on
+    /// since: a live record, or a root reported after the park. A record
+    /// whose id was reported since stays as reported, and a child the cap
+    /// has no room for stays out.
+    pub(crate) fn restore(&mut self, parked: ParkedRecords) {
+        let root_reported = self
+            .records
+            .get(ROOT)
+            .is_some_and(|root| root.updated_seq > parked.seq);
+        if root_reported || self.records.values().any(|record| is_live(record.state)) {
+            return;
+        }
+        for (id, record) in parked.records {
+            if id == ROOT || self.records.contains_key(&id) || self.children() < MAX_CHILDREN {
+                self.records.entry(id).or_insert(record);
+            }
+        }
+        if parked.root_unprompted && self.records.contains_key(ROOT) {
+            self.root_prompted = false;
+        }
+    }
+
+    /// End what a program that is gone left on the tab, as a prompt mark
+    /// would: its live records, and the root's say. With `upto`, only
+    /// records reported by then are its; a later one belongs to whatever
+    /// runs in front now.
+    pub(crate) fn end(&mut self, upto: Option<u64>) {
+        let ours = |record: &Record| upto.is_none_or(|seq| record.updated_seq <= seq);
+        self.records
+            .retain(|_, record| !(is_live(record.state) && ours(record)));
+        if self.records.get(ROOT).is_none_or(ours) {
+            self.root_prompted = true;
+        }
+    }
+
     /// Apply one ordered batch from the tab's authoritative terminal to the
     /// records and to the hook layer `agent`, whose shell marks come from
     /// the same stream (plan 083 D-B1).
@@ -302,9 +387,11 @@ impl ProgramStatusRecords {
     }
 
     /// [`Self::apply`] with the tab's process layer beside the hook layer:
-    /// each prompt mark also reaches `process`, after its own effect and
-    /// read with `fg` in front, so a mark's release or park lands at its
-    /// byte like everything else.
+    /// each prompt mark also reaches `process`, read with `fg` in front,
+    /// so a mark's release or park lands at its byte like everything else.
+    /// A mark that parks takes the records it would drop aside instead.
+    /// The batch then tells `process` whether the records still decide
+    /// the tab.
     pub(crate) fn apply_with_process(
         &mut self,
         agent: &mut AgentTabState,
@@ -319,7 +406,11 @@ impl ProgramStatusRecords {
             match event {
                 StatusEvent::Report(report) => self.report(&report, now_ms, &mut applied),
                 StatusEvent::Prompt(mark) => {
-                    self.prompt(mark);
+                    if process.parks_records_at(mark, fg) {
+                        process.park_records(self.park());
+                    } else {
+                        self.prompt(mark);
+                    }
                     let unmarked = agent.clone();
                     if let Some(next) = agent::apply_shell_mark(agent, osc133_body(mark)) {
                         *agent = next;
@@ -340,6 +431,7 @@ impl ProgramStatusRecords {
             }
             before = self.announce(agent, before, now_ms, &mut applied);
         }
+        process.records_settled(self);
         applied
     }
 

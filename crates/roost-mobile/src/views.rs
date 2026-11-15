@@ -128,7 +128,8 @@ pub fn workspace(mirror: &HostMirror) -> WorkspaceView {
 
 /// The badge is what the tab presents — its effective lifecycle, program
 /// status composed over the hooks — so the phone and the desktop's dot
-/// agree. A failed agent needs the user as much as a waiting one.
+/// agree. A failed agent needs the user as much as a waiting one. An
+/// agent `Tab.process` names (one stopped with `Ctrl-Z`) is an agent too.
 pub fn tab(tab: &Tab) -> TabView {
     let effective = tab.effective_lifecycle();
     let has_agent = tab.ownership.is_some()
@@ -136,7 +137,11 @@ pub fn tab(tab: &Tab) -> TabView {
             .program_status
             .as_ref()
             .and_then(|status| status.record.as_ref())
-            .is_some_and(|record| !record.app.is_empty());
+            .is_some_and(|record| !record.app.is_empty())
+        || tab
+            .process
+            .as_ref()
+            .is_some_and(|process| !process.agent.is_empty());
     let agent = match effective {
         AgentLifecycle::Working => AgentBadge::Working,
         AgentLifecycle::Waiting | AgentLifecycle::Failed => AgentBadge::Waiting,
@@ -220,6 +225,23 @@ mod tests {
             "ownership": {"source": "claude", "session_id": "s1"},
         })));
         assert_eq!(idle.agent, AgentBadge::Idle, "an agent between turns");
+    }
+
+    /// A 7501 agent stopped with Ctrl-Z has no record left (the prompt
+    /// mark set them aside) and no owner: `Tab.process` alone says it is
+    /// there, and the phone shows it as the desktop's row does.
+    #[test]
+    fn a_suspended_agent_named_only_by_its_process_is_an_idle_agent() {
+        let suspended = tab(&wire_tab(json!({
+            "process": {"state": "suspended", "agent": "codex", "pid": "48213", "since": 1},
+        })));
+        assert_eq!(suspended.agent, AgentBadge::Idle);
+        assert_eq!(suspended.status_text.as_deref(), Some("Suspended"));
+
+        let unnamed = tab(&wire_tab(json!({
+            "process": {"state": "running", "agent": "", "pid": "48213", "since": 1},
+        })));
+        assert_eq!(unnamed.agent, AgentBadge::None);
     }
 
     #[test]

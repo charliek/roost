@@ -2405,13 +2405,41 @@ impl Workspace {
     }
 
     /// Every sample a tab's process layer is due, clearing what it asked.
-    pub(crate) fn take_process_requests(&self) -> Vec<SampleRequest> {
+    /// On the sampler's `tick`, every tab holding a stamp is due as well.
+    pub(crate) fn take_process_requests(&self, tick: bool) -> Vec<SampleRequest> {
         let mut inner = self.inner.lock().unwrap();
         inner
             .tabs
             .iter_mut()
-            .filter_map(|(tab_id, row)| row.process.take_request(*tab_id))
+            .filter_map(|(tab_id, row)| {
+                if tick {
+                    row.process.request_tick();
+                }
+                row.process.take_request(*tab_id, &row.program_status)
+            })
             .collect()
+    }
+
+    /// Whether any tab holds a stamp, so the sampler's tick has something
+    /// to read.
+    pub(crate) fn holds_process_stamps(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.tabs.values().any(|row| row.process.ticks())
+    }
+
+    /// Ask `tab_id`'s process layer for a sample, where it has something
+    /// to read: a session's viewer came or went, which is the only focus
+    /// a session sees.
+    #[cfg(feature = "server-vt")]
+    pub(crate) fn request_process_sample(&self, tab_id: i64) {
+        let wake = self
+            .inner
+            .lock()
+            .unwrap()
+            .request_process_samples(&[tab_id]);
+        if wake {
+            self.process_wake.notify_one();
+        }
     }
 
     /// Apply what the sampler read for `request` to its tab's process
@@ -2423,11 +2451,11 @@ impl Workspace {
             return;
         };
         let mut next_agent = row.agent.clone();
+        let mut records = row.program_status.clone();
         let mut process = row.process.clone();
-        process.apply_sample(request, sample, &mut next_agent, unix_now());
-        let ended = row.agent.ownership.is_some() && next_agent.ownership.is_none();
+        let ended =
+            process.apply_sample(request, sample, &mut next_agent, &mut records, unix_now());
         let wake = process.is_due();
-        let records = row.program_status.clone();
         let events = replace_axes(row, next_agent, records, process);
         if events.is_empty() {
             drop(inner);
@@ -2435,10 +2463,16 @@ impl Workspace {
             // Run state isn't in the persisted snapshot — emit only.
             self.commit(inner, events, Persist::Skip);
         }
-        if ended {
+        if ended.owner {
             tracing::info!(
                 tab_id = request.tab_id,
                 "the agent's process is gone and its group left the terminal; released its owner"
+            );
+        }
+        if ended.records {
+            tracing::info!(
+                tab_id = request.tab_id,
+                "the program's process is gone and its group left the terminal; ended its live records"
             );
         }
         if wake {
@@ -3034,11 +3068,6 @@ impl Default for Workspace {
 type Selection = (i64, i64);
 
 impl Inner {
-    /// Move the active selection onto one tab, reporting where it was
-    /// and where it landed. The mutation half of [`Workspace::focus_tab`].
-    ///
-    /// Validation comes first and mutates nothing on the way out: an
-    /// unknown tab leaves the selection exactly as it was.
     /// Ask each of `tab_ids`' process layers for a sample, where it has
     /// something to read. Answers whether any asked.
     fn request_process_samples(&mut self, tab_ids: &[i64]) -> bool {
@@ -3051,6 +3080,11 @@ impl Inner {
         asked
     }
 
+    /// Move the active selection onto one tab, reporting where it was
+    /// and where it landed. The mutation half of [`Workspace::focus_tab`].
+    ///
+    /// Validation comes first and mutates nothing on the way out: an
+    /// unknown tab leaves the selection exactly as it was.
     fn select_tab(&mut self, tab_id: i64) -> Result<(Selection, Selection), WorkspaceError> {
         let row = self
             .tabs
@@ -3522,7 +3556,7 @@ fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
         password_input: row.password_input,
         dropped_reports: row.dropped_reports.clone(),
         program_status: status,
-        process: row.process.wire(&row.agent),
+        process: row.process.wire(&row.agent, &row.program_status),
     }
 }
 
@@ -3574,13 +3608,13 @@ fn replace_axes(
     let prev_status = program_status::summary(&row.agent, &row.program_status);
     let prev_state = roost_ipc::program_status::effective(&row.agent, prev_status.as_ref());
     let prev_live = agent::is_live(&row.agent);
-    let prev_process = row.process.wire(&row.agent);
+    let prev_process = row.process.wire(&row.agent, &row.program_status);
     let agent_changed = row.agent != next_agent;
     row.agent = next_agent;
     row.program_status = next_records;
     row.process = next_process;
     let status = program_status::summary(&row.agent, &row.program_status);
-    let process = row.process.wire(&row.agent);
+    let process = row.process.wire(&row.agent, &row.program_status);
     if !agent_changed
         && same_summary(prev_status.as_ref(), status.as_ref())
         && prev_process == process
@@ -8542,7 +8576,7 @@ mod tests {
             leader: Option<Stamp>,
             liveness: Liveness,
         ) {
-            let requests = ws.take_process_requests();
+            let requests = ws.take_process_requests(false);
             assert!(!requests.is_empty(), "the precondition: a sample was due");
             for request in requests {
                 let sample = ProcessSample {
@@ -8631,7 +8665,7 @@ mod tests {
             let owner = ws.tab(tid).unwrap().ownership.expect("kept");
             assert_eq!(owner.source, SOURCE_MANUAL);
             assert!(
-                ws.take_process_requests().is_empty(),
+                ws.take_process_requests(false).is_empty(),
                 "no process to follow"
             );
         }
@@ -8729,7 +8763,7 @@ mod tests {
                 )),
                 "{events:?}"
             );
-            assert!(ws.take_process_requests().is_empty());
+            assert!(ws.take_process_requests(false).is_empty());
         }
 
         /// U5: a mark from the stamped group itself — Claude's own Screen
@@ -8742,7 +8776,7 @@ mod tests {
             let tab = ws.tab(tid).unwrap();
             assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
             assert!(tab.ownership.is_some());
-            assert!(ws.take_process_requests().is_empty(), "nothing parked");
+            assert!(ws.take_process_requests(false).is_empty(), "nothing parked");
         }
 
         /// U12: a new Claude started beside a suspended one is its own
@@ -8770,6 +8804,199 @@ mod tests {
             assert!(accepted, "{:?}", tab.dropped_reports);
             assert_eq!(tab.ownership.map(|o| o.session_id), Some("s2".into()));
             assert_eq!(tab.process, None, "the new owner waits for its own stamp");
+        }
+
+        fn codex(state: roost_ipc::program_status::ProgramStatusState) -> StatusEvent {
+            StatusEvent::Report(roost_ipc::program_status::ProgramStatusReport {
+                state,
+                kind: None,
+                progress: None,
+                id: String::new(),
+                app: "codex".into(),
+                title: String::new(),
+                msg: String::new(),
+            })
+        }
+
+        fn raw_osc_raises(ws: &Workspace, tid: i64) -> bool {
+            ws.raise_attention(
+                tid,
+                "",
+                "after",
+                AttentionSource::RawOsc {
+                    suppressed_at_place: None,
+                },
+            )
+            .unwrap()
+        }
+
+        /// A Codex with no hooks working in front of a shell with no prompt
+        /// marks, its records stamped.
+        fn stamped_codex() -> (Workspace, i64, Arc<Mutex<Foreground>>) {
+            let (ws, tid, fg) = probed_ws();
+            mark(&ws, tid, PromptMark::OutputStart);
+            ws.apply_program_status(
+                tid,
+                vec![codex(
+                    roost_ipc::program_status::ProgramStatusState::Working,
+                )],
+                T,
+            )
+            .unwrap();
+            sample(
+                &ws,
+                Foreground::Group(AGENT.pgid),
+                Some(AGENT),
+                Liveness::Running,
+            );
+            (ws, tid, fg)
+        }
+
+        /// U14: the records' process rides `Tab.process` and
+        /// `AgentChanged`, under the record's app; and (#519) once the
+        /// tick finds it gone with the shell in front, its live record
+        /// ends as a prompt would end it, the tab leaves `running`, and a
+        /// raw notification is no longer muted.
+        #[test]
+        fn a_records_process_is_on_the_wire_and_its_end_unmutes_the_tab() {
+            let (ws, tid) = agent_ws();
+            ws.apply_program_status(
+                tid,
+                vec![codex(
+                    roost_ipc::program_status::ProgramStatusState::Working,
+                )],
+                T,
+            )
+            .unwrap();
+            let mut rx = ws.subscribe();
+            sample(
+                &ws,
+                Foreground::Group(AGENT.pgid),
+                Some(AGENT),
+                Liveness::Running,
+            );
+            let tab = ws.tab(tid).unwrap();
+            let process = tab.process.clone().expect("the records are stamped");
+            assert_eq!(
+                (process.agent.as_str(), process.pid, process.state),
+                ("codex", AGENT.pid, ProcessState::Running)
+            );
+            assert!(drain(&mut rx).iter().any(|event| matches!(
+                event,
+                WorkspaceEvent::AgentChanged { process: Some(process), .. }
+                    if process.agent == "codex"
+            )));
+            assert_eq!(tab.state, TabState::Running);
+            assert!(!raw_osc_raises(&ws, tid), "the precondition: muted");
+
+            let requests = ws.take_process_requests(true);
+            assert_eq!(requests.len(), 1, "the tick reads the stamped tab");
+            ws.apply_process_sample(
+                &requests[0],
+                &ProcessSample {
+                    incarnation: 1,
+                    foreground: Foreground::Shell,
+                    leader: None,
+                    liveness: vec![(AGENT, Liveness::Gone)],
+                },
+            );
+            let tab = ws.tab(tid).unwrap();
+            assert_eq!(tab.state, TabState::None);
+            assert_eq!(tab.program_status, None);
+            assert_eq!(tab.process, None);
+            assert!(drain(&mut rx).iter().any(|event| matches!(
+                event,
+                WorkspaceEvent::AgentChanged {
+                    process: None,
+                    program_status: None,
+                    ..
+                }
+            )));
+            assert!(raw_osc_raises(&ws, tid), "a raw notification lands again");
+            assert!(!ws.holds_process_stamps());
+        }
+
+        /// E4's core: a Ctrl-Z of a 7501 agent with no hooks keeps its
+        /// row's process, suspended under the app, while the tab shows
+        /// what the prompt shows; the records are back on `fg`.
+        #[test]
+        fn a_suspended_7501_agent_shows_suspended_and_comes_back() {
+            let (ws, tid, probe) = stamped_codex();
+            *probe.lock().unwrap() = Foreground::Shell;
+            mark(&ws, tid, PromptMark::CommandEnd);
+            sample(&ws, Foreground::Shell, None, Liveness::Stopped);
+            let tab = ws.tab(tid).unwrap();
+            assert_eq!(tab.state, TabState::None);
+            assert_eq!(tab.ownership, None);
+            let process = tab.process.expect("still stamped");
+            assert_eq!(
+                (process.state, process.agent.as_str()),
+                (ProcessState::Suspended, "codex")
+            );
+            assert!(raw_osc_raises(&ws, tid), "a suspended agent mutes nothing");
+
+            *probe.lock().unwrap() = Foreground::Group(AGENT.pgid);
+            mark(&ws, tid, PromptMark::OutputStart);
+            sample(&ws, Foreground::Group(AGENT.pgid), None, Liveness::Running);
+            let tab = ws.tab(tid).unwrap();
+            assert_eq!(tab.state, TabState::Running, "the record is back");
+            assert_eq!(
+                tab.process.map(|process| process.state),
+                Some(ProcessState::Running)
+            );
+        }
+
+        /// U13: the tick reads every tab holding a stamp, and only those —
+        /// not a plain tab, not records it found nothing to stamp for.
+        #[test]
+        fn the_tick_reads_only_tabs_holding_a_stamp() {
+            let (ws, stamped, _) = stamped_codex();
+            let project = ws.tab(stamped).unwrap().project_id;
+            let plain = ws
+                .open_tab(project, "/", "", true, TabOpener::None)
+                .unwrap()
+                .id;
+            let unstamped = ws
+                .open_tab(project, "/", "", true, TabOpener::None)
+                .unwrap()
+                .id;
+            ws.apply_program_status(
+                unstamped,
+                vec![codex(
+                    roost_ipc::program_status::ProgramStatusState::Working,
+                )],
+                T,
+            )
+            .unwrap();
+            sample(&ws, Foreground::Shell, None, Liveness::Running);
+            assert!(ws.take_process_requests(false).is_empty());
+
+            let ticked: Vec<i64> = ws
+                .take_process_requests(true)
+                .iter()
+                .map(|request| request.tab_id)
+                .collect();
+            assert_eq!(ticked, vec![stamped], "not {plain} or {unstamped}");
+            assert!(ws.holds_process_stamps());
+        }
+
+        /// A session's viewer coming or going asks a stamped tab for a
+        /// sample: the only focus a session sees.
+        #[cfg(feature = "server-vt")]
+        #[test]
+        fn a_viewer_coming_or_going_asks_a_stamped_tab_for_a_sample() {
+            use crate::tab_task::ServerVtWorkspace;
+            let (ws, tid, _) = stamped_codex();
+            assert!(ws.take_process_requests(false).is_empty());
+            ws.tab_viewers_changed(tid);
+            let requests = ws.take_process_requests(false);
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.tab_id)
+                    .collect::<Vec<_>>(),
+                vec![tid]
+            );
         }
     }
 }

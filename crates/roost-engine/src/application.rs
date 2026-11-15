@@ -409,11 +409,13 @@ impl LocalClient {
 }
 
 impl LocalClient {
-    /// Start the process layer (#621): install the probe a prompt mark
-    /// asks who has its tab's terminal, and a sampler that reads a tab's
-    /// processes whenever its layer asks — an agent's claim, a hook
-    /// report, a mark that parked, a `C` on a stamped tab, a focus — and
-    /// applies what it read under the workspace lock.
+    /// Start the process layer (#621, #519): install the probe a prompt
+    /// mark asks who has its tab's terminal, and a sampler that reads a
+    /// tab's processes whenever its layer asks — an agent's claim, records
+    /// that start deciding the tab, a hook report, a mark that parked, a
+    /// `C` on a stamped tab, a focus or a session viewer coming or going —
+    /// and once a second for every tab holding a stamp, and applies what
+    /// it read under the workspace lock.
     ///
     /// Call from inside a Tokio runtime. Only the call that installs the
     /// probe starts a sampler, so it is idempotent per workspace. The
@@ -437,50 +439,83 @@ impl LocalClient {
     }
 }
 
+/// How often the sampler reads every tab that holds a stamp (#519): in a
+/// shell that prints no prompt marks, nothing else says a stamped agent
+/// died. A tick only reads; what it finds ends something only on the
+/// evidence a mark's sample would need.
+const PROCESS_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// [`LocalClient::watch_processes`]'s sampler: every request the tabs'
 /// process layers made since it last woke, read off the lock, applied
-/// under it. A sample of a spawn the tab no longer has is dropped, as a
-/// stale password report is.
+/// under it, and, every [`PROCESS_TICK`] while any tab holds a stamp,
+/// every such tab. It sleeps on its wake while none does. A sample of a
+/// spawn the tab no longer has is dropped, as a stale password report is.
 async fn sample_processes(
     workspace: Weak<Workspace>,
     supervisor: Weak<PtySupervisor>,
     wake: Arc<Notify>,
 ) {
+    let mut next_tick: Option<tokio::time::Instant> = None;
     loop {
-        wake.notified().await;
+        // A wake never moves the tick: a tab whose agent reports all the
+        // time must not starve a quiet one of its reads.
+        let tick = match next_tick {
+            Some(at) => tokio::select! {
+                () = wake.notified() => false,
+                () = tokio::time::sleep_until(at) => true,
+            },
+            None => {
+                wake.notified().await;
+                false
+            }
+        };
         let (Some(workspace), Some(supervisor)) = (workspace.upgrade(), supervisor.upgrade())
         else {
             return;
         };
-        let requests = workspace.take_process_requests();
-        if requests.is_empty() {
-            continue;
+        let requests = workspace.take_process_requests(tick);
+        if !requests.is_empty() {
+            sample(&workspace, &supervisor, requests).await;
         }
-        let reader = Arc::clone(&supervisor);
-        let read = tokio::task::spawn_blocking(move || {
-            requests
-                .into_iter()
-                .filter_map(|request| {
-                    reader
-                        .sample_process(request.tab_id, request.stamp_wanted, &request.stamps)
-                        .map(|sample| (request, sample))
-                })
-                .collect::<Vec<_>>()
-        })
-        .await;
-        let samples = match read {
-            Ok(samples) => samples,
-            Err(error) => {
-                tracing::warn!(%error, "a process-layer read failed");
-                continue;
-            }
+        next_tick = match next_tick {
+            _ if !workspace.holds_process_stamps() => None,
+            Some(at) if !tick => Some(at),
+            _ => Some(tokio::time::Instant::now() + PROCESS_TICK),
         };
-        for (request, sample) in samples {
-            if supervisor.incarnation(request.tab_id) == Some(sample.incarnation) {
-                workspace.apply_process_sample(&request, &sample);
-            } else {
-                tracing::debug!(tab_id = request.tab_id, "dropping a stale process sample");
-            }
+    }
+}
+
+/// Read `requests` on a blocking thread with no lock held, and apply each
+/// sample under the workspace lock.
+async fn sample(
+    workspace: &Workspace,
+    supervisor: &Arc<PtySupervisor>,
+    requests: Vec<crate::process_axis::SampleRequest>,
+) {
+    let reader = Arc::clone(supervisor);
+    let read = tokio::task::spawn_blocking(move || {
+        requests
+            .into_iter()
+            .filter_map(|request| {
+                reader
+                    .sample_process(request.tab_id, request.stamp_wanted, &request.stamps)
+                    .map(|sample| (request, sample))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+    let samples = match read {
+        Ok(samples) => samples,
+        Err(error) => {
+            tracing::warn!(%error, "a process-layer read failed");
+            return;
+        }
+    };
+    for (request, sample) in samples {
+        if supervisor.incarnation(request.tab_id) == Some(sample.incarnation) {
+            workspace.apply_process_sample(&request, &sample);
+        } else {
+            tracing::debug!(tab_id = request.tab_id, "dropping a stale process sample");
         }
     }
 }
