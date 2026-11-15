@@ -273,7 +273,7 @@ pub(crate) fn row_agent(tab: &Tab) -> Option<RowAgent> {
 /// no program-status record at all. Its row never guesses what the agent
 /// is doing — the tab's shell may say a command runs, which is the agent
 /// itself — so it reads `Running` or `Suspended`, with no lifecycle.
-fn named_by_its_process_alone(tab: &Tab) -> bool {
+pub fn named_by_its_process_alone(tab: &Tab) -> bool {
     agent_owner(&tab.agent_state()).is_none()
         && tab
             .program_status
@@ -341,14 +341,16 @@ pub fn status_text(effective: AgentLifecycle, raw: AgentLifecycle, detail: &str)
 /// capped here like a hook's `detail`. The hook layer's `detail` is shown
 /// only while hooks decide: under a record, deciding or kept, it belongs
 /// to a state the record overrode. An agent stopped with `Ctrl-Z` reads
-/// `Suspended`, whatever the prompt in front of it shows; one only its
-/// process names reads `Running` while it runs.
+/// `Suspended`, whatever the shell in front of it shows, unless a live
+/// record or a working owner decides the tab: another agent run in front
+/// of the stopped one, whose state is the tab's. One only its process
+/// names reads `Running` while it runs.
 pub fn tab_status_text(tab: &Tab, effective: AgentLifecycle, detail: &str) -> String {
-    if tab
+    let suspended = tab
         .process
         .as_ref()
-        .is_some_and(|process| process.state == ProcessState::Suspended)
-    {
+        .is_some_and(|process| process.state == ProcessState::Suspended);
+    if suspended && deciding_record(tab).is_none() && !agent::agent_drives(&tab.agent_state()) {
         return "Suspended".to_string();
     }
     if named_by_its_process_alone(tab) {
@@ -895,6 +897,47 @@ mod tests {
         assert_eq!(
             tab_status_text(&running, AgentLifecycle::Inactive, ""),
             "Idle"
+        );
+    }
+
+    /// A second agent run in front of a stopped one decides the tab: a
+    /// live record of its own, or a hook owner at work, reads as itself
+    /// while `Tab.process` still names the stopped one. What the stopped
+    /// one kept — a root `done` no prompt took — decides nothing, and the
+    /// row reads Suspended over it.
+    #[test]
+    fn another_agents_live_state_reads_over_a_suspended_process() {
+        use roost_ipc::process::ProcessState::Suspended;
+        use roost_ipc::program_status::ProgramStatusState as S;
+        let stopped = with_process(tab(1, "t"), "codex", Suspended, NOW);
+
+        let reporting = recorded(
+            stopped.clone(),
+            AgentLifecycle::Working,
+            DecidedBy::Records,
+            Some(view(S::Working, "crush", "", NOW)),
+        );
+        assert_eq!(
+            tab_status_text(&reporting, AgentLifecycle::Working, ""),
+            "Working"
+        );
+        assert_eq!(row_agent(&reporting).expect("a row").agent, "Crush");
+
+        let hooked = owned(stopped.clone(), "claude", AgentLifecycle::Waiting, NOW);
+        assert_eq!(
+            tab_status_text(&hooked, AgentLifecycle::Waiting, ""),
+            "Waiting for input"
+        );
+
+        let kept = recorded(
+            stopped,
+            AgentLifecycle::Finished,
+            DecidedBy::KeptRecord,
+            Some(view(S::Done, "codex", "", NOW)),
+        );
+        assert_eq!(
+            tab_status_text(&kept, AgentLifecycle::Finished, ""),
+            "Suspended"
         );
     }
 
