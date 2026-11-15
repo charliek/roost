@@ -4333,15 +4333,8 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             let jobs = tempfile::tempdir().unwrap();
-            let tmux = jobs.path().join("tmux");
-            std::fs::copy(
-                ["/bin/sleep", "/usr/bin/sleep"]
-                    .into_iter()
-                    .find(|sleep| std::path::Path::new(sleep).exists())
-                    .expect("a sleep binary"),
-                &tmux,
-            )
-            .unwrap();
+            let tmux = crate::foreground::sleeper_named(jobs.path(), "tmux")
+                .expect("cc or a shell to make a process named tmux");
             sup.write(
                 tab_id,
                 format!("( exec '{}' 30 )\n", tmux.display()).into_bytes(),
@@ -4438,7 +4431,7 @@ mod tests {
                 named(format!("'{}' 30", agent.display())).await,
                 Some("cursor")
             ),
-            None => eprintln!("skipping the native half: no sleep to copy or cc to build one"),
+            None => eprintln!("skipping the native half: no cc to build a named sleeper"),
         }
         match which_node() {
             Some(node) => {

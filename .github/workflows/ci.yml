@@ -2452,8 +2452,9 @@ jobs:
       - name: Install libclang (Linux)
         if: runner.os == 'Linux'
         # bindgen needs it to build roost-vt with `--features ffi`.
-        # macOS gets it via Xcode's command-line tools.
-        run: sudo linux/scripts/ci-apt-install.sh libclang-dev
+        # macOS gets it via Xcode's command-line tools. zsh: the process-
+        # layer cases run Roost's zsh integration and fail without it.
+        run: sudo linux/scripts/ci-apt-install.sh libclang-dev zsh
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1

@@ -533,22 +533,25 @@ fn proc_stamp(pid: u32) -> Option<ProcStamp> {
     }
 }
 
-/// A binary called `name` in `dir` that sleeps whatever its arguments,
-/// for a test that needs a process named `name`. Linux names a process
-/// after the path it ran as, so a copied `sleep` will do; macOS names it
-/// after the binary and kills a copied system one, so there it is built
-/// with `cc`. `None` when neither is at hand.
+/// A program called `name` in `dir` that sleeps whatever its arguments,
+/// for a test that needs a process named `name`, built with `cc`. A
+/// copied `sleep` won't do: macOS kills a copied system binary, and a
+/// multicall coreutils (uutils, Ubuntu 26.04) picks its tool by the name
+/// it ran as. Without `cc`, Linux takes a shebang script, which the
+/// kernel also names after its own file. `None` when neither works.
 #[cfg(test)]
 pub(crate) fn sleeper_named(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     let path = dir.join(name);
-    if cfg!(target_os = "linux") {
-        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
-            .into_iter()
-            .find(|sleep| std::path::Path::new(sleep).exists())?;
-        std::fs::copy(sleep, &path).ok()?;
+    if build_sleeper(&path) {
         return Some(path);
     }
-    build_sleeper(&path).then_some(path)
+    if cfg!(target_os = "linux") {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&path, SLEEPER_SCRIPT).ok()?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok()?;
+        return Some(path);
+    }
+    None
 }
 
 /// Build a binary at `path` that pauses forever, with `cc`.
@@ -573,6 +576,9 @@ fn build_sleeper(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 const SLEEPER: &str = "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n";
+
+#[cfg(test)]
+const SLEEPER_SCRIPT: &str = "#!/bin/sh\nwhile :; do sleep 300; done\n";
 
 /// `pid`'s short name, for a test waiting on an `exec`.
 #[cfg(all(test, target_os = "linux"))]

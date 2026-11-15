@@ -553,21 +553,29 @@ async fn an_owner_behind_a_multiplexer_outlives_its_client() {
     assert_eq!(listed.agent_lifecycle, AgentLifecycle::Working);
 }
 
-/// A command that runs a process called `name`, made in `dir`: Linux
-/// names a process after the path it ran as, so a copied `sleep` will
-/// do; macOS names it after its binary, and kills a copied system one, so
-/// there it is built with `cc`.
+/// A command that runs a process called `name`, made in `dir` with `cc`
+/// (a copied `sleep` won't do: macOS kills a copied system binary, and a
+/// multicall coreutils picks its tool by the name it ran as). Without
+/// `cc`, Linux takes a shebang script, which it names after the file.
 fn named_sleeper(dir: &std::path::Path, name: &str) -> Option<String> {
     let agent = dir.join(name);
-    if cfg!(target_os = "linux") {
-        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
-            .into_iter()
-            .find(|sleep| std::path::Path::new(sleep).exists())?;
-        std::fs::copy(sleep, &agent).ok()?;
-    } else {
+    if !build_named(&agent) {
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&agent, "#!/bin/sh\nwhile :; do sleep 300; done\n").ok()?;
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).ok()?;
+    }
+    Some(format!("'{}' 300", agent.display()))
+}
+
+/// Build a binary at `agent` that pauses forever, with `cc`.
+fn build_named(agent: &std::path::Path) -> bool {
+    (|| -> Option<()> {
         let mut cc = std::process::Command::new("cc")
             .args(["-x", "c", "-o"])
-            .arg(&agent)
+            .arg(agent)
             .arg("-")
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -577,9 +585,9 @@ fn named_sleeper(dir: &std::path::Path, name: &str) -> Option<String> {
             b"#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
         )
         .ok()?;
-        cc.wait().ok()?.success().then_some(())?;
-    }
-    Some(format!("'{}' 300", agent.display()))
+        cc.wait().ok()?.success().then_some(())
+    })()
+    .is_some()
 }
 
 /// `pid`'s name by `ps`, less any directory (macOS's `ps` prints the

@@ -543,18 +543,21 @@ SLEEPER = "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n"
 
 def named_agent(directory: str, name: str) -> str:
     """A command running something Roost names by its process, made in
-    `directory`: a binary called `name`. Linux names a process after the
-    path it ran as, so a copied `sleep` will do; macOS names it after the
-    binary, and kills a copied system one, so it is a sleeper built with
-    `cc` — or, with no compiler, `node` running `<name>/index.js`, as
-    cursor-agent's own launcher runs its script."""
+    `directory`: a sleeper called `name`, built with `cc`. A copied `sleep`
+    won't do: macOS kills a copied system binary, and a multicall coreutils
+    (uutils, Ubuntu 26.04) picks its tool by the name it ran as. Without a
+    compiler, Linux takes a shebang script, which it names after the file;
+    macOS takes `node` running `<name>/index.js`, as cursor-agent's own
+    launcher runs its script."""
     agent = os.path.join(directory, name)
-    if sys.platform.startswith("linux"):
-        shutil.copy(shutil.which("sleep") or "/bin/sleep", agent)
-        return f"'{agent}' 300"
     cc = shutil.which("cc")
     if cc is not None:
         subprocess.run([cc, "-x", "c", "-o", agent, "-"], input=SLEEPER, text=True, check=True)
+        return f"'{agent}'"
+    if sys.platform.startswith("linux"):
+        with open(agent, "w") as script:
+            script.write("#!/bin/sh\nwhile :; do sleep 300; done\n")
+        os.chmod(agent, 0o755)
         return f"'{agent}'"
     node = shutil.which("node")
     if node is None:
