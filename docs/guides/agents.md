@@ -295,7 +295,11 @@ settings. Claude then refuses to start with `CLAUDE_CODE_PLUGIN_DIRS`
 set. Roost checks before it hands Claude the variable: a managed-settings
 file under `/etc/claude-code` (`/Library/Application Support/ClaudeCode`
 on macOS), Claude's cached server settings, and `claude plugin list
---json` run once in the background with the variable set. If the policy
+--json` run once in the background with the variable set. That last
+check waits until Claude has run on the machine (`~/.claude`, or
+`$CLAUDE_CONFIG_DIR`, exists), because Claude's first run writes its
+config and Roost would otherwise create it for someone who only
+installed Claude. If the policy
 is there, Roost leaves Claude's variable out, so Claude starts normally,
 and its status still shows over OSC 7501. Doctor names the policy and
 where it was found; switch Claude Code off under Agent Integration… to
