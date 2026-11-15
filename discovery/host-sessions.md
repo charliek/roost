@@ -11,7 +11,10 @@ Update this file when a later pass changes the recommendation.
 win where they differ. The roadmap tracks status; the open work after
 the protocol-7 release continues in
 [sessions-everywhere.md](sessions-everywhere.md) and
-[mobile-client.md](mobile-client.md). The text below is kept as
+[mobile-client.md](mobile-client.md). Phase 4's default flip and
+`--ephemeral` escape hatch were replaced on 2026-11-14 by removing
+in-process local tabs ([in-process-removal.md](in-process-removal.md)).
+The text below is kept as
 written.
 
 The feature: an opt-in way to connect a **host** (this machine or

@@ -7,7 +7,9 @@ Kitty item closed in plan 088.**
 [protocol-7-release.md](protocol-7-release.md) is now the source of
 truth for G1, G2 and the new G9, and supersedes the leanings below
 where they differ. The [decision summary](#decided-2026-10-28-protocol-7-release)
-lists what changed. Everything else here is still undecided. This note
+lists what changed. In-process's fate was decided on 2026-11-14
+(removed in one release, not scheduled; [`in-process-removal.md`](in-process-removal.md)). Everything else
+here is still undecided. This note
 came out of
 running a real two-machine setup (a MacBook driving a Pop!_OS box) and
 finding where the shipped host-session design stops short of that
@@ -30,8 +32,9 @@ shouldn't matter. Concretely:
 
 **Direction.** Sessions become the normal backend on every machine.
 In-process local tabs (`local-backend = in-process`) stay supported for
-now. They are a candidate for removal later if few users want them (see
-[Retiring in-process local tabs](#retiring-in-process-local-tabs-later)).
+now. **Decided 2026-11-14:** they will be removed entirely, in one
+release, with no flip-first step and no `--ephemeral` mode; that release
+is not yet scheduled. See [`in-process-removal.md`](in-process-removal.md).
 
 **Still non-goals.** These match `docs/index.md` and the project
 instructions: no browser or HTML viewer, not multi-window. (Split panes
@@ -337,6 +340,11 @@ they have to be closed, or explicitly accepted, first:
 
 ### G6. The default and the switch (#480)
 
+**Superseded 2026-11-14:** instead of flipping the default, in-process
+local tabs will be removed in one release (not yet scheduled); see
+[`in-process-removal.md`](in-process-removal.md). The G1 and G2 prerequisites listed below have both
+shipped (protocol-7 M2 and M3).
+
 Existing setups still default to `in-process` by design (DL-27). #480
 tracks the flip and says the remaining work is "the product decision …
 not new mechanism". The field report adds prerequisites:
@@ -402,8 +410,9 @@ whoever started the daemon decides every tab's environment.
 
 ## Retiring in-process local tabs (later)
 
-Not proposed now. This section records what it would involve so it can
-be weighed when the time comes.
+**Decided 2026-11-14: remove in one go, deferred.** The scoping, its
+findings and the open decisions are in [`in-process-removal.md`](in-process-removal.md), which supersedes this
+section. The text below is kept as first written.
 
 **What would go:** the in-process tab backend in `roost-iced`
 (`TabBackend::InProcess`, `crates/roost-iced/src/app/tab_backend.rs`);
@@ -431,9 +440,10 @@ count.
 
 ## A possible order
 
-*Steps 1 and 2 are now the protocol-7 release
+*Steps 1 and 2 shipped in the protocol-7 release
 ([protocol-7-release.md](protocol-7-release.md)). Step 3's shipped
-user service is dropped. Step 4 follows that release.*
+user service is dropped. Steps 4 and 5 are replaced by the 2026-11-14
+decision below.*
 
 1. **Finding the session (G1)**: option A plus B or C, and the `doctor`
    check. Small, low risk, and it unblocks the field-report workflow
@@ -443,9 +453,10 @@ user service is dropped. Step 4 follows that release.*
    foreign-size view. Re-evaluate #568 afterwards.
 3. **Staying connected (G3, G4 reboot)**: per-host auto-connect and a
    shipped user service.
-4. **Flip the default (#480, G6)** once 1 and 2 have landed.
-5. **Decide on in-process** (retire, keep `--ephemeral` only, or keep
-   as is) based on G5 and feedback. Upgrade handoff (G4) is its own
+4. ~~**Flip the default (#480, G6)** once 1 and 2 have landed.~~
+5. ~~**Decide on in-process** (retire, keep `--ephemeral` only, or keep
+   as is) based on G5 and feedback.~~ **Decided 2026-11-14:** remove it
+   in one release, replacing step 4; see [`in-process-removal.md`](in-process-removal.md). Upgrade handoff (G4) is its own
    track, whenever it's worth the investment.
 
 ## Open questions
@@ -465,8 +476,9 @@ user service is dropped. Step 4 follows that release.*
   "view from my phone". The wire allows any same-UID client over an SSH
   forward, but "Not a browser host" is a stated non-goal. Does that
   still hold?
-- **In-process's fate**: removed, `--ephemeral` only, or kept? And what
-  feedback would decide it?
+- ~~**In-process's fate**: removed, `--ephemeral` only, or kept?~~
+  **Decided 2026-11-14:** removed, in one release (not yet scheduled);
+  see [`in-process-removal.md`](in-process-removal.md).
 - **Who owns the binary** on a machine with both a package and a
   bootstrap install (G4)?
 

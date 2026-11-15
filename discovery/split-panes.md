@@ -868,6 +868,9 @@ Colors from `ChromePalette`; sizes from the chrome font-size seam in
 - **Why P2 excludes sessions.** It tests the UX with no attach or
   size-ownership change, because in-process tabs have neither. P3 should
   follow closely, because the session backend is the fresh-install default.
+- **If in-process tabs are removed first** ([`in-process-removal.md`](in-process-removal.md), decided
+  2026-11-14, not scheduled), P2 has no in-process backend to target: fold
+  its UI work into P3 and test the UX on session tabs.
 - **Total.** Two L plans plus M and S-M ones: XL across the whole track.
 - **Where #566 fits.** It is independently useful (faster switch-back) and
   provides the multi-attach plumbing P3 needs. Landing it before P3 shrinks
