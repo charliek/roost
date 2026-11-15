@@ -61,7 +61,7 @@ jobs:
       scripts: ${{ steps.filter.outputs.scripts }}
       mobile: ${{ steps.filter.outputs.mobile }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dorny/paths-filter@v4
@@ -264,7 +264,7 @@ jobs:
     # libghostty-vt archive before it can lint.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -280,7 +280,7 @@ jobs:
         run: sudo linux/scripts/ci-apt-install.sh libclang-dev
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -288,7 +288,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -316,7 +316,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Install zsh
@@ -332,7 +332,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       # verify-sparkle-key.sh and its test reach `cryptography` through uv.
@@ -358,7 +358,7 @@ jobs:
       # whose CPU is slower/variable than the budgets were tuned against.
       ROOST_TEST_TIMEOUT_SCALE: "3"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -369,7 +369,7 @@ jobs:
         run: sudo linux/scripts/ci-apt-install.sh libclang-dev
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -377,7 +377,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -585,7 +585,7 @@ jobs:
     # more), so 40 leaves a cold one room again.
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -599,7 +599,7 @@ jobs:
       # Only the wgpu cells that run `cargo test` and clippy save: a Wayland
       # cell lacks their artifacts, and a tiny-skia cell runs neither.
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           cache-shared-key: iced-debug
           cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.display != 'wayland' && matrix.renderer == 'wgpu' }}
@@ -611,7 +611,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -1401,7 +1401,7 @@ jobs:
       # flake the assemble step on a warm cache (plan 028 § 3.10).
       - name: Cache Sparkle stage
         if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: third_party/sparkle/out
           key: sparkle-stage-${{ hashFiles('third_party/sparkle/fetch.sh') }}
@@ -2035,7 +2035,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -2048,7 +2048,7 @@ jobs:
             mesa-vulkan-drivers xvfb xdotool zsh
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -2059,7 +2059,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -2326,7 +2326,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -2342,7 +2342,7 @@ jobs:
             cage seatd
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           cache-shared-key: iced-debug
           cache-save-if: false
@@ -2354,7 +2354,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -2445,7 +2445,7 @@ jobs:
     # headroom up front rather than discover it as a flake.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -2457,7 +2457,7 @@ jobs:
         run: sudo linux/scripts/ci-apt-install.sh libclang-dev zsh
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           cache-shared-key: iced-debug
           cache-save-if: false
@@ -2469,7 +2469,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -2520,7 +2520,7 @@ jobs:
 
       - name: Cache released sessions (Linux)
         if: runner.os == 'Linux'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: target/old-session
           # The pinned releases live in the test module, so its hash
@@ -2565,7 +2565,7 @@ jobs:
     env:
       ROOST_TEST_TIMEOUT_SCALE: "3"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -2578,7 +2578,7 @@ jobs:
           libclang-dev libgtk-3-dev ninja-build xvfb
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -2590,7 +2590,7 @@ jobs:
       # version).
       - name: Cache flutter_rust_bridge_codegen
         id: cache-frb-codegen
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/flutter_rust_bridge_codegen
           key: frb-codegen-2.13.0-beta.5-${{ runner.os }}
@@ -2606,7 +2606,7 @@ jobs:
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
@@ -2660,7 +2660,7 @@ jobs:
       # Gradle and tools/mobile/android-env.sh link with the same NDK.
       ROOST_NDK_VERSION: 28.2.13676358
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -2669,7 +2669,7 @@ jobs:
         run: sudo linux/scripts/ci-apt-install.sh libclang-dev
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           target: aarch64-linux-android,x86_64-linux-android
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -2695,7 +2695,7 @@ jobs:
       # A key of its own: this one also holds out/<android triple>/, which
       # the host jobs' entry never has (and a cache hit is never re-saved).
       - name: Cache vendored libghostty-vt (Android)
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/ghostty/out
