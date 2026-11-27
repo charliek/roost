@@ -56,6 +56,15 @@ SystemUiOverlayStyle _styleAbove(WidgetTester tester, Finder of) => tester
     )
     .value;
 
+/// The color a modal shows behind [content]: the nearest Material that
+/// paints one.
+Color _modalColor(WidgetTester tester, Finder content) => tester
+    .widgetList<Material>(
+      find.ancestor(of: content, matching: find.byType(Material)),
+    )
+    .map((m) => m.color)
+    .firstWhere((c) => c != null && c.a > 0)!;
+
 void main() {
   testWidgets('Light appearance paints the light chrome', (tester) async {
     await _pump(
@@ -160,5 +169,46 @@ void main() {
     final want = systemOverlayStyleFor(Brightness.light, RoostPalette.light);
     expect(bar, want);
     expect(SystemChrome.latestStyle, want, reason: 'what Flutter applies');
+  });
+
+  testWidgets('default Dark keeps the M3 dialog and sheet colors', (
+    tester,
+  ) async {
+    await pumpApp(tester, width: 1200);
+    await tester.tap(byKey('add-host'));
+    await tester.pumpAndSettle();
+    expect(
+      _modalColor(tester, byKey('add-host-label')),
+      RoostPalette.dark.surfaceHigh,
+    );
+    await tester.tapAt(const Offset(4, 4));
+    await tester.pumpAndSettle();
+
+    await tester.longPress(byKey('tab-devbox-13'));
+    await tester.pumpAndSettle();
+    expect(
+      _modalColor(tester, byKey('tab-action-rename')),
+      RoostPalette.dark.surfaceLow,
+    );
+  });
+
+  testWidgets('the Copy sheet follows a platform flip while it shows', (
+    tester,
+  ) async {
+    await _pump(
+      tester,
+      appearance: Appearance.system,
+      platform: Brightness.dark,
+    );
+    await _openTerminal(tester);
+    await tester.tap(find.byTooltip('Tab actions'));
+    await tester.pumpAndSettle();
+    await tester.tap(byKey('menu-copy-text'));
+    await tester.pumpAndSettle();
+    final hint = find.text('Long-press to select, then drag the handles.');
+    expect(_modalColor(tester, hint), RoostPalette.dark.surface);
+
+    await _flip(tester, Brightness.light);
+    expect(_modalColor(tester, hint), RoostPalette.light.surface);
   });
 }

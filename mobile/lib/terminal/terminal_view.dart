@@ -55,6 +55,7 @@ class TerminalView extends StatefulWidget {
     required this.tab,
     required this.fontSize,
     this.fontSizeSetting,
+    this.fontEdits = 0,
     this.focused = false,
     this.readability = const TextReadability(),
     this.onGeometry,
@@ -74,6 +75,11 @@ class TerminalView extends StatefulWidget {
   /// new size because another setting now applies (a rotation into another
   /// width class) is not.
   final WidthClass? fontSizeSetting;
+
+  /// Counts the user's edits to the text size. A new [fontSize] is
+  /// deliberate only when this moved too: a size put back after a failed
+  /// save is not the user's change.
+  final int fontEdits;
   final bool focused;
   final TextReadability readability;
 
@@ -112,9 +118,11 @@ class _TerminalViewState extends State<TerminalView>
   Geometry? _reported;
   double? _reportedFontSize;
   WidthClass? _reportedSetting;
+  int _reportedFontEdits = 0;
   Geometry? _pending;
   double? _pendingFontSize;
   WidthClass? _pendingSetting;
+  int? _pendingFontEdits;
   Timer? _debounce;
   bool _pulling = false;
   double _pinchStartFont = 0;
@@ -187,11 +195,17 @@ class _TerminalViewState extends State<TerminalView>
     return _metrics = CellMetrics.measure(fontSize, dpr);
   }
 
-  void _offer(Geometry local, double fontSize, WidthClass? setting) {
+  void _offer(
+    Geometry local,
+    double fontSize,
+    WidthClass? setting,
+    int fontEdits,
+  ) {
     if (_reported == null) {
       _reported = local;
       _reportedFontSize = fontSize;
       _reportedSetting = setting;
+      _reportedFontEdits = fontEdits;
       SchedulerBinding.instance.addPostFrameCallback((_) {
         if (mounted) widget.onGeometry?.call(local, deliberate: false);
       });
@@ -201,22 +215,27 @@ class _TerminalViewState extends State<TerminalView>
     // reported (two sizes can round to the same cells): it is how the user
     // takes the tab's size back.
     bool deliberate() =>
-        fontSize != _reportedFontSize && setting == _reportedSetting;
+        fontSize != _reportedFontSize &&
+        setting == _reportedSetting &&
+        fontEdits != _reportedFontEdits;
     if (local == _reported && !deliberate()) {
       _debounce?.cancel();
       _pending = null;
       _reportedFontSize = fontSize;
       _reportedSetting = setting;
+      _reportedFontEdits = fontEdits;
       return;
     }
     if (local == _pending &&
         fontSize == _pendingFontSize &&
-        setting == _pendingSetting) {
+        setting == _pendingSetting &&
+        fontEdits == _pendingFontEdits) {
       return;
     }
     _pending = local;
     _pendingFontSize = fontSize;
     _pendingSetting = setting;
+    _pendingFontEdits = fontEdits;
     _debounce?.cancel();
     _debounce = Timer(regridDebounce, () {
       _pending = null;
@@ -226,6 +245,7 @@ class _TerminalViewState extends State<TerminalView>
       _reported = local;
       _reportedFontSize = fontSize;
       _reportedSetting = setting;
+      _reportedFontEdits = fontEdits;
       widget.onGeometry?.call(local, deliberate: userChanged);
     });
   }
@@ -299,7 +319,12 @@ class _TerminalViewState extends State<TerminalView>
         _size = size;
         final area = terminalGridArea(size);
         final local = metrics.geometryFor(area);
-        _offer(local, metrics.fontSize, widget.fontSizeSetting);
+        _offer(
+          local,
+          metrics.fontSize,
+          widget.fontSizeSetting,
+          widget.fontEdits,
+        );
         _reportGridArea(area);
         return Listener(
           onPointerSignal: _onPointerSignal,

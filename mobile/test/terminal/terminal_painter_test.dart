@@ -224,6 +224,11 @@ void main() {
       final toggled = painter(on);
       expect(toggled.shouldRepaint(off), isTrue);
       expect(painter(on).shouldRepaint(toggled), isFalse);
+      expect(
+        painter(const TextReadability(minimumContrast: 3.0, onlyOnLight: true))
+            .shouldRepaint(toggled),
+        isTrue,
+      );
       paint(toggled);
       expect(cache.builds, first * 2, reason: 'every row is rebuilt once');
       final three = double.parse('3.0');
@@ -331,9 +336,10 @@ void main() {
       Frame frame,
       int col,
       int row,
-      Color from,
-    ) async {
-      final image = await render(tester, frame, readability: on);
+      Color from, {
+      TextReadability readability = on,
+    }) async {
+      final image = await render(tester, frame, readability: readability);
       final data = (await tester.runAsync(image.toByteData))!;
       Color at(int x, int y) {
         final i = (y * image.width + x) * 4;
@@ -355,16 +361,48 @@ void main() {
       return (ink, at(col * 8, row * 16));
     }
 
-    Frame oneRun(FrameRun run) => Frame(
+    Frame oneRun(FrameRun run, {int bg = 0xEFF1F5}) => Frame(
       flags: FrameFlags.full,
       cols: 32,
       rows: 7,
       defaultFg: 0x4C4F69,
-      defaultBg: 0xEFF1F5,
+      defaultBg: bg,
       cursorColor: 0,
       rowData: [
         FrameRow(index: 1, runs: [run]),
       ],
+    );
+
+    testWidgets(
+      'auto raises text on the light frame it paints, not a dark one',
+      (tester) async {
+        await loadTerminalFont();
+        const auto = TextReadability(minimumContrast: 3.0, onlyOnLight: true);
+        const light = Color(0xFFEFF1F5);
+        final (ink, _) = await inkIn(
+          tester,
+          oneRun(_run(0, '█', fg: 0xDDDDDD, bg: 0xEFF1F5)),
+          0,
+          1,
+          light,
+          readability: auto,
+        );
+        expect(contrastRatio(ink, light), greaterThanOrEqualTo(3));
+
+        final dark = oneRun(
+          _run(0, '█', fg: 0x202020, bg: 0x0F1115),
+          bg: 0x0F1115,
+        );
+        Future<List<int>> bytes(TextReadability r) async {
+          final image = await render(tester, dark, readability: r);
+          final data = (await tester.runAsync(image.toByteData))!;
+          return data.buffer.asUint8List();
+        }
+
+        final off = await bytes(const TextReadability());
+        expect(await bytes(auto), off, reason: 'auto on dark draws as off');
+        expect(await bytes(on), isNot(off), reason: 'on raises the same run');
+      },
     );
 
     testWidgets('a faint run is blended, then raised to 3:1', (tester) async {

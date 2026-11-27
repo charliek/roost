@@ -199,6 +199,26 @@ extension RoostPaletteX on BuildContext {
 
 const monoFamily = 'JetBrains Mono';
 
+/// A bottom sheet's background, painted inside the route: the color a
+/// sheet route is opened with is fixed until it closes, and this one follows
+/// an appearance change made while the sheet shows. Open the sheet with a
+/// transparent `backgroundColor`.
+class SheetSurface extends StatelessWidget {
+  const SheetSurface({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) => Material(
+    color: context.palette.surface,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+    ),
+    clipBehavior: Clip.antiAlias,
+    child: child,
+  );
+}
+
 /// Icon brightness is the opposite of the chrome's. One style for the app
 /// root and the AppBar, so a route with a bar and one without agree.
 SystemUiOverlayStyle systemOverlayStyleFor(
@@ -246,10 +266,6 @@ ThemeData roostTheme(Brightness brightness) {
     appBarTheme: AppBarTheme(
       systemOverlayStyle: systemOverlayStyleFor(brightness, palette),
     ),
-    // From the theme, not captured at open: a modal follows an appearance
-    // change made while it is showing.
-    bottomSheetTheme: BottomSheetThemeData(backgroundColor: palette.surface),
-    dialogTheme: DialogThemeData(backgroundColor: palette.surface),
     dividerTheme: DividerThemeData(color: palette.divider, space: 1),
     cardTheme: CardThemeData(
       color: palette.surface,

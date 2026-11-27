@@ -7,6 +7,12 @@ import '../app/workspace_actions.dart';
 import '../core/roost_core.dart';
 import 'host_widgets.dart';
 
+// Wide enough for the text whole at 1.0x. Bounds rather than flexes: a
+// flexible label takes half the row from the name beside it even when it is
+// short.
+const _newProjectMaxWidth = 180.0;
+const _waitingMaxWidth = 116.0;
+
 /// A host's projects, each with its tabs. Not scrollable itself: the
 /// sidebar, the drawer and the phone's projects screen each scroll it.
 class WorkspaceList extends ConsumerWidget {
@@ -32,7 +38,8 @@ class WorkspaceList extends ConsumerWidget {
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ),
-            Flexible(
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: _newProjectMaxWidth),
               child: TextButton(
                 onPressed: () => newProjectFlow(context, ref, hostId),
                 child: const Text(
@@ -83,7 +90,8 @@ class _ProjectHeader extends ConsumerWidget {
             ),
           ),
           if (waiting > 0)
-            Flexible(
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: _waitingMaxWidth),
               child: Padding(
                 padding: const EdgeInsets.only(right: 4),
                 child: Text(

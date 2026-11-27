@@ -29,6 +29,7 @@ Future<void> showCopySheet(
     context: context,
     isScrollControlled: true,
     useSafeArea: true,
+    backgroundColor: Colors.transparent,
     builder: (sheet) {
       Future<void> copy(String value, String what) async {
         if (copying) return;
@@ -51,12 +52,14 @@ Future<void> showCopySheet(
         onCopied?.call(what);
       }
 
-      return _CopySheet(
-        text: text,
-        urls: urls,
-        cols: cols,
-        onCopyAll: () => copy(text, 'Screen'),
-        onCopyUrl: (url) => copy(url, 'Link'),
+      return SheetSurface(
+        child: _CopySheet(
+          text: text,
+          urls: urls,
+          cols: cols,
+          onCopyAll: () => copy(text, 'Screen'),
+          onCopyUrl: (url) => copy(url, 'Link'),
+        ),
       );
     },
   );

@@ -349,6 +349,24 @@ void main() {
     expect(tab.sizedElsewhere, isFalse, reason: 'the fake took the size');
   });
 
+  for (final (name, width, bottom) in [
+    ('sheet', 360.0, 24.0 + 48),
+    ('dialog', 1000.0, 24.0),
+  ]) {
+    testWidgets('the $name keeps its last line clear of the navigation bar', (
+      tester,
+    ) async {
+      tester.view.padding = FakeViewPadding(
+        bottom: 48 * tester.view.devicePixelRatio,
+      );
+      addTearDown(tester.view.resetPadding);
+      await pumpApp(tester, width: width);
+      await _openSheet(tester);
+      final list = tester.widget<ListView>(byKey('display-sheet'));
+      expect((list.padding! as EdgeInsets).bottom, bottom);
+    });
+  }
+
   for (final (name, width) in [('sheet', 360.0), ('dialog', 1000.0)]) {
     testWidgets('the $name follows an appearance change made inside it', (
       tester,

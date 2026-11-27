@@ -72,25 +72,24 @@ class SettingsModel {
     required this.acknowledged,
     required this.desired,
     required this.revision,
+    this.fontEdits = 0,
   });
 
   final SettingsState acknowledged;
   final MobileSettings desired;
   final int revision;
+
+  /// Edits that changed a terminal text size. A size put back after a failed
+  /// write, or adopted from the core, is not one.
+  final int fontEdits;
 }
 
 /// What the painter does about faint and low-contrast text: `auto` raises
 /// contrast only on a light terminal theme, so a dark install is drawn as
 /// the session sent it.
-TextReadability textReadabilityFor(
-  MobileSettings desired, {
-  required bool effectiveDark,
-}) => TextReadability(
-  minimumContrast: switch (desired.readableText) {
-    ReadableText.on => 3.0,
-    ReadableText.off => 1.0,
-    ReadableText.auto => effectiveDark ? 1.0 : 3.0,
-  },
+TextReadability textReadabilityFor(MobileSettings desired) => TextReadability(
+  minimumContrast: desired.readableText == ReadableText.off ? 1.0 : 3.0,
+  onlyOnLight: desired.readableText == ReadableText.auto,
   faintAlpha: desired.brightFaint ? 0.75 : 0.55,
 );
 
@@ -146,10 +145,16 @@ class SettingsNotifier extends Notifier<SettingsModel> {
     MobileSettings Function(MobileSettings) change, {
     bool continuous = false,
   }) {
+    final desired = change(state.desired);
+    final fontChanged =
+        desired.terminalFontSizeCompact !=
+            state.desired.terminalFontSizeCompact ||
+        desired.terminalFontSizeWide != state.desired.terminalFontSizeWide;
     state = SettingsModel(
       acknowledged: state.acknowledged,
-      desired: change(state.desired),
+      desired: desired,
       revision: state.revision + 1,
+      fontEdits: state.fontEdits + (fontChanged ? 1 : 0),
     );
     if (continuous) {
       _trailing?.cancel();
@@ -186,6 +191,7 @@ class SettingsNotifier extends Notifier<SettingsModel> {
         acknowledged: kept,
         desired: state.revision == revision ? kept.settings : state.desired,
         revision: state.revision,
+        fontEdits: state.fontEdits,
       );
     } catch (e) {
       if (!ref.mounted) return;
@@ -194,6 +200,7 @@ class SettingsNotifier extends Notifier<SettingsModel> {
           acknowledged: state.acknowledged,
           desired: state.acknowledged.settings,
           revision: state.revision,
+          fontEdits: state.fontEdits,
         );
       }
       _report(e);
@@ -208,6 +215,7 @@ class SettingsNotifier extends Notifier<SettingsModel> {
         acknowledged: kept,
         desired: state.desired,
         revision: state.revision,
+        fontEdits: state.fontEdits,
       );
     } catch (e) {
       if (ref.mounted) _report(e);

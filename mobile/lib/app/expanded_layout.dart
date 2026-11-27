@@ -13,6 +13,11 @@ import 'workspace_actions.dart';
 /// The sidebar's width, beside a divider of [layoutDividerWidth].
 const hostSidebarWidth = 300.0;
 
+/// Fits every host state label whole at 1.0x text. A bound rather than a
+/// flex: a flexible label takes half the row from the host name even when
+/// it is short.
+const _stateLabelMaxWidth = 144.0;
+
 /// ≥ 840 dp: a persistent sidebar of hosts with their projects and tabs, and
 /// the selected tab beside it.
 class ExpandedLayout extends StatelessWidget {
@@ -119,7 +124,10 @@ class HostSection extends StatelessWidget {
                     ),
                   ),
                 ),
-                Flexible(
+                ConstrainedBox(
+                  constraints: const BoxConstraints(
+                    maxWidth: _stateLabelMaxWidth,
+                  ),
                   child: Text(
                     hostStateLabel(host.state),
                     maxLines: 1,

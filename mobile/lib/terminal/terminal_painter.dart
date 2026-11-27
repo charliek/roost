@@ -20,6 +20,7 @@ class RowTextCache {
   double? _fontSize;
   int? _defaultBg;
   TextReadability? _readability;
+  double _minimumContrast = 1.0;
   final Map<(int, int, double), int> _adjusted = {};
 
   /// A true-colour animation brings new color pairs every frame.
@@ -45,8 +46,11 @@ class RowTextCache {
       _fontSize = metrics.fontSize;
       _defaultBg = defaultBg;
       _readability = readability;
+      _minimumContrast = readability.minimumContrastOn(
+        terminalColor(defaultBg),
+      );
     }
-    final raise = readability.minimumContrast > 1.0;
+    final raise = _minimumContrast > 1.0;
     final cached = _rows[row];
     if (cached != null && cached.generation == generation) return cached.runs;
     cached?.dispose();
@@ -70,7 +74,7 @@ class RowTextCache {
             bg,
           );
         }
-        color = adjusted(color, bg, readability.minimumContrast);
+        color = adjusted(color, bg, _minimumContrast);
       } else if (faint) {
         color = color.withValues(alpha: readability.faintAlpha);
       }
@@ -175,7 +179,7 @@ class TerminalPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final m = model;
     final bg = terminalColor(m.defaultBg);
-    final lightBg = wcagLuminance(bg) > 0.5;
+    final lightBg = isLightBackground(bg);
     if (!m.hasFrame || m.cols == 0 || m.rows == 0) {
       canvas.drawRect(Offset.zero & size, Paint()..color = bg);
       return;
@@ -233,7 +237,7 @@ class TerminalPainter extends CustomPainter {
         );
       }
     }
-    _paintCursor(canvas);
+    _paintCursor(canvas, readability.minimumContrastOn(bg));
     if (letterbox) {
       canvas.drawRect(
         grid,
@@ -251,7 +255,7 @@ class TerminalPainter extends CustomPainter {
     );
   }
 
-  void _paintCursor(Canvas canvas) {
+  void _paintCursor(Canvas canvas, double minimumContrast) {
     final m = model;
     if (!m.cursorVisible) return;
     final c = m.cursorCol;
@@ -275,11 +279,11 @@ class TerminalPainter extends CustomPainter {
             glyph,
             terminalTextStyle(
               fontSize: metrics.fontSize,
-              color: readability.minimumContrast > 1.0
+              color: minimumContrast > 1.0
                   ? textCache.adjusted(
                       terminalColor(m.defaultBg),
                       color,
-                      readability.minimumContrast,
+                      minimumContrast,
                     )
                   : terminalColor(m.defaultBg),
               bold: run!.has(RunAttrs.bold),

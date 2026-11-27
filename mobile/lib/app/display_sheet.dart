@@ -32,12 +32,13 @@ Future<void> showDisplaySheet(BuildContext context) {
       isScrollControlled: true,
       useSafeArea: true,
       barrierColor: _barrier,
+      backgroundColor: Colors.transparent,
       builder: (context) => DraggableScrollableSheet(
         expand: false,
         initialChildSize: 0.6,
         maxChildSize: 0.92,
         builder: (context, controller) =>
-            DisplaySettings(controller: controller),
+            SheetSurface(child: DisplaySettings(controller: controller)),
       ),
     );
   }
@@ -45,6 +46,7 @@ Future<void> showDisplaySheet(BuildContext context) {
     context: context,
     barrierColor: _barrier,
     builder: (context) => Dialog(
+      backgroundColor: context.palette.surface,
       child: ConstrainedBox(
         constraints: BoxConstraints(
           maxWidth: 560,
@@ -123,7 +125,12 @@ class DisplaySettings extends ConsumerWidget {
       key: const ValueKey('display-sheet'),
       controller: controller,
       shrinkWrap: controller == null,
-      padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+      padding: EdgeInsets.fromLTRB(
+        20,
+        16,
+        20,
+        24 + MediaQuery.paddingOf(context).bottom,
+      ),
       children: [
         Text('Display', style: text.titleLarge),
         const _Heading('Appearance'),
@@ -206,7 +213,7 @@ class DisplaySettings extends ConsumerWidget {
               settings.edit((s) => s.copyWith(readableText: picked.single)),
         ),
         const SizedBox(height: 4),
-        Text('Auto: on for light themes', style: muted),
+        Text('Auto: on when the background is light', style: muted),
         SwitchListTile(
           key: const ValueKey('bright-faint'),
           contentPadding: EdgeInsets.zero,

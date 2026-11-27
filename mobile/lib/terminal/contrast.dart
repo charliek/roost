@@ -17,22 +17,40 @@ double contrastRatio(Color a, Color b) {
   return (math.max(la, lb) + 0.05) / (math.min(la, lb) + 0.05);
 }
 
+bool isLightBackground(Color bg) => wcagLuminance(bg) > 0.5;
+
 /// How the painter keeps text legible: the contrast it raises text to
-/// (1.0 draws colors as they are) and the alpha faint text is drawn at.
+/// (1.0 draws colors as they are), whether only on a light background, and
+/// the alpha faint text is drawn at.
 class TextReadability {
-  const TextReadability({this.minimumContrast = 1.0, this.faintAlpha = 0.55});
+  const TextReadability({
+    this.minimumContrast = 1.0,
+    this.onlyOnLight = false,
+    this.faintAlpha = 0.55,
+  });
 
   final double minimumContrast;
+
+  /// Decided from the background of the frame being painted, not from the
+  /// theme the core acknowledged, which can change a frame before the
+  /// recolored one arrives.
+  final bool onlyOnLight;
+
   final double faintAlpha;
+
+  /// The contrast text is raised to on a background of [bg].
+  double minimumContrastOn(Color bg) =>
+      onlyOnLight && !isLightBackground(bg) ? 1.0 : minimumContrast;
 
   @override
   bool operator ==(Object other) =>
       other is TextReadability &&
       other.minimumContrast == minimumContrast &&
+      other.onlyOnLight == onlyOnLight &&
       other.faintAlpha == faintAlpha;
 
   @override
-  int get hashCode => Object.hash(minimumContrast, faintAlpha);
+  int get hashCode => Object.hash(minimumContrast, onlyOnLight, faintAlpha);
 }
 
 /// [fg], moved toward black or white until it reaches [minRatio] against

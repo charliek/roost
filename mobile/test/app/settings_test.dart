@@ -276,4 +276,109 @@ void main() {
     core.held.single.complete();
     await tester.pumpAndSettle();
   });
+
+  for (final appearanceEdit in [false, true]) {
+    final also = appearanceEdit ? ', with an Appearance edit right after,' : '';
+    testWidgets('a size put back after a failed save$also does not take the '
+        'tab', (tester) async {
+      core = _HeldCore();
+      await pumpApp(tester, width: 1200, core: core);
+      container = _container(tester);
+      await tester.tap(byKey('tab-devbox-13'));
+      await tester.pumpAndSettle();
+      final session = lastSession(core);
+      final tab = tester.widget<TerminalView>(find.byType(TerminalView)).tab!;
+      await tester.tap(byKey('open-display'));
+      await tester.pumpAndSettle();
+
+      await tester.drag(byKey('terminal-text-slider'), const Offset(80, 0));
+      await tester.pump();
+      await tester.pump(regridDebounce);
+      await tester.pumpAndSettle();
+      expect(model().desired.terminalFontSizeWide, greaterThan(13));
+      expect(session.resizes.last.$2, isTrue, reason: 'the slider is the user');
+      expect(tab.sizedElsewhere, isFalse);
+
+      core.takeSizeFrom(
+        'devbox',
+        13,
+        label: 'charlie-laptop',
+        cols: 132,
+        rows: 40,
+      );
+      await tester.pumpAndSettle();
+      await tester.pump(regridDebounce);
+      expect(tab.sizedElsewhere, isTrue);
+      final resizes = session.resizes.length;
+
+      core.held.single.fail();
+      await tester.pump();
+      expect(model().desired.terminalFontSizeWide, 13, reason: 'put back');
+      if (appearanceEdit) {
+        settings().edit((s) => s.copyWith(appearance: Appearance.light));
+        await tester.pump(const Duration(milliseconds: 50));
+        expect(session.resizes, hasLength(resizes), reason: 'still settling');
+      }
+      await tester.pump(regridDebounce);
+      await tester.pumpAndSettle();
+      expect(session.resizes.length, greaterThan(resizes), reason: 'offered');
+      expect(session.resizes.last.$2, isFalse, reason: 'not the user');
+      expect(tab.sizedElsewhere, isTrue, reason: 'the desktop keeps it');
+      if (appearanceEdit) {
+        core.held.last.complete();
+        await tester.pumpAndSettle();
+      }
+    });
+  }
+
+  testWidgets('a saved size stays deliberate when another setting fails', (
+    tester,
+  ) async {
+    core = _HeldCore();
+    await pumpApp(tester, width: 1200, core: core);
+    container = _container(tester);
+    await tester.tap(byKey('tab-devbox-13'));
+    await tester.pumpAndSettle();
+    final session = lastSession(core);
+    final tab = tester.widget<TerminalView>(find.byType(TerminalView)).tab!;
+    core.takeSizeFrom(
+      'devbox',
+      13,
+      label: 'charlie-laptop',
+      cols: 132,
+      rows: 40,
+    );
+    await tester.pumpAndSettle();
+    await tester.pump(regridDebounce);
+    expect(tab.sizedElsewhere, isTrue);
+    await tester.tap(byKey('open-display'));
+    await tester.pumpAndSettle();
+    final resizes = session.resizes.length;
+
+    await tester.drag(byKey('terminal-text-slider'), const Offset(80, 0));
+    await tester.pump();
+    final size = model().desired.terminalFontSizeWide;
+    expect(size, greaterThan(13));
+    core.held.single.complete();
+    await tester.pump();
+    expect(model().acknowledged.settings.terminalFontSizeWide, size);
+
+    settings().edit((s) => s.copyWith(appearance: Appearance.light));
+    await tester.pump();
+    expect(core.held, hasLength(2));
+    core.held.last.fail();
+    await tester.pump();
+    expect(model().desired.terminalFontSizeWide, size, reason: 'saved');
+    expect(session.resizes, hasLength(resizes), reason: 'still settling');
+
+    await tester.pump(regridDebounce);
+    await tester.pumpAndSettle();
+    expect(session.resizes.length, greaterThan(resizes));
+    expect(
+      session.resizes[resizes].$2,
+      isTrue,
+      reason: 'the slider is the user',
+    );
+    expect(tab.sizedElsewhere, isFalse);
+  });
 }

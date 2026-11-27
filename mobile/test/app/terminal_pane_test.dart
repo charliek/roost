@@ -411,13 +411,18 @@ void main() {
 
     testWidgets('a size from another width class is advisory', (tester) async {
       final reports = <(Geometry, bool)>[];
-      Future<void> show(double fontSize, WidthClass widthClass) async {
+      Future<void> show(
+        double fontSize,
+        WidthClass widthClass, {
+        int fontEdits = 0,
+      }) async {
         await tester.pumpWidget(
           MaterialApp(
             home: TerminalView(
               tab: null,
               fontSize: fontSize,
               fontSizeSetting: widthClass,
+              fontEdits: fontEdits,
               onGeometry: (g, {required deliberate}) =>
                   reports.add((g, deliberate)),
             ),
@@ -430,9 +435,11 @@ void main() {
       expect(reports.map((r) => r.$2), [false], reason: 'the first grid');
       await show(9, WidthClass.compact);
       expect(reports.last.$2, isFalse, reason: 'another setting applies');
-      await show(11, WidthClass.compact);
+      await show(11, WidthClass.compact, fontEdits: 1);
       expect(reports.last.$2, isTrue, reason: 'the user changed this one');
       expect(reports.map((r) => r.$1.cols).toSet(), hasLength(3));
+      await show(13, WidthClass.compact, fontEdits: 1);
+      expect(reports.last.$2, isFalse, reason: 'no edit: a size put back');
     });
 
     testWidgets('a burst of size changes settles into one resize', (

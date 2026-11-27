@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -157,6 +158,18 @@ void main() {
     expect(scale, greaterThan(1));
     expect(label(), '${(scale * 100).round()}%');
     expect(tester.getSize(title).height, greaterThan(titleHeight));
+  });
+
+  testWidgets('at 1.0x the sidebar labels beside a name show whole', (
+    tester,
+  ) async {
+    await pumpApp(tester, width: 1000, height: 900);
+    for (final label in ['connected', 'needs trust', '1 waiting']) {
+      final paragraph = tester.renderObject<RenderParagraph>(
+        find.descendant(of: byKey('host-sidebar'), matching: find.text(label)),
+      );
+      expect(paragraph.didExceedMaxLines, isFalse, reason: label);
+    }
   });
 
   for (final layout in _layouts) {

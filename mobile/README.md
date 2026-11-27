@@ -41,8 +41,9 @@ tab is the one on screen; a copy from a tab you are not looking at is ignored.
 ## Display
 
 Open it from the gear beside **+** (the Hosts bar on a phone, the host rail,
-or the sidebar header) or from a terminal's **⋮ → Display…**. Every change
-shows at once, on the terminal behind the sheet:
+or the sidebar header) or from a terminal's **⋮ → Display…**. Changes show
+in the app at once; the terminal behind the sheet recolors when the core
+applies the theme.
 
 - **Appearance:** System, Dark or Light. It picks which terminal theme is
   used.
@@ -54,13 +55,12 @@ shows at once, on the terminal behind the sheet:
 - **App text:** 85–160% on top of the system's text size (never more than
   twice the font size). The terminal itself does not scale with it.
 - **Terminal theme:** one dark and one light theme, of the bundled ones.
-- **Readability:** keep text readable (Auto, on for light themes only) and
-  brighter dim text.
+- **Readability:** keep text readable (Auto: on when the background is
+  light) and brighter dim text.
 
-The settings live on the phone, in `settings.json` next to `hosts.json`, and
-survive a relaunch. A pinch or slider drag is saved 300 ms after its last
-step, or when it ends, or when the app goes to the background; a process
-killed inside those 300 ms loses that last step.
+The settings live on the phone, in `settings.json` next to `hosts.json`. A
+pinch or slider drag is saved shortly after it ends, and when the app goes to
+the background. Only a save the core has acknowledged survives a relaunch.
 
 **Claude Code:** run `/theme` and pick `dark-ansi` or `light-ansi`, so Claude
 Code draws with the terminal theme's own colors and follows it.
