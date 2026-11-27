@@ -29,7 +29,6 @@ Future<void> showCopySheet(
     context: context,
     isScrollControlled: true,
     useSafeArea: true,
-    backgroundColor: context.palette.surface,
     builder: (sheet) {
       Future<void> copy(String value, String what) async {
         if (copying) return;

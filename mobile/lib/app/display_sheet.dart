@@ -26,14 +26,12 @@ String formatPoints(double size) =>
 /// Opens the Display settings: a bottom sheet on a phone-width layout, a
 /// dialog beside a rail or sidebar.
 Future<void> showDisplaySheet(BuildContext context) {
-  final palette = context.palette;
   if (WidthClassScope.of(context) == WidthClass.compact) {
     return showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
       barrierColor: _barrier,
-      backgroundColor: palette.surface,
       builder: (context) => DraggableScrollableSheet(
         expand: false,
         initialChildSize: 0.6,
@@ -47,7 +45,6 @@ Future<void> showDisplaySheet(BuildContext context) {
     context: context,
     barrierColor: _barrier,
     builder: (context) => Dialog(
-      backgroundColor: palette.surface,
       child: ConstrainedBox(
         constraints: BoxConstraints(
           maxWidth: 560,

@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:roost_mobile/app/display_sheet.dart';
 import 'package:roost_mobile/app/providers.dart';
+import 'package:roost_mobile/app/theme.dart';
 import 'package:roost_mobile/app/width_class.dart';
 import 'package:roost_mobile/core/fake/fake_core.dart';
 import 'package:roost_mobile/core/roost_core.dart';
@@ -347,4 +348,32 @@ void main() {
     expect(session.resizes.last, (before, true));
     expect(tab.sizedElsewhere, isFalse, reason: 'the fake took the size');
   });
+
+  for (final (name, width) in [('sheet', 360.0), ('dialog', 1000.0)]) {
+    testWidgets('the $name follows an appearance change made inside it', (
+      tester,
+    ) async {
+      await pumpApp(tester, width: width);
+      await _openSheet(tester);
+      Color? surface() => tester
+          .widget<Material>(
+            find
+                .ancestor(
+                  of: byKey('display-sheet'),
+                  matching: find.byType(Material),
+                )
+                .first,
+          )
+          .color;
+      expect(surface(), RoostPalette.dark.surface);
+      await tester.tap(
+        find.descendant(
+          of: byKey('display-appearance'),
+          matching: find.text('Light'),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(surface(), RoostPalette.light.surface);
+    });
+  }
 }

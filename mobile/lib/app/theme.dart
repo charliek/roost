@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../core/models.dart';
 
@@ -56,6 +57,32 @@ class RoostPalette extends ThemeExtension<RoostPalette> {
     error: Color(0xFFF08A8A),
     errorSurface: Color(0xFF1A1213),
     errorBorder: Color(0xFF5A2F2F),
+  );
+
+  static const light = RoostPalette(
+    background: Color(0xFFF6F7F9),
+    surfaceLow: Color(0xFFFFFFFF),
+    surface: Color(0xFFFFFFFF),
+    surfaceHigh: Color(0xFFF0F2F5),
+    surfaceHighest: Color(0xFFE9ECF1),
+    border: Color(0xFFD6DAE1),
+    divider: Color(0xFFE3E6EB),
+    outline: Color(0xFFC8CDD6),
+    text: Color(0xFF1B1E24),
+    muted: Color(0xFF5B6372),
+    waiting: Color(0xFF9A5407),
+    waitingText: Color(0xFF8A4A08),
+    waitingAction: Color(0xFF8A4A08),
+    waitingSurface: Color(0xFFFFF4E6),
+    waitingBorder: Color(0xFFEFCF9F),
+    waitingPill: Color(0xFFFCE9D2),
+    working: Color(0xFF2A62C9),
+    workingPill: Color(0xFFE8F0FE),
+    idle: Color(0xFF6B7280),
+    connected: Color(0xFF17784A),
+    error: Color(0xFFC23B3B),
+    errorSurface: Color(0xFFFDECEC),
+    errorBorder: Color(0xFFF2B8B8),
   );
 
   final Color background;
@@ -172,9 +199,29 @@ extension RoostPaletteX on BuildContext {
 
 const monoFamily = 'JetBrains Mono';
 
+/// Icon brightness is the opposite of the chrome's. One style for the app
+/// root and the AppBar, so a route with a bar and one without agree.
+SystemUiOverlayStyle systemOverlayStyleFor(
+  Brightness brightness,
+  RoostPalette palette,
+) {
+  final icons = brightness == Brightness.dark
+      ? Brightness.light
+      : Brightness.dark;
+  return SystemUiOverlayStyle(
+    statusBarColor: Colors.transparent,
+    statusBarIconBrightness: icons,
+    statusBarBrightness: brightness,
+    systemNavigationBarColor: palette.background,
+    systemNavigationBarIconBrightness: icons,
+    systemNavigationBarDividerColor: palette.background,
+  );
+}
+
 ThemeData roostTheme(Brightness brightness) {
-  // The light palette arrives with U6.
-  const palette = RoostPalette.dark;
+  final palette = brightness == Brightness.dark
+      ? RoostPalette.dark
+      : RoostPalette.light;
   final scheme =
       ColorScheme.fromSeed(
         seedColor: palette.working,
@@ -195,7 +242,14 @@ ThemeData roostTheme(Brightness brightness) {
   return ThemeData(
     colorScheme: scheme,
     scaffoldBackgroundColor: palette.background,
-    extensions: const [palette],
+    extensions: [palette],
+    appBarTheme: AppBarTheme(
+      systemOverlayStyle: systemOverlayStyleFor(brightness, palette),
+    ),
+    // From the theme, not captured at open: a modal follows an appearance
+    // change made while it is showing.
+    bottomSheetTheme: BottomSheetThemeData(backgroundColor: palette.surface),
+    dialogTheme: DialogThemeData(backgroundColor: palette.surface),
     dividerTheme: DividerThemeData(color: palette.divider, space: 1),
     cardTheme: CardThemeData(
       color: palette.surface,
