@@ -22,18 +22,38 @@ import 'serial_queue.dart';
 class FrbCore implements RoostCore {
   FrbCore(this._app);
 
-  /// Call `RustLib.init()` first.
+  /// Call `RustLib.init()` first. [systemDark]: the platform is in dark mode
+  /// now, so the first tab opens in the right terminal theme.
   static Future<FrbCore> start({
     required String dataDir,
     required String deviceLabel,
+    required bool systemDark,
   }) async => FrbCore(
-    await _guard(() => roostInit(dataDir: dataDir, deviceLabel: deviceLabel)),
+    await _guard(
+      () => roostInit(
+        dataDir: dataDir,
+        deviceLabel: deviceLabel,
+        systemDark: systemDark,
+      ),
+    ),
   );
 
   final BridgeApp _app;
   ReplayFeed<List<HostView>>? _hosts;
   final Map<String, ReplayFeed<WorkspaceView>> _workspaces = {};
   final _writes = SerialQueue();
+  final _settings = SerialQueue();
+  late final List<ThemeSummary> _themes = List.unmodifiable([
+    for (final t in _app.terminalThemes())
+      ThemeSummary(
+        name: t.name,
+        light: t.light,
+        background: t.background,
+        foreground: t.foreground,
+        cursor: t.cursor,
+        ansi: List.unmodifiable(t.ansi),
+      ),
+  ]);
 
   BridgeLeakCounts leakCounts() => _app.leakCounts();
 
@@ -140,6 +160,31 @@ class FrbCore implements RoostCore {
 
   @override
   Future<void> appResumed() => _app.appResumed();
+
+  @override
+  SettingsState settings() => _settingsState(_app.settings());
+
+  /// Settings calls cross the bridge one at a time: two pool calls can reach
+  /// the core in either order, and an older write must not land last.
+  @override
+  Future<SettingsState> updateSettings(MobileSettings settings) =>
+      _settings.run(
+        this,
+        () async => _settingsState(
+          await _guard(
+            () => _app.updateSettings(settings: _bridgeSettings(settings)),
+          ),
+        ),
+      );
+
+  @override
+  Future<SettingsState> setSystemDark(bool dark) => _settings.run(
+    this,
+    () async => _settingsState(await _app.setSystemDark(dark: dark)),
+  );
+
+  @override
+  List<ThemeSummary> terminalThemes() => _themes;
 }
 
 /// One attached tab over the bridge. The input calls are synchronous on
@@ -232,6 +277,48 @@ BridgeGeometry _geometry(Geometry g) => BridgeGeometry(
   rows: g.rows,
   cellWPx: g.cellWidthPx,
   cellHPx: g.cellHeightPx,
+);
+
+BridgeSettings _bridgeSettings(MobileSettings s) => BridgeSettings(
+  terminalFontSizeCompact: s.terminalFontSizeCompact,
+  terminalFontSizeWide: s.terminalFontSizeWide,
+  uiTextScale: s.uiTextScale,
+  appearance: switch (s.appearance) {
+    Appearance.system => BridgeAppearance.system,
+    Appearance.dark => BridgeAppearance.dark,
+    Appearance.light => BridgeAppearance.light,
+  },
+  darkTheme: s.darkTheme,
+  lightTheme: s.lightTheme,
+  readableText: switch (s.readableText) {
+    ReadableText.auto => BridgeReadableText.auto,
+    ReadableText.on => BridgeReadableText.on_,
+    ReadableText.off => BridgeReadableText.off,
+  },
+  brightFaint: s.brightFaint,
+);
+
+SettingsState _settingsState(BridgeSettingsState s) => SettingsState(
+  settings: MobileSettings(
+    terminalFontSizeCompact: s.settings.terminalFontSizeCompact,
+    terminalFontSizeWide: s.settings.terminalFontSizeWide,
+    uiTextScale: s.settings.uiTextScale,
+    appearance: switch (s.settings.appearance) {
+      BridgeAppearance.system => Appearance.system,
+      BridgeAppearance.dark => Appearance.dark,
+      BridgeAppearance.light => Appearance.light,
+    },
+    darkTheme: s.settings.darkTheme,
+    lightTheme: s.settings.lightTheme,
+    readableText: switch (s.settings.readableText) {
+      BridgeReadableText.auto => ReadableText.auto,
+      BridgeReadableText.on_ => ReadableText.on,
+      BridgeReadableText.off => ReadableText.off,
+    },
+    brightFaint: s.settings.brightFaint,
+  ),
+  effectiveDark: s.effectiveDark,
+  effectiveTheme: s.effectiveTheme,
 );
 
 HostView _hostView(BridgeHostView h) => HostView(

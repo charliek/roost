@@ -41,7 +41,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0-beta.5";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -601237520;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -817835163;
 
 // Section: executor
 
@@ -769,6 +769,153 @@ fn wire__crate__api__app__BridgeApp_send_text_impl(
         },
     )
 }
+fn wire__crate__api__app__BridgeApp_set_system_dark_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "BridgeApp_set_system_dark",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<BridgeApp>,
+            >>::sse_decode(&mut deserializer);
+            let api_dark = <bool>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, ()>((move || {
+                    let mut api_that_guard = None;
+                    let decode_indices_ =
+                        flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                            flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                &api_that, 0, false,
+                            ),
+                        ]);
+                    for i in decode_indices_ {
+                        match i {
+                            0 => api_that_guard = Some(api_that.lockable_decode_sync_ref()),
+                            _ => unreachable!(),
+                        }
+                    }
+                    let api_that_guard = api_that_guard.unwrap();
+                    let output_ok = Result::<_, ()>::Ok(
+                        crate::api::app::BridgeApp::set_system_dark(&*api_that_guard, api_dark),
+                    )?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__app__BridgeApp_settings_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "BridgeApp_settings",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<BridgeApp>,
+            >>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let mut api_that_guard = None;
+                let decode_indices_ =
+                    flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                        flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                            &api_that, 0, false,
+                        ),
+                    ]);
+                for i in decode_indices_ {
+                    match i {
+                        0 => api_that_guard = Some(api_that.lockable_decode_sync_ref()),
+                        _ => unreachable!(),
+                    }
+                }
+                let api_that_guard = api_that_guard.unwrap();
+                let output_ok =
+                    Result::<_, ()>::Ok(crate::api::app::BridgeApp::settings(&*api_that_guard))?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__app__BridgeApp_terminal_themes_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "BridgeApp_terminal_themes",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<BridgeApp>,
+            >>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let mut api_that_guard = None;
+                let decode_indices_ =
+                    flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                        flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                            &api_that, 0, false,
+                        ),
+                    ]);
+                for i in decode_indices_ {
+                    match i {
+                        0 => api_that_guard = Some(api_that.lockable_decode_sync_ref()),
+                        _ => unreachable!(),
+                    }
+                }
+                let api_that_guard = api_that_guard.unwrap();
+                let output_ok = Result::<_, ()>::Ok(crate::api::app::BridgeApp::terminal_themes(
+                    &*api_that_guard,
+                ))?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
 fn wire__crate__api__app__BridgeApp_trust_host_key_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -818,6 +965,61 @@ fn wire__crate__api__app__BridgeApp_trust_host_key_impl(
                             &*api_that_guard,
                             api_host_id,
                             api_fingerprint,
+                        )?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__app__BridgeApp_update_settings_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "BridgeApp_update_settings",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<BridgeApp>,
+            >>::sse_decode(&mut deserializer);
+            let api_settings = <crate::api::types::BridgeSettings>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let mut api_that_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_that, 0, false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => api_that_guard = Some(api_that.lockable_decode_sync_ref()),
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_that_guard = api_that_guard.unwrap();
+                        let output_ok = crate::api::app::BridgeApp::update_settings(
+                            &*api_that_guard,
+                            api_settings,
                         )?;
                         Ok(output_ok)
                     })(),
@@ -1471,12 +1673,16 @@ fn wire__crate__api__app__roost_init_impl(
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
             let api_data_dir = <String>::sse_decode(&mut deserializer);
             let api_device_label = <String>::sse_decode(&mut deserializer);
+            let api_system_dark = <bool>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || {
-                        let output_ok =
-                            crate::api::app::roost_init(api_data_dir, api_device_label)?;
+                        let output_ok = crate::api::app::roost_init(
+                            api_data_dir,
+                            api_device_label,
+                            api_system_dark,
+                        )?;
                         Ok(output_ok)
                     })(),
                 )
@@ -1608,6 +1814,19 @@ impl SseDecode for crate::api::types::BridgeAgentBadge {
             2 => crate::api::types::BridgeAgentBadge::Working,
             3 => crate::api::types::BridgeAgentBadge::Waiting,
             _ => unreachable!("Invalid variant for BridgeAgentBadge: {}", inner),
+        };
+    }
+}
+
+impl SseDecode for crate::api::types::BridgeAppearance {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::types::BridgeAppearance::System,
+            1 => crate::api::types::BridgeAppearance::Dark,
+            2 => crate::api::types::BridgeAppearance::Light,
+            _ => unreachable!("Invalid variant for BridgeAppearance: {}", inner),
         };
     }
 }
@@ -1750,6 +1969,58 @@ impl SseDecode for crate::api::types::BridgeProjectView {
     }
 }
 
+impl SseDecode for crate::api::types::BridgeReadableText {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::types::BridgeReadableText::Auto,
+            1 => crate::api::types::BridgeReadableText::On,
+            2 => crate::api::types::BridgeReadableText::Off,
+            _ => unreachable!("Invalid variant for BridgeReadableText: {}", inner),
+        };
+    }
+}
+
+impl SseDecode for crate::api::types::BridgeSettings {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_terminalFontSizeCompact = <f64>::sse_decode(deserializer);
+        let mut var_terminalFontSizeWide = <f64>::sse_decode(deserializer);
+        let mut var_uiTextScale = <f64>::sse_decode(deserializer);
+        let mut var_appearance = <crate::api::types::BridgeAppearance>::sse_decode(deserializer);
+        let mut var_darkTheme = <String>::sse_decode(deserializer);
+        let mut var_lightTheme = <String>::sse_decode(deserializer);
+        let mut var_readableText =
+            <crate::api::types::BridgeReadableText>::sse_decode(deserializer);
+        let mut var_brightFaint = <bool>::sse_decode(deserializer);
+        return crate::api::types::BridgeSettings {
+            terminal_font_size_compact: var_terminalFontSizeCompact,
+            terminal_font_size_wide: var_terminalFontSizeWide,
+            ui_text_scale: var_uiTextScale,
+            appearance: var_appearance,
+            dark_theme: var_darkTheme,
+            light_theme: var_lightTheme,
+            readable_text: var_readableText,
+            bright_faint: var_brightFaint,
+        };
+    }
+}
+
+impl SseDecode for crate::api::types::BridgeSettingsState {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_settings = <crate::api::types::BridgeSettings>::sse_decode(deserializer);
+        let mut var_effectiveDark = <bool>::sse_decode(deserializer);
+        let mut var_effectiveTheme = <String>::sse_decode(deserializer);
+        return crate::api::types::BridgeSettingsState {
+            settings: var_settings,
+            effective_dark: var_effectiveDark,
+            effective_theme: var_effectiveTheme,
+        };
+    }
+}
+
 impl SseDecode for crate::api::types::BridgeTabView {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1811,6 +2082,26 @@ impl SseDecode for crate::api::types::BridgeTerminalEventKind {
     }
 }
 
+impl SseDecode for crate::api::types::BridgeThemeSummary {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_name = <String>::sse_decode(deserializer);
+        let mut var_light = <bool>::sse_decode(deserializer);
+        let mut var_background = <u32>::sse_decode(deserializer);
+        let mut var_foreground = <u32>::sse_decode(deserializer);
+        let mut var_cursor = <u32>::sse_decode(deserializer);
+        let mut var_ansi = <Vec<u32>>::sse_decode(deserializer);
+        return crate::api::types::BridgeThemeSummary {
+            name: var_name,
+            light: var_light,
+            background: var_background,
+            foreground: var_foreground,
+            cursor: var_cursor,
+            ansi: var_ansi,
+        };
+    }
+}
+
 impl SseDecode for crate::api::types::BridgeWorkspaceView {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1823,6 +2114,13 @@ impl SseDecode for crate::api::types::BridgeWorkspaceView {
             active_project_id: var_activeProjectId,
             active_tab_id: var_activeTabId,
         };
+    }
+}
+
+impl SseDecode for f64 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_f64::<NativeEndian>().unwrap()
     }
 }
 
@@ -1887,6 +2185,32 @@ impl SseDecode for Vec<crate::api::types::BridgeTabView> {
         let mut ans_ = Vec::with_capacity(len_ as usize);
         for idx_ in 0..len_ {
             ans_.push(<crate::api::types::BridgeTabView>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
+impl SseDecode for Vec<crate::api::types::BridgeThemeSummary> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::types::BridgeThemeSummary>::sse_decode(
+                deserializer,
+            ));
+        }
+        return ans_;
+    }
+}
+
+impl SseDecode for Vec<u32> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<u32>::sse_decode(deserializer));
         }
         return ans_;
     }
@@ -1974,34 +2298,40 @@ fn pde_ffi_dispatcher_primary_impl(
         12 => wire__crate__api__app__BridgeApp_remove_host_impl(port, ptr, rust_vec_len, data_len),
         13 => wire__crate__api__app__BridgeApp_send_text_impl(port, ptr, rust_vec_len, data_len),
         14 => {
+            wire__crate__api__app__BridgeApp_set_system_dark_impl(port, ptr, rust_vec_len, data_len)
+        }
+        17 => {
             wire__crate__api__app__BridgeApp_trust_host_key_impl(port, ptr, rust_vec_len, data_len)
         }
-        15 => wire__crate__api__app__BridgeApp_workspace_impl(port, ptr, rust_vec_len, data_len),
-        17 => wire__crate__api__terminal__BridgeTerminal_events_impl(
+        18 => {
+            wire__crate__api__app__BridgeApp_update_settings_impl(port, ptr, rust_vec_len, data_len)
+        }
+        19 => wire__crate__api__app__BridgeApp_workspace_impl(port, ptr, rust_vec_len, data_len),
+        21 => wire__crate__api__terminal__BridgeTerminal_events_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        22 => wire__crate__api__terminal__BridgeTerminal_take_frame_impl(
+        26 => wire__crate__api__terminal__BridgeTerminal_take_frame_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        23 => wire__crate__api__terminal__BridgeTerminal_take_full_frame_impl(
+        27 => wire__crate__api__terminal__BridgeTerminal_take_full_frame_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        26 => wire__crate__api__terminal__BridgeTerminal_viewport_text_impl(
+        30 => wire__crate__api__terminal__BridgeTerminal_viewport_text_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        27 => wire__crate__api__app__roost_init_impl(port, ptr, rust_vec_len, data_len),
+        31 => wire__crate__api__app__roost_init_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -2016,15 +2346,17 @@ fn pde_ffi_dispatcher_sync_impl(
     match func_id {
         6 => wire__crate__api__app__BridgeApp_client_id_impl(ptr, rust_vec_len, data_len),
         10 => wire__crate__api__app__BridgeApp_leak_counts_impl(ptr, rust_vec_len, data_len),
-        16 => wire__crate__api__terminal__BridgeTerminal_close_impl(ptr, rust_vec_len, data_len),
-        18 => wire__crate__api__terminal__BridgeTerminal_key_impl(ptr, rust_vec_len, data_len),
-        19 => wire__crate__api__terminal__BridgeTerminal_paste_impl(ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__terminal__BridgeTerminal_resize_impl(ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__terminal__BridgeTerminal_scroll_impl(ptr, rust_vec_len, data_len),
-        24 => {
+        15 => wire__crate__api__app__BridgeApp_settings_impl(ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__app__BridgeApp_terminal_themes_impl(ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__terminal__BridgeTerminal_close_impl(ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__terminal__BridgeTerminal_key_impl(ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__terminal__BridgeTerminal_paste_impl(ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__terminal__BridgeTerminal_resize_impl(ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__terminal__BridgeTerminal_scroll_impl(ptr, rust_vec_len, data_len),
+        28 => {
             wire__crate__api__terminal__BridgeTerminal_take_size_impl(ptr, rust_vec_len, data_len)
         }
-        25 => wire__crate__api__terminal__BridgeTerminal_text_impl(ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__terminal__BridgeTerminal_text_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -2081,6 +2413,28 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::types::BridgeAgentBadge>
     for crate::api::types::BridgeAgentBadge
 {
     fn into_into_dart(self) -> crate::api::types::BridgeAgentBadge {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::types::BridgeAppearance {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::System => 0.into_dart(),
+            Self::Dark => 1.into_dart(),
+            Self::Light => 2.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::types::BridgeAppearance
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::types::BridgeAppearance>
+    for crate::api::types::BridgeAppearance
+{
+    fn into_into_dart(self) -> crate::api::types::BridgeAppearance {
         self
     }
 }
@@ -2277,6 +2631,77 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::types::BridgeProjectView>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::types::BridgeReadableText {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::Auto => 0.into_dart(),
+            Self::On => 1.into_dart(),
+            Self::Off => 2.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::types::BridgeReadableText
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::types::BridgeReadableText>
+    for crate::api::types::BridgeReadableText
+{
+    fn into_into_dart(self) -> crate::api::types::BridgeReadableText {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::types::BridgeSettings {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.terminal_font_size_compact.into_into_dart().into_dart(),
+            self.terminal_font_size_wide.into_into_dart().into_dart(),
+            self.ui_text_scale.into_into_dart().into_dart(),
+            self.appearance.into_into_dart().into_dart(),
+            self.dark_theme.into_into_dart().into_dart(),
+            self.light_theme.into_into_dart().into_dart(),
+            self.readable_text.into_into_dart().into_dart(),
+            self.bright_faint.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::types::BridgeSettings
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::types::BridgeSettings>
+    for crate::api::types::BridgeSettings
+{
+    fn into_into_dart(self) -> crate::api::types::BridgeSettings {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::types::BridgeSettingsState {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.settings.into_into_dart().into_dart(),
+            self.effective_dark.into_into_dart().into_dart(),
+            self.effective_theme.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::types::BridgeSettingsState
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::types::BridgeSettingsState>
+    for crate::api::types::BridgeSettingsState
+{
+    fn into_into_dart(self) -> crate::api::types::BridgeSettingsState {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::types::BridgeTabView {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
@@ -2350,6 +2775,31 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::types::BridgeTerminalEventKin
     for crate::api::types::BridgeTerminalEventKind
 {
     fn into_into_dart(self) -> crate::api::types::BridgeTerminalEventKind {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::types::BridgeThemeSummary {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.name.into_into_dart().into_dart(),
+            self.light.into_into_dart().into_dart(),
+            self.background.into_into_dart().into_dart(),
+            self.foreground.into_into_dart().into_dart(),
+            self.cursor.into_into_dart().into_dart(),
+            self.ansi.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::types::BridgeThemeSummary
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::types::BridgeThemeSummary>
+    for crate::api::types::BridgeThemeSummary
+{
+    fn into_into_dart(self) -> crate::api::types::BridgeThemeSummary {
         self
     }
 }
@@ -2487,6 +2937,23 @@ impl SseEncode for crate::api::types::BridgeAgentBadge {
     }
 }
 
+impl SseEncode for crate::api::types::BridgeAppearance {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::types::BridgeAppearance::System => 0,
+                crate::api::types::BridgeAppearance::Dark => 1,
+                crate::api::types::BridgeAppearance::Light => 2,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
+    }
+}
+
 impl SseEncode for crate::api::types::BridgeAttachState {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -2591,6 +3058,46 @@ impl SseEncode for crate::api::types::BridgeProjectView {
     }
 }
 
+impl SseEncode for crate::api::types::BridgeReadableText {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::types::BridgeReadableText::Auto => 0,
+                crate::api::types::BridgeReadableText::On => 1,
+                crate::api::types::BridgeReadableText::Off => 2,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
+    }
+}
+
+impl SseEncode for crate::api::types::BridgeSettings {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <f64>::sse_encode(self.terminal_font_size_compact, serializer);
+        <f64>::sse_encode(self.terminal_font_size_wide, serializer);
+        <f64>::sse_encode(self.ui_text_scale, serializer);
+        <crate::api::types::BridgeAppearance>::sse_encode(self.appearance, serializer);
+        <String>::sse_encode(self.dark_theme, serializer);
+        <String>::sse_encode(self.light_theme, serializer);
+        <crate::api::types::BridgeReadableText>::sse_encode(self.readable_text, serializer);
+        <bool>::sse_encode(self.bright_faint, serializer);
+    }
+}
+
+impl SseEncode for crate::api::types::BridgeSettingsState {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <crate::api::types::BridgeSettings>::sse_encode(self.settings, serializer);
+        <bool>::sse_encode(self.effective_dark, serializer);
+        <String>::sse_encode(self.effective_theme, serializer);
+    }
+}
+
 impl SseEncode for crate::api::types::BridgeTabView {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -2637,12 +3144,31 @@ impl SseEncode for crate::api::types::BridgeTerminalEventKind {
     }
 }
 
+impl SseEncode for crate::api::types::BridgeThemeSummary {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.name, serializer);
+        <bool>::sse_encode(self.light, serializer);
+        <u32>::sse_encode(self.background, serializer);
+        <u32>::sse_encode(self.foreground, serializer);
+        <u32>::sse_encode(self.cursor, serializer);
+        <Vec<u32>>::sse_encode(self.ansi, serializer);
+    }
+}
+
 impl SseEncode for crate::api::types::BridgeWorkspaceView {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <Vec<crate::api::types::BridgeProjectView>>::sse_encode(self.projects, serializer);
         <i64>::sse_encode(self.active_project_id, serializer);
         <i64>::sse_encode(self.active_tab_id, serializer);
+    }
+}
+
+impl SseEncode for f64 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_f64::<NativeEndian>(self).unwrap();
     }
 }
 
@@ -2696,6 +3222,26 @@ impl SseEncode for Vec<crate::api::types::BridgeTabView> {
         <i32>::sse_encode(self.len() as _, serializer);
         for item in self {
             <crate::api::types::BridgeTabView>::sse_encode(item, serializer);
+        }
+    }
+}
+
+impl SseEncode for Vec<crate::api::types::BridgeThemeSummary> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::types::BridgeThemeSummary>::sse_encode(item, serializer);
+        }
+    }
+}
+
+impl SseEncode for Vec<u32> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <u32>::sse_encode(item, serializer);
         }
     }
 }

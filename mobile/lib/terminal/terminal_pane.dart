@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../app/providers.dart';
 import '../app/theme.dart';
+import '../app/width_class.dart';
 import '../app/workspace_actions.dart';
 import '../core/roost_core.dart';
 import '../hosts/host_widgets.dart';
@@ -296,7 +297,11 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
         .watch(workspaceProvider(widget.hostId))
         .value
         ?.tab(widget.tabId);
-    final fontSize = ref.watch(terminalFontSizeProvider);
+    final widthClass = WidthClassScope.of(context);
+    final fontSize = ref.watch(
+      settingsProvider.select((s) => s.desired.terminalFontSizeFor(widthClass)),
+    );
+    final settings = ref.read(settingsProvider.notifier);
     final tab = _tab;
     final focused = _focus.hasFocus;
     return Column(
@@ -317,14 +322,15 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
           onClose: view == null
               ? null
               : () => closeTabFlow(context, ref, widget.hostId, view),
-          onFontSize: (delta) => ref
-              .read(terminalFontSizeProvider.notifier)
-              .set(
-                (fontSize + delta).clamp(
-                  minTerminalFontSize,
-                  maxTerminalFontSize,
-                ),
+          onFontSize: (delta) => settings.edit(
+            (s) => s.withTerminalFontSize(
+              widthClass,
+              (fontSize + delta).clamp(
+                minTerminalFontSize,
+                maxTerminalFontSize,
               ),
+            ),
+          ),
         ),
         if (tab != null && tab.sizedElsewhere)
           _SizeOwnerBanner(
@@ -353,10 +359,14 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
                   child: TerminalView(
                     tab: tab,
                     fontSize: fontSize,
+                    fontSizeSetting: widthClass,
                     focused: focused,
                     onGeometry: _onGeometry,
-                    onFontSize: (s) =>
-                        ref.read(terminalFontSizeProvider.notifier).set(s),
+                    onFontSize: (size) => settings.edit(
+                      (s) => s.withTerminalFontSize(widthClass, size),
+                      continuous: true,
+                    ),
+                    onPinchEnd: settings.flush,
                     onScroll: _scroll,
                     onTap: () => _input.currentState?.showKeyboard(),
                     onLongPress: _openCopy,

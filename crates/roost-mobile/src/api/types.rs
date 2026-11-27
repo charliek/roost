@@ -2,9 +2,10 @@
 //! becomes a freezed class on the Dart side, which would add a second
 //! codegen step for no gain, since Dart maps these to its own models.
 
-use crate::app::LeakCounts;
+use crate::app::{LeakCounts, SettingsState, ThemeSummary};
 use crate::keys::KeyInput;
 use crate::owner::TerminalEvent;
+use crate::registry::{Appearance, MobileSettings, ReadableText};
 use crate::terminal::{AttachState, Geometry};
 use crate::views::{AgentBadge, HostStateView, HostView, ProjectView, TabView, WorkspaceView};
 
@@ -308,6 +309,122 @@ impl From<LeakCounts> for BridgeLeakCounts {
             attach_pumps: n(c.attach_pumps),
             attachments: n(c.attachments),
             terminals: n(c.terminals),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeAppearance {
+    System,
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeReadableText {
+    Auto,
+    On,
+    Off,
+}
+
+/// `MobileSettings` without its file version.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeSettings {
+    pub terminal_font_size_compact: f64,
+    pub terminal_font_size_wide: f64,
+    pub ui_text_scale: f64,
+    pub appearance: BridgeAppearance,
+    pub dark_theme: String,
+    pub light_theme: String,
+    pub readable_text: BridgeReadableText,
+    pub bright_faint: bool,
+}
+
+impl From<BridgeSettings> for MobileSettings {
+    fn from(s: BridgeSettings) -> Self {
+        Self {
+            terminal_font_size_compact: s.terminal_font_size_compact,
+            terminal_font_size_wide: s.terminal_font_size_wide,
+            ui_text_scale: s.ui_text_scale,
+            appearance: match s.appearance {
+                BridgeAppearance::System => Appearance::System,
+                BridgeAppearance::Dark => Appearance::Dark,
+                BridgeAppearance::Light => Appearance::Light,
+            },
+            dark_theme: s.dark_theme,
+            light_theme: s.light_theme,
+            readable_text: match s.readable_text {
+                BridgeReadableText::Auto => ReadableText::Auto,
+                BridgeReadableText::On => ReadableText::On,
+                BridgeReadableText::Off => ReadableText::Off,
+            },
+            bright_faint: s.bright_faint,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<MobileSettings> for BridgeSettings {
+    fn from(s: MobileSettings) -> Self {
+        Self {
+            terminal_font_size_compact: s.terminal_font_size_compact,
+            terminal_font_size_wide: s.terminal_font_size_wide,
+            ui_text_scale: s.ui_text_scale,
+            appearance: match s.appearance {
+                Appearance::System => BridgeAppearance::System,
+                Appearance::Dark => BridgeAppearance::Dark,
+                Appearance::Light => BridgeAppearance::Light,
+            },
+            dark_theme: s.dark_theme,
+            light_theme: s.light_theme,
+            readable_text: match s.readable_text {
+                ReadableText::Auto => BridgeReadableText::Auto,
+                ReadableText::On => BridgeReadableText::On,
+                ReadableText::Off => BridgeReadableText::Off,
+            },
+            bright_faint: s.bright_faint,
+        }
+    }
+}
+
+/// The settings, and the brightness and terminal theme they make now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeSettingsState {
+    pub settings: BridgeSettings,
+    pub effective_dark: bool,
+    pub effective_theme: String,
+}
+
+impl From<SettingsState> for BridgeSettingsState {
+    fn from(state: SettingsState) -> Self {
+        Self {
+            effective_dark: state.effective_dark(),
+            effective_theme: state.effective_theme_name().to_string(),
+            settings: state.settings.into(),
+        }
+    }
+}
+
+/// Colors are `0x00RRGGBB`; `ansi` holds the 16 ANSI colors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeThemeSummary {
+    pub name: String,
+    pub light: bool,
+    pub background: u32,
+    pub foreground: u32,
+    pub cursor: u32,
+    pub ansi: Vec<u32>,
+}
+
+impl From<ThemeSummary> for BridgeThemeSummary {
+    fn from(t: ThemeSummary) -> Self {
+        Self {
+            name: t.name,
+            light: t.light,
+            background: t.background,
+            foreground: t.foreground,
+            cursor: t.cursor,
+            ansi: t.ansi,
         }
     }
 }

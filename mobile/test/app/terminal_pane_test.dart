@@ -5,7 +5,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:roost_mobile/app/providers.dart';
 import 'package:roost_mobile/core/fake/fake_core.dart';
 import 'package:roost_mobile/core/roost_core.dart';
+import 'package:roost_mobile/app/width_class.dart';
 import 'package:roost_mobile/terminal/terminal_pane.dart';
+import 'package:roost_mobile/terminal/terminal_view.dart';
 
 import '../support/pump_app.dart';
 
@@ -365,12 +367,72 @@ void main() {
       );
       expect(find.text('sized by charlie-laptop · 132×40'), findsOneWidget);
 
+      final before = session.resizes.last.$1;
       ProviderScope.containerOf(tester.element(find.byType(TerminalPane)))
-          .read(terminalFontSizeProvider.notifier)
-          .set(16);
+          .read(settingsProvider.notifier)
+          .edit((s) => s.copyWith(terminalFontSizeWide: 16));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 200));
-      expect(session.resizes.last.$2, isTrue, reason: 'a zoom is deliberate');
+      final (zoomed, focused) = session.resizes.last;
+      expect(focused, isTrue, reason: 'a zoom is deliberate');
+      expect(zoomed.cols, lessThan(before.cols), reason: 'bigger text');
+      expect(zoomed.cellWidthPx, greaterThan(before.cellWidthPx));
+      expect(core.settingsWrites.last.terminalFontSizeWide, 16);
+      await tester.pumpAndSettle();
+      final tab = tester.widget<TerminalView>(find.byType(TerminalView)).tab!;
+      expect(tab.sizedElsewhere, isFalse, reason: 'the zoom took the size');
+      expect(byKey('size-owner-banner'), findsNothing);
+      expect((tab.model.cols, tab.model.rows), (zoomed.cols, zoomed.rows));
+    });
+
+    testWidgets('a pinch that comes back to where it started lands there', (
+      tester,
+    ) async {
+      final sizes = <double>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: TerminalView(tab: null, fontSize: 13, onFontSize: sizes.add),
+        ),
+      );
+      final center = tester.getCenter(byKey('terminal-canvas'));
+      final a = await tester.startGesture(center - const Offset(100, 0));
+      final b = await tester.startGesture(center + const Offset(100, 0));
+      // No pump between the moves: the view still draws 13 throughout.
+      await a.moveTo(center - const Offset(130, 0));
+      await b.moveTo(center + const Offset(130, 0));
+      await a.moveTo(center - const Offset(100, 0));
+      await b.moveTo(center + const Offset(100, 0));
+      await a.up();
+      await b.up();
+      expect(sizes, isNotEmpty, reason: 'the pinch grew the text');
+      expect(sizes.first, greaterThan(13));
+      expect(sizes.last, 13, reason: 'and brought it back');
+    });
+
+    testWidgets('a size from another width class is advisory', (tester) async {
+      final reports = <(Geometry, bool)>[];
+      Future<void> show(double fontSize, WidthClass widthClass) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: TerminalView(
+              tab: null,
+              fontSize: fontSize,
+              fontSizeSetting: widthClass,
+              onGeometry: (g, {required deliberate}) =>
+                  reports.add((g, deliberate)),
+            ),
+          ),
+        );
+        await tester.pump(regridDebounce);
+      }
+
+      await show(13, WidthClass.medium);
+      expect(reports.map((r) => r.$2), [false], reason: 'the first grid');
+      await show(9, WidthClass.compact);
+      expect(reports.last.$2, isFalse, reason: 'another setting applies');
+      await show(11, WidthClass.compact);
+      expect(reports.last.$2, isTrue, reason: 'the user changed this one');
+      expect(reports.map((r) => r.$1.cols).toSet(), hasLength(3));
     });
 
     testWidgets('a burst of size changes settles into one resize', (

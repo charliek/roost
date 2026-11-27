@@ -12,8 +12,10 @@ import 'package:roost_mobile/core/frb_core.dart';
 import 'package:roost_mobile/core/roost_core.dart';
 import 'package:roost_mobile/hosts/host_widgets.dart';
 import 'package:roost_mobile/hosts/workspace_list.dart';
+import 'package:roost_mobile/src/rust/api/app.dart';
 import 'package:roost_mobile/src/rust/frb_generated.dart';
 import 'package:roost_mobile/terminal/attached_tab.dart';
+import 'package:roost_mobile/terminal/frame.dart';
 import 'package:roost_mobile/terminal/terminal_view.dart';
 
 import 'support/session.dart';
@@ -54,9 +56,14 @@ void main() {
     final dataDir = ssh
         ? (await Directory.systemTemp.createTemp('roost-e2e-')).path
         : '${session!.root.path}/app';
-    final core = await FrbCore.start(
-      dataDir: dataDir,
-      deviceLabel: 'e2e-$name',
+    final core = _FirstFrameCore(
+      await roostInit(
+        dataDir: dataDir,
+        deviceLabel: 'e2e-$name',
+        systemDark:
+            WidgetsBinding.instance.platformDispatcher.platformBrightness ==
+            Brightness.dark,
+      ),
     );
     await tester.pumpWidget(
       ProviderScope(
@@ -114,7 +121,7 @@ void main() {
       () => find.byType(TabTile).evaluate().isNotEmpty,
     );
     await tester.tap(find.byType(TabTile).first);
-    final tab = await _attached(tester, 'the seed tab attaches');
+    var tab = await _attached(tester, 'the seed tab attaches');
     final selection = container.read(selectionProvider);
 
     // Hardware keys.
@@ -211,6 +218,61 @@ void main() {
       'state': 'none',
     });
 
+    // The terminal theme: the attached tab recolors live both ways, and a
+    // tab opened later starts in the saved one.
+    final themes = core.terminalThemes();
+    expect(themes.first.name, 'roost-dark');
+    expect(themes.where((t) => !t.light), hasLength(26));
+    expect(themes.where((t) => t.light), hasLength(4));
+    expect(themes.every((t) => t.ansi.length == 16), isTrue);
+    expect(() => themes.removeLast(), throwsUnsupportedError);
+    final settings = container.read(settingsProvider.notifier);
+    final darkBg = tab.model.defaultBg;
+    expect(darkBg, isNot(_latteBg));
+    settings.edit((s) => s.copyWith(appearance: Appearance.light));
+    await _until(
+      tester,
+      'the tab recolors to Catppuccin Latte and light is acknowledged',
+      () =>
+          tab.model.defaultBg == _latteBg &&
+          !container.read(settingsProvider).acknowledged.effectiveDark,
+    );
+    settings.edit((s) => s.copyWith(appearance: Appearance.dark));
+    await _until(
+      tester,
+      'the tab recolors back to dark',
+      () => tab.model.defaultBg == darkBg,
+    );
+    settings.edit((s) => s.copyWith(appearance: Appearance.light));
+    await _until(
+      tester,
+      'light is saved',
+      () => !container.read(settingsProvider).acknowledged.effectiveDark,
+    );
+    container.read(selectionProvider.notifier).clearTab();
+    await _until(
+      tester,
+      'the tab closes',
+      () => find.byType(TerminalView).evaluate().isEmpty,
+    );
+    if (find.byType(HostCard).evaluate().isNotEmpty) {
+      await tester.tap(find.byType(HostCard).first);
+    }
+    await _until(
+      tester,
+      'the tab is listed again',
+      () => find.byType(TabTile).evaluate().isNotEmpty,
+    );
+    final attachesBefore = core.attached.length;
+    await tester.tap(find.byType(TabTile).first);
+    tab = await _attached(tester, 'the tab reopens', not: tab);
+    expect(core.attached.length, attachesBefore + 1);
+    expect(
+      core.attached.last.firstDefaultBg,
+      _latteBg,
+      reason: 'its first drawable frame is in the saved theme',
+    );
+
     await _measureFramePulls(tab);
 
     // Background: the core gives the size back and detaches the tab.
@@ -280,6 +342,9 @@ void main() {
 }
 
 const _budget = Duration(seconds: 45);
+
+/// Catppuccin Latte's background, the default light terminal theme.
+const _latteBg = 0xeff1f5;
 
 Future<void> _until(
   WidgetTester tester,
@@ -358,4 +423,70 @@ Future<void> _measureFramePulls(AttachedTab tab) async {
     'e2e: takeFrame over the bridge: min ${times.first} us, '
     'median ${times[times.length ~/ 2]} us, max ${times.last} us',
   );
+}
+
+/// [FrbCore] that wraps each attached tab to note its first drawable frame,
+/// before the UI sees any of them.
+class _FirstFrameCore extends FrbCore {
+  _FirstFrameCore(super.app);
+
+  final List<_FirstFrame> attached = [];
+
+  @override
+  Future<TerminalSession> attach(
+    String hostId,
+    int tabId,
+    Geometry geometry, {
+    required bool take,
+  }) async {
+    final session = _FirstFrame(
+      await super.attach(hostId, tabId, geometry, take: take),
+    );
+    attached.add(session);
+    return session;
+  }
+}
+
+class _FirstFrame implements TerminalSession {
+  _FirstFrame(this._inner);
+
+  final TerminalSession _inner;
+
+  /// The default background of the first frame that drew anything.
+  int? firstDefaultBg;
+
+  @override
+  Future<Uint8List> takeFrame() async {
+    final bytes = await _inner.takeFrame();
+    if (firstDefaultBg == null && bytes.isNotEmpty) {
+      firstDefaultBg = decodeFrame(bytes).defaultBg;
+    }
+    return bytes;
+  }
+
+  @override
+  Stream<TerminalEvent> events() => _inner.events();
+
+  @override
+  Future<void> key(KeyInput key) => _inner.key(key);
+
+  @override
+  Future<void> text(String text) => _inner.text(text);
+
+  @override
+  Future<void> paste(String text) => _inner.paste(text);
+
+  @override
+  Future<void> scroll(int rows, {required int col, required int row}) =>
+      _inner.scroll(rows, col: col, row: row);
+
+  @override
+  Future<void> resize(Geometry geometry, {required bool focused}) =>
+      _inner.resize(geometry, focused: focused);
+
+  @override
+  Future<void> takeSize() => _inner.takeSize();
+
+  @override
+  Future<void> close() => _inner.close();
 }

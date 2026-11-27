@@ -9,15 +9,7 @@ import 'expanded_layout.dart';
 import 'medium_layout.dart';
 import 'providers.dart';
 import 'theme.dart';
-
-enum WidthClass { compact, medium, expanded }
-
-/// Material 3 window size classes.
-WidthClass widthClassFor(double width) => width >= 840
-    ? WidthClass.expanded
-    : width >= 600
-    ? WidthClass.medium
-    : WidthClass.compact;
+import 'width_class.dart';
 
 class RoostMobileApp extends ConsumerStatefulWidget {
   const RoostMobileApp({super.key});
@@ -72,6 +64,7 @@ class _RoostMobileAppState extends ConsumerState<RoostMobileApp> {
       case AppLifecycleState.hidden || AppLifecycleState.paused:
         if (_backgrounded) return;
         _backgrounded = true;
+        ref.read(settingsProvider.notifier).flush();
         _enqueue(core.appPaused);
       case AppLifecycleState.resumed:
         if (!_backgrounded) return;
@@ -99,6 +92,7 @@ class _RoostMobileAppState extends ConsumerState<RoostMobileApp> {
     return MaterialApp(
       title: 'Roost',
       debugShowCheckedModeBanner: false,
+      scaffoldMessengerKey: ref.watch(scaffoldMessengerKeyProvider),
       theme: roostDarkTheme(),
       home: const AppShell(),
     );
@@ -111,16 +105,22 @@ class AppShell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
-      builder: (context, constraints) => switch (widthClassFor(
-        constraints.maxWidth,
-      )) {
-        WidthClass.compact => const CompactLayout(
-          key: ValueKey('layout-compact'),
-        ),
-        WidthClass.medium => const MediumLayout(key: ValueKey('layout-medium')),
-        WidthClass.expanded => const ExpandedLayout(
-          key: ValueKey('layout-expanded'),
-        ),
+      builder: (context, constraints) {
+        final widthClass = widthClassFor(constraints.maxWidth);
+        return WidthClassScope(
+          widthClass: widthClass,
+          child: switch (widthClass) {
+            WidthClass.compact => const CompactLayout(
+              key: ValueKey('layout-compact'),
+            ),
+            WidthClass.medium => const MediumLayout(
+              key: ValueKey('layout-medium'),
+            ),
+            WidthClass.expanded => const ExpandedLayout(
+              key: ValueKey('layout-expanded'),
+            ),
+          },
+        );
       },
     );
   }

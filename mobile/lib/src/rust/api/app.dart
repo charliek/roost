@@ -13,14 +13,17 @@ import 'types.dart';
 // These functions are ignored because they are not marked as `pub`: `app`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `drop`
 
-/// Load the saved hosts from `data_dir` and start the app's runtime and
-/// terminal thread. One per process.
+/// Load the saved hosts and settings from `data_dir` and start the app's
+/// runtime and terminal thread. `system_dark`: the platform's brightness
+/// now. One per process.
 Future<BridgeApp> roostInit({
   required String dataDir,
   required String deviceLabel,
+  required bool systemDark,
 }) => RustLib.instance.api.crateApiAppRoostInit(
   dataDir: dataDir,
   deviceLabel: deviceLabel,
+  systemDark: systemDark,
 );
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<BridgeApp>>
@@ -69,9 +72,25 @@ abstract class BridgeApp implements RustOpaqueInterface {
     required bool paste,
   });
 
+  /// Waits behind any settings write in progress: the pool.
+  Future<BridgeSettingsState> setSystemDark({required bool dark});
+
+  /// The settings in memory; never waits on the disk.
+  BridgeSettingsState settings();
+
+  List<BridgeThemeSummary> terminalThemes();
+
   Future<void> trustHostKey({
     required String hostId,
     required String fingerprint,
+  });
+
+  /// Success means the settings are saved and any terminal theme change
+  /// is queued for the tabs. A tab that then fails to apply the theme is
+  /// a warning in the log on the terminal thread, not an error here.
+  /// Writes and waits on the disk: the pool.
+  Future<BridgeSettingsState> updateSettings({
+    required BridgeSettings settings,
   });
 
   Stream<BridgeWorkspaceView> workspace({required String hostId});

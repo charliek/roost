@@ -134,6 +134,9 @@ pub struct TerminalOwner {
     thread_id: std::thread::ThreadId,
     next_id: AtomicU64,
     live: Arc<AtomicUsize>,
+    /// The background of every theme sent, in channel order.
+    #[cfg(test)]
+    sent_themes: Mutex<Vec<roost_vt::ColorRgb>>,
 }
 
 impl TerminalOwner {
@@ -152,6 +155,8 @@ impl TerminalOwner {
             thread: Mutex::new(Some(thread)),
             next_id: AtomicU64::new(1),
             live,
+            #[cfg(test)]
+            sent_themes: Mutex::default(),
         })
     }
 
@@ -229,8 +234,18 @@ impl TerminalOwner {
         answer.recv().ok().flatten()
     }
 
+    /// Every open tab redraws in `theme`, and every tab opened later
+    /// starts in it.
     pub fn set_theme(&self, theme: Theme) {
         self.send(Command::SetTheme(Box::new(theme)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sent_themes(&self) -> Vec<roost_vt::ColorRgb> {
+        self.sent_themes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Drop a tab's terminal. Idempotent.
@@ -289,8 +304,23 @@ impl TerminalOwner {
     }
 
     fn send(&self, command: Command) {
-        if self.commands.send(command).is_err() {
+        #[cfg(test)]
+        let mut sent_themes = self
+            .sent_themes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        let theme = match &command {
+            Command::SetTheme(theme) => Some(theme.background),
+            _ => None,
+        };
+        let sent = self.commands.send(command).is_ok();
+        if !sent {
             tracing::debug!("terminal owner thread is gone; command dropped");
+        }
+        #[cfg(test)]
+        if sent {
+            sent_themes.extend(theme);
         }
     }
 }
@@ -790,6 +820,36 @@ mod tests {
             "another thread still pulls"
         );
         owner.shutdown();
+    }
+
+    const LATTE_BG: u32 = 0x00ef_f1f5;
+
+    #[test]
+    fn a_drained_tab_redraws_in_a_new_theme() {
+        let owner = owner();
+        let (id, outputs) = recording(&owner);
+        attach_hello(&owner, id, "phone");
+        let first = decode(&owner.take_frame(id, false)).expect("a frame");
+        assert_ne!(first.header.default_bg, LATTE_BG);
+        assert!(owner.take_frame(id, false).is_empty(), "drained");
+        drain(&outputs);
+
+        owner.set_theme(Theme::load_bundled("Catppuccin Latte"));
+        owner.viewport_text(id);
+        assert_eq!(frame_ready_count(&drain(&outputs)), 1);
+        let frame = decode(&owner.take_frame(id, false)).expect("a frame");
+        assert_eq!(frame.header.default_bg, LATTE_BG);
+        assert_eq!(row_text(&frame.rows[0], 20), "hello", "every row re-sent");
+    }
+
+    #[test]
+    fn a_theme_set_before_any_tab_is_the_next_tabs() {
+        let owner = owner();
+        owner.set_theme(Theme::load_bundled("Catppuccin Latte"));
+        let (id, _outputs) = recording(&owner);
+        attach_hello(&owner, id, "phone");
+        let frame = decode(&owner.take_frame(id, false)).expect("a frame");
+        assert_eq!(frame.header.default_bg, LATTE_BG);
     }
 
     #[test]

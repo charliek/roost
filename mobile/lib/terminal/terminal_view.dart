@@ -4,6 +4,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 
+import '../app/width_class.dart';
 import '../core/models.dart';
 import 'attached_tab.dart';
 import 'cell_metrics.dart';
@@ -28,9 +29,11 @@ class TerminalView extends StatefulWidget {
     super.key,
     required this.tab,
     required this.fontSize,
+    this.fontSizeSetting,
     this.focused = false,
     this.onGeometry,
     this.onFontSize,
+    this.onPinchEnd,
     this.onScroll,
     this.onTap,
     this.onLongPress,
@@ -38,14 +41,24 @@ class TerminalView extends StatefulWidget {
 
   final AttachedTab? tab;
   final double fontSize;
+
+  /// Which setting [fontSize] comes from (the layout's width class). Only the
+  /// user changes a setting, so a new size from the same one is deliberate; a
+  /// new size because another setting now applies (a rotation into another
+  /// width class) is not.
+  final WidthClass? fontSizeSetting;
   final bool focused;
 
   /// The grid that fits. [deliberate] when the user changed it (the font
-  /// size), not when the space around it moved (a banner, a bar, the
-  /// keyboard): only a deliberate regrid may take the tab's size.
+  /// size, see [fontSizeSetting]), not when the space around it moved (a
+  /// banner, a bar, the keyboard, a width class): only a deliberate regrid
+  /// may take the tab's size.
   final void Function(Geometry geometry, {required bool deliberate})?
   onGeometry;
   final ValueChanged<double>? onFontSize;
+
+  /// A pinch ended: the size it left is final.
+  final VoidCallback? onPinchEnd;
 
   /// Rows to scroll, positive up into history, and the cell (col, row)
   /// under the pointer, for a program that reads the wheel.
@@ -65,11 +78,16 @@ class _TerminalViewState extends State<TerminalView>
   CellMetrics? _metrics;
   Geometry? _reported;
   double? _reportedFontSize;
+  WidthClass? _reportedSetting;
   Geometry? _pending;
   double? _pendingFontSize;
+  WidthClass? _pendingSetting;
   Timer? _debounce;
   bool _pulling = false;
   double _pinchStartFont = 0;
+
+  /// The size this pinch last asked for, which a rebuild may not show yet.
+  double _pinchFont = 0;
   double _scrollCarry = 0;
   Size _size = Size.zero;
 
@@ -135,10 +153,11 @@ class _TerminalViewState extends State<TerminalView>
     return _metrics = CellMetrics.measure(fontSize, dpr);
   }
 
-  void _offer(Geometry local, double fontSize) {
+  void _offer(Geometry local, double fontSize, WidthClass? setting) {
     if (_reported == null) {
       _reported = local;
       _reportedFontSize = fontSize;
+      _reportedSetting = setting;
       SchedulerBinding.instance.addPostFrameCallback((_) {
         if (mounted) widget.onGeometry?.call(local, deliberate: false);
       });
@@ -148,24 +167,33 @@ class _TerminalViewState extends State<TerminalView>
       _debounce?.cancel();
       _pending = null;
       _reportedFontSize = fontSize;
+      _reportedSetting = setting;
       return;
     }
-    if (local == _pending && fontSize == _pendingFontSize) return;
+    if (local == _pending &&
+        fontSize == _pendingFontSize &&
+        setting == _pendingSetting) {
+      return;
+    }
     _pending = local;
     _pendingFontSize = fontSize;
+    _pendingSetting = setting;
     _debounce?.cancel();
     _debounce = Timer(regridDebounce, () {
       _pending = null;
       if (!mounted || local == _reported) return;
-      final deliberate = fontSize != _reportedFontSize;
+      final deliberate =
+          fontSize != _reportedFontSize && setting == _reportedSetting;
       _reported = local;
       _reportedFontSize = fontSize;
+      _reportedSetting = setting;
       widget.onGeometry?.call(local, deliberate: deliberate);
     });
   }
 
   void _onScaleStart(ScaleStartDetails d) {
     _pinchStartFont = widget.fontSize;
+    _pinchFont = widget.fontSize;
     _scrollCarry = 0;
   }
 
@@ -176,7 +204,10 @@ class _TerminalViewState extends State<TerminalView>
         maxTerminalFontSize,
       );
       final rounded = (next * 2).roundToDouble() / 2;
-      if (rounded != widget.fontSize) widget.onFontSize?.call(rounded);
+      if (rounded != _pinchFont) {
+        _pinchFont = rounded;
+        widget.onFontSize?.call(rounded);
+      }
       return;
     }
     _scrollBy(d.focalPointDelta.dy, d.localFocalPoint);
@@ -226,7 +257,7 @@ class _TerminalViewState extends State<TerminalView>
         final local = metrics.geometryFor(
           Size(size.width - 2 * terminalInset, size.height - 2 * terminalInset),
         );
-        _offer(local, metrics.fontSize);
+        _offer(local, metrics.fontSize, widget.fontSizeSetting);
         return Listener(
           onPointerSignal: _onPointerSignal,
           child: GestureDetector(
@@ -235,6 +266,7 @@ class _TerminalViewState extends State<TerminalView>
             onLongPress: widget.onLongPress,
             onScaleStart: _onScaleStart,
             onScaleUpdate: _onScaleUpdate,
+            onScaleEnd: (_) => widget.onPinchEnd?.call(),
             child: CustomPaint(
               key: const ValueKey('terminal-canvas'),
               size: size,

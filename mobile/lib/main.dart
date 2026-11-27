@@ -32,7 +32,10 @@ Future<void> main() async {
 }
 
 Future<RoostCore> _createCore() async {
-  if (_useFakeCore) return FakeCore.demo();
+  final systemDark =
+      WidgetsBinding.instance.platformDispatcher.platformBrightness ==
+      Brightness.dark;
+  if (_useFakeCore) return FakeCore.demo(systemDark: systemDark);
   // On macOS cargokit links the Rust core into the roost_mobile_rust pod
   // framework, not the roost_mobile.framework FRB's default loader looks for;
   // that framework is loaded at launch, so its symbols are in the process.
@@ -42,7 +45,11 @@ Future<RoostCore> _createCore() async {
         : null,
   );
   final dir = await getApplicationSupportDirectory();
-  return FrbCore.start(dataDir: dir.path, deviceLabel: deviceLabel());
+  return FrbCore.start(
+    dataDir: dir.path,
+    deviceLabel: deviceLabel(),
+    systemDark: systemDark,
+  );
 }
 
 /// How other clients see this device in "sized by …". Android and iOS

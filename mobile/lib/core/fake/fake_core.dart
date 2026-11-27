@@ -17,14 +17,18 @@ class FakeCore implements RoostCore {
     Duration? pauseLatency,
     this.demo = false,
     bool seed = true,
+    this.systemDark = true,
   }) : pauseLatency = pauseLatency ?? latency {
     if (seed) _seed();
   }
 
   /// The scripted hosts plus the timers that make the demo move: a test run
   /// that streams output and a desktop that takes a tab's size back.
-  factory FakeCore.demo() =>
-      FakeCore(latency: const Duration(milliseconds: 600), demo: true);
+  factory FakeCore.demo({bool systemDark = true}) => FakeCore(
+    latency: const Duration(milliseconds: 600),
+    demo: true,
+    systemDark: systemDark,
+  );
 
   static const desktopLabel = 'charlie-laptop';
   static const macMiniFingerprint =
@@ -44,6 +48,19 @@ class FakeCore implements RoostCore {
   final List<FakeTerminalSession> sessions = [];
   int pausedCount = 0;
   int resumedCount = 0;
+
+  /// Every settings write, as sent.
+  final List<MobileSettings> settingsWrites = [];
+  final List<bool> systemDarkCalls = [];
+
+  MobileSettings _settings = const MobileSettings();
+
+  /// What the platform says, as `setSystemDark` last reported it.
+  bool systemDark;
+
+  /// Each fake color's stand-in in the terminal theme in effect: none under
+  /// roost-dark, where the fake draws its own colors unchanged.
+  Map<int, int> _colors = const {};
 
   final List<_FakeHost> _hosts = [];
   final _hostsFeed = ReplayFeed<List<HostView>>(const []);
@@ -284,6 +301,197 @@ class FakeCore implements RoostCore {
   @override
   Future<void> appResumed() async {
     resumedCount++;
+  }
+
+  @override
+  SettingsState settings() => _settingsState();
+
+  @override
+  Future<SettingsState> updateSettings(MobileSettings settings) async {
+    settingsWrites.add(settings);
+    _changeSettings(() => _settings = sanitizeSettings(settings));
+    return _settingsState();
+  }
+
+  @override
+  Future<SettingsState> setSystemDark(bool dark) async {
+    systemDarkCalls.add(dark);
+    _changeSettings(() => systemDark = dark);
+    return _settingsState();
+  }
+
+  @override
+  List<ThemeSummary> terminalThemes() => fakeThemes;
+
+  /// The roost-dark and Catppuccin Mocha values are the repo's theme files;
+  /// the light two are the pinned Ghostty package's.
+  static const fakeThemes = [
+    ThemeSummary(
+      name: 'roost-dark',
+      light: false,
+      background: 0x1e1e1e,
+      foreground: 0xffffff,
+      cursor: 0x98989d,
+      ansi: [
+        0x1a1a1a,
+        0xcc372e,
+        0x26a439,
+        0xcdac08,
+        0x0869cb,
+        0x9647bf,
+        0x479ec2,
+        0x98989d,
+        0x464646,
+        0xff453a,
+        0x32d74b,
+        0xffd60a,
+        0x0a84ff,
+        0xbf5af2,
+        0x76d6ff,
+        0xffffff,
+      ],
+    ),
+    ThemeSummary(
+      name: 'Catppuccin Mocha',
+      light: false,
+      background: 0x1e1e2e,
+      foreground: 0xcdd6f4,
+      cursor: 0xf5e0dc,
+      ansi: [
+        0x45475a,
+        0xf38ba8,
+        0xa6e3a1,
+        0xf9e2af,
+        0x89b4fa,
+        0xf5c2e7,
+        0x94e2d5,
+        0xa6adc8,
+        0x585b70,
+        0xf37799,
+        0x89d88b,
+        0xebd391,
+        0x74a8fc,
+        0xf2aede,
+        0x6bd7ca,
+        0xbac2de,
+      ],
+    ),
+    ThemeSummary(
+      name: 'Catppuccin Latte',
+      light: true,
+      background: 0xeff1f5,
+      foreground: 0x4c4f69,
+      cursor: 0xdc8a78,
+      ansi: [
+        0xbcc0cc,
+        0xd20f39,
+        0x40a02b,
+        0xdf8e1d,
+        0x1e66f5,
+        0xea76cb,
+        0x179299,
+        0x5c5f77,
+        0xacb0be,
+        0xe7103f,
+        0x46b02f,
+        0xe49931,
+        0x3878f6,
+        0xef95d7,
+        0x19a1a8,
+        0x6c6f85,
+      ],
+    ),
+    ThemeSummary(
+      name: 'GitHub Light Default',
+      light: true,
+      background: 0xffffff,
+      foreground: 0x1f2328,
+      cursor: 0x0969da,
+      ansi: [
+        0x24292f,
+        0xcf222e,
+        0x116329,
+        0x4d2d00,
+        0x0969da,
+        0x8250df,
+        0x1b7c83,
+        0x6e7781,
+        0x57606a,
+        0xa40e26,
+        0x1a7f37,
+        0x633c01,
+        0x218bff,
+        0xa475f9,
+        0x3192aa,
+        0x8c959f,
+      ],
+    ),
+  ];
+
+  /// The core's sanitize rules (`MobileSettings::sanitize` in
+  /// `registry.rs`), over the fake's own themes.
+  static MobileSettings sanitizeSettings(MobileSettings s) {
+    const defaults = MobileSettings();
+    double stepped(
+      double value,
+      double fallback,
+      double min,
+      double max,
+      double perUnit,
+    ) => value.isFinite
+        ? (value.clamp(min, max) * perUnit).round() / perUnit
+        : fallback;
+    String theme(String name, {required bool light, required String or}) {
+      final want = name.trim().toLowerCase();
+      for (final t in fakeThemes) {
+        if (t.light == light && t.name.toLowerCase() == want) return t.name;
+      }
+      return or;
+    }
+
+    return s.copyWith(
+      terminalFontSizeCompact: stepped(
+        s.terminalFontSizeCompact,
+        defaults.terminalFontSizeCompact,
+        7,
+        28,
+        2,
+      ),
+      terminalFontSizeWide: stepped(
+        s.terminalFontSizeWide,
+        defaults.terminalFontSizeWide,
+        7,
+        28,
+        2,
+      ),
+      uiTextScale: stepped(s.uiTextScale, defaults.uiTextScale, 0.85, 1.6, 20),
+      darkTheme: theme(s.darkTheme, light: false, or: defaults.darkTheme),
+      lightTheme: theme(s.lightTheme, light: true, or: defaults.lightTheme),
+    );
+  }
+
+  SettingsState _settingsState() {
+    final dark =
+        _settings.appearance == Appearance.dark ||
+        (_settings.appearance == Appearance.system && systemDark);
+    return SettingsState(
+      settings: _settings,
+      effectiveDark: dark,
+      effectiveTheme: dark ? _settings.darkTheme : _settings.lightTheme,
+    );
+  }
+
+  void _changeSettings(void Function() change) {
+    final before = _settingsState().effectiveTheme;
+    change();
+    final theme = _settingsState().effectiveTheme;
+    if (theme == before) return;
+    _colors = theme == MobileSettings.defaultDarkTheme
+        ? const {}
+        : FakeColors.mappedTo(fakeThemes.firstWhere((t) => t.name == theme));
+    for (final s in List.of(sessions)) {
+      s._redrawAll();
+    }
   }
 
   /// Another client takes [tabId]'s size, as a desktop does when its user
@@ -668,6 +876,13 @@ class FakeTerminalSession implements TerminalSession {
 
   void _onShellChanged() => _signalFrame();
 
+  /// Every attachment of a tab shares its screen, so each takes its own
+  /// full frame rather than the first pull clearing it for the rest.
+  void _redrawAll() {
+    _needFull = true;
+    _signalFrame();
+  }
+
   void _signalFrame() {
     if (closed || _framePending) return;
     _framePending = true;
@@ -712,7 +927,9 @@ class FakeTerminalSession implements TerminalSession {
       screen.markFull();
     }
     if (closed || !screen.dirty) return Uint8List(0);
-    return encodeFrame(screen.takeFrame());
+    final frame = screen.takeFrame();
+    final colors = _core._colors;
+    return encodeFrame(colors.isEmpty ? frame : recolorFrame(frame, colors));
   }
 
   @override
@@ -752,8 +969,9 @@ class FakeTerminalSession implements TerminalSession {
     if (closed) return;
     resizes.add((geometry, focused));
     _geometry = geometry;
-    if (!_tab.ownerIsMe) return;
-    _tab.shell.screen.resize(geometry.cols, geometry.rows);
+    // A focused resize takes the size, as the session's does.
+    if (!focused && !_tab.ownerIsMe) return;
+    _takeSize();
     _announceOwner();
     _signalFrame();
   }

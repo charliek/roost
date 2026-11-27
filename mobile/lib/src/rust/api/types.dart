@@ -7,9 +7,11 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`
 
 enum BridgeAgentBadge { none, idle, working, waiting }
+
+enum BridgeAppearance { system, dark, light }
 
 enum BridgeAttachState { attaching, live, reconnecting, ended }
 
@@ -228,6 +230,82 @@ class BridgeProjectView {
           tabs == other.tabs;
 }
 
+enum BridgeReadableText { auto, on_, off }
+
+/// `MobileSettings` without its file version.
+class BridgeSettings {
+  final double terminalFontSizeCompact;
+  final double terminalFontSizeWide;
+  final double uiTextScale;
+  final BridgeAppearance appearance;
+  final String darkTheme;
+  final String lightTheme;
+  final BridgeReadableText readableText;
+  final bool brightFaint;
+
+  const BridgeSettings({
+    required this.terminalFontSizeCompact,
+    required this.terminalFontSizeWide,
+    required this.uiTextScale,
+    required this.appearance,
+    required this.darkTheme,
+    required this.lightTheme,
+    required this.readableText,
+    required this.brightFaint,
+  });
+
+  @override
+  int get hashCode =>
+      terminalFontSizeCompact.hashCode ^
+      terminalFontSizeWide.hashCode ^
+      uiTextScale.hashCode ^
+      appearance.hashCode ^
+      darkTheme.hashCode ^
+      lightTheme.hashCode ^
+      readableText.hashCode ^
+      brightFaint.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is BridgeSettings &&
+          runtimeType == other.runtimeType &&
+          terminalFontSizeCompact == other.terminalFontSizeCompact &&
+          terminalFontSizeWide == other.terminalFontSizeWide &&
+          uiTextScale == other.uiTextScale &&
+          appearance == other.appearance &&
+          darkTheme == other.darkTheme &&
+          lightTheme == other.lightTheme &&
+          readableText == other.readableText &&
+          brightFaint == other.brightFaint;
+}
+
+/// The settings, and the brightness and terminal theme they make now.
+class BridgeSettingsState {
+  final BridgeSettings settings;
+  final bool effectiveDark;
+  final String effectiveTheme;
+
+  const BridgeSettingsState({
+    required this.settings,
+    required this.effectiveDark,
+    required this.effectiveTheme,
+  });
+
+  @override
+  int get hashCode =>
+      settings.hashCode ^ effectiveDark.hashCode ^ effectiveTheme.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is BridgeSettingsState &&
+          runtimeType == other.runtimeType &&
+          settings == other.settings &&
+          effectiveDark == other.effectiveDark &&
+          effectiveTheme == other.effectiveTheme;
+}
+
 class BridgeTabView {
   final PlatformInt64 id;
   final String title;
@@ -322,6 +400,46 @@ class BridgeTerminalEvent {
 }
 
 enum BridgeTerminalEventKind { frameReady, status, owner, exited, clipboard }
+
+/// Colors are `0x00RRGGBB`; `ansi` holds the 16 ANSI colors.
+class BridgeThemeSummary {
+  final String name;
+  final bool light;
+  final int background;
+  final int foreground;
+  final int cursor;
+  final Uint32List ansi;
+
+  const BridgeThemeSummary({
+    required this.name,
+    required this.light,
+    required this.background,
+    required this.foreground,
+    required this.cursor,
+    required this.ansi,
+  });
+
+  @override
+  int get hashCode =>
+      name.hashCode ^
+      light.hashCode ^
+      background.hashCode ^
+      foreground.hashCode ^
+      cursor.hashCode ^
+      ansi.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is BridgeThemeSummary &&
+          runtimeType == other.runtimeType &&
+          name == other.name &&
+          light == other.light &&
+          background == other.background &&
+          foreground == other.foreground &&
+          cursor == other.cursor &&
+          ansi == other.ansi;
+}
 
 class BridgeWorkspaceView {
   final List<BridgeProjectView> projects;

@@ -95,7 +95,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BridgeKeyInput dco_decode_box_autoadd_bridge_key_input(dynamic raw);
 
   @protected
+  BridgeSettings dco_decode_box_autoadd_bridge_settings(dynamic raw);
+
+  @protected
   BridgeAgentBadge dco_decode_bridge_agent_badge(dynamic raw);
+
+  @protected
+  BridgeAppearance dco_decode_bridge_appearance(dynamic raw);
 
   @protected
   BridgeAttachState dco_decode_bridge_attach_state(dynamic raw);
@@ -122,6 +128,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BridgeProjectView dco_decode_bridge_project_view(dynamic raw);
 
   @protected
+  BridgeReadableText dco_decode_bridge_readable_text(dynamic raw);
+
+  @protected
+  BridgeSettings dco_decode_bridge_settings(dynamic raw);
+
+  @protected
+  BridgeSettingsState dco_decode_bridge_settings_state(dynamic raw);
+
+  @protected
   BridgeTabView dco_decode_bridge_tab_view(dynamic raw);
 
   @protected
@@ -131,7 +146,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BridgeTerminalEventKind dco_decode_bridge_terminal_event_kind(dynamic raw);
 
   @protected
+  BridgeThemeSummary dco_decode_bridge_theme_summary(dynamic raw);
+
+  @protected
   BridgeWorkspaceView dco_decode_bridge_workspace_view(dynamic raw);
+
+  @protected
+  double dco_decode_f_64(dynamic raw);
 
   @protected
   int dco_decode_i_32(dynamic raw);
@@ -150,6 +171,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<BridgeTabView> dco_decode_list_bridge_tab_view(dynamic raw);
+
+  @protected
+  List<BridgeThemeSummary> dco_decode_list_bridge_theme_summary(dynamic raw);
+
+  @protected
+  Uint32List dco_decode_list_prim_u_32_strict(dynamic raw);
 
   @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
@@ -240,7 +267,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  BridgeSettings sse_decode_box_autoadd_bridge_settings(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   BridgeAgentBadge sse_decode_bridge_agent_badge(SseDeserializer deserializer);
+
+  @protected
+  BridgeAppearance sse_decode_bridge_appearance(SseDeserializer deserializer);
 
   @protected
   BridgeAttachState sse_decode_bridge_attach_state(
@@ -273,6 +308,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  BridgeReadableText sse_decode_bridge_readable_text(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  BridgeSettings sse_decode_bridge_settings(SseDeserializer deserializer);
+
+  @protected
+  BridgeSettingsState sse_decode_bridge_settings_state(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   BridgeTabView sse_decode_bridge_tab_view(SseDeserializer deserializer);
 
   @protected
@@ -286,9 +334,17 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  BridgeThemeSummary sse_decode_bridge_theme_summary(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   BridgeWorkspaceView sse_decode_bridge_workspace_view(
     SseDeserializer deserializer,
   );
+
+  @protected
+  double sse_decode_f_64(SseDeserializer deserializer);
 
   @protected
   int sse_decode_i_32(SseDeserializer deserializer);
@@ -313,6 +369,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<BridgeTabView> sse_decode_list_bridge_tab_view(
     SseDeserializer deserializer,
   );
+
+  @protected
+  List<BridgeThemeSummary> sse_decode_list_bridge_theme_summary(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  Uint32List sse_decode_list_prim_u_32_strict(SseDeserializer deserializer);
 
   @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
@@ -420,8 +484,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_bridge_settings(
+    BridgeSettings self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_bridge_agent_badge(
     BridgeAgentBadge self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_bridge_appearance(
+    BridgeAppearance self,
     SseSerializer serializer,
   );
 
@@ -474,6 +550,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_bridge_readable_text(
+    BridgeReadableText self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_bridge_settings(
+    BridgeSettings self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_bridge_settings_state(
+    BridgeSettingsState self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_bridge_tab_view(BridgeTabView self, SseSerializer serializer);
 
   @protected
@@ -489,10 +583,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_bridge_theme_summary(
+    BridgeThemeSummary self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_bridge_workspace_view(
     BridgeWorkspaceView self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_f_64(double self, SseSerializer serializer);
 
   @protected
   void sse_encode_i_32(int self, SseSerializer serializer);
@@ -518,6 +621,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_list_bridge_tab_view(
     List<BridgeTabView> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_bridge_theme_summary(
+    List<BridgeThemeSummary> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_prim_u_32_strict(
+    Uint32List self,
     SseSerializer serializer,
   );
 

@@ -119,10 +119,15 @@ Which thread a bridge call runs on:
 - `#[frb(sync)]`, on the Dart thread, in call order: key, text, paste,
   scroll, resize, take size, close, leak counts. They are channel sends to
   the owner thread; running them in order keeps typed characters in order.
+  So are `settings` and `terminal_themes`, which only read memory: the
+  settings snapshot and the theme list built once at `roost_init`.
 - The bridge's thread pool (a `Future`): frame pulls and `viewport_text`
   (a round trip to the owner thread, about 1.7 ms median in a debug build),
   `app_paused` (waits up to 2 s for size releases), host registry writes,
-  `attach`, `roost_init`.
+  `attach`, `roost_init`, and `update_settings` (writes `settings.json`)
+  and `set_system_dark` (waits behind a settings write in progress).
+  `FrbCore` runs those two through one `SerialQueue` of their own, so they
+  reach the core in call order.
 - The bridge's async runtime: `op`, `send_text`, `clear_notification`.
 
 None of them runs on `RoostApp`'s own runtime, which the waiting calls would

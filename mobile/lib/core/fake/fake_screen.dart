@@ -4,6 +4,7 @@ import 'package:characters/characters.dart';
 import 'package:flutter/foundation.dart';
 
 import '../../terminal/frame.dart';
+import '../models.dart';
 
 /// Colors the fake screens draw with (the mockup's palette).
 abstract final class FakeColors {
@@ -15,6 +16,55 @@ abstract final class FakeColors {
   static const int orange = 0xf2a65a;
   static const int green = 0x7fd19b;
   static const int red = 0xf08a8a;
+
+  /// Each fake color's stand-in in a terminal theme: the theme's own
+  /// foreground, background and cursor, and ANSI colors for the rest.
+  static Map<int, int> mappedTo(ThemeSummary theme) => {
+    fg: theme.foreground,
+    bg: theme.background,
+    cursor: theme.cursor,
+    blue: theme.ansi[4],
+    orange: theme.ansi[3],
+    green: theme.ansi[2],
+    red: theme.ansi[1],
+    muted: theme.ansi[8],
+  };
+}
+
+/// [frame] with every color looked up in [colors]; a color not in it stays.
+Frame recolorFrame(Frame frame, Map<int, int> colors) {
+  int c(int color) => colors[color] ?? color;
+  return Frame(
+    flags: frame.flags,
+    cols: frame.cols,
+    rows: frame.rows,
+    defaultFg: c(frame.defaultFg),
+    defaultBg: c(frame.defaultBg),
+    cursorColor: c(frame.cursorColor),
+    cursorCol: frame.cursorCol,
+    cursorRow: frame.cursorRow,
+    cursorStyle: frame.cursorStyle,
+    scrollTotal: frame.scrollTotal,
+    scrollOffset: frame.scrollOffset,
+    scrollLen: frame.scrollLen,
+    rowData: [
+      for (final row in frame.rowData)
+        FrameRow(
+          index: row.index,
+          runs: [
+            for (final run in row.runs)
+              FrameRun(
+                col: run.col,
+                cells: run.cells,
+                fg: c(run.fg),
+                bg: c(run.bg),
+                attrs: run.attrs,
+                text: run.text,
+              ),
+          ],
+        ),
+    ],
+  );
 }
 
 class FakeCell {
