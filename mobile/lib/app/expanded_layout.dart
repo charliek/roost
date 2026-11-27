@@ -114,9 +114,13 @@ class HostSection extends StatelessWidget {
                     ),
                   ),
                 ),
-                Text(
-                  hostStateLabel(host.state),
-                  style: text.bodySmall?.copyWith(color: RoostColors.muted),
+                Flexible(
+                  child: Text(
+                    hostStateLabel(host.state),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: text.bodySmall?.copyWith(color: RoostColors.muted),
+                  ),
                 ),
                 HostMenuButton(host: host),
               ],

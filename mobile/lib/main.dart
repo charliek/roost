@@ -12,8 +12,10 @@ import 'core/frb_core.dart';
 import 'core/roost_core.dart';
 import 'src/rust/frb_generated.dart';
 
-/// `--dart-define=ROOST_FAKE=1` runs the scripted core: no Rust, no host.
-const _useFakeCore = bool.fromEnvironment('ROOST_FAKE');
+/// `--dart-define=ROOST_FAKE=true` (or `=1`) runs the scripted core: no Rust,
+/// no host. `bool.fromEnvironment` reads only `true`, hence the string.
+const _fakeFlag = String.fromEnvironment('ROOST_FAKE');
+const _useFakeCore = _fakeFlag == '1' || _fakeFlag == 'true';
 
 /// `--dart-define=ROOST_DEVICE_LABEL=…` names this device to the hosts.
 const _deviceLabelOverride = String.fromEnvironment('ROOST_DEVICE_LABEL');

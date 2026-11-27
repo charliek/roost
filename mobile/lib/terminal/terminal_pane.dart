@@ -427,9 +427,9 @@ class _Toolbar extends StatelessWidget {
     final sub = subtitle ?? view?.statusText;
     return Container(
       key: const ValueKey('terminal-toolbar'),
-      height: 48,
-      decoration: const BoxDecoration(
-        color: RoostColors.surfaceLow,
+      constraints: const BoxConstraints(minHeight: 48),
+      decoration: const BoxDecoration(color: RoostColors.surfaceLow),
+      foregroundDecoration: const BoxDecoration(
         border: Border(bottom: BorderSide(color: RoostColors.divider)),
       ),
       child: Row(

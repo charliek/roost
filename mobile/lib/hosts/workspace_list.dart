@@ -32,9 +32,15 @@ class WorkspaceList extends ConsumerWidget {
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ),
-            TextButton(
-              onPressed: () => newProjectFlow(context, ref, hostId),
-              child: const Text('New project'),
+            Flexible(
+              child: TextButton(
+                onPressed: () => newProjectFlow(context, ref, hostId),
+                child: const Text(
+                  'New project',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
             ),
           ],
         ),
@@ -77,13 +83,17 @@ class _ProjectHeader extends ConsumerWidget {
             ),
           ),
           if (waiting > 0)
-            Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: Text(
-                '$waiting waiting',
-                style: const TextStyle(
-                  fontSize: 12,
-                  color: RoostColors.waiting,
+            Flexible(
+              child: Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Text(
+                  '$waiting waiting',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: RoostColors.waiting,
+                  ),
                 ),
               ),
             ),

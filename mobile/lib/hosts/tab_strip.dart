@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../app/providers.dart';
+import '../app/text_scale.dart';
 import '../app/theme.dart';
 import '../app/workspace_actions.dart';
 import '../core/roost_core.dart';
@@ -18,10 +19,11 @@ class TabStrip extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final workspace = ref.watch(workspaceProvider(hostId)).value;
     final project = workspace?.projectOfTab(tabId);
-    if (project == null) return const SizedBox(height: 44);
+    final height = scaledBarHeight(context, 44, 13);
+    if (project == null) return SizedBox(height: height);
     return Container(
       key: const ValueKey('tab-strip'),
-      height: 44,
+      height: height,
       decoration: const BoxDecoration(
         color: RoostColors.surfaceLow,
         border: Border(bottom: BorderSide(color: RoostColors.divider)),
