@@ -6,16 +6,24 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/rendering.dart';
 
 import 'cell_metrics.dart';
+import 'contrast.dart';
 import 'frame.dart';
 import 'terminal_model.dart';
 
 Color terminalColor(int rgb) => Color(0xFF000000 | (rgb & 0xFFFFFF));
 
 /// Laid-out text for each row's runs, rebuilt only when the row's
-/// generation in the [TerminalModel] moves or the font size changes.
+/// generation in the [TerminalModel] moves, or the font size, the default
+/// background or the readability changes.
 class RowTextCache {
   final Map<int, _RowText> _rows = {};
   double? _fontSize;
+  int? _defaultBg;
+  TextReadability? _readability;
+  final Map<(int, int, double), int> _adjusted = {};
+
+  /// A true-colour animation brings new color pairs every frame.
+  static const _maxAdjusted = 4096;
 
   /// Paragraphs built since creation; tests watch it to prove that clean rows
   /// are not rebuilt.
@@ -26,12 +34,19 @@ class RowTextCache {
     int row,
     int generation,
     FrameRow data,
-    CellMetrics metrics,
-  ) {
-    if (_fontSize != metrics.fontSize) {
+    CellMetrics metrics, [
+    int defaultBg = 0,
+    TextReadability readability = const TextReadability(),
+  ]) {
+    if (_fontSize != metrics.fontSize ||
+        _defaultBg != defaultBg ||
+        _readability != readability) {
       clear();
       _fontSize = metrics.fontSize;
+      _defaultBg = defaultBg;
+      _readability = readability;
     }
+    final raise = readability.minimumContrast > 1.0;
     final cached = _rows[row];
     if (cached != null && cached.generation == generation) return cached.runs;
     cached?.dispose();
@@ -40,14 +55,30 @@ class RowTextCache {
       final underline = run.has(RunAttrs.underline);
       final strike = run.has(RunAttrs.strike);
       if (run.text.trim().isEmpty && !underline && !strike) continue;
-      final color = terminalColor(run.fg);
+      final faint = run.has(RunAttrs.faint);
+      var color = terminalColor(run.fg);
+      final bgRgb = run.has(RunAttrs.explicitBg) || run.bg != defaultBg
+          ? run.bg
+          : defaultBg;
+      // Text the color of its background is hidden on purpose.
+      final hidden = (run.fg & 0xFFFFFF) == (bgRgb & 0xFFFFFF);
+      if (raise && !hidden) {
+        final bg = terminalColor(bgRgb);
+        if (faint) {
+          color = Color.alphaBlend(
+            color.withValues(alpha: readability.faintAlpha),
+            bg,
+          );
+        }
+        color = adjusted(color, bg, readability.minimumContrast);
+      } else if (faint) {
+        color = color.withValues(alpha: readability.faintAlpha);
+      }
       final paragraph = layoutTerminalText(
         run.text,
         terminalTextStyle(
           fontSize: metrics.fontSize,
-          color: run.has(RunAttrs.faint)
-              ? color.withValues(alpha: 0.55)
-              : color,
+          color: color,
           bold: run.has(RunAttrs.bold),
           italic: run.has(RunAttrs.italic),
           underline: underline,
@@ -60,6 +91,18 @@ class RowTextCache {
     }
     _rows[row] = _RowText(generation, runs);
     return runs;
+  }
+
+  /// [ensureContrast], remembered until the cache is cleared.
+  Color adjusted(Color fg, Color bg, double minRatio) {
+    final candidate = Color(fg.toARGB32());
+    final key = (candidate.toARGB32(), bg.toARGB32(), minRatio);
+    final hit = _adjusted[key];
+    if (hit != null) return Color(hit);
+    final out = ensureContrast(candidate, bg, minRatio);
+    if (_adjusted.length >= _maxAdjusted) _adjusted.clear();
+    _adjusted[key] = out.toARGB32();
+    return out;
   }
 
   /// Drops rows past [rows] (the grid shrank).
@@ -76,6 +119,7 @@ class RowTextCache {
       r.dispose();
     }
     _rows.clear();
+    _adjusted.clear();
   }
 }
 
@@ -112,6 +156,7 @@ class TerminalPainter extends CustomPainter {
     required this.localRows,
     required this.focused,
     this.inset = 0,
+    this.readability = const TextReadability(),
   }) : super(repaint: model);
 
   final TerminalModel model;
@@ -124,10 +169,13 @@ class TerminalPainter extends CustomPainter {
   /// Margin around the grid, painted in the terminal's background.
   final double inset;
 
+  final TextReadability readability;
+
   @override
   void paint(Canvas canvas, Size size) {
     final m = model;
     final bg = terminalColor(m.defaultBg);
+    final lightBg = wcagLuminance(bg) > 0.5;
     if (!m.hasFrame || m.cols == 0 || m.rows == 0) {
       canvas.drawRect(Offset.zero & size, Paint()..color = bg);
       return;
@@ -171,7 +219,14 @@ class TerminalPainter extends CustomPainter {
           );
         }
       }
-      for (final t in textCache.textFor(r, m.rowGeneration(r), row, metrics)) {
+      for (final t in textCache.textFor(
+        r,
+        m.rowGeneration(r),
+        row,
+        metrics,
+        m.defaultBg,
+        readability,
+      )) {
         canvas.drawParagraph(
           t.paragraph,
           Offset(t.col * cw, top + (ch - t.paragraph.height) / 2),
@@ -185,13 +240,14 @@ class TerminalPainter extends CustomPainter {
         Paint()
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1 / scale
-          ..color = const Color(0x33FFFFFF),
+          ..color = Color(lightBg ? 0x33000000 : 0x33FFFFFF),
       );
     }
     canvas.restore();
     _paintScrollbar(
       canvas,
       Offset(inset, inset) & Size(grid.width * scale, grid.height * scale),
+      lightBg,
     );
   }
 
@@ -219,7 +275,13 @@ class TerminalPainter extends CustomPainter {
             glyph,
             terminalTextStyle(
               fontSize: metrics.fontSize,
-              color: terminalColor(m.defaultBg),
+              color: readability.minimumContrast > 1.0
+                  ? textCache.adjusted(
+                      terminalColor(m.defaultBg),
+                      color,
+                      readability.minimumContrast,
+                    )
+                  : terminalColor(m.defaultBg),
               bold: run!.has(RunAttrs.bold),
               italic: run.has(RunAttrs.italic),
             ),
@@ -252,7 +314,7 @@ class TerminalPainter extends CustomPainter {
     }
   }
 
-  void _paintScrollbar(Canvas canvas, Rect grid) {
+  void _paintScrollbar(Canvas canvas, Rect grid, bool lightBg) {
     final m = model;
     if (!m.scrolledBack) return;
     final track = grid.height;
@@ -264,7 +326,7 @@ class TerminalPainter extends CustomPainter {
         Rect.fromLTWH(grid.right - 5, grid.top + top, 3, thumb),
         const Radius.circular(1.5),
       ),
-      Paint()..color = const Color(0x66FFFFFF),
+      Paint()..color = Color(lightBg ? 0x66000000 : 0x66FFFFFF),
     );
   }
 
@@ -292,5 +354,6 @@ class TerminalPainter extends CustomPainter {
       old.localCols != localCols ||
       old.localRows != localRows ||
       old.focused != focused ||
-      old.inset != inset;
+      old.inset != inset ||
+      old.readability != readability;
 }

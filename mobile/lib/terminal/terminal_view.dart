@@ -8,6 +8,7 @@ import '../app/width_class.dart';
 import '../core/models.dart';
 import 'attached_tab.dart';
 import 'cell_metrics.dart';
+import 'contrast.dart';
 import 'terminal_model.dart';
 import 'terminal_painter.dart';
 
@@ -55,6 +56,7 @@ class TerminalView extends StatefulWidget {
     required this.fontSize,
     this.fontSizeSetting,
     this.focused = false,
+    this.readability = const TextReadability(),
     this.onGeometry,
     this.onGridArea,
     this.onFontSize,
@@ -73,6 +75,7 @@ class TerminalView extends StatefulWidget {
   /// width class) is not.
   final WidthClass? fontSizeSetting;
   final bool focused;
+  final TextReadability readability;
 
   /// The grid that fits. [deliberate] when the user changed it (the font
   /// size, see [fontSizeSetting]), not when the space around it moved (a
@@ -320,6 +323,7 @@ class _TerminalViewState extends State<TerminalView>
                 localRows: local.rows,
                 focused: widget.focused,
                 inset: terminalInset,
+                readability: widget.readability,
               ),
             ),
           ),

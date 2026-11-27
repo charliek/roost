@@ -363,6 +363,14 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
     final fontSize = ref.watch(
       settingsProvider.select((s) => s.desired.terminalFontSizeFor(widthClass)),
     );
+    final readability = ref.watch(
+      settingsProvider.select(
+        (s) => textReadabilityFor(
+          s.desired,
+          effectiveDark: s.acknowledged.effectiveDark,
+        ),
+      ),
+    );
     final tab = _tab;
     final focused = _focus.hasFocus;
     return Column(
@@ -414,6 +422,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
                     fontSize: fontSize,
                     fontSizeSetting: widthClass,
                     focused: focused,
+                    readability: readability,
                     onGeometry: _onGeometry,
                     onGridArea: _onGridArea,
                     onFontSize: (size) => _onPinchFontSize(size, widthClass),

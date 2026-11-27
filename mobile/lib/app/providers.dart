@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/roost_core.dart';
 import '../core/serial_queue.dart';
+import '../terminal/contrast.dart';
 import 'width_class.dart';
 
 /// The core every widget talks to. `main` overrides it (FakeCore until the
@@ -77,6 +78,21 @@ class SettingsModel {
   final MobileSettings desired;
   final int revision;
 }
+
+/// What the painter does about faint and low-contrast text: `auto` raises
+/// contrast only on a light terminal theme, so a dark install is drawn as
+/// the session sent it.
+TextReadability textReadabilityFor(
+  MobileSettings desired, {
+  required bool effectiveDark,
+}) => TextReadability(
+  minimumContrast: switch (desired.readableText) {
+    ReadableText.on => 3.0,
+    ReadableText.off => 1.0,
+    ReadableText.auto => effectiveDark ? 1.0 : 3.0,
+  },
+  faintAlpha: desired.brightFaint ? 0.75 : 0.55,
+);
 
 extension TerminalFontSizes on MobileSettings {
   /// A phone-width layout has its own terminal text size; medium and
