@@ -97,7 +97,7 @@ class _RoostMobileAppState extends ConsumerState<RoostMobileApp> {
       title: 'Roost',
       debugShowCheckedModeBanner: false,
       scaffoldMessengerKey: ref.watch(scaffoldMessengerKeyProvider),
-      theme: roostDarkTheme(),
+      theme: roostTheme(Brightness.dark),
       // Above the navigator, so a sheet or dialog sees the same width class
       // and text scale as the layout under it.
       builder: (context, child) {

@@ -37,7 +37,7 @@ TerminalModel _fullRows(List<String> rows) => TerminalModel()
 Future<void> _openSheet(WidgetTester tester, TerminalModel model) async {
   await tester.pumpWidget(
     MaterialApp(
-      theme: roostDarkTheme(),
+      theme: roostTheme(Brightness.dark),
       home: Scaffold(
         body: Builder(
           builder: (context) => TextButton(
@@ -165,7 +165,7 @@ void main() {
     final model = _fullRows(['see https://a.io/x']);
     await tester.pumpWidget(
       MaterialApp(
-        theme: roostDarkTheme(),
+        theme: roostTheme(Brightness.dark),
         home: Builder(
           builder: (context) => TextButton(
             onPressed: () => Navigator.of(context).push(

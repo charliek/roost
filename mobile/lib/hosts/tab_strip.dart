@@ -27,9 +27,9 @@ class TabStrip extends ConsumerWidget {
     return Container(
       key: const ValueKey('tab-strip'),
       height: height,
-      decoration: const BoxDecoration(
-        color: RoostColors.surfaceLow,
-        border: Border(bottom: BorderSide(color: RoostColors.divider)),
+      decoration: BoxDecoration(
+        color: context.palette.surfaceLow,
+        border: Border(bottom: BorderSide(color: context.palette.divider)),
       ),
       child: ListView(
         scrollDirection: Axis.horizontal,
@@ -66,11 +66,11 @@ class _TabChip extends ConsumerWidget {
     return Padding(
       padding: const EdgeInsets.only(right: 4),
       child: Material(
-        color: selected ? RoostColors.background : Colors.transparent,
+        color: selected ? context.palette.background : Colors.transparent,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(8),
           side: BorderSide(
-            color: selected ? RoostColors.border : Colors.transparent,
+            color: selected ? context.palette.border : Colors.transparent,
           ),
         ),
         child: InkWell(
@@ -94,7 +94,9 @@ class _TabChip extends ConsumerWidget {
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       fontSize: 13,
-                      color: selected ? RoostColors.text : RoostColors.muted,
+                      color: selected
+                          ? context.palette.text
+                          : context.palette.muted,
                     ),
                   ),
                 ),

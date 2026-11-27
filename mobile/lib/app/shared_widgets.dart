@@ -31,13 +31,13 @@ class EmptyState extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(icon, size: 40, color: RoostColors.muted),
+              Icon(icon, size: 40, color: context.palette.muted),
               const SizedBox(height: 12),
               Text(title, style: text.titleMedium, textAlign: TextAlign.center),
               const SizedBox(height: 6),
               Text(
                 message,
-                style: text.bodySmall?.copyWith(color: RoostColors.muted),
+                style: text.bodySmall?.copyWith(color: context.palette.muted),
                 textAlign: TextAlign.center,
               ),
               if (action != null) ...[const SizedBox(height: 16), action!],

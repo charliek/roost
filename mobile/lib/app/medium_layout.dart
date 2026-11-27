@@ -115,7 +115,7 @@ class _HostHeader extends StatelessWidget {
                 Text(host.label, style: text.titleMedium),
                 Text(
                   '${hostStateLabel(host.state)} · ${host.target}',
-                  style: text.bodySmall?.copyWith(color: RoostColors.muted),
+                  style: text.bodySmall?.copyWith(color: context.palette.muted),
                 ),
               ],
             ),
@@ -139,7 +139,7 @@ class HostRail extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     return Material(
       key: const ValueKey('host-rail'),
-      color: RoostColors.surfaceLow,
+      color: context.palette.surfaceLow,
       child: SizedBox(
         width: hostRailWidth,
         child: ListView(
@@ -214,10 +214,10 @@ class _RailHost extends StatelessWidget {
                   child: HostStatusDot(state: host.state),
                 ),
                 if (host.waitingTabs > 0)
-                  const Positioned(
+                  Positioned(
                     left: 2,
                     top: 0,
-                    child: StatusDot(color: RoostColors.waiting, size: 8),
+                    child: StatusDot(color: context.palette.waiting, size: 8),
                   ),
               ],
             ),
@@ -228,7 +228,7 @@ class _RailHost extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 fontSize: 12,
-                color: selected ? RoostColors.text : RoostColors.muted,
+                color: selected ? context.palette.text : context.palette.muted,
               ),
             ),
           ],

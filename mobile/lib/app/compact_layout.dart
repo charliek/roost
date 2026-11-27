@@ -135,17 +135,19 @@ class HostCard extends ConsumerWidget {
                   ),
                   Text(
                     hostStateLabel(host.state),
-                    style: text.bodySmall?.copyWith(color: RoostColors.muted),
+                    style: text.bodySmall?.copyWith(
+                      color: context.palette.muted,
+                    ),
                   ),
                   HostMenuButton(host: host),
                 ],
               ),
               Text(
                 host.target,
-                style: const TextStyle(
+                style: TextStyle(
                   fontFamily: monoFamily,
                   fontSize: 12,
-                  color: RoostColors.muted,
+                  color: context.palette.muted,
                 ),
               ),
               const SizedBox(height: 10),
@@ -186,9 +188,9 @@ class _WaitingBanner extends ConsumerWidget {
     final n = host.waitingTabs;
     return Material(
       key: const ValueKey('waiting-banner'),
-      color: RoostColors.waitingSurface,
+      color: context.palette.waitingSurface,
       shape: RoundedRectangleBorder(
-        side: const BorderSide(color: RoostColors.waitingBorder),
+        side: BorderSide(color: context.palette.waitingBorder),
         borderRadius: BorderRadius.circular(14),
       ),
       child: InkWell(
@@ -202,7 +204,7 @@ class _WaitingBanner extends ConsumerWidget {
           padding: const EdgeInsets.all(14),
           child: Row(
             children: [
-              const StatusDot(color: RoostColors.waiting),
+              StatusDot(color: context.palette.waiting),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(
@@ -219,15 +221,18 @@ class _WaitingBanner extends ConsumerWidget {
                         '${tab.title} on ${host.label} › $project',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 13,
-                          color: RoostColors.muted,
+                          color: context.palette.muted,
                         ),
                       ),
                   ],
                 ),
               ),
-              const Text('Open', style: TextStyle(color: RoostColors.waiting)),
+              Text(
+                'Open',
+                style: TextStyle(color: context.palette.waitingAction),
+              ),
             ],
           ),
         ),
@@ -271,7 +276,7 @@ class ProjectsScreen extends ConsumerWidget {
             if (host != null)
               Text(
                 hostStateLabel(host.state),
-                style: text.bodySmall?.copyWith(color: RoostColors.muted),
+                style: text.bodySmall?.copyWith(color: context.palette.muted),
               ),
           ],
         ),

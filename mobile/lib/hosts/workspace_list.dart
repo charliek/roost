@@ -72,7 +72,7 @@ class _ProjectHeader extends ConsumerWidget {
       padding: const EdgeInsets.fromLTRB(12, 8, 0, 0),
       child: Row(
         children: [
-          const Icon(Icons.folder_outlined, size: 16, color: RoostColors.muted),
+          Icon(Icons.folder_outlined, size: 16, color: context.palette.muted),
           const SizedBox(width: 8),
           Expanded(
             child: Text(
@@ -90,9 +90,9 @@ class _ProjectHeader extends ConsumerWidget {
                   '$waiting waiting',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 12,
-                    color: RoostColors.waiting,
+                    color: context.palette.waiting,
                   ),
                 ),
               ),
@@ -160,14 +160,14 @@ class TabTile extends ConsumerWidget {
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 color: tab.agent == AgentBadge.waiting
-                    ? RoostColors.waiting
-                    : RoostColors.muted,
+                    ? context.palette.waiting
+                    : context.palette.muted,
               ),
             ),
       trailing: tab.hasNotification
-          ? const StatusDot(
-              key: ValueKey('notification-dot'),
-              color: RoostColors.waiting,
+          ? StatusDot(
+              key: const ValueKey('notification-dot'),
+              color: context.palette.waiting,
               size: 8,
             )
           : null,

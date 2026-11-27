@@ -43,7 +43,7 @@ class HostSidebar extends ConsumerWidget {
     final hosts = ref.watch(hostsProvider).value ?? const <HostView>[];
     return Material(
       key: const ValueKey('host-sidebar'),
-      color: RoostColors.surfaceLow,
+      color: context.palette.surfaceLow,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -124,7 +124,9 @@ class HostSection extends StatelessWidget {
                     hostStateLabel(host.state),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: text.bodySmall?.copyWith(color: RoostColors.muted),
+                    style: text.bodySmall?.copyWith(
+                      color: context.palette.muted,
+                    ),
                   ),
                 ),
                 HostMenuButton(host: host),

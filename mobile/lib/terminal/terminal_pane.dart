@@ -498,9 +498,9 @@ class _Toolbar extends StatelessWidget {
     return Container(
       key: const ValueKey('terminal-toolbar'),
       constraints: const BoxConstraints(minHeight: terminalToolbarHeight),
-      decoration: const BoxDecoration(color: RoostColors.surfaceLow),
-      foregroundDecoration: const BoxDecoration(
-        border: Border(bottom: BorderSide(color: RoostColors.divider)),
+      decoration: BoxDecoration(color: context.palette.surfaceLow),
+      foregroundDecoration: BoxDecoration(
+        border: Border(bottom: BorderSide(color: context.palette.divider)),
       ),
       child: Row(
         children: [
@@ -526,7 +526,9 @@ class _Toolbar extends StatelessWidget {
                     sub,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: text.bodySmall?.copyWith(color: RoostColors.muted),
+                    style: text.bodySmall?.copyWith(
+                      color: context.palette.muted,
+                    ),
                   ),
               ],
             ),
@@ -589,11 +591,11 @@ class _SizeOwnerBanner extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       key: const ValueKey('size-owner-banner'),
-      color: RoostColors.surfaceHighest,
+      color: context.palette.surfaceHighest,
       padding: const EdgeInsets.only(left: 12),
       child: Row(
         children: [
-          const Icon(Icons.aspect_ratio, size: 16, color: RoostColors.muted),
+          Icon(Icons.aspect_ratio, size: 16, color: context.palette.muted),
           const SizedBox(width: 8),
           Expanded(
             child: Text(
@@ -656,9 +658,9 @@ class _StatusOverlay extends StatelessWidget {
         padding: const EdgeInsets.all(12),
         child: Material(
           key: const ValueKey('terminal-status'),
-          color: RoostColors.surfaceHigh,
+          color: context.palette.surfaceHigh,
           shape: RoundedRectangleBorder(
-            side: const BorderSide(color: RoostColors.border),
+            side: BorderSide(color: context.palette.border),
             borderRadius: BorderRadius.circular(12),
           ),
           child: Padding(
@@ -737,8 +739,8 @@ class _Notice extends StatelessWidget {
       alignment: Alignment.bottomCenter,
       margin: const EdgeInsets.all(16),
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-      color: RoostColors.surfaceHighest,
-      borderColor: RoostColors.border,
+      color: context.palette.surfaceHighest,
+      borderColor: context.palette.border,
       child: Text(text, style: Theme.of(context).textTheme.bodyMedium),
     );
   }
