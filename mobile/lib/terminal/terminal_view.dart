@@ -56,6 +56,7 @@ class TerminalView extends StatefulWidget {
     required this.fontSize,
     this.fontSizeSetting,
     this.fontEdits = 0,
+    this.editedFontSize,
     this.focused = false,
     this.readability = const TextReadability(),
     this.onGeometry,
@@ -80,6 +81,11 @@ class TerminalView extends StatefulWidget {
   /// deliberate only when this moved too: a size put back after a failed
   /// save is not the user's change.
   final int fontEdits;
+
+  /// The size the last of those edits set for this width class: a new
+  /// [fontSize] other than it (put back after a failed save in the same
+  /// frame as an edit) is not the user's.
+  final double? editedFontSize;
   final bool focused;
   final TextReadability readability;
 
@@ -116,13 +122,14 @@ class _TerminalViewState extends State<TerminalView>
   final TerminalModel _blank = TerminalModel();
   CellMetrics? _metrics;
   Geometry? _reported;
-  double? _reportedFontSize;
-  WidthClass? _reportedSetting;
-  int _reportedFontEdits = 0;
   Geometry? _pending;
-  double? _pendingFontSize;
-  WidthClass? _pendingSetting;
-  int? _pendingFontEdits;
+  bool _pendingDeliberate = false;
+
+  /// The font size, width class and edit count of the last offer, reported
+  /// or not.
+  double? _seenFontSize;
+  WidthClass? _seenSetting;
+  int _seenFontEdits = 0;
   Timer? _debounce;
   bool _pulling = false;
   double _pinchStartFont = 0;
@@ -201,11 +208,30 @@ class _TerminalViewState extends State<TerminalView>
     WidthClass? setting,
     int fontEdits,
   ) {
-    if (_reported == null) {
+    final first = _reported == null;
+    // Deliberate: a font edit changed this width class's size since the last
+    // offer. A later offer in the same class at that size (the keyboard, a
+    // rotation) still carries the pending edit; a class switch or a size put
+    // back without an edit does not.
+    final userChanged =
+        !first &&
+        ((fontEdits != _seenFontEdits &&
+                setting == _seenSetting &&
+                fontSize != _seenFontSize &&
+                fontSize == widget.editedFontSize) ||
+            (_pending != null &&
+                _pendingDeliberate &&
+                setting == _seenSetting &&
+                fontSize == _seenFontSize));
+    final unchanged =
+        fontSize == _seenFontSize &&
+        setting == _seenSetting &&
+        fontEdits == _seenFontEdits;
+    _seenFontSize = fontSize;
+    _seenSetting = setting;
+    _seenFontEdits = fontEdits;
+    if (first) {
       _reported = local;
-      _reportedFontSize = fontSize;
-      _reportedSetting = setting;
-      _reportedFontEdits = fontEdits;
       SchedulerBinding.instance.addPostFrameCallback((_) {
         if (mounted) widget.onGeometry?.call(local, deliberate: false);
       });
@@ -214,38 +240,19 @@ class _TerminalViewState extends State<TerminalView>
     // A deliberate change is offered even when its grid is the one already
     // reported (two sizes can round to the same cells): it is how the user
     // takes the tab's size back.
-    bool deliberate() =>
-        fontSize != _reportedFontSize &&
-        setting == _reportedSetting &&
-        fontEdits != _reportedFontEdits;
-    if (local == _reported && !deliberate()) {
+    if (local == _reported && !userChanged) {
       _debounce?.cancel();
       _pending = null;
-      _reportedFontSize = fontSize;
-      _reportedSetting = setting;
-      _reportedFontEdits = fontEdits;
       return;
     }
-    if (local == _pending &&
-        fontSize == _pendingFontSize &&
-        setting == _pendingSetting &&
-        fontEdits == _pendingFontEdits) {
-      return;
-    }
+    if (local == _pending && unchanged) return;
     _pending = local;
-    _pendingFontSize = fontSize;
-    _pendingSetting = setting;
-    _pendingFontEdits = fontEdits;
+    _pendingDeliberate = userChanged;
     _debounce?.cancel();
     _debounce = Timer(regridDebounce, () {
       _pending = null;
       if (!mounted) return;
-      final userChanged = deliberate();
-      if (local == _reported && !userChanged) return;
       _reported = local;
-      _reportedFontSize = fontSize;
-      _reportedSetting = setting;
-      _reportedFontEdits = fontEdits;
       widget.onGeometry?.call(local, deliberate: userChanged);
     });
   }

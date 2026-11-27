@@ -73,6 +73,7 @@ class SettingsModel {
     required this.desired,
     required this.revision,
     this.fontEdits = 0,
+    this.fontEditedTo,
   });
 
   final SettingsState acknowledged;
@@ -82,6 +83,10 @@ class SettingsModel {
   /// Edits that changed a terminal text size. A size put back after a failed
   /// write, or adopted from the core, is not one.
   final int fontEdits;
+
+  /// [desired] as the last of those edits left it: a size other than the one
+  /// it set (a failed write put back) is not the user's.
+  final MobileSettings? fontEditedTo;
 }
 
 /// What the painter does about faint and low-contrast text: `auto` raises
@@ -155,6 +160,7 @@ class SettingsNotifier extends Notifier<SettingsModel> {
       desired: desired,
       revision: state.revision + 1,
       fontEdits: state.fontEdits + (fontChanged ? 1 : 0),
+      fontEditedTo: fontChanged ? desired : state.fontEditedTo,
     );
     if (continuous) {
       _trailing?.cancel();
@@ -192,6 +198,7 @@ class SettingsNotifier extends Notifier<SettingsModel> {
         desired: state.revision == revision ? kept.settings : state.desired,
         revision: state.revision,
         fontEdits: state.fontEdits,
+        fontEditedTo: state.fontEditedTo,
       );
     } catch (e) {
       if (!ref.mounted) return;
@@ -201,6 +208,7 @@ class SettingsNotifier extends Notifier<SettingsModel> {
           desired: state.acknowledged.settings,
           revision: state.revision,
           fontEdits: state.fontEdits,
+          fontEditedTo: state.fontEditedTo,
         );
       }
       _report(e);
@@ -216,6 +224,7 @@ class SettingsNotifier extends Notifier<SettingsModel> {
         desired: state.desired,
         revision: state.revision,
         fontEdits: state.fontEdits,
+        fontEditedTo: state.fontEditedTo,
       );
     } catch (e) {
       if (ref.mounted) _report(e);

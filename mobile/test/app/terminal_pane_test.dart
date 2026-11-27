@@ -415,6 +415,7 @@ void main() {
         double fontSize,
         WidthClass widthClass, {
         int fontEdits = 0,
+        double? editedFontSize,
       }) async {
         await tester.pumpWidget(
           MaterialApp(
@@ -423,6 +424,7 @@ void main() {
               fontSize: fontSize,
               fontSizeSetting: widthClass,
               fontEdits: fontEdits,
+              editedFontSize: editedFontSize ?? fontSize,
               onGeometry: (g, {required deliberate}) =>
                   reports.add((g, deliberate)),
             ),
@@ -440,6 +442,118 @@ void main() {
       expect(reports.map((r) => r.$1.cols).toSet(), hasLength(3));
       await show(13, WidthClass.compact, fontEdits: 1);
       expect(reports.last.$2, isFalse, reason: 'no edit: a size put back');
+    });
+
+    testWidgets('only a font edit at its own size takes the size', (
+      tester,
+    ) async {
+      final reports = <(Geometry, bool)>[];
+      Future<void> show(
+        double fontSize,
+        WidthClass widthClass, {
+        int fontEdits = 0,
+        double? editedFontSize,
+        double width = 800,
+      }) => tester.pumpWidget(
+        MaterialApp(
+          home: Center(
+            child: SizedBox(
+              width: width,
+              height: 600,
+              child: TerminalView(
+                tab: null,
+                fontSize: fontSize,
+                fontSizeSetting: widthClass,
+                fontEdits: fontEdits,
+                editedFontSize: editedFontSize ?? fontSize,
+                onGeometry: (g, {required deliberate}) =>
+                    reports.add((g, deliberate)),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      // An edit to 15, then the layout changes, then a failed save puts 13
+      // back, all inside one debounce: the rollback is not the user's.
+      await show(13, WidthClass.compact);
+      await tester.pump(regridDebounce);
+      await show(15, WidthClass.compact, fontEdits: 1);
+      await show(15, WidthClass.compact, fontEdits: 1, width: 700);
+      await show(
+        13,
+        WidthClass.compact,
+        fontEdits: 1,
+        editedFontSize: 15,
+        width: 700,
+      );
+      await tester.pump(regridDebounce);
+      expect(reports, hasLength(2), reason: 'the first grid, then one offer');
+      expect(reports.last.$2, isFalse, reason: 'a rollback, not an edit');
+
+      // A pinch step that is never laid out, then a rollback in the same
+      // frame: the edit counter moved, but not to this size.
+      await show(14, WidthClass.compact, fontEdits: 2, width: 700);
+      await show(
+        13,
+        WidthClass.compact,
+        fontEdits: 3,
+        editedFontSize: 15,
+        width: 700,
+      );
+      await tester.pump(regridDebounce);
+      expect(reports, hasLength(2), reason: 'back on the reported grid');
+
+      // An edit in compact, then a switch to medium and a layout change
+      // there: neither medium offer is the user's.
+      await show(15, WidthClass.compact, fontEdits: 4, width: 700);
+      await show(16, WidthClass.medium, fontEdits: 4, width: 700);
+      await show(16, WidthClass.medium, fontEdits: 4, width: 650);
+      await tester.pump(regridDebounce);
+      expect(reports, hasLength(3), reason: 'one offer after the burst');
+      expect(reports.last.$2, isFalse, reason: 'a class switch, then layout');
+
+      // A medium edit while that is still settling is the user's, even
+      // when it lands on the size the last report had.
+      await show(13, WidthClass.medium, fontEdits: 4, width: 600);
+      await tester.pump(regridDebounce ~/ 2);
+      await show(16, WidthClass.medium, fontEdits: 5, width: 600);
+      await tester.pump(regridDebounce);
+      expect(reports, hasLength(4), reason: 'one offer after the burst');
+      expect(reports.last.$2, isTrue, reason: 'the edit within medium');
+    });
+
+    testWidgets('an edit made while a class change debounces is the user\'s', (
+      tester,
+    ) async {
+      final reports = <(Geometry, bool)>[];
+      Future<void> show(
+        double fontSize,
+        WidthClass widthClass, {
+        int fontEdits = 0,
+        double? editedFontSize,
+      }) => tester.pumpWidget(
+        MaterialApp(
+          home: TerminalView(
+            tab: null,
+            fontSize: fontSize,
+            fontSizeSetting: widthClass,
+            fontEdits: fontEdits,
+            editedFontSize: editedFontSize ?? fontSize,
+            onGeometry: (g, {required deliberate}) =>
+                reports.add((g, deliberate)),
+          ),
+        ),
+      );
+
+      await show(13, WidthClass.medium);
+      await tester.pump(regridDebounce);
+      await show(9, WidthClass.compact);
+      await tester.pump(regridDebounce ~/ 2);
+      await show(11, WidthClass.compact, fontEdits: 1);
+      await tester.pump(regridDebounce);
+      expect(reports, hasLength(2), reason: 'the first grid, then one offer');
+      expect(reports.last.$2, isTrue, reason: 'the edit within compact');
     });
 
     testWidgets('a burst of size changes settles into one resize', (

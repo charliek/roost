@@ -209,7 +209,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
       final deliberate = _deliberatePending;
       _deliberatePending = false;
       if (latest != null && latest != geometry) {
-        _fire(session.resize(latest, focused: deliberate || _focus.hasFocus));
+        _fire(session.resize(latest, focused: deliberate));
       }
       _clearNotification();
     } catch (e) {
@@ -364,6 +364,11 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
       settingsProvider.select((s) => s.desired.terminalFontSizeFor(widthClass)),
     );
     final fontEdits = ref.watch(settingsProvider.select((s) => s.fontEdits));
+    final editedFontSize = ref.watch(
+      settingsProvider.select(
+        (s) => s.fontEditedTo?.terminalFontSizeFor(widthClass),
+      ),
+    );
     final readability = ref.watch(
       settingsProvider.select((s) => textReadabilityFor(s.desired)),
     );
@@ -418,6 +423,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
                     fontSize: fontSize,
                     fontSizeSetting: widthClass,
                     fontEdits: fontEdits,
+                    editedFontSize: editedFontSize,
                     focused: focused,
                     readability: readability,
                     onGeometry: _onGeometry,
