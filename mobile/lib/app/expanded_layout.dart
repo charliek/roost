@@ -4,10 +4,14 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../core/roost_core.dart';
 import '../hosts/host_widgets.dart';
 import '../hosts/workspace_list.dart';
+import 'display_sheet.dart';
 import 'providers.dart';
 import 'shared_widgets.dart';
 import 'theme.dart';
 import 'workspace_actions.dart';
+
+/// The sidebar's width, beside a divider of [layoutDividerWidth].
+const hostSidebarWidth = 300.0;
 
 /// ≥ 840 dp: a persistent sidebar of hosts with their projects and tabs, and
 /// the selected tab beside it.
@@ -21,8 +25,8 @@ class ExpandedLayout extends StatelessWidget {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            SizedBox(width: 300, child: HostSidebar()),
-            VerticalDivider(width: 1),
+            SizedBox(width: hostSidebarWidth, child: HostSidebar()),
+            VerticalDivider(width: layoutDividerWidth),
             Expanded(child: SelectedTabArea()),
           ],
         ),
@@ -53,6 +57,7 @@ class HostSidebar extends ConsumerWidget {
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
                 ),
+                const DisplayButton(),
                 IconButton(
                   key: const ValueKey('add-host'),
                   tooltip: 'Add host',

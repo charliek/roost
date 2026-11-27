@@ -227,3 +227,34 @@ class ResumeEpoch extends Notifier<int> {
 }
 
 final resumeEpochProvider = NotifierProvider<ResumeEpoch, int>(ResumeEpoch.new);
+
+/// The terminal on screen as the Display sheet sees it: the area its grid
+/// fits into (what `CellMetrics.geometryFor` is given) and who else sizes
+/// the tab, if anyone.
+typedef TerminalPaneSize = ({Size gridArea, String? sizedBy});
+
+/// Null while no terminal is mounted. The pane mounted last owns it: an
+/// outgoing pane (one still fading out of a screen transition) can neither
+/// report over the new one nor clear it when it goes.
+class TerminalPaneSizeNotifier extends Notifier<TerminalPaneSize?> {
+  int _owner = 0;
+
+  @override
+  TerminalPaneSize? build() => null;
+
+  /// A newly mounted pane's token, which makes it the owner.
+  int claim() => ++_owner;
+
+  void report(int token, TerminalPaneSize size) {
+    if (token == _owner && state != size) state = size;
+  }
+
+  void release(int token) {
+    if (ref.mounted && token == _owner) state = null;
+  }
+}
+
+final terminalPaneSizeProvider =
+    NotifierProvider<TerminalPaneSizeNotifier, TerminalPaneSize?>(
+      TerminalPaneSizeNotifier.new,
+    );

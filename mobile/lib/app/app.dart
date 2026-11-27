@@ -8,6 +8,7 @@ import 'compact_layout.dart';
 import 'expanded_layout.dart';
 import 'medium_layout.dart';
 import 'providers.dart';
+import 'text_scale.dart';
 import 'theme.dart';
 import 'width_class.dart';
 
@@ -89,11 +90,30 @@ class _RoostMobileAppState extends ConsumerState<RoostMobileApp> {
 
   @override
   Widget build(BuildContext context) {
+    final textScale = ref.watch(
+      settingsProvider.select((s) => s.desired.uiTextScale),
+    );
     return MaterialApp(
       title: 'Roost',
       debugShowCheckedModeBanner: false,
       scaffoldMessengerKey: ref.watch(scaffoldMessengerKeyProvider),
       theme: roostDarkTheme(),
+      // Above the navigator, so a sheet or dialog sees the same width class
+      // and text scale as the layout under it.
+      builder: (context, child) {
+        final media = MediaQuery.of(context);
+        return MediaQuery(
+          data: media.copyWith(
+            textScaler: ScaledTextScaler.over(media.textScaler, textScale),
+          ),
+          child: LayoutBuilder(
+            builder: (context, constraints) => WidthClassScope(
+              widthClass: widthClassFor(constraints.maxWidth),
+              child: child!,
+            ),
+          ),
+        );
+      },
       home: const AppShell(),
     );
   }
@@ -104,24 +124,14 @@ class AppShell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final widthClass = widthClassFor(constraints.maxWidth);
-        return WidthClassScope(
-          widthClass: widthClass,
-          child: switch (widthClass) {
-            WidthClass.compact => const CompactLayout(
-              key: ValueKey('layout-compact'),
-            ),
-            WidthClass.medium => const MediumLayout(
-              key: ValueKey('layout-medium'),
-            ),
-            WidthClass.expanded => const ExpandedLayout(
-              key: ValueKey('layout-expanded'),
-            ),
-          },
-        );
-      },
-    );
+    return switch (WidthClassScope.of(context)) {
+      WidthClass.compact => const CompactLayout(
+        key: ValueKey('layout-compact'),
+      ),
+      WidthClass.medium => const MediumLayout(key: ValueKey('layout-medium')),
+      WidthClass.expanded => const ExpandedLayout(
+        key: ValueKey('layout-expanded'),
+      ),
+    };
   }
 }

@@ -8,6 +8,9 @@ import '../app/workspace_actions.dart';
 import '../core/roost_core.dart';
 import 'host_widgets.dart';
 
+/// The strip's height at the default text scale.
+const tabStripHeight = 44.0;
+
 /// The selected tab's project, as a row of tabs plus "new tab".
 class TabStrip extends ConsumerWidget {
   const TabStrip({super.key, required this.hostId, required this.tabId});
@@ -19,7 +22,7 @@ class TabStrip extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final workspace = ref.watch(workspaceProvider(hostId)).value;
     final project = workspace?.projectOfTab(tabId);
-    final height = scaledBarHeight(context, 44, 13);
+    final height = scaledBarHeight(context, tabStripHeight, 13);
     if (project == null) return SizedBox(height: height);
     return Container(
       key: const ValueKey('tab-strip'),

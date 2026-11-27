@@ -5,6 +5,7 @@ import '../core/roost_core.dart';
 import '../hosts/host_widgets.dart';
 import '../hosts/workspace_list.dart';
 import '../terminal/terminal_pane.dart';
+import 'display_sheet.dart';
 import 'providers.dart';
 import 'shared_widgets.dart';
 import 'text_scale.dart';
@@ -63,6 +64,7 @@ class HostsScreen extends ConsumerWidget {
       appBar: AppBar(
         title: const Text('Hosts'),
         actions: [
+          const DisplayButton(),
           IconButton(
             key: const ValueKey('add-host'),
             tooltip: 'Add host',

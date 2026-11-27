@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:roost_mobile/app/providers.dart';
+import 'package:roost_mobile/app/width_class.dart';
 import 'package:roost_mobile/core/fake/fake_core.dart';
 import 'package:roost_mobile/core/roost_core.dart';
 import 'package:roost_mobile/terminal/terminal_pane.dart';
@@ -183,9 +184,7 @@ void main() {
     double drawn() =>
         tester.widget<TerminalView>(find.byType(TerminalView)).fontSize;
 
-    await tester.tap(find.byTooltip('Tab actions'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Larger text'));
+    settings().edit((s) => s.withTerminalFontSize(WidthClass.compact, 14));
     await tester.pumpAndSettle();
     expect(core.held.single.settings.terminalFontSizeCompact, 14);
     expect(core.held.single.settings.terminalFontSizeWide, 13);

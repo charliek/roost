@@ -38,6 +38,33 @@ selectable text, **Copy all**, and its links listed whole, a wrapped one
 such as Claude Code's **c to copy**, reaches the phone's clipboard while its
 tab is the one on screen; a copy from a tab you are not looking at is ignored.
 
+## Display
+
+Open it from the gear beside **+** (the Hosts bar on a phone, the host rail,
+or the sidebar header) or from a terminal's **⋮ → Display…**. Every change
+shows at once, on the terminal behind the sheet:
+
+- **Appearance:** System, Dark or Light. It picks which terminal theme is
+  used.
+- **Terminal text:** 7–28 pt, with the columns it gives this screen ("about"
+  when no terminal is open). A phone-width layout keeps its own size; tablet
+  and desktop widths share another. Changing it, here or by pinching the
+  terminal, takes the tab's size from any other client. **Reset** goes back
+  to 13 pt.
+- **App text:** 85–160% on top of the system's text size (never more than
+  twice the font size). The terminal itself does not scale with it.
+- **Terminal theme:** one dark and one light theme, of the bundled ones.
+- **Readability:** keep text readable (Auto, on for light themes only) and
+  brighter dim text.
+
+The settings live on the phone, in `settings.json` next to `hosts.json`, and
+survive a relaunch. A pinch or slider drag is saved 300 ms after its last
+step, or when it ends, or when the app goes to the background; a process
+killed inside those 300 ms loses that last step.
+
+**Claude Code:** run `/theme` and pick `dark-ansi` or `light-ansi`, so Claude
+Code draws with the terminal theme's own colors and follows it.
+
 ## Dev loop
 
 ```bash
@@ -98,7 +125,7 @@ keyboard comes up).
 | `lib/terminal/terminal_painter.dart`, `terminal_view.dart` | `CustomPainter` with per-row cached paragraphs; the view that fits the grid, pulls frames once per vsync, pinches and scrolls |
 | `lib/terminal/terminal_pane.dart` | One tab on screen: attach/detach, input routing, toolbar, quick replies, compose, extra keys |
 | `lib/input/` | Hardware key mapping, the soft-keyboard `TextInputClient`, extra keys, quick replies, compose box |
-| `lib/app/`, `lib/hosts/` | Riverpod providers, the three layouts, host and workspace widgets, dialogs |
+| `lib/app/`, `lib/hosts/` | Riverpod providers, the three layouts, the Display sheet, host and workspace widgets, dialogs |
 | `test/fixtures/` | C6 fixtures (every `frame_v1_*.bin` is decoded against its `.json`) and the key-name contract |
 | `integration_test/` | The whole stack against a real `roost-session` |
 

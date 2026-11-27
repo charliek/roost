@@ -9,7 +9,7 @@ WidthClass widthClassFor(double width) => width >= 840
     ? WidthClass.medium
     : WidthClass.compact;
 
-/// The width class of the layout on screen, from `AppShell`.
+/// The width class of the layout on screen, from `MaterialApp.builder`.
 class WidthClassScope extends InheritedWidget {
   const WidthClassScope({
     super.key,
@@ -19,7 +19,7 @@ class WidthClassScope extends InheritedWidget {
 
   final WidthClass widthClass;
 
-  /// Outside `AppShell` (a widget test of one pane), the screen's own width
+  /// Outside the app (a widget test of one pane), the screen's own width
   /// decides.
   static WidthClass of(BuildContext context) =>
       context

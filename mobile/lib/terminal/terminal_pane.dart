@@ -5,6 +5,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../app/display_sheet.dart';
 import '../app/providers.dart';
 import '../app/theme.dart';
 import '../app/width_class.dart';
@@ -27,6 +28,12 @@ const scrollSettle = Duration(milliseconds: 500);
 
 /// How long a "copied" notice stays after the last copy.
 const noticeDuration = Duration(milliseconds: 1500);
+
+/// The tab toolbar's height at the default text scale.
+const terminalToolbarHeight = 48.0;
+
+/// How long the pinch's size readout stays after the pinch's last change.
+const fontSizeHudDuration = Duration(milliseconds: 900);
 
 /// One tab on screen: attaches it (taking its size) once the view knows its
 /// grid, routes every kind of input to it, and detaches when it goes away.
@@ -58,6 +65,10 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
   final _input = GlobalKey<TerminalInputState>();
   AttachedTab? _tab;
   Geometry? _geometry;
+
+  /// The user changed the grid while no tab was attached: the resize that
+  /// follows the attach carries it, or it would not take the size.
+  bool _deliberatePending = false;
   int _attachSeq = 0;
   bool _attaching = false;
   String? _attachError;
@@ -68,12 +79,19 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
   Timer? _scrollSettle;
   String? _notice;
   Timer? _noticeTimer;
+  bool _hud = false;
+  Timer? _hudTimer;
+  Size? _gridArea;
+  late final TerminalPaneSizeNotifier _paneSize;
+  late final int _paneToken;
 
   RoostCore get _core => ref.read(coreProvider);
 
   @override
   void initState() {
     super.initState();
+    _paneSize = ref.read(terminalPaneSizeProvider.notifier);
+    _paneToken = _paneSize.claim();
     _focus.addListener(_onFocusChange);
   }
 
@@ -82,6 +100,13 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
     _attachSeq++;
     _scrollSettle?.cancel();
     _noticeTimer?.cancel();
+    _hudTimer?.cancel();
+    // Not now: providers may not change while the tree is torn down.
+    final paneSize = _paneSize;
+    final token = _paneToken;
+    SchedulerBinding.instance.addPostFrameCallback(
+      (_) => paneSize.release(token),
+    );
     _detach();
     _focus
       ..removeListener(_onFocusChange)
@@ -94,7 +119,38 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
   }
 
   void _onTabChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    setState(() {});
+    _publishPaneSize();
+  }
+
+  void _onGridArea(Size area) {
+    _gridArea = area;
+    _publishPaneSize();
+  }
+
+  void _publishPaneSize() {
+    final area = _gridArea;
+    if (area == null) return;
+    final tab = _tab;
+    final sizedBy = tab != null && tab.sizedElsewhere
+        ? tab.owner!.label ?? 'another client'
+        : null;
+    _paneSize.report(_paneToken, (gridArea: area, sizedBy: sizedBy));
+  }
+
+  void _onPinchFontSize(double size, WidthClass widthClass) {
+    ref
+        .read(settingsProvider.notifier)
+        .edit(
+          (s) => s.withTerminalFontSize(widthClass, size),
+          continuous: true,
+        );
+    _hudTimer?.cancel();
+    if (!_hud) setState(() => _hud = true);
+    _hudTimer = Timer(fontSizeHudDuration, () {
+      if (mounted) setState(() => _hud = false);
+    });
   }
 
   void _detach() {
@@ -113,15 +169,18 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
     final tab = _tab;
     if (tab != null) {
       _fire(tab.session.resize(geometry, focused: deliberate));
-    } else if (!_attaching && _attachError == null) {
-      unawaited(_attach());
+      return;
     }
+    _deliberatePending |= deliberate;
+    if (!_attaching && _attachError == null) unawaited(_attach());
   }
 
   Future<void> _attach() async {
     final geometry = _geometry;
     if (geometry == null) return;
     final seq = ++_attachSeq;
+    // The attach takes the size of the grid it starts with.
+    _deliberatePending = false;
     _detach();
     setState(() {
       _attaching = true;
@@ -145,9 +204,12 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
         _tab = tab;
         _attaching = false;
       });
+      _publishPaneSize();
       final latest = _geometry;
+      final deliberate = _deliberatePending;
+      _deliberatePending = false;
       if (latest != null && latest != geometry) {
-        _fire(session.resize(latest, focused: _focus.hasFocus));
+        _fire(session.resize(latest, focused: deliberate || _focus.hasFocus));
       }
       _clearNotification();
     } catch (e) {
@@ -301,7 +363,6 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
     final fontSize = ref.watch(
       settingsProvider.select((s) => s.desired.terminalFontSizeFor(widthClass)),
     );
-    final settings = ref.read(settingsProvider.notifier);
     final tab = _tab;
     final focused = _focus.hasFocus;
     return Column(
@@ -322,15 +383,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
           onClose: view == null
               ? null
               : () => closeTabFlow(context, ref, widget.hostId, view),
-          onFontSize: (delta) => settings.edit(
-            (s) => s.withTerminalFontSize(
-              widthClass,
-              (fontSize + delta).clamp(
-                minTerminalFontSize,
-                maxTerminalFontSize,
-              ),
-            ),
-          ),
+          onDisplay: () => unawaited(showDisplaySheet(context)),
         ),
         if (tab != null && tab.sizedElsewhere)
           _SizeOwnerBanner(
@@ -362,17 +415,24 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
                     fontSizeSetting: widthClass,
                     focused: focused,
                     onGeometry: _onGeometry,
-                    onFontSize: (size) => settings.edit(
-                      (s) => s.withTerminalFontSize(widthClass, size),
-                      continuous: true,
-                    ),
-                    onPinchEnd: settings.flush,
+                    onGridArea: _onGridArea,
+                    onFontSize: (size) => _onPinchFontSize(size, widthClass),
+                    onPinchEnd: ref.read(settingsProvider.notifier).flush,
                     onScroll: _scroll,
                     onTap: () => _input.currentState?.showKeyboard(),
                     onLongPress: _openCopy,
                   ),
                 ),
                 if (_notice != null) _Notice(text: _notice!),
+                if (_hud && _gridArea != null)
+                  _FontSizeHud(
+                    fontSize: fontSize,
+                    geometry: terminalGeometry(
+                      fontSize,
+                      MediaQuery.devicePixelRatioOf(context),
+                      _gridArea!,
+                    ),
+                  ),
                 _StatusOverlay(
                   attaching: _attaching,
                   error: _attachError,
@@ -416,7 +476,7 @@ class _Toolbar extends StatelessWidget {
     required this.onCopy,
     required this.onRename,
     required this.onClose,
-    required this.onFontSize,
+    required this.onDisplay,
   });
 
   final Widget? leading;
@@ -429,7 +489,7 @@ class _Toolbar extends StatelessWidget {
   final VoidCallback onCopy;
   final VoidCallback? onRename;
   final VoidCallback? onClose;
-  final ValueChanged<double> onFontSize;
+  final VoidCallback onDisplay;
 
   @override
   Widget build(BuildContext context) {
@@ -437,7 +497,7 @@ class _Toolbar extends StatelessWidget {
     final sub = subtitle ?? view?.statusText;
     return Container(
       key: const ValueKey('terminal-toolbar'),
-      constraints: const BoxConstraints(minHeight: 48),
+      constraints: const BoxConstraints(minHeight: terminalToolbarHeight),
       decoration: const BoxDecoration(color: RoostColors.surfaceLow),
       foregroundDecoration: const BoxDecoration(
         border: Border(bottom: BorderSide(color: RoostColors.divider)),
@@ -494,10 +554,8 @@ class _Toolbar extends StatelessWidget {
                   onRename?.call();
                 case 'close':
                   onClose?.call();
-                case 'bigger':
-                  onFontSize(1);
-                case 'smaller':
-                  onFontSize(-1);
+                case 'display':
+                  onDisplay();
               }
             },
             itemBuilder: (context) => const [
@@ -508,8 +566,11 @@ class _Toolbar extends StatelessWidget {
               ),
               PopupMenuItem(value: 'rename', child: Text('Rename tab')),
               PopupMenuItem(value: 'close', child: Text('Close tab')),
-              PopupMenuItem(value: 'bigger', child: Text('Larger text')),
-              PopupMenuItem(value: 'smaller', child: Text('Smaller text')),
+              PopupMenuItem(
+                key: ValueKey('menu-display'),
+                value: 'display',
+                child: Text('Display…'),
+              ),
             ],
           ),
         ],
@@ -622,6 +683,48 @@ class _StatusOverlay extends StatelessWidget {
   }
 }
 
+/// A card floating over the terminal that never takes a touch.
+class _OverlayCard extends StatelessWidget {
+  const _OverlayCard({
+    required this.cardKey,
+    required this.alignment,
+    required this.margin,
+    required this.padding,
+    required this.color,
+    required this.borderColor,
+    required this.child,
+  });
+
+  final Key cardKey;
+  final Alignment alignment;
+  final EdgeInsets margin;
+  final EdgeInsets padding;
+  final Color color;
+  final Color borderColor;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: Align(
+        alignment: alignment,
+        child: Padding(
+          padding: margin,
+          child: Material(
+            key: cardKey,
+            color: color,
+            shape: RoundedRectangleBorder(
+              side: BorderSide(color: borderColor),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Padding(padding: padding, child: child),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _Notice extends StatelessWidget {
   const _Notice({required this.text});
 
@@ -629,24 +732,44 @@ class _Notice extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return IgnorePointer(
-      child: Align(
-        alignment: Alignment.bottomCenter,
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Material(
-            key: const ValueKey('terminal-notice'),
-            color: RoostColors.surfaceHighest,
-            shape: RoundedRectangleBorder(
-              side: const BorderSide(color: RoostColors.border),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-              child: Text(text, style: Theme.of(context).textTheme.bodyMedium),
-            ),
+    return _OverlayCard(
+      cardKey: const ValueKey('terminal-notice'),
+      alignment: Alignment.bottomCenter,
+      margin: const EdgeInsets.all(16),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      color: RoostColors.surfaceHighest,
+      borderColor: RoostColors.border,
+      child: Text(text, style: Theme.of(context).textTheme.bodyMedium),
+    );
+  }
+}
+
+class _FontSizeHud extends StatelessWidget {
+  const _FontSizeHud({required this.fontSize, required this.geometry});
+
+  final double fontSize;
+  final Geometry geometry;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = context.palette;
+    final text = Theme.of(context).textTheme;
+    return _OverlayCard(
+      cardKey: const ValueKey('font-size-hud'),
+      alignment: Alignment.center,
+      margin: EdgeInsets.zero,
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+      color: palette.surfaceHighest,
+      borderColor: palette.border,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text('${formatPoints(fontSize)} pt', style: text.titleMedium),
+          Text(
+            '${geometry.cols} × ${geometry.rows}',
+            style: text.bodySmall?.copyWith(color: palette.muted),
           ),
-        ),
+        ],
       ),
     );
   }

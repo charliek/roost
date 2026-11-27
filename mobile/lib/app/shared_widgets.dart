@@ -95,3 +95,6 @@ class SelectedTabArea extends ConsumerWidget {
     );
   }
 }
+
+/// The vertical divider between a rail or sidebar and the terminal area.
+const layoutDividerWidth = 1.0;

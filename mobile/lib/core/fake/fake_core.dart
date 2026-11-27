@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import '../../app/text_scale.dart' show minUiTextScale, maxUiTextScale;
 import '../../terminal/frame.dart';
 import '../../terminal/frame_encoder.dart';
 import '../replay_feed.dart';
@@ -464,7 +465,13 @@ class FakeCore implements RoostCore {
         28,
         2,
       ),
-      uiTextScale: stepped(s.uiTextScale, defaults.uiTextScale, 0.85, 1.6, 20),
+      uiTextScale: stepped(
+        s.uiTextScale,
+        defaults.uiTextScale,
+        minUiTextScale,
+        maxUiTextScale,
+        20,
+      ),
       darkTheme: theme(s.darkTheme, light: false, or: defaults.darkTheme),
       lightTheme: theme(s.lightTheme, light: true, or: defaults.lightTheme),
     );

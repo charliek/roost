@@ -26,6 +26,25 @@ abstract final class RoostColors {
   static const errorBorder = Color(0xFF5A2F2F);
 }
 
+/// The chrome colors as a widget reads them, through its context, so they can
+/// follow the appearance once there is a light palette. Dark only for now.
+class RoostPalette {
+  const RoostPalette._();
+
+  static const dark = RoostPalette._();
+
+  Color get surface => RoostColors.surface;
+  Color get surfaceHighest => RoostColors.surfaceHighest;
+  Color get border => RoostColors.border;
+  Color get text => RoostColors.text;
+  Color get muted => RoostColors.muted;
+  Color get working => RoostColors.working;
+}
+
+extension RoostPaletteX on BuildContext {
+  RoostPalette get palette => RoostPalette.dark;
+}
+
 const monoFamily = 'JetBrains Mono';
 
 ThemeData roostDarkTheme() {

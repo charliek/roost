@@ -19,6 +19,30 @@ const maxTerminalFontSize = 28.0;
 /// 150 ms the desktop's background resize wave waits.
 const regridDebounce = Duration(milliseconds: 150);
 
+/// The area a terminal's grid fits into on a canvas of [canvas]: inside the
+/// inset on every side.
+Size terminalGridArea(Size canvas) =>
+    Size(canvas.width - 2 * terminalInset, canvas.height - 2 * terminalInset);
+
+CellMetrics? _lastMeasured;
+
+/// The grid [TerminalView] offers for [fontSize] in [gridArea]. Remembers the
+/// last measurement: the Display sheet and the pinch readout ask on every
+/// rebuild, and a paragraph layout is not free.
+Geometry terminalGeometry(
+  double fontSize,
+  double devicePixelRatio,
+  Size gridArea,
+) {
+  var metrics = _lastMeasured;
+  if (metrics == null ||
+      metrics.fontSize != fontSize ||
+      metrics.devicePixelRatio != devicePixelRatio) {
+    metrics = _lastMeasured = CellMetrics.measure(fontSize, devicePixelRatio);
+  }
+  return metrics.geometryFor(gridArea);
+}
+
 /// Draws an attached tab and turns the space it is given into a grid.
 ///
 /// The first grid is reported as soon as it is known (the attach needs it);
@@ -32,6 +56,7 @@ class TerminalView extends StatefulWidget {
     this.fontSizeSetting,
     this.focused = false,
     this.onGeometry,
+    this.onGridArea,
     this.onFontSize,
     this.onPinchEnd,
     this.onScroll,
@@ -55,6 +80,11 @@ class TerminalView extends StatefulWidget {
   /// may take the tab's size.
   final void Function(Geometry geometry, {required bool deliberate})?
   onGeometry;
+
+  /// The [terminalGridArea] laid out, after the frame, each time it changes.
+  final ValueChanged<Size>? onGridArea;
+
+  /// A pinch changed the text size.
   final ValueChanged<double>? onFontSize;
 
   /// A pinch ended: the size it left is final.
@@ -90,6 +120,7 @@ class _TerminalViewState extends State<TerminalView>
   double _pinchFont = 0;
   double _scrollCarry = 0;
   Size _size = Size.zero;
+  Size? _gridArea;
 
   @override
   void initState() {
@@ -163,7 +194,12 @@ class _TerminalViewState extends State<TerminalView>
       });
       return;
     }
-    if (local == _reported) {
+    // A deliberate change is offered even when its grid is the one already
+    // reported (two sizes can round to the same cells): it is how the user
+    // takes the tab's size back.
+    bool deliberate() =>
+        fontSize != _reportedFontSize && setting == _reportedSetting;
+    if (local == _reported && !deliberate()) {
       _debounce?.cancel();
       _pending = null;
       _reportedFontSize = fontSize;
@@ -181,13 +217,21 @@ class _TerminalViewState extends State<TerminalView>
     _debounce?.cancel();
     _debounce = Timer(regridDebounce, () {
       _pending = null;
-      if (!mounted || local == _reported) return;
-      final deliberate =
-          fontSize != _reportedFontSize && setting == _reportedSetting;
+      if (!mounted) return;
+      final userChanged = deliberate();
+      if (local == _reported && !userChanged) return;
       _reported = local;
       _reportedFontSize = fontSize;
       _reportedSetting = setting;
-      widget.onGeometry?.call(local, deliberate: deliberate);
+      widget.onGeometry?.call(local, deliberate: userChanged);
+    });
+  }
+
+  void _reportGridArea(Size area) {
+    if (area == _gridArea) return;
+    _gridArea = area;
+    SchedulerBinding.instance.addPostFrameCallback((_) {
+      if (mounted && area == _gridArea) widget.onGridArea?.call(area);
     });
   }
 
@@ -230,11 +274,7 @@ class _TerminalViewState extends State<TerminalView>
   (int, int) _cellAt(CellMetrics m, Offset at) {
     final model = widget.tab?.model;
     if (model == null || model.cols == 0 || model.rows == 0) return (0, 0);
-    final inner = Size(
-      _size.width - 2 * terminalInset,
-      _size.height - 2 * terminalInset,
-    );
-    final scale = m.scaleToFit(model.cols, model.rows, inner);
+    final scale = m.scaleToFit(model.cols, model.rows, terminalGridArea(_size));
     final col = ((at.dx - terminalInset) / (m.cellWidth * scale)).floor();
     final row = ((at.dy - terminalInset) / (m.cellHeight * scale)).floor();
     return (col.clamp(0, model.cols - 1), row.clamp(0, model.rows - 1));
@@ -254,10 +294,10 @@ class _TerminalViewState extends State<TerminalView>
       builder: (context, constraints) {
         final size = constraints.biggest;
         _size = size;
-        final local = metrics.geometryFor(
-          Size(size.width - 2 * terminalInset, size.height - 2 * terminalInset),
-        );
+        final area = terminalGridArea(size);
+        final local = metrics.geometryFor(area);
         _offer(local, metrics.fontSize, widget.fontSizeSetting);
+        _reportGridArea(area);
         return Listener(
           onPointerSignal: _onPointerSignal,
           child: GestureDetector(
