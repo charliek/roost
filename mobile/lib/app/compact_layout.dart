@@ -7,6 +7,7 @@ import '../hosts/workspace_list.dart';
 import '../terminal/terminal_pane.dart';
 import 'providers.dart';
 import 'shared_widgets.dart';
+import 'text_scale.dart';
 import 'theme.dart';
 import 'workspace_actions.dart';
 
@@ -244,8 +245,20 @@ class ProjectsScreen extends ConsumerWidget {
         .where((h) => h.id == hostId)
         .firstOrNull;
     final text = Theme.of(context).textTheme;
+    final subtitleSize = text.bodySmall?.fontSize ?? 12;
     return Scaffold(
       appBar: AppBar(
+        toolbarHeight: host == null
+            ? null
+            : scaledBarHeight(
+                context,
+                scaledBarHeight(
+                  context,
+                  kToolbarHeight,
+                  text.titleLarge?.fontSize ?? 22,
+                ),
+                subtitleSize,
+              ),
         leading: BackButton(
           onPressed: () => ref.read(selectionProvider.notifier).clear(),
         ),

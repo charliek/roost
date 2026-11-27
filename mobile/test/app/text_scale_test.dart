@@ -1,3 +1,4 @@
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -45,14 +46,27 @@ void main() {
       await tester.pumpAndSettle();
       expect(byKey('extra-keys'), findsOneWidget);
       expect(tester.takeException(), isNull);
+      // A label that outgrows its bar is clipped without an exception.
+      expect(tester.getSize(byKey('extra-keys')).height, greaterThan(48));
 
       if (wide) {
         expect(byKey('tab-strip'), findsOneWidget);
         expect(tester.takeException(), isNull);
+        expect(tester.getSize(byKey('tab-strip')).height, greaterThan(44));
         await tester.longPress(byKey('strip-tab-11'));
       } else {
         await tester.pageBack();
         await tester.pumpAndSettle();
+        final bar = tester.getRect(find.byType(AppBar));
+        final titles = find.descendant(
+          of: find.byType(AppBar),
+          matching: find.byType(Text),
+        );
+        expect(titles, findsWidgets);
+        for (final title in titles.evaluate()) {
+          final rect = tester.getRect(find.byWidget(title.widget));
+          expect(rect.bottom, lessThanOrEqualTo(bar.bottom));
+        }
         await tester.longPress(byKey('tab-devbox-11'));
       }
       await tester.pumpAndSettle();

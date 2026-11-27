@@ -70,10 +70,11 @@ impl Theme {
     }
 
     /// Look up a bundled theme by name. Case-insensitive matching
-    /// against the file names under `resources/themes/`. Returns
+    /// against the file names under `resources/themes/` and
+    /// `resources/themes-light/`. Returns
     /// the fallback if nothing matches so the UI always renders.
     pub fn load_bundled(name: &str) -> Self {
-        for (theme_name, source) in BUNDLED_THEMES {
+        for (theme_name, source) in BUNDLED_THEMES.iter().chain(BUNDLED_LIGHT_THEMES) {
             if theme_name.eq_ignore_ascii_case(name) {
                 if let Some(parsed) = parse_theme(source) {
                     return parsed;
@@ -98,6 +99,17 @@ impl Theme {
         names.sort();
         names
     }
+
+    /// Bundled light theme names, sorted. Kept out of `bundled_names` so
+    /// the desktop picker stays dark-only; `load_bundled` resolves them.
+    pub fn bundled_light_names() -> Vec<String> {
+        let mut names: Vec<String> = BUNDLED_LIGHT_THEMES
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect();
+        names.sort();
+        names
+    }
 }
 
 impl Default for Theme {
@@ -112,6 +124,15 @@ impl Default for Theme {
 macro_rules! bundled_theme {
     ($name:literal) => {
         ($name, include_str!(concat!("resources/themes/", $name)))
+    };
+}
+
+macro_rules! bundled_light_theme {
+    ($name:literal) => {
+        (
+            $name,
+            include_str!(concat!("resources/themes-light/", $name)),
+        )
     };
 }
 
@@ -146,6 +167,15 @@ const BUNDLED_THEMES: &[(&str, &str)] = &[
     bundled_theme!("Synthwave"),
     bundled_theme!("Material Ocean"),
     bundled_theme!("Oxocarbon"),
+];
+
+/// Light themes, offered by mobile only (`README.roost.md` in the
+/// directory has the removal condition).
+const BUNDLED_LIGHT_THEMES: &[(&str, &str)] = &[
+    bundled_light_theme!("Catppuccin Latte"),
+    bundled_light_theme!("GitHub Light Default"),
+    bundled_light_theme!("Gruvbox Light"),
+    bundled_light_theme!("Rose Pine Dawn"),
 ];
 
 /// The standard xterm 256-color palette: 16 ANSI colors (0–15), the
@@ -369,6 +399,93 @@ mod tests {
             missing.is_empty(),
             "theme files present in resources/themes/ but not in BUNDLED_THEMES: {missing:?}"
         );
+    }
+
+    #[test]
+    fn every_light_theme_file_is_registered() {
+        use std::collections::HashSet;
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/resources/themes-light");
+        let registered: HashSet<String> = Theme::bundled_light_names().into_iter().collect();
+        let mut missing: Vec<String> = std::fs::read_dir(dir)
+            .expect("themes-light dir readable")
+            .map(|e| e.expect("dir entry"))
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "README.roost.md" && !registered.contains(name))
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "files in resources/themes-light/ but not in BUNDLED_LIGHT_THEMES: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn every_bundled_source_parses_and_sets_the_full_palette() {
+        for (name, source) in BUNDLED_THEMES.iter().chain(BUNDLED_LIGHT_THEMES) {
+            assert!(parse_theme(source).is_some(), "{name} does not parse");
+            let mut palette = [false; 16];
+            let mut cursor = false;
+            for line in source.lines() {
+                let Some((key, value)) = line.trim().split_once('=') else {
+                    continue;
+                };
+                match key.trim() {
+                    "palette" => {
+                        if let Some((idx, color)) = value.split_once('=') {
+                            if let (Ok(i), Some(_)) =
+                                (idx.trim().parse::<usize>(), parse_hex(color.trim()))
+                            {
+                                if i < 16 {
+                                    palette[i] = true;
+                                }
+                            }
+                        }
+                    }
+                    "cursor-color" => cursor |= parse_hex(value.trim()).is_some(),
+                    _ => {}
+                }
+            }
+            let missing: Vec<usize> = (0..16).filter(|&i| !palette[i]).collect();
+            assert!(
+                missing.is_empty(),
+                "{name} sets no valid palette {missing:?}"
+            );
+            assert!(cursor, "{name} sets no valid cursor-color");
+        }
+    }
+
+    #[test]
+    fn light_and_dark_sets_split_on_background() {
+        for (name, source) in BUNDLED_LIGHT_THEMES {
+            let theme = parse_theme(source).expect("parses");
+            assert!(theme.background.is_light(), "{name} is not light");
+        }
+        for (name, source) in BUNDLED_THEMES {
+            let theme = parse_theme(source).expect("parses");
+            assert!(!theme.background.is_light(), "{name} is light");
+        }
+    }
+
+    #[test]
+    fn light_themes_stay_out_of_the_desktop_picker() {
+        assert_eq!(Theme::bundled_names().len(), 26);
+        let light = Theme::bundled_light_names();
+        assert_eq!(
+            light,
+            [
+                "Catppuccin Latte",
+                "GitHub Light Default",
+                "Gruvbox Light",
+                "Rose Pine Dawn"
+            ]
+        );
+        for name in &light {
+            assert!(!Theme::bundled_names().contains(name));
+            assert!(Theme::load_bundled(&name.to_lowercase())
+                .background
+                .is_light());
+        }
     }
 
     #[test]
