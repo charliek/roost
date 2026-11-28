@@ -66,9 +66,12 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
   AttachedTab? _tab;
   Geometry? _geometry;
 
-  /// The user changed the grid while no tab was attached: the resize that
-  /// follows the attach carries it, or it would not take the size.
-  bool _deliberatePending = false;
+  /// The text (cell size, width class) of a grid the user set while no tab
+  /// was attached. The resize that follows the attach sends only the newest
+  /// grid, and it carries the user's intent only while that grid is still
+  /// at the text they set: a later keyboard or bar change keeps it, a width
+  /// class switch drops it.
+  (int, int, WidthClass)? _deliberateFor;
   int _attachSeq = 0;
   bool _attaching = false;
   String? _attachError;
@@ -171,7 +174,16 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
       _fire(tab.session.resize(geometry, focused: deliberate));
       return;
     }
-    _deliberatePending |= deliberate;
+    final text = (
+      geometry.cellWidthPx,
+      geometry.cellHeightPx,
+      WidthClassScope.of(context),
+    );
+    if (deliberate) {
+      _deliberateFor = text;
+    } else if (_deliberateFor != text) {
+      _deliberateFor = null;
+    }
     if (!_attaching && _attachError == null) unawaited(_attach());
   }
 
@@ -180,7 +192,7 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
     if (geometry == null) return;
     final seq = ++_attachSeq;
     // The attach takes the size of the grid it starts with.
-    _deliberatePending = false;
+    _deliberateFor = null;
     _detach();
     setState(() {
       _attaching = true;
@@ -206,9 +218,9 @@ class _TerminalPaneState extends ConsumerState<TerminalPane> {
       });
       _publishPaneSize();
       final latest = _geometry;
-      final deliberate = _deliberatePending;
-      _deliberatePending = false;
-      if (latest != null && latest != geometry) {
+      final deliberate = _deliberateFor != null;
+      _deliberateFor = null;
+      if (latest != null && (latest != geometry || deliberate)) {
         _fire(session.resize(latest, focused: deliberate));
       }
       _clearNotification();
