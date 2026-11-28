@@ -22,6 +22,7 @@ Condition waits only.
 from __future__ import annotations
 
 import errno
+import glob
 import os
 import re
 import shutil
@@ -483,6 +484,64 @@ def tmux_client_in_front(shell: int) -> bool:
     return job is not None and ps_field(job, "comm").startswith("tmux")
 
 
+def tmux_attached(server: list[str], session: str) -> bool:
+    """The tmux server is up and a client is attached to `session`. The
+    client process comes to the front before the server it forks has made
+    its socket, so being in front is not enough to detach it."""
+    listed = subprocess.run(
+        [*server, "list-clients", "-t", session], capture_output=True, text=True, timeout=15
+    )
+    return listed.returncode == 0 and listed.stdout.strip() != ""
+
+
+def tmux_state(lane, tab: int, home: str) -> str:
+    """For a failure: what is left in the server's dir (its socket and the
+    `-v` logs), the tmux and sleep processes, and what the tab shows. Each
+    part is read on its own, so one that fails does not hide the others."""
+    parts = []
+
+    def part(name, read):
+        try:
+            parts.append(f"--- {name}:\n{read()}")
+        except Exception as e:  # noqa: BLE001 - a diagnostic must not mask the failure
+            parts.append(f"--- {name}: unreadable ({e!r})")
+
+    part("dir", lambda: sorted(os.listdir(home)))
+    for log in sorted(glob.glob(os.path.join(home, "tmux-server-*.log"))):
+        part(os.path.basename(log), lambda log=log: tmux_log_tail(log))
+    part(
+        "ps",
+        lambda: "".join(
+            line
+            for i, line in enumerate(
+                subprocess.run(
+                    ["ps", "-eo", "pid,ppid,pgid,sid,stat,args"], capture_output=True, text=True
+                ).stdout.splitlines(keepends=True)
+            )
+            if i == 0 or "tmux" in line or "sleep 600" in line
+        ),
+    )
+    part("screen", lambda: lane.client.dump_text(tab))
+    return "\n".join(parts)
+
+
+def tmux_log_tail(path: str, lines: int = 60) -> str:
+    """The end of a tmux `-v` log, less the format expansion and message
+    traffic that bury what the server did, and never the environment the
+    client sent (`IDENTIFY_ENVIRON`): this goes into a public CI log."""
+    noise = ("notify_add:", "format_", "cmd_find_", "tty_", "input_", "peer ", "IDENTIFY_")
+    with open(path, errors="replace") as log:
+        kept = [line for line in log if not any(n in line for n in noise)]
+    return "".join(kept[-lines:])
+
+
+def wait_tmux_attached(lane, tab: int, home: str, server: list[str], what: str) -> None:
+    try:
+        lane.client._wait(lambda: tmux_attached(server, "agent"), 15.0, what)
+    except Exception as e:
+        raise AssertionError(f"{e}\n{tmux_state(lane, tab, home)}") from e
+
+
 def test_an_agent_behind_tmux_keeps_its_owner_across_a_detach(lane):
     """An agent inside a real tmux claims while the tmux client has the
     terminal, so nothing is stamped. A detach ends the client and the
@@ -492,8 +551,8 @@ def test_an_agent_behind_tmux_keeps_its_owner_across_a_detach(lane):
 
     A bash tab opened after it, with a stamped job, is the fence that the
     claim was read before the detach: the sampler applies what it read in
-    tab id order. Linux only, and tmux is optional: CI installs none, and
-    the PTY test with a process named `tmux` covers the rule there."""
+    tab id order. Linux only, and tmux is optional: where it is missing,
+    the PTY test with a process named `tmux` covers the rule."""
     if not sys.platform.startswith("linux"):
         pytest.skip("the real-tmux case runs on Linux")
     tmux = shutil.which("tmux")
@@ -507,17 +566,24 @@ def test_an_agent_behind_tmux_keeps_its_owner_across_a_detach(lane):
     session = uuid.uuid4().hex
     fenced = None
     try:
+        # `-v` from `home` leaves the server's own log there, for a failure.
         lane.client.send(
-            tab, f"'{tmux}' -S '{home}/s' -f /dev/null new-session -s agent 'sleep 600'\n"
+            tab,
+            f"cd '{home}' && '{tmux}' -v -S '{home}/s' -f /dev/null"
+            " new-session -s agent 'sleep 600'\n",
         )
         lane.client._wait(lambda: tmux_client_in_front(shell), 15.0, "the tmux client in front")
+        wait_tmux_attached(lane, tab, home, server, "the tmux client attached")
         lane.client.agent_report(tab, "claude", "claim", session_id=session, lifecycle="working")
         fenced = int(lane.stamped_job(fence, fence_shell)["pid"])
         listed = lane.client.tab(tab)
         assert "process" not in listed, listed
         assert listed["ownership"]["session_id"] == session, listed
 
-        subprocess.run([*server, "detach-client", "-s", "agent"], check=True, timeout=15)
+        detached = subprocess.run(
+            [*server, "detach-client", "-s", "agent"], capture_output=True, text=True, timeout=15
+        )
+        assert detached.returncode == 0, f"{detached.stderr}\n{tmux_state(lane, tab, home)}"
         listed = lane.wait(
             tab, "the shell's D after the detach", lambda t: t["shell_state"] == "at_prompt"
         )
@@ -525,6 +591,7 @@ def test_an_agent_behind_tmux_keeps_its_owner_across_a_detach(lane):
         assert listed["agent_lifecycle"] == "inactive", listed
 
         lane.client.send(tab, f"'{tmux}' -S '{home}/s' attach -t agent\n")
+        wait_tmux_attached(lane, tab, home, server, "the tmux client back")
         lane.client._wait(lambda: tmux_client_in_front(shell), 15.0, "the tmux client back")
         reply = lane.client.agent_report(
             tab, "claude", "preserve", session_id=session, lifecycle="working"
