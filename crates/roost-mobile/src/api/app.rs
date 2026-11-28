@@ -3,15 +3,23 @@
 use flutter_rust_bridge::frb;
 
 use super::terminal::BridgeTerminal;
-use super::types::{BridgeGeometry, BridgeHostView, BridgeLeakCounts, BridgeWorkspaceView};
+use super::types::{
+    BridgeGeometry, BridgeHostView, BridgeLeakCounts, BridgeSettings, BridgeSettingsState,
+    BridgeThemeSummary, BridgeWorkspaceView,
+};
 use crate::app::RoostApp;
 use crate::frb_generated::StreamSink;
 
-/// Load the saved hosts from `data_dir` and start the app's runtime and
-/// terminal thread. One per process.
-pub fn roost_init(data_dir: String, device_label: String) -> anyhow::Result<BridgeApp> {
+/// Load the saved hosts and settings from `data_dir` and start the app's
+/// runtime and terminal thread. `system_dark`: the platform's brightness
+/// now. One per process.
+pub fn roost_init(
+    data_dir: String,
+    device_label: String,
+    system_dark: bool,
+) -> anyhow::Result<BridgeApp> {
     Ok(BridgeApp {
-        app: Some(RoostApp::new(data_dir, device_label)?),
+        app: Some(RoostApp::new(data_dir, device_label, system_dark)?),
     })
 }
 
@@ -111,6 +119,34 @@ impl BridgeApp {
 
     pub fn app_resumed(&self) {
         self.app().app_resumed();
+    }
+
+    /// The settings in memory; never waits on the disk.
+    #[frb(sync)]
+    pub fn settings(&self) -> BridgeSettingsState {
+        self.app().settings().into()
+    }
+
+    /// Success means the settings are saved and any terminal theme change
+    /// is queued for the tabs. A tab that then fails to apply the theme is
+    /// a warning in the log on the terminal thread, not an error here.
+    /// Writes and waits on the disk: the pool.
+    pub fn update_settings(&self, settings: BridgeSettings) -> anyhow::Result<BridgeSettingsState> {
+        Ok(self.app().update_settings(settings.into())?.into())
+    }
+
+    /// Waits behind any settings write in progress: the pool.
+    pub fn set_system_dark(&self, dark: bool) -> BridgeSettingsState {
+        self.app().set_system_dark(dark).into()
+    }
+
+    #[frb(sync)]
+    pub fn terminal_themes(&self) -> Vec<BridgeThemeSummary> {
+        self.app()
+            .terminal_themes()
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     #[frb(sync)]

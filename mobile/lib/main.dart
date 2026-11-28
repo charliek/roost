@@ -12,8 +12,10 @@ import 'core/frb_core.dart';
 import 'core/roost_core.dart';
 import 'src/rust/frb_generated.dart';
 
-/// `--dart-define=ROOST_FAKE=1` runs the scripted core: no Rust, no host.
-const _useFakeCore = bool.fromEnvironment('ROOST_FAKE');
+/// `--dart-define=ROOST_FAKE=true` (or `=1`) runs the scripted core: no Rust,
+/// no host. `bool.fromEnvironment` reads only `true`, hence the string.
+const _fakeFlag = String.fromEnvironment('ROOST_FAKE');
+const _useFakeCore = _fakeFlag == '1' || _fakeFlag == 'true';
 
 /// `--dart-define=ROOST_DEVICE_LABEL=…` names this device to the hosts.
 const _deviceLabelOverride = String.fromEnvironment('ROOST_DEVICE_LABEL');
@@ -30,7 +32,10 @@ Future<void> main() async {
 }
 
 Future<RoostCore> _createCore() async {
-  if (_useFakeCore) return FakeCore.demo();
+  final systemDark =
+      WidgetsBinding.instance.platformDispatcher.platformBrightness ==
+      Brightness.dark;
+  if (_useFakeCore) return FakeCore.demo(systemDark: systemDark);
   // On macOS cargokit links the Rust core into the roost_mobile_rust pod
   // framework, not the roost_mobile.framework FRB's default loader looks for;
   // that framework is loaded at launch, so its symbols are in the process.
@@ -40,7 +45,11 @@ Future<RoostCore> _createCore() async {
         : null,
   );
   final dir = await getApplicationSupportDirectory();
-  return FrbCore.start(dataDir: dir.path, deviceLabel: deviceLabel());
+  return FrbCore.start(
+    dataDir: dir.path,
+    deviceLabel: deviceLabel(),
+    systemDark: systemDark,
+  );
 }
 
 /// How other clients see this device in "sized by …". Android and iOS

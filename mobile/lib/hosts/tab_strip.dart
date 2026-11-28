@@ -2,10 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../app/providers.dart';
+import '../app/text_scale.dart';
 import '../app/theme.dart';
 import '../app/workspace_actions.dart';
 import '../core/roost_core.dart';
 import 'host_widgets.dart';
+
+/// The strip's height at the default text scale.
+const tabStripHeight = 44.0;
 
 /// The selected tab's project, as a row of tabs plus "new tab".
 class TabStrip extends ConsumerWidget {
@@ -18,13 +22,14 @@ class TabStrip extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final workspace = ref.watch(workspaceProvider(hostId)).value;
     final project = workspace?.projectOfTab(tabId);
-    if (project == null) return const SizedBox(height: 44);
+    final height = scaledBarHeight(context, tabStripHeight, 13);
+    if (project == null) return SizedBox(height: height);
     return Container(
       key: const ValueKey('tab-strip'),
-      height: 44,
-      decoration: const BoxDecoration(
-        color: RoostColors.surfaceLow,
-        border: Border(bottom: BorderSide(color: RoostColors.divider)),
+      height: height,
+      decoration: BoxDecoration(
+        color: context.palette.surfaceLow,
+        border: Border(bottom: BorderSide(color: context.palette.divider)),
       ),
       child: ListView(
         scrollDirection: Axis.horizontal,
@@ -61,11 +66,11 @@ class _TabChip extends ConsumerWidget {
     return Padding(
       padding: const EdgeInsets.only(right: 4),
       child: Material(
-        color: selected ? RoostColors.background : Colors.transparent,
+        color: selected ? context.palette.background : Colors.transparent,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(8),
           side: BorderSide(
-            color: selected ? RoostColors.border : Colors.transparent,
+            color: selected ? context.palette.border : Colors.transparent,
           ),
         ),
         child: InkWell(
@@ -89,7 +94,9 @@ class _TabChip extends ConsumerWidget {
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       fontSize: 13,
-                      color: selected ? RoostColors.text : RoostColors.muted,
+                      color: selected
+                          ? context.palette.text
+                          : context.palette.muted,
                     ),
                   ),
                 ),

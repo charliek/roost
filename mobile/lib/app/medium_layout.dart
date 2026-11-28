@@ -4,10 +4,14 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../core/roost_core.dart';
 import '../hosts/host_widgets.dart';
 import '../hosts/workspace_list.dart';
+import 'display_sheet.dart';
 import 'providers.dart';
 import 'shared_widgets.dart';
 import 'theme.dart';
 import 'workspace_actions.dart';
+
+/// The rail's width, and the divider beside it ([layoutDividerWidth]).
+const hostRailWidth = 84.0;
 
 /// 600–840 dp: a rail of hosts; the host's projects and tabs fill the rest
 /// until a tab is picked, then a drawer holds them beside the terminal.
@@ -45,7 +49,7 @@ class MediumLayout extends ConsumerWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             HostRail(hosts: hosts, selectedId: host?.id),
-            const VerticalDivider(width: 1),
+            const VerticalDivider(width: layoutDividerWidth),
             Expanded(
               child: switch (host) {
                 null => EmptyState(
@@ -111,7 +115,7 @@ class _HostHeader extends StatelessWidget {
                 Text(host.label, style: text.titleMedium),
                 Text(
                   '${hostStateLabel(host.state)} · ${host.target}',
-                  style: text.bodySmall?.copyWith(color: RoostColors.muted),
+                  style: text.bodySmall?.copyWith(color: context.palette.muted),
                 ),
               ],
             ),
@@ -135,9 +139,9 @@ class HostRail extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     return Material(
       key: const ValueKey('host-rail'),
-      color: RoostColors.surfaceLow,
+      color: context.palette.surfaceLow,
       child: SizedBox(
-        width: 84,
+        width: hostRailWidth,
         child: ListView(
           padding: const EdgeInsets.symmetric(vertical: 8),
           children: [
@@ -149,6 +153,7 @@ class HostRail extends ConsumerWidget {
                     ref.read(selectionProvider.notifier).selectHost(host.id),
               ),
             const SizedBox(height: 8),
+            const Center(child: DisplayButton()),
             Center(
               child: IconButton.filledTonal(
                 key: const ValueKey('add-host'),
@@ -209,10 +214,10 @@ class _RailHost extends StatelessWidget {
                   child: HostStatusDot(state: host.state),
                 ),
                 if (host.waitingTabs > 0)
-                  const Positioned(
+                  Positioned(
                     left: 2,
                     top: 0,
-                    child: StatusDot(color: RoostColors.waiting, size: 8),
+                    child: StatusDot(color: context.palette.waiting, size: 8),
                   ),
               ],
             ),
@@ -223,7 +228,7 @@ class _RailHost extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 fontSize: 12,
-                color: selected ? RoostColors.text : RoostColors.muted,
+                color: selected ? context.palette.text : context.palette.muted,
               ),
             ),
           ],

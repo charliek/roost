@@ -69,6 +69,23 @@ abstract class RoostCore {
   /// Back in the foreground: reconnect hosts now. The UI re-attaches the
   /// visible tab itself.
   Future<void> appResumed();
+
+  /// The settings in effect now, without waiting.
+  SettingsState settings();
+
+  /// Saves [settings] (sanitized) and moves every tab to the terminal theme
+  /// they make. Resolves to what was kept; throws [CoreError] when the save
+  /// failed, leaving the settings as they were. Calls apply in call order.
+  Future<SettingsState> updateSettings(MobileSettings settings);
+
+  /// The platform went dark or light. Nothing is saved; under
+  /// [Appearance.system] the terminal theme follows. Ordered with
+  /// [updateSettings].
+  Future<SettingsState> setSystemDark(bool dark);
+
+  /// Every bundled terminal theme: `roost-dark` first, then the other dark
+  /// ones, then the light ones.
+  List<ThemeSummary> terminalThemes();
 }
 
 /// One attached tab (`TerminalHandle` on the Rust side).

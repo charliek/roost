@@ -327,3 +327,146 @@ final class ClipboardWrite extends TerminalEvent {
 
   final String text;
 }
+
+/// Light or dark chrome and terminal, or whichever the platform says.
+enum Appearance { system, dark, light }
+
+/// Raise faint and low-contrast terminal text to a minimum contrast; [auto]
+/// does so only on a light terminal theme.
+enum ReadableText { auto, on, off }
+
+/// The phone's display settings, kept by the core in `settings.json`. The
+/// core sanitizes every value it is given and hands back what it kept.
+@immutable
+class MobileSettings {
+  const MobileSettings({
+    this.terminalFontSizeCompact = defaultTerminalFontSize,
+    this.terminalFontSizeWide = defaultTerminalFontSize,
+    this.uiTextScale = 1.0,
+    this.appearance = Appearance.dark,
+    this.darkTheme = defaultDarkTheme,
+    this.lightTheme = defaultLightTheme,
+    this.readableText = ReadableText.auto,
+    this.brightFaint = false,
+  });
+
+  static const defaultTerminalFontSize = 13.0;
+  static const defaultDarkTheme = 'roost-dark';
+  static const defaultLightTheme = 'Catppuccin Latte';
+
+  /// The terminal's text size on a phone-width layout.
+  final double terminalFontSizeCompact;
+
+  /// The terminal's text size on the medium and expanded layouts.
+  final double terminalFontSizeWide;
+  final double uiTextScale;
+  final Appearance appearance;
+  final String darkTheme;
+  final String lightTheme;
+  final ReadableText readableText;
+  final bool brightFaint;
+
+  MobileSettings copyWith({
+    double? terminalFontSizeCompact,
+    double? terminalFontSizeWide,
+    double? uiTextScale,
+    Appearance? appearance,
+    String? darkTheme,
+    String? lightTheme,
+    ReadableText? readableText,
+    bool? brightFaint,
+  }) => MobileSettings(
+    terminalFontSizeCompact:
+        terminalFontSizeCompact ?? this.terminalFontSizeCompact,
+    terminalFontSizeWide: terminalFontSizeWide ?? this.terminalFontSizeWide,
+    uiTextScale: uiTextScale ?? this.uiTextScale,
+    appearance: appearance ?? this.appearance,
+    darkTheme: darkTheme ?? this.darkTheme,
+    lightTheme: lightTheme ?? this.lightTheme,
+    readableText: readableText ?? this.readableText,
+    brightFaint: brightFaint ?? this.brightFaint,
+  );
+
+  @override
+  bool operator ==(Object other) =>
+      other is MobileSettings &&
+      other.terminalFontSizeCompact == terminalFontSizeCompact &&
+      other.terminalFontSizeWide == terminalFontSizeWide &&
+      other.uiTextScale == uiTextScale &&
+      other.appearance == appearance &&
+      other.darkTheme == darkTheme &&
+      other.lightTheme == lightTheme &&
+      other.readableText == readableText &&
+      other.brightFaint == brightFaint;
+
+  @override
+  int get hashCode => Object.hash(
+    terminalFontSizeCompact,
+    terminalFontSizeWide,
+    uiTextScale,
+    appearance,
+    darkTheme,
+    lightTheme,
+    readableText,
+    brightFaint,
+  );
+
+  @override
+  String toString() =>
+      'MobileSettings(terminal $terminalFontSizeCompact/$terminalFontSizeWide '
+      'pt, ui ×$uiTextScale, ${appearance.name}, dark "$darkTheme", '
+      'light "$lightTheme", readable ${readableText.name}, '
+      'brightFaint $brightFaint)';
+}
+
+/// The settings the core kept, and the brightness and terminal theme they
+/// make now (the platform's brightness included). Worked out by the core
+/// only.
+@immutable
+class SettingsState {
+  const SettingsState({
+    required this.settings,
+    required this.effectiveDark,
+    required this.effectiveTheme,
+  });
+
+  final MobileSettings settings;
+  final bool effectiveDark;
+  final String effectiveTheme;
+
+  @override
+  bool operator ==(Object other) =>
+      other is SettingsState &&
+      other.settings == settings &&
+      other.effectiveDark == effectiveDark &&
+      other.effectiveTheme == effectiveTheme;
+
+  @override
+  int get hashCode => Object.hash(settings, effectiveDark, effectiveTheme);
+
+  @override
+  String toString() =>
+      'SettingsState($settings, dark $effectiveDark, "$effectiveTheme")';
+}
+
+/// A bundled terminal theme, for a swatch. Colors are `0x00RRGGBB`.
+@immutable
+class ThemeSummary {
+  const ThemeSummary({
+    required this.name,
+    required this.light,
+    required this.background,
+    required this.foreground,
+    required this.cursor,
+    required this.ansi,
+  });
+
+  final String name;
+  final bool light;
+  final int background;
+  final int foreground;
+  final int cursor;
+
+  /// The 16 ANSI colors.
+  final List<int> ansi;
+}

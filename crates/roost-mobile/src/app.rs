@@ -29,10 +29,11 @@ use roost_ssh::{HostKeyPolicy, TailscaleSshDialer};
 use roost_ui_model::theme::Theme;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::frame::rgb;
 use crate::handle::{self, Attachment, TerminalHandle};
 use crate::live::Live;
 use crate::owner::{OwnerConfig, TerminalEvent, TerminalId, TerminalOwner};
-use crate::registry::{self, HostRecord, Target};
+use crate::registry::{self, Appearance, HostRecord, MobileSettings, Target};
 use crate::terminal::Geometry;
 use crate::views::{self, HostStateView, HostView, NotificationView, WorkspaceView};
 
@@ -104,6 +105,70 @@ impl Counters {
     }
 }
 
+/// The saved settings plus what the platform says, and the brightness and
+/// terminal theme they make: worked out here once, so the app never
+/// recomputes them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsState {
+    pub settings: MobileSettings,
+    pub system_dark: bool,
+}
+
+impl SettingsState {
+    pub fn effective_dark(&self) -> bool {
+        match self.settings.appearance {
+            Appearance::Dark => true,
+            Appearance::Light => false,
+            Appearance::System => self.system_dark,
+        }
+    }
+
+    pub fn effective_theme_name(&self) -> &str {
+        if self.effective_dark() {
+            &self.settings.dark_theme
+        } else {
+            &self.settings.light_theme
+        }
+    }
+}
+
+/// A bundled terminal theme, for a swatch. Colors are `0x00RRGGBB`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeSummary {
+    pub name: String,
+    pub light: bool,
+    pub background: u32,
+    pub foreground: u32,
+    pub cursor: u32,
+    /// The 16 ANSI colors.
+    pub ansi: Vec<u32>,
+}
+
+/// `roost-dark` first, the other dark themes after it, then the light ones.
+fn theme_summaries() -> Vec<ThemeSummary> {
+    let summary = |name: String, light: bool| {
+        let theme = Theme::load_bundled(&name);
+        ThemeSummary {
+            light,
+            background: rgb(theme.background),
+            foreground: rgb(theme.foreground),
+            cursor: rgb(theme.cursor),
+            ansi: theme.palette[..16].iter().copied().map(rgb).collect(),
+            name,
+        }
+    };
+    let mut dark = Theme::bundled_names();
+    dark.sort_by_key(|name| name != registry::DEFAULT_DARK_THEME);
+    dark.into_iter()
+        .map(|name| summary(name, false))
+        .chain(
+            Theme::bundled_light_names()
+                .into_iter()
+                .map(|name| summary(name, true)),
+        )
+        .collect()
+}
+
 /// One saved host and, while it is wanted, its connection.
 struct HostSlot {
     record: HostRecord,
@@ -167,6 +232,15 @@ pub(crate) struct Inner {
     /// Between `app_paused` and `app_resumed`: attaches are refused. Set
     /// and read under the `attachments` lock.
     paused: AtomicBool,
+    /// Held for a whole settings change, through its write and its theme
+    /// send, so changes reach the file and the owner in the order made.
+    settings_io: Mutex<()>,
+    /// Never held across a write or a send.
+    settings: Mutex<SettingsState>,
+    themes: Vec<ThemeSummary>,
+    /// Runs just before a settings write, to hold one partway.
+    #[cfg(test)]
+    before_settings_save: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -223,6 +297,27 @@ impl Inner {
             source,
         })?;
         Ok(changed)
+    }
+
+    /// Change the settings as one step: saved before the change is
+    /// visible, then the owner told of a new terminal theme.
+    fn change_settings<E>(
+        &self,
+        change: impl FnOnce(&mut SettingsState),
+        save: impl FnOnce(&MobileSettings) -> Result<(), E>,
+    ) -> Result<SettingsState, E> {
+        let _io = lock(&self.settings_io);
+        let current = lock(&self.settings).clone();
+        let mut next = current.clone();
+        change(&mut next);
+        next.settings = next.settings.sanitize();
+        save(&next.settings)?;
+        *lock(&self.settings) = next.clone();
+        if next.effective_theme_name() != current.effective_theme_name() {
+            self.owner
+                .set_theme(Theme::load_bundled(next.effective_theme_name()));
+        }
+        Ok(next)
     }
 
     fn attachments_of(&self, host_id: Option<&str>) -> Vec<Arc<Attachment>> {
@@ -450,14 +545,24 @@ pub struct RoostApp {
 }
 
 impl RoostApp {
-    /// Load the saved hosts and this install's `client_id` from
-    /// `data_dir`, creating it. No host is dialed until [`Self::connect`].
-    pub fn new(data_dir: impl Into<PathBuf>, device_label: String) -> Result<Self, AppError> {
+    /// Load the saved hosts, settings and this install's `client_id` from
+    /// `data_dir`, creating it. `system_dark`: the platform is in dark mode
+    /// now, so the first tab opens in the right theme. No host is dialed
+    /// until [`Self::connect`].
+    pub fn new(
+        data_dir: impl Into<PathBuf>,
+        device_label: String,
+        system_dark: bool,
+    ) -> Result<Self, AppError> {
         let data_dir = data_dir.into();
         let io = |what| move |source| AppError::Io { what, source };
         std::fs::create_dir_all(&data_dir).map_err(io("creating the data directory"))?;
         let client_id = registry::client_id(&data_dir).map_err(io("reading client_id"))?;
         let records = registry::load_hosts(&data_dir).map_err(io("reading hosts.json"))?;
+        let settings = SettingsState {
+            settings: registry::load_settings(&data_dir).map_err(io("reading settings.json"))?,
+            system_dark,
+        };
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("roost-mobile-rt")
@@ -466,7 +571,7 @@ impl RoostApp {
             .map_err(io("starting the runtime"))?;
         let owner = TerminalOwner::spawn(OwnerConfig {
             client_id: client_id.clone(),
-            theme: Theme::default(),
+            theme: Theme::load_bundled(settings.effective_theme_name()),
         })
         .map_err(io("starting the terminal thread"))?;
         let counters = Arc::new(Counters {
@@ -507,6 +612,11 @@ impl RoostApp {
             counters,
             closed: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            settings_io: Mutex::new(()),
+            settings: Mutex::new(settings),
+            themes: theme_summaries(),
+            #[cfg(test)]
+            before_settings_save: Mutex::new(None),
         });
         Ok(Self {
             inner,
@@ -771,6 +881,46 @@ impl RoostApp {
         }
     }
 
+    pub fn settings(&self) -> SettingsState {
+        lock(&self.inner.settings).clone()
+    }
+
+    /// Save `settings` (sanitized) and, if the terminal theme in effect
+    /// changed, send it to every tab. An error leaves the settings as
+    /// they were.
+    pub fn update_settings(&self, settings: MobileSettings) -> Result<SettingsState, AppError> {
+        let inner = &self.inner;
+        inner.change_settings(
+            |state| state.settings = settings,
+            |settings| {
+                #[cfg(test)]
+                if let Some(hook) = &*lock(&inner.before_settings_save) {
+                    hook();
+                }
+                registry::save_settings(&inner.data_dir, settings).map_err(|source| AppError::Io {
+                    what: "saving settings.json",
+                    source,
+                })
+            },
+        )
+    }
+
+    /// The platform went dark or light: nothing is saved, but under
+    /// `Appearance::System` the terminal theme follows.
+    pub fn set_system_dark(&self, dark: bool) -> SettingsState {
+        let Ok(state) = self.inner.change_settings(
+            |state| state.system_dark = dark,
+            |_| Ok::<(), std::convert::Infallible>(()),
+        );
+        state
+    }
+
+    /// Every bundled terminal theme, `roost-dark` first, then the other
+    /// dark ones, then the light ones.
+    pub fn terminal_themes(&self) -> Vec<ThemeSummary> {
+        self.inner.themes.clone()
+    }
+
     pub fn leak_counts(&self) -> LeakCounts {
         self.inner.counters.counts()
     }
@@ -820,7 +970,282 @@ impl Drop for RoostApp {
 
 #[cfg(test)]
 mod tests {
+    use roost_vt::ColorRgb;
+
     use super::*;
+    use crate::registry::ReadableText;
+
+    fn background(name: &str) -> ColorRgb {
+        Theme::load_bundled(name).background
+    }
+
+    fn settings_with(change: impl FnOnce(&mut MobileSettings)) -> MobileSettings {
+        let mut settings = MobileSettings::default();
+        change(&mut settings);
+        settings
+    }
+
+    #[test]
+    fn the_effective_brightness_and_theme_follow_appearance_and_platform() {
+        let cases = [
+            (Appearance::Dark, false, true),
+            (Appearance::Dark, true, true),
+            (Appearance::Light, false, false),
+            (Appearance::Light, true, false),
+            (Appearance::System, false, false),
+            (Appearance::System, true, true),
+        ];
+        for (appearance, system_dark, dark) in cases {
+            let state = SettingsState {
+                settings: settings_with(|s| {
+                    s.appearance = appearance;
+                    s.dark_theme = "Catppuccin Mocha".into();
+                    s.light_theme = "GitHub Light Default".into();
+                }),
+                system_dark,
+            };
+            assert_eq!(state.effective_dark(), dark, "{appearance:?} {system_dark}");
+            assert_eq!(
+                state.effective_theme_name(),
+                if dark {
+                    "Catppuccin Mocha"
+                } else {
+                    "GitHub Light Default"
+                },
+                "{appearance:?} {system_dark}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_themes_list_roost_dark_first_then_dark_then_light() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = RoostApp::new(dir.path(), "phone".into(), true).expect("app");
+        let themes = app.terminal_themes();
+        let names: Vec<&str> = themes.iter().map(|t| t.name.as_str()).collect();
+        let mut dark = Theme::bundled_names();
+        dark.retain(|name| name != "roost-dark");
+        let want: Vec<String> = std::iter::once("roost-dark".to_string())
+            .chain(dark)
+            .chain(Theme::bundled_light_names())
+            .collect();
+        assert_eq!(names, want);
+        assert!(
+            themes.iter().all(|t| t.ansi.len() == 16),
+            "16 ANSI colors each"
+        );
+        assert!(themes
+            .iter()
+            .all(|t| t.light == Theme::bundled_light_names().contains(&t.name)));
+        let latte = themes
+            .iter()
+            .find(|t| t.name == "Catppuccin Latte")
+            .expect("Latte");
+        assert_eq!(
+            (
+                latte.background,
+                latte.foreground,
+                latte.cursor,
+                latte.ansi[1]
+            ),
+            (0x00ef_f1f5, 0x004c_4f69, 0x00dc_8a78, 0x00d2_0f39)
+        );
+    }
+
+    #[test]
+    fn only_a_change_of_the_theme_in_effect_sends_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = RoostApp::new(dir.path(), "phone".into(), true).expect("app");
+        let sent = || app.inner.owner.sent_themes();
+
+        app.update_settings(settings_with(|s| s.terminal_font_size_wide = 18.0))
+            .expect("size");
+        app.update_settings(settings_with(|s| {
+            s.terminal_font_size_wide = 18.0;
+            s.light_theme = "GitHub Light Default".into();
+        }))
+        .expect("a light theme while dark");
+        assert_eq!(sent(), vec![], "the theme in effect did not change");
+
+        let light = app
+            .update_settings(settings_with(|s| {
+                s.appearance = Appearance::Light;
+                s.light_theme = "github light default".into();
+            }))
+            .expect("light");
+        assert_eq!(light.effective_theme_name(), "GitHub Light Default");
+        assert_eq!(sent(), vec![background("GitHub Light Default")]);
+
+        app.update_settings(settings_with(|s| {
+            s.appearance = Appearance::Light;
+            s.light_theme = "GitHub Light Default".into();
+            s.readable_text = ReadableText::On;
+        }))
+        .expect("same theme");
+        app.set_system_dark(false);
+        assert_eq!(sent(), vec![background("GitHub Light Default")]);
+    }
+
+    #[test]
+    fn the_platform_brightness_moves_the_theme_only_under_system() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = RoostApp::new(dir.path(), "phone".into(), true).expect("app");
+        assert_eq!(
+            app.set_system_dark(false).effective_theme_name(),
+            "roost-dark"
+        );
+        assert_eq!(
+            app.inner.owner.sent_themes(),
+            vec![],
+            "Dark ignores the platform"
+        );
+
+        app.update_settings(settings_with(|s| s.appearance = Appearance::System))
+            .expect("system");
+        assert_eq!(
+            app.inner.owner.sent_themes(),
+            vec![background("Catppuccin Latte")]
+        );
+        let dark = app.set_system_dark(true);
+        assert_eq!(dark.effective_theme_name(), "roost-dark");
+        assert_eq!(
+            app.inner.owner.sent_themes(),
+            vec![background("Catppuccin Latte"), background("roost-dark")]
+        );
+    }
+
+    #[test]
+    fn a_failed_save_changes_nothing_and_sends_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = RoostApp::new(dir.path(), "phone".into(), true).expect("app");
+        let before = app.settings();
+        std::fs::create_dir_all(dir.path().join("settings.json").join("in-the-way"))
+            .expect("a directory where the file goes");
+        let error = app
+            .update_settings(settings_with(|s| s.appearance = Appearance::Light))
+            .expect_err("the save fails");
+        assert!(
+            error.to_string().contains("saving settings.json"),
+            "{error}"
+        );
+        assert_eq!(app.settings(), before);
+        assert_eq!(app.inner.owner.sent_themes(), vec![]);
+    }
+
+    /// A's update is held in its write while B's platform change arrives:
+    /// B waits for A, so the snapshot and the theme sends follow the
+    /// order the two were made in.
+    #[test]
+    fn a_platform_change_waits_for_an_update_in_flight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = &RoostApp::new(dir.path(), "phone".into(), true).expect("app");
+        app.update_settings(settings_with(|s| s.appearance = Appearance::System))
+            .expect("system, dark platform");
+        assert_eq!(app.inner.owner.sent_themes(), vec![]);
+
+        let (entered, in_save) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        *lock(&app.inner.before_settings_save) = Some(Box::new(move || {
+            let _ = entered.send(());
+            let _ = lock(&held).recv();
+        }));
+
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                app.update_settings(settings_with(|s| {
+                    s.appearance = Appearance::System;
+                    s.dark_theme = "Catppuccin Mocha".into();
+                }))
+            });
+            in_save.recv().expect("A is in its write");
+            let (b_calling, b_called) = std::sync::mpsc::channel();
+            let (b_done, b_finished) = std::sync::mpsc::channel();
+            let b = scope.spawn(move || {
+                let _ = b_calling.send(());
+                let state = app.set_system_dark(false);
+                let _ = b_done.send(());
+                state
+            });
+            b_called.recv().expect("B is about to call");
+            // B is in its call now; a grace period for it to overtake A if
+            // nothing holds it back.
+            let b_overtook = b_finished.recv_timeout(Duration::from_millis(200)).is_ok();
+            release.send(()).expect("release A");
+            a.join().expect("A").expect("A saved");
+            let b = b.join().expect("B");
+            assert!(!b_overtook, "B finished while A was still writing");
+            assert_eq!(b.effective_theme_name(), "Catppuccin Latte");
+        });
+
+        let state = app.settings();
+        assert_eq!(state.settings.dark_theme, "Catppuccin Mocha");
+        assert!(!state.system_dark);
+        assert_eq!(
+            app.inner.owner.sent_themes(),
+            vec![
+                background("Catppuccin Mocha"),
+                background("Catppuccin Latte")
+            ]
+        );
+        assert_eq!(
+            registry::load_settings(dir.path())
+                .expect("load")
+                .dark_theme,
+            "Catppuccin Mocha"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_settings_file_still_starts_the_app() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("settings.json"), "{ nope").expect("corrupt");
+        let app = RoostApp::new(dir.path(), "phone".into(), true).expect("app");
+        assert_eq!(app.settings().settings, MobileSettings::default());
+        assert!(dir.path().join("settings.json.bad").exists());
+    }
+
+    #[test]
+    fn an_unreadable_settings_file_fails_the_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("settings.json")).expect("in the way");
+        let error = RoostApp::new(dir.path(), "phone".into(), true)
+            .err()
+            .expect("a read error");
+        assert!(
+            error.to_string().contains("reading settings.json"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn every_setting_survives_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chosen = MobileSettings {
+            terminal_font_size_compact: 9.5,
+            terminal_font_size_wide: 17.0,
+            ui_text_scale: 1.35,
+            appearance: Appearance::Light,
+            dark_theme: "Catppuccin Mocha".into(),
+            light_theme: "GitHub Light Default".into(),
+            readable_text: ReadableText::Off,
+            bright_faint: true,
+            ..MobileSettings::default()
+        };
+        {
+            let app = RoostApp::new(dir.path(), "phone".into(), true).expect("app");
+            let saved = app.update_settings(chosen.clone()).expect("save");
+            assert_eq!(saved.settings, chosen);
+        }
+        let app = RoostApp::new(dir.path(), "phone".into(), false).expect("app again");
+        assert_eq!(
+            app.settings(),
+            SettingsState {
+                settings: chosen,
+                system_dark: false,
+            }
+        );
+    }
 
     /// Concurrent changes, each saved as made: once a change returns,
     /// the file holds it, and no older list written afterwards takes it
@@ -828,7 +1253,7 @@ mod tests {
     #[test]
     fn concurrent_host_changes_all_reach_the_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let app = RoostApp::new(dir.path(), "phone".into()).expect("app");
+        let app = RoostApp::new(dir.path(), "phone".into(), true).expect("app");
         let saved = |id: &str| {
             registry::load_hosts(dir.path())
                 .expect("a whole file")

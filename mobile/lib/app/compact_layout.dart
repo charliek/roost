@@ -5,8 +5,10 @@ import '../core/roost_core.dart';
 import '../hosts/host_widgets.dart';
 import '../hosts/workspace_list.dart';
 import '../terminal/terminal_pane.dart';
+import 'display_sheet.dart';
 import 'providers.dart';
 import 'shared_widgets.dart';
+import 'text_scale.dart';
 import 'theme.dart';
 import 'workspace_actions.dart';
 
@@ -62,6 +64,7 @@ class HostsScreen extends ConsumerWidget {
       appBar: AppBar(
         title: const Text('Hosts'),
         actions: [
+          const DisplayButton(),
           IconButton(
             key: const ValueKey('add-host'),
             tooltip: 'Add host',
@@ -132,17 +135,19 @@ class HostCard extends ConsumerWidget {
                   ),
                   Text(
                     hostStateLabel(host.state),
-                    style: text.bodySmall?.copyWith(color: RoostColors.muted),
+                    style: text.bodySmall?.copyWith(
+                      color: context.palette.muted,
+                    ),
                   ),
                   HostMenuButton(host: host),
                 ],
               ),
               Text(
                 host.target,
-                style: const TextStyle(
+                style: TextStyle(
                   fontFamily: monoFamily,
                   fontSize: 12,
-                  color: RoostColors.muted,
+                  color: context.palette.muted,
                 ),
               ),
               const SizedBox(height: 10),
@@ -183,9 +188,9 @@ class _WaitingBanner extends ConsumerWidget {
     final n = host.waitingTabs;
     return Material(
       key: const ValueKey('waiting-banner'),
-      color: RoostColors.waitingSurface,
+      color: context.palette.waitingSurface,
       shape: RoundedRectangleBorder(
-        side: const BorderSide(color: RoostColors.waitingBorder),
+        side: BorderSide(color: context.palette.waitingBorder),
         borderRadius: BorderRadius.circular(14),
       ),
       child: InkWell(
@@ -199,7 +204,7 @@ class _WaitingBanner extends ConsumerWidget {
           padding: const EdgeInsets.all(14),
           child: Row(
             children: [
-              const StatusDot(color: RoostColors.waiting),
+              StatusDot(color: context.palette.waiting),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(
@@ -216,15 +221,18 @@ class _WaitingBanner extends ConsumerWidget {
                         '${tab.title} on ${host.label} › $project',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 13,
-                          color: RoostColors.muted,
+                          color: context.palette.muted,
                         ),
                       ),
                   ],
                 ),
               ),
-              const Text('Open', style: TextStyle(color: RoostColors.waiting)),
+              Text(
+                'Open',
+                style: TextStyle(color: context.palette.waitingAction),
+              ),
             ],
           ),
         ),
@@ -244,8 +252,20 @@ class ProjectsScreen extends ConsumerWidget {
         .where((h) => h.id == hostId)
         .firstOrNull;
     final text = Theme.of(context).textTheme;
+    final subtitleSize = text.bodySmall?.fontSize ?? 12;
     return Scaffold(
       appBar: AppBar(
+        toolbarHeight: host == null
+            ? null
+            : scaledBarHeight(
+                context,
+                scaledBarHeight(
+                  context,
+                  kToolbarHeight,
+                  text.titleLarge?.fontSize ?? 22,
+                ),
+                subtitleSize,
+              ),
         leading: BackButton(
           onPressed: () => ref.read(selectionProvider.notifier).clear(),
         ),
@@ -256,7 +276,7 @@ class ProjectsScreen extends ConsumerWidget {
             if (host != null)
               Text(
                 hostStateLabel(host.state),
-                style: text.bodySmall?.copyWith(color: RoostColors.muted),
+                style: text.bodySmall?.copyWith(color: context.palette.muted),
               ),
           ],
         ),

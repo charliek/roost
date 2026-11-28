@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../app/text_scale.dart';
 import '../core/models.dart';
 
 typedef ExtraKey = ({String id, String label, KeyInput input});
@@ -65,7 +66,7 @@ class ExtraKeysBar extends StatelessWidget {
     return ExcludeFocus(
       child: Container(
         key: const ValueKey('extra-keys'),
-        height: 48,
+        height: scaledBarHeight(context, 48, 14),
         decoration: BoxDecoration(
           color: scheme.surfaceContainer,
           border: Border(top: BorderSide(color: scheme.outlineVariant)),

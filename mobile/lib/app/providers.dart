@@ -1,7 +1,12 @@
-import 'package:flutter/foundation.dart';
+import 'dart:async';
+
+import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/roost_core.dart';
+import '../core/serial_queue.dart';
+import '../terminal/contrast.dart';
+import 'width_class.dart';
 
 /// The core every widget talks to. `main` overrides it (FakeCore until the
 /// Rust bridge lands); so do the tests.
@@ -48,15 +53,201 @@ final selectionProvider = NotifierProvider<SelectionNotifier, Selection>(
   SelectionNotifier.new,
 );
 
-class TerminalFontSize extends Notifier<double> {
-  @override
-  double build() => 13;
+/// The app's one `ScaffoldMessenger`, so an error from anywhere (a failed
+/// settings save after a pinch, with no sheet open) still shows.
+final scaffoldMessengerKeyProvider = Provider(
+  (ref) => GlobalKey<ScaffoldMessengerState>(),
+);
 
-  void set(double size) => state = size;
+/// A continuous change (a pinch, a slider being dragged) is written this
+/// long after its last step.
+const settingsWriteDelay = Duration(milliseconds: 300);
+
+/// [desired] is what the UI shows, edits included; [acknowledged] is what
+/// the core last kept, and the only source of the effective brightness and
+/// terminal theme. [revision] moves with every edit.
+@immutable
+class SettingsModel {
+  const SettingsModel({
+    required this.acknowledged,
+    required this.desired,
+    required this.revision,
+    this.fontEdits = 0,
+    this.fontEditedTo,
+  });
+
+  final SettingsState acknowledged;
+  final MobileSettings desired;
+  final int revision;
+
+  /// Edits that changed a terminal text size. A size put back after a failed
+  /// write, or adopted from the core, is not one.
+  final int fontEdits;
+
+  /// [desired] as the last of those edits left it: a size other than the one
+  /// it set (a failed write put back) is not the user's.
+  final MobileSettings? fontEditedTo;
 }
 
-final terminalFontSizeProvider = NotifierProvider<TerminalFontSize, double>(
-  TerminalFontSize.new,
+/// What the painter does about faint and low-contrast text: `auto` raises
+/// contrast only on a light terminal theme, so a dark install is drawn as
+/// the session sent it.
+TextReadability textReadabilityFor(MobileSettings desired) => TextReadability(
+  minimumContrast: desired.readableText == ReadableText.off ? 1.0 : 3.0,
+  onlyOnLight: desired.readableText == ReadableText.auto,
+  faintAlpha: desired.brightFaint ? 0.75 : 0.55,
+);
+
+extension TerminalFontSizes on MobileSettings {
+  /// A phone-width layout has its own terminal text size; medium and
+  /// expanded share the other.
+  double terminalFontSizeFor(WidthClass widthClass) =>
+      widthClass == WidthClass.compact
+      ? terminalFontSizeCompact
+      : terminalFontSizeWide;
+
+  MobileSettings withTerminalFontSize(WidthClass widthClass, double size) =>
+      widthClass == WidthClass.compact
+      ? copyWith(terminalFontSizeCompact: size)
+      : copyWith(terminalFontSizeWide: size);
+}
+
+/// Edits apply to the UI at once and are written to the core behind them.
+/// Every call this makes to the core waits its turn in one queue, and a
+/// write reads the newest edit when its turn comes, so no older value can
+/// land after a newer one. At most one write waits in the queue: it will
+/// carry every edit made meanwhile. A write's answer never undoes a newer
+/// edit: it is adopted only when no edit came after it, and a failure
+/// reverts only then.
+///
+/// What survives a relaunch is the last write the core acknowledged: a
+/// process killed within [settingsWriteDelay] of a pinch step, before the
+/// write, loses that step.
+class SettingsNotifier extends Notifier<SettingsModel> {
+  final _core = SerialQueue();
+  Timer? _trailing;
+  bool _writeQueued = false;
+
+  /// The revision the core last kept: a write of it again is skipped.
+  int _written = 0;
+
+  @override
+  SettingsModel build() {
+    ref.onDispose(() {
+      _trailing?.cancel();
+    });
+    final initial = ref.watch(coreProvider).settings();
+    return SettingsModel(
+      acknowledged: initial,
+      desired: initial.settings,
+      revision: 0,
+    );
+  }
+
+  /// [continuous]: one step of a gesture or a drag, written once the steps
+  /// stop (or on [flush]); otherwise written now.
+  void edit(
+    MobileSettings Function(MobileSettings) change, {
+    bool continuous = false,
+  }) {
+    final desired = change(state.desired);
+    final fontChanged =
+        desired.terminalFontSizeCompact !=
+            state.desired.terminalFontSizeCompact ||
+        desired.terminalFontSizeWide != state.desired.terminalFontSizeWide;
+    state = SettingsModel(
+      acknowledged: state.acknowledged,
+      desired: desired,
+      revision: state.revision + 1,
+      fontEdits: state.fontEdits + (fontChanged ? 1 : 0),
+      fontEditedTo: fontChanged ? desired : state.fontEditedTo,
+    );
+    if (continuous) {
+      _trailing?.cancel();
+      _trailing = Timer(settingsWriteDelay, _write);
+    } else {
+      _write();
+    }
+  }
+
+  /// Writes a continuous change now: its gesture ended, or the app is going
+  /// to the background.
+  void flush() {
+    if (_trailing != null) _write();
+  }
+
+  void _write() {
+    _trailing?.cancel();
+    _trailing = null;
+    if (_writeQueued) return;
+    _writeQueued = true;
+    unawaited(_core.run(this, _writeLatest));
+  }
+
+  Future<void> _writeLatest() async {
+    _writeQueued = false;
+    if (!ref.mounted) return;
+    final revision = state.revision;
+    if (revision == _written) return;
+    try {
+      final kept = await ref.read(coreProvider).updateSettings(state.desired);
+      if (!ref.mounted) return;
+      _written = revision;
+      state = SettingsModel(
+        acknowledged: kept,
+        desired: state.revision == revision ? kept.settings : state.desired,
+        revision: state.revision,
+        fontEdits: state.fontEdits,
+        fontEditedTo: state.fontEditedTo,
+      );
+    } catch (e) {
+      if (!ref.mounted) return;
+      if (state.revision == revision) {
+        state = SettingsModel(
+          acknowledged: state.acknowledged,
+          desired: state.acknowledged.settings,
+          revision: state.revision,
+          fontEdits: state.fontEdits,
+          fontEditedTo: state.fontEditedTo,
+        );
+      }
+      _report(e);
+    }
+  }
+
+  Future<void> setSystemDark(bool dark) => _core.run(this, () async {
+    try {
+      final kept = await ref.read(coreProvider).setSystemDark(dark);
+      if (!ref.mounted) return;
+      state = SettingsModel(
+        acknowledged: kept,
+        desired: state.desired,
+        revision: state.revision,
+        fontEdits: state.fontEdits,
+        fontEditedTo: state.fontEditedTo,
+      );
+    } catch (e) {
+      if (ref.mounted) _report(e);
+    }
+  });
+
+  void _report(Object error) {
+    final messenger = ref.read(scaffoldMessengerKeyProvider).currentState;
+    if (messenger == null) {
+      debugPrint('roost: settings not saved: $error');
+      return;
+    }
+    messenger.showSnackBar(
+      SnackBar(
+        key: const ValueKey('settings-error'),
+        content: Text('Display settings not saved: $error'),
+      ),
+    );
+  }
+}
+
+final settingsProvider = NotifierProvider<SettingsNotifier, SettingsModel>(
+  SettingsNotifier.new,
 );
 
 /// Bumped each time the app comes back to the foreground, after
@@ -69,3 +260,34 @@ class ResumeEpoch extends Notifier<int> {
 }
 
 final resumeEpochProvider = NotifierProvider<ResumeEpoch, int>(ResumeEpoch.new);
+
+/// The terminal on screen as the Display sheet sees it: the area its grid
+/// fits into (what `CellMetrics.geometryFor` is given) and who else sizes
+/// the tab, if anyone.
+typedef TerminalPaneSize = ({Size gridArea, String? sizedBy});
+
+/// Null while no terminal is mounted. The pane mounted last owns it: an
+/// outgoing pane (one still fading out of a screen transition) can neither
+/// report over the new one nor clear it when it goes.
+class TerminalPaneSizeNotifier extends Notifier<TerminalPaneSize?> {
+  int _owner = 0;
+
+  @override
+  TerminalPaneSize? build() => null;
+
+  /// A newly mounted pane's token, which makes it the owner.
+  int claim() => ++_owner;
+
+  void report(int token, TerminalPaneSize size) {
+    if (token == _owner && state != size) state = size;
+  }
+
+  void release(int token) {
+    if (ref.mounted && token == _owner) state = null;
+  }
+}
+
+final terminalPaneSizeProvider =
+    NotifierProvider<TerminalPaneSizeNotifier, TerminalPaneSize?>(
+      TerminalPaneSizeNotifier.new,
+    );

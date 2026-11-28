@@ -89,7 +89,7 @@ run-linux:
 # The same against the scripted FakeCore: no Rust, no host. Resize the window
 # across 600 and 840 dp to see the three layouts.
 run-linux-fake:
-	$(CLEAN_ENV) $(FLUTTER) run -d linux --dart-define=ROOST_FAKE=1
+	$(CLEAN_ENV) $(FLUTTER) run -d linux --dart-define=ROOST_FAKE=true
 
 build-linux:
 	$(CLEAN_ENV) $(FLUTTER) build linux --debug

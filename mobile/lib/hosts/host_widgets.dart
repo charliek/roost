@@ -39,7 +39,7 @@ class HostStatusDot extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => StatusDot(
-    color: hostStateColor(state),
+    color: hostStateColor(context.palette, state),
     hollow: state is HostDisconnected || state is HostRetrying,
   );
 }
@@ -52,7 +52,7 @@ class AgentDot extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => StatusDot(
-    color: agentColor(badge),
+    color: agentColor(context.palette, badge),
     size: size,
     hollow: badge == AgentBadge.none,
   );
@@ -124,7 +124,7 @@ class HostStateCard extends ConsumerWidget {
       HostFailed(:final reason) => _ProblemCard(
         key: ValueKey('host-failed-${host.id}'),
         icon: Icons.error_outline,
-        color: RoostColors.error,
+        color: context.palette.error,
         message: reason,
         action: 'Retry',
         onAction: () => runCoreAction(context, () => core.connect(host.id)),
@@ -132,7 +132,7 @@ class HostStateCard extends ConsumerWidget {
       HostRetrying(:final reason, :final inMs) => _ProblemCard(
         key: ValueKey('host-retrying-${host.id}'),
         icon: Icons.schedule,
-        color: RoostColors.muted,
+        color: context.palette.muted,
         message: '$reason · retrying in ${(inMs / 1000).ceil()} s',
         action: 'Retry now',
         onAction: () => runCoreAction(context, () => core.connect(host.id)),
@@ -175,8 +175,8 @@ class TrustCard extends StatelessWidget {
       key: ValueKey('trust-card-${host.id}'),
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: RoostColors.waitingSurface,
-        border: Border.all(color: RoostColors.waitingBorder),
+        color: context.palette.waitingSurface,
+        border: Border.all(color: context.palette.waitingBorder),
         borderRadius: BorderRadius.circular(12),
       ),
       child: Column(
@@ -193,7 +193,7 @@ class TrustCard extends StatelessWidget {
           Container(
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(
-              color: RoostColors.background,
+              color: context.palette.background,
               borderRadius: BorderRadius.circular(8),
             ),
             child: SelectableText(
@@ -247,11 +247,13 @@ class _ProblemCard extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
       decoration: BoxDecoration(
-        color: color == RoostColors.error ? RoostColors.errorSurface : null,
+        color: color == context.palette.error
+            ? context.palette.errorSurface
+            : null,
         border: Border.all(
-          color: color == RoostColors.error
-              ? RoostColors.errorBorder
-              : RoostColors.border,
+          color: color == context.palette.error
+              ? context.palette.errorBorder
+              : context.palette.border,
         ),
         borderRadius: BorderRadius.circular(12),
       ),
@@ -279,7 +281,7 @@ class _StatusLine extends StatelessWidget {
   Widget build(BuildContext context) {
     return Row(
       children: [
-        Icon(icon, size: 16, color: RoostColors.muted),
+        Icon(icon, size: 16, color: context.palette.muted),
         const SizedBox(width: 8),
         Text(text, style: Theme.of(context).textTheme.bodySmall),
       ],
@@ -303,20 +305,20 @@ class HostCounts extends StatelessWidget {
         if (host.waitingTabs > 0)
           _Pill(
             text: '${host.waitingTabs} waiting',
-            color: RoostColors.waiting,
-            background: const Color(0xFF3A2A17),
+            color: context.palette.waiting,
+            background: context.palette.waitingPill,
           ),
         if (host.workingTabs > 0)
           _Pill(
             text: '${host.workingTabs} running',
-            color: RoostColors.working,
-            background: const Color(0xFF172338),
+            color: context.palette.working,
+            background: context.palette.workingPill,
           ),
         if (host.waitingTabs == 0 && host.workingTabs == 0)
-          const _Pill(
+          _Pill(
             text: 'idle',
-            color: RoostColors.muted,
-            background: RoostColors.surfaceHighest,
+            color: context.palette.muted,
+            background: context.palette.surfaceHighest,
           ),
       ],
     );

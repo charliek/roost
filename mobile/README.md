@@ -38,6 +38,33 @@ selectable text, **Copy all**, and its links listed whole, a wrapped one
 such as Claude Code's **c to copy**, reaches the phone's clipboard while its
 tab is the one on screen; a copy from a tab you are not looking at is ignored.
 
+## Display
+
+Open it from the gear beside **+** (the Hosts bar on a phone, the host rail,
+or the sidebar header) or from a terminal's **⋮ → Display…**. Changes show
+in the app at once; the terminal behind the sheet recolors when the core
+applies the theme.
+
+- **Appearance:** System, Dark or Light. It picks which terminal theme is
+  used.
+- **Terminal text:** 7–28 pt, with the columns it gives this screen ("about"
+  when no terminal is open). A phone-width layout keeps its own size; tablet
+  and desktop widths share another. Changing it, here or by pinching the
+  terminal, takes the tab's size from any other client. **Reset** goes back
+  to 13 pt.
+- **App text:** 85–160% on top of the system's text size (never more than
+  twice the font size). The terminal itself does not scale with it.
+- **Terminal theme:** one dark and one light theme, of the bundled ones.
+- **Readability:** keep text readable (Auto: on when the background is
+  light) and brighter dim text.
+
+The settings live on the phone, in `settings.json` next to `hosts.json`. A
+pinch or slider drag is saved shortly after it ends, and when the app goes to
+the background. Only a save the core has acknowledged survives a relaunch.
+
+**Claude Code:** run `/theme` and pick `dark-ansi` or `light-ansi`, so Claude
+Code draws with the terminal theme's own colors and follows it.
+
 ## Dev loop
 
 ```bash
@@ -98,7 +125,7 @@ keyboard comes up).
 | `lib/terminal/terminal_painter.dart`, `terminal_view.dart` | `CustomPainter` with per-row cached paragraphs; the view that fits the grid, pulls frames once per vsync, pinches and scrolls |
 | `lib/terminal/terminal_pane.dart` | One tab on screen: attach/detach, input routing, toolbar, quick replies, compose, extra keys |
 | `lib/input/` | Hardware key mapping, the soft-keyboard `TextInputClient`, extra keys, quick replies, compose box |
-| `lib/app/`, `lib/hosts/` | Riverpod providers, the three layouts, host and workspace widgets, dialogs |
+| `lib/app/`, `lib/hosts/` | Riverpod providers, the three layouts, the Display sheet, host and workspace widgets, dialogs |
 | `test/fixtures/` | C6 fixtures (every `frame_v1_*.bin` is decoded against its `.json`) and the key-name contract |
 | `integration_test/` | The whole stack against a real `roost-session` |
 
@@ -119,10 +146,15 @@ Which thread a bridge call runs on:
 - `#[frb(sync)]`, on the Dart thread, in call order: key, text, paste,
   scroll, resize, take size, close, leak counts. They are channel sends to
   the owner thread; running them in order keeps typed characters in order.
+  So are `settings` and `terminal_themes`, which only read memory: the
+  settings snapshot and the theme list built once at `roost_init`.
 - The bridge's thread pool (a `Future`): frame pulls and `viewport_text`
   (a round trip to the owner thread, about 1.7 ms median in a debug build),
   `app_paused` (waits up to 2 s for size releases), host registry writes,
-  `attach`, `roost_init`.
+  `attach`, `roost_init`, and `update_settings` (writes `settings.json`)
+  and `set_system_dark` (waits behind a settings write in progress).
+  `FrbCore` runs those two through one `SerialQueue` of their own, so they
+  reach the core in call order.
 - The bridge's async runtime: `op`, `send_text`, `clear_notification`.
 
 None of them runs on `RoostApp`'s own runtime, which the waiting calls would

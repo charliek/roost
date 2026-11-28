@@ -244,7 +244,7 @@ fn connected_app(
     dir: &str,
     label: &str,
 ) -> (RoostApp, String, Recorder<Vec<HostView>>) {
-    let app = RoostApp::new(root.join(dir), label.into()).expect("app");
+    let app = RoostApp::new(root.join(dir), label.into(), true).expect("app");
     let hosts = Recorder::new();
     app.hosts(hosts.sink());
     let host = app
@@ -517,7 +517,7 @@ fn saved_hosts_and_the_client_id_survive_a_restart() {
     let (_tmp, root) = root();
     let dir = root.join("app");
     let (first_id, unix, ssh) = {
-        let app = RoostApp::new(&dir, "Phone".into()).expect("app");
+        let app = RoostApp::new(&dir, "Phone".into(), true).expect("app");
         let unix = app
             .add_host("dev".into(), "unix:/nonexistent/roost.sock".into())
             .expect("a unix host");
@@ -537,7 +537,7 @@ fn saved_hosts_and_the_client_id_survive_a_restart() {
         (app.client_id(), unix, ssh)
     };
 
-    let app = RoostApp::new(&dir, "Phone".into()).expect("app again");
+    let app = RoostApp::new(&dir, "Phone".into(), true).expect("app again");
     assert_eq!(app.client_id(), first_id);
     let hosts = Recorder::new();
     app.hosts(hosts.sink());

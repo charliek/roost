@@ -17,6 +17,17 @@ Copyright: 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains
 Comment: Embedded in the roost binary as the default terminal font.
 License: OFL-1.1
 
+Files: crates/roost-ui-model/src/resources/themes-light/*
+Copyright: 2021 Catppuccin
+           2020 Primer
+           Pavel Pertsev
+           mvllow
+           2011 to Present Mark Badolato (the iTerm2-Color-Schemes collection)
+Comment: Light terminal themes embedded in the roost binary: Catppuccin Latte,
+ GitHub Light Default, Gruvbox Light and Rose Pine Dawn, in that order of
+ copyright holders. README.roost.md in that directory has the sources.
+License: MIT
+
 License: MIT
  Permission is hereby granted, free of charge, to any person obtaining a copy
  of this software and associated documentation files (the "Software"), to deal

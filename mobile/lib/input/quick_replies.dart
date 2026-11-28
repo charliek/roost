@@ -32,9 +32,9 @@ class QuickRepliesBar extends StatelessWidget {
     return ExcludeFocus(
       child: Container(
         key: const ValueKey('quick-replies'),
-        decoration: const BoxDecoration(
-          color: RoostColors.waitingSurface,
-          border: Border(top: BorderSide(color: RoostColors.waitingBorder)),
+        decoration: BoxDecoration(
+          color: context.palette.waitingSurface,
+          border: Border(top: BorderSide(color: context.palette.waitingBorder)),
         ),
         padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
         child: LayoutBuilder(
@@ -49,16 +49,16 @@ class QuickRepliesBar extends StatelessWidget {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: text.labelMedium?.copyWith(
-                      color: RoostColors.waiting,
+                      color: context.palette.waitingAction,
                     ),
                   ),
                 )
               else
-                const Padding(
-                  padding: EdgeInsets.only(right: 8),
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
                   child: StatusDot(
-                    key: ValueKey('quick-replies-dot'),
-                    color: RoostColors.waiting,
+                    key: const ValueKey('quick-replies-dot'),
+                    color: context.palette.waiting,
                   ),
                 ),
               Flexible(
@@ -78,9 +78,9 @@ class QuickRepliesBar extends StatelessWidget {
                               padding: const EdgeInsets.symmetric(
                                 horizontal: 10,
                               ),
-                              foregroundColor: RoostColors.waitingText,
-                              side: const BorderSide(
-                                color: RoostColors.waitingBorder,
+                              foregroundColor: context.palette.waitingText,
+                              side: BorderSide(
+                                color: context.palette.waitingBorder,
                               ),
                               tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                             ),

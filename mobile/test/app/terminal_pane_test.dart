@@ -1,11 +1,15 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:roost_mobile/app/providers.dart';
 import 'package:roost_mobile/core/fake/fake_core.dart';
 import 'package:roost_mobile/core/roost_core.dart';
+import 'package:roost_mobile/app/width_class.dart';
+import 'package:roost_mobile/terminal/cell_metrics.dart';
 import 'package:roost_mobile/terminal/terminal_pane.dart';
+import 'package:roost_mobile/terminal/terminal_view.dart';
 
 import '../support/pump_app.dart';
 
@@ -365,12 +369,230 @@ void main() {
       );
       expect(find.text('sized by charlie-laptop · 132×40'), findsOneWidget);
 
+      final before = session.resizes.last.$1;
       ProviderScope.containerOf(tester.element(find.byType(TerminalPane)))
-          .read(terminalFontSizeProvider.notifier)
-          .set(16);
+          .read(settingsProvider.notifier)
+          .edit((s) => s.copyWith(terminalFontSizeWide: 16));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 200));
-      expect(session.resizes.last.$2, isTrue, reason: 'a zoom is deliberate');
+      final (zoomed, focused) = session.resizes.last;
+      expect(focused, isTrue, reason: 'a zoom is deliberate');
+      expect(zoomed.cols, lessThan(before.cols), reason: 'bigger text');
+      expect(zoomed.cellWidthPx, greaterThan(before.cellWidthPx));
+      expect(core.settingsWrites.last.terminalFontSizeWide, 16);
+      await tester.pumpAndSettle();
+      final tab = tester.widget<TerminalView>(find.byType(TerminalView)).tab!;
+      expect(tab.sizedElsewhere, isFalse, reason: 'the zoom took the size');
+      expect(byKey('size-owner-banner'), findsNothing);
+      expect((tab.model.cols, tab.model.rows), (zoomed.cols, zoomed.rows));
+    });
+
+    testWidgets('a pinch that comes back to where it started lands there', (
+      tester,
+    ) async {
+      final sizes = <double>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: TerminalView(tab: null, fontSize: 13, onFontSize: sizes.add),
+        ),
+      );
+      final center = tester.getCenter(byKey('terminal-canvas'));
+      final a = await tester.startGesture(center - const Offset(100, 0));
+      final b = await tester.startGesture(center + const Offset(100, 0));
+      // No pump between the moves: the view still draws 13 throughout.
+      await a.moveTo(center - const Offset(130, 0));
+      await b.moveTo(center + const Offset(130, 0));
+      await a.moveTo(center - const Offset(100, 0));
+      await b.moveTo(center + const Offset(100, 0));
+      await a.up();
+      await b.up();
+      expect(sizes, isNotEmpty, reason: 'the pinch grew the text');
+      expect(sizes.first, greaterThan(13));
+      expect(sizes.last, 13, reason: 'and brought it back');
+    });
+
+    testWidgets('a two-finger trackpad scroll scrolls, and leaves the size', (
+      tester,
+    ) async {
+      final scrolls = <int>[];
+      final sizes = <double>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: TerminalView(
+            tab: null,
+            fontSize: 13,
+            onScroll: (rows, _, _) => scrolls.add(rows),
+            onFontSize: sizes.add,
+          ),
+        ),
+      );
+      final center = tester.getCenter(byKey('terminal-canvas'));
+      final pad = TestPointer(1, PointerDeviceKind.trackpad);
+      await tester.sendEventToBinding(pad.panZoomStart(center));
+      for (var y = 10.0; y <= 200; y += 10) {
+        await tester.sendEventToBinding(
+          pad.panZoomUpdate(center, pan: Offset(0, y)),
+        );
+      }
+      await tester.sendEventToBinding(pad.panZoomEnd());
+      final cellHeight = CellMetrics.measure(
+        13,
+        tester.view.devicePixelRatio,
+      ).cellHeight;
+      final rows = scrolls.fold(0, (a, b) => a + b);
+      expect(scrolls.every((r) => r > 0), isTrue, reason: 'down: older lines');
+      // The recognizer takes the gesture once it moves past the pan slop
+      // (36 px), and the pan scrolls from there, once.
+      expect(rows, greaterThanOrEqualTo((150 / cellHeight).floor()));
+      expect(rows, lessThanOrEqualTo((200 / cellHeight).floor()));
+      expect(sizes, isEmpty, reason: 'not a pinch');
+    });
+
+    testWidgets('a size from another width class is advisory', (tester) async {
+      final reports = <(Geometry, bool)>[];
+      Future<void> show(
+        double fontSize,
+        WidthClass widthClass, {
+        int fontEdits = 0,
+        double? editedFontSize,
+      }) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: TerminalView(
+              tab: null,
+              fontSize: fontSize,
+              fontSizeSetting: widthClass,
+              fontEdits: fontEdits,
+              editedFontSize: editedFontSize ?? fontSize,
+              onGeometry: (g, {required deliberate}) =>
+                  reports.add((g, deliberate)),
+            ),
+          ),
+        );
+        await tester.pump(regridDebounce);
+      }
+
+      await show(13, WidthClass.medium);
+      expect(reports.map((r) => r.$2), [false], reason: 'the first grid');
+      await show(9, WidthClass.compact);
+      expect(reports.last.$2, isFalse, reason: 'another setting applies');
+      await show(11, WidthClass.compact, fontEdits: 1);
+      expect(reports.last.$2, isTrue, reason: 'the user changed this one');
+      expect(reports.map((r) => r.$1.cols).toSet(), hasLength(3));
+      await show(13, WidthClass.compact, fontEdits: 1);
+      expect(reports.last.$2, isFalse, reason: 'no edit: a size put back');
+    });
+
+    testWidgets('only a font edit at its own size takes the size', (
+      tester,
+    ) async {
+      final reports = <(Geometry, bool)>[];
+      Future<void> show(
+        double fontSize,
+        WidthClass widthClass, {
+        int fontEdits = 0,
+        double? editedFontSize,
+        double width = 800,
+      }) => tester.pumpWidget(
+        MaterialApp(
+          home: Center(
+            child: SizedBox(
+              width: width,
+              height: 600,
+              child: TerminalView(
+                tab: null,
+                fontSize: fontSize,
+                fontSizeSetting: widthClass,
+                fontEdits: fontEdits,
+                editedFontSize: editedFontSize ?? fontSize,
+                onGeometry: (g, {required deliberate}) =>
+                    reports.add((g, deliberate)),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      // An edit to 15, then the layout changes, then a failed save puts 13
+      // back, all inside one debounce: the rollback is not the user's.
+      await show(13, WidthClass.compact);
+      await tester.pump(regridDebounce);
+      await show(15, WidthClass.compact, fontEdits: 1);
+      await show(15, WidthClass.compact, fontEdits: 1, width: 700);
+      await show(
+        13,
+        WidthClass.compact,
+        fontEdits: 1,
+        editedFontSize: 15,
+        width: 700,
+      );
+      await tester.pump(regridDebounce);
+      expect(reports, hasLength(2), reason: 'the first grid, then one offer');
+      expect(reports.last.$2, isFalse, reason: 'a rollback, not an edit');
+
+      // A pinch step that is never laid out, then a rollback in the same
+      // frame: the edit counter moved, but not to this size.
+      await show(14, WidthClass.compact, fontEdits: 2, width: 700);
+      await show(
+        13,
+        WidthClass.compact,
+        fontEdits: 3,
+        editedFontSize: 15,
+        width: 700,
+      );
+      await tester.pump(regridDebounce);
+      expect(reports, hasLength(2), reason: 'back on the reported grid');
+
+      // An edit in compact, then a switch to medium and a layout change
+      // there: neither medium offer is the user's.
+      await show(15, WidthClass.compact, fontEdits: 4, width: 700);
+      await show(16, WidthClass.medium, fontEdits: 4, width: 700);
+      await show(16, WidthClass.medium, fontEdits: 4, width: 650);
+      await tester.pump(regridDebounce);
+      expect(reports, hasLength(3), reason: 'one offer after the burst');
+      expect(reports.last.$2, isFalse, reason: 'a class switch, then layout');
+
+      // A medium edit while that is still settling is the user's, even
+      // when it lands on the size the last report had.
+      await show(13, WidthClass.medium, fontEdits: 4, width: 600);
+      await tester.pump(regridDebounce ~/ 2);
+      await show(16, WidthClass.medium, fontEdits: 5, width: 600);
+      await tester.pump(regridDebounce);
+      expect(reports, hasLength(4), reason: 'one offer after the burst');
+      expect(reports.last.$2, isTrue, reason: 'the edit within medium');
+    });
+
+    testWidgets('an edit made while a class change debounces is the user\'s', (
+      tester,
+    ) async {
+      final reports = <(Geometry, bool)>[];
+      Future<void> show(
+        double fontSize,
+        WidthClass widthClass, {
+        int fontEdits = 0,
+        double? editedFontSize,
+      }) => tester.pumpWidget(
+        MaterialApp(
+          home: TerminalView(
+            tab: null,
+            fontSize: fontSize,
+            fontSizeSetting: widthClass,
+            fontEdits: fontEdits,
+            editedFontSize: editedFontSize ?? fontSize,
+            onGeometry: (g, {required deliberate}) =>
+                reports.add((g, deliberate)),
+          ),
+        ),
+      );
+
+      await show(13, WidthClass.medium);
+      await tester.pump(regridDebounce);
+      await show(9, WidthClass.compact);
+      await tester.pump(regridDebounce ~/ 2);
+      await show(11, WidthClass.compact, fontEdits: 1);
+      await tester.pump(regridDebounce);
+      expect(reports, hasLength(2), reason: 'the first grid, then one offer');
+      expect(reports.last.$2, isTrue, reason: 'the edit within compact');
     });
 
     testWidgets('a burst of size changes settles into one resize', (

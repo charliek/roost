@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:roost_mobile/app/app.dart';
 import 'package:roost_mobile/app/providers.dart';
 import 'package:roost_mobile/core/fake/fake_core.dart';
+import 'package:roost_mobile/core/roost_core.dart';
 
 /// The whole app at a logical [width], on a fresh scripted core. Tall by
 /// default: the test font is wider than JetBrains Mono or Roboto, so lists
@@ -32,3 +33,9 @@ Finder byKey(String key) => find.byKey(ValueKey(key));
 
 /// The session of the tab attached last.
 FakeTerminalSession lastSession(FakeCore core) => core.sessions.last;
+
+/// The grid the tab was last given: its attach, or the last resize since.
+Geometry lastGeometry(FakeCore core) {
+  final resizes = lastSession(core).resizes;
+  return resizes.isEmpty ? core.attaches.last.geometry : resizes.last.$1;
+}

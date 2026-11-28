@@ -7,6 +7,12 @@ import '../app/workspace_actions.dart';
 import '../core/roost_core.dart';
 import 'host_widgets.dart';
 
+// Wide enough for the text whole at 1.0x. Bounds rather than flexes: a
+// flexible label takes half the row from the name beside it even when it is
+// short.
+const _newProjectMaxWidth = 180.0;
+const _waitingMaxWidth = 116.0;
+
 /// A host's projects, each with its tabs. Not scrollable itself: the
 /// sidebar, the drawer and the phone's projects screen each scroll it.
 class WorkspaceList extends ConsumerWidget {
@@ -32,9 +38,16 @@ class WorkspaceList extends ConsumerWidget {
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ),
-            TextButton(
-              onPressed: () => newProjectFlow(context, ref, hostId),
-              child: const Text('New project'),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: _newProjectMaxWidth),
+              child: TextButton(
+                onPressed: () => newProjectFlow(context, ref, hostId),
+                child: const Text(
+                  'New project',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
             ),
           ],
         ),
@@ -66,7 +79,7 @@ class _ProjectHeader extends ConsumerWidget {
       padding: const EdgeInsets.fromLTRB(12, 8, 0, 0),
       child: Row(
         children: [
-          const Icon(Icons.folder_outlined, size: 16, color: RoostColors.muted),
+          Icon(Icons.folder_outlined, size: 16, color: context.palette.muted),
           const SizedBox(width: 8),
           Expanded(
             child: Text(
@@ -77,13 +90,18 @@ class _ProjectHeader extends ConsumerWidget {
             ),
           ),
           if (waiting > 0)
-            Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: Text(
-                '$waiting waiting',
-                style: const TextStyle(
-                  fontSize: 12,
-                  color: RoostColors.waiting,
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: _waitingMaxWidth),
+              child: Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Text(
+                  '$waiting waiting',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: context.palette.waiting,
+                  ),
                 ),
               ),
             ),
@@ -150,14 +168,14 @@ class TabTile extends ConsumerWidget {
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 color: tab.agent == AgentBadge.waiting
-                    ? RoostColors.waiting
-                    : RoostColors.muted,
+                    ? context.palette.waiting
+                    : context.palette.muted,
               ),
             ),
       trailing: tab.hasNotification
-          ? const StatusDot(
-              key: ValueKey('notification-dot'),
-              color: RoostColors.waiting,
+          ? StatusDot(
+              key: const ValueKey('notification-dot'),
+              color: context.palette.waiting,
               size: 8,
             )
           : null,

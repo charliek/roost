@@ -29,7 +29,7 @@ Future<void> showCopySheet(
     context: context,
     isScrollControlled: true,
     useSafeArea: true,
-    backgroundColor: RoostColors.surface,
+    backgroundColor: Colors.transparent,
     builder: (sheet) {
       Future<void> copy(String value, String what) async {
         if (copying) return;
@@ -52,12 +52,14 @@ Future<void> showCopySheet(
         onCopied?.call(what);
       }
 
-      return _CopySheet(
-        text: text,
-        urls: urls,
-        cols: cols,
-        onCopyAll: () => copy(text, 'Screen'),
-        onCopyUrl: (url) => copy(url, 'Link'),
+      return SheetSurface(
+        child: _CopySheet(
+          text: text,
+          urls: urls,
+          cols: cols,
+          onCopyAll: () => copy(text, 'Screen'),
+          onCopyUrl: (url) => copy(url, 'Link'),
+        ),
       );
     },
   );
@@ -175,7 +177,9 @@ class _CopySheetState extends State<_CopySheet> {
               padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
               child: Text(
                 'Links',
-                style: theme.labelMedium?.copyWith(color: RoostColors.muted),
+                style: theme.labelMedium?.copyWith(
+                  color: context.palette.muted,
+                ),
               ),
             ),
             ConstrainedBox(
@@ -211,7 +215,7 @@ class _CopySheetState extends State<_CopySheet> {
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
             child: Text(
               'Long-press to select, then drag the handles.',
-              style: theme.bodySmall?.copyWith(color: RoostColors.muted),
+              style: theme.bodySmall?.copyWith(color: context.palette.muted),
             ),
           ),
           Expanded(
@@ -258,7 +262,7 @@ class _CopySheetState extends State<_CopySheet> {
                               FontFeature.disable('liga'),
                               FontFeature.disable('calt'),
                             ],
-                            color: RoostColors.text,
+                            color: context.palette.text,
                           ),
                         ),
                       ),

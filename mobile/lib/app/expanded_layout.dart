@@ -4,10 +4,19 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../core/roost_core.dart';
 import '../hosts/host_widgets.dart';
 import '../hosts/workspace_list.dart';
+import 'display_sheet.dart';
 import 'providers.dart';
 import 'shared_widgets.dart';
 import 'theme.dart';
 import 'workspace_actions.dart';
+
+/// The sidebar's width, beside a divider of [layoutDividerWidth].
+const hostSidebarWidth = 300.0;
+
+/// Fits every host state label whole at 1.0x text. A bound rather than a
+/// flex: a flexible label takes half the row from the host name even when
+/// it is short.
+const _stateLabelMaxWidth = 144.0;
 
 /// ≥ 840 dp: a persistent sidebar of hosts with their projects and tabs, and
 /// the selected tab beside it.
@@ -21,8 +30,8 @@ class ExpandedLayout extends StatelessWidget {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            SizedBox(width: 300, child: HostSidebar()),
-            VerticalDivider(width: 1),
+            SizedBox(width: hostSidebarWidth, child: HostSidebar()),
+            VerticalDivider(width: layoutDividerWidth),
             Expanded(child: SelectedTabArea()),
           ],
         ),
@@ -39,7 +48,7 @@ class HostSidebar extends ConsumerWidget {
     final hosts = ref.watch(hostsProvider).value ?? const <HostView>[];
     return Material(
       key: const ValueKey('host-sidebar'),
-      color: RoostColors.surfaceLow,
+      color: context.palette.surfaceLow,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -53,6 +62,7 @@ class HostSidebar extends ConsumerWidget {
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
                 ),
+                const DisplayButton(),
                 IconButton(
                   key: const ValueKey('add-host'),
                   tooltip: 'Add host',
@@ -114,9 +124,18 @@ class HostSection extends StatelessWidget {
                     ),
                   ),
                 ),
-                Text(
-                  hostStateLabel(host.state),
-                  style: text.bodySmall?.copyWith(color: RoostColors.muted),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(
+                    maxWidth: _stateLabelMaxWidth,
+                  ),
+                  child: Text(
+                    hostStateLabel(host.state),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: text.bodySmall?.copyWith(
+                      color: context.palette.muted,
+                    ),
+                  ),
                 ),
                 HostMenuButton(host: host),
               ],

@@ -1,23 +1,18 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../core/models.dart';
 import '../core/roost_core.dart';
 import 'compact_layout.dart';
 import 'expanded_layout.dart';
 import 'medium_layout.dart';
 import 'providers.dart';
+import 'text_scale.dart';
 import 'theme.dart';
-
-enum WidthClass { compact, medium, expanded }
-
-/// Material 3 window size classes.
-WidthClass widthClassFor(double width) => width >= 840
-    ? WidthClass.expanded
-    : width >= 600
-    ? WidthClass.medium
-    : WidthClass.compact;
+import 'width_class.dart';
 
 class RoostMobileApp extends ConsumerStatefulWidget {
   const RoostMobileApp({super.key});
@@ -26,7 +21,8 @@ class RoostMobileApp extends ConsumerStatefulWidget {
   ConsumerState<RoostMobileApp> createState() => _RoostMobileAppState();
 }
 
-class _RoostMobileAppState extends ConsumerState<RoostMobileApp> {
+class _RoostMobileAppState extends ConsumerState<RoostMobileApp>
+    with WidgetsBindingObserver {
   late final AppLifecycleListener _lifecycle;
   bool _backgrounded = false;
 
@@ -38,6 +34,9 @@ class _RoostMobileAppState extends ConsumerState<RoostMobileApp> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // The platform may have changed since `main` told the core.
+    _reportPlatformBrightness();
     _lifecycle = AppLifecycleListener(onStateChange: _onLifecycle);
     ref.listenManual(hostsProvider, (_, next) {
       final hosts = next.value;
@@ -59,7 +58,18 @@ class _RoostMobileAppState extends ConsumerState<RoostMobileApp> {
   }
 
   @override
+  void didChangePlatformBrightness() => _reportPlatformBrightness();
+
+  void _reportPlatformBrightness() {
+    final dark =
+        WidgetsBinding.instance.platformDispatcher.platformBrightness ==
+        Brightness.dark;
+    unawaited(ref.read(settingsProvider.notifier).setSystemDark(dark));
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _lifecycle.dispose();
     super.dispose();
   }
@@ -72,6 +82,7 @@ class _RoostMobileAppState extends ConsumerState<RoostMobileApp> {
       case AppLifecycleState.hidden || AppLifecycleState.paused:
         if (_backgrounded) return;
         _backgrounded = true;
+        ref.read(settingsProvider.notifier).flush();
         _enqueue(core.appPaused);
       case AppLifecycleState.resumed:
         if (!_backgrounded) return;
@@ -96,10 +107,43 @@ class _RoostMobileAppState extends ConsumerState<RoostMobileApp> {
 
   @override
   Widget build(BuildContext context) {
+    final textScale = ref.watch(
+      settingsProvider.select((s) => s.desired.uiTextScale),
+    );
+    final appearance = ref.watch(
+      settingsProvider.select((s) => s.desired.appearance),
+    );
     return MaterialApp(
       title: 'Roost',
       debugShowCheckedModeBanner: false,
-      theme: roostDarkTheme(),
+      scaffoldMessengerKey: ref.watch(scaffoldMessengerKeyProvider),
+      theme: roostTheme(Brightness.light),
+      darkTheme: roostTheme(Brightness.dark),
+      themeMode: switch (appearance) {
+        Appearance.system => ThemeMode.system,
+        Appearance.dark => ThemeMode.dark,
+        Appearance.light => ThemeMode.light,
+      },
+      // Above the navigator, so a sheet or dialog sees the same width class
+      // and text scale as the layout under it.
+      builder: (context, child) {
+        final media = MediaQuery.of(context);
+        final theme = Theme.of(context);
+        return AnnotatedRegion<SystemUiOverlayStyle>(
+          value: systemOverlayStyleFor(theme.brightness, context.palette),
+          child: MediaQuery(
+            data: media.copyWith(
+              textScaler: ScaledTextScaler.over(media.textScaler, textScale),
+            ),
+            child: LayoutBuilder(
+              builder: (context, constraints) => WidthClassScope(
+                widthClass: widthClassFor(constraints.maxWidth),
+                child: child!,
+              ),
+            ),
+          ),
+        );
+      },
       home: const AppShell(),
     );
   }
@@ -110,18 +154,14 @@ class AppShell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) => switch (widthClassFor(
-        constraints.maxWidth,
-      )) {
-        WidthClass.compact => const CompactLayout(
-          key: ValueKey('layout-compact'),
-        ),
-        WidthClass.medium => const MediumLayout(key: ValueKey('layout-medium')),
-        WidthClass.expanded => const ExpandedLayout(
-          key: ValueKey('layout-expanded'),
-        ),
-      },
-    );
+    return switch (WidthClassScope.of(context)) {
+      WidthClass.compact => const CompactLayout(
+        key: ValueKey('layout-compact'),
+      ),
+      WidthClass.medium => const MediumLayout(key: ValueKey('layout-medium')),
+      WidthClass.expanded => const ExpandedLayout(
+        key: ValueKey('layout-expanded'),
+      ),
+    };
   }
 }

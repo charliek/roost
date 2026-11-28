@@ -40,7 +40,9 @@ To switch while Roost runs, use **Select Theme…** in the command palette: it p
 | `TokyoNight`             | Cool blues + softer accent colors.                       |
 | `TokyoNight Storm`       | TokyoNight on a slightly lighter base.                  |
 
-Every theme other than `roost-dark` is a byte-identical copy of a file from [Ghostty's bundled set](https://github.com/ghostty-org/ghostty/tree/main/src/config/themes). If you want a Ghostty theme that's not on this list, it usually parses cleanly in roost — see *File format* below. The bundled set is dark-only by design; light-background Ghostty themes still load if you add one, but they render a light terminal area inside Roost's dark window chrome.
+Every theme other than `roost-dark` is a byte-identical copy of a file from [Ghostty's bundled set](https://github.com/ghostty-org/ghostty/tree/main/src/config/themes). If you want a Ghostty theme that's not on this list, it usually parses cleanly in roost — see *File format* below. The desktop picker is dark-only by design: a light terminal area would sit inside Roost's dark window chrome.
+
+Four light themes are bundled separately for Roost mobile, which offers them next to the dark set: `Catppuccin Latte`, `GitHub Light Default`, `Gruvbox Light` and `Rose Pine Dawn`. They are byte-identical copies of Ghostty files too, and they stay out of the desktop picker. The desktop resolves the `theme` config value by name among all bundled themes, so a hand-written `theme = Catppuccin Latte` in `config.conf` loads the bundled file and renders a light terminal area inside the dark chrome. Colors a program sets through OSC 4, 10 or 11 are kept when the theme changes.
 
 ## File format
 
