@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -6,6 +7,7 @@ import 'package:roost_mobile/app/providers.dart';
 import 'package:roost_mobile/core/fake/fake_core.dart';
 import 'package:roost_mobile/core/roost_core.dart';
 import 'package:roost_mobile/app/width_class.dart';
+import 'package:roost_mobile/terminal/cell_metrics.dart';
 import 'package:roost_mobile/terminal/terminal_pane.dart';
 import 'package:roost_mobile/terminal/terminal_view.dart';
 
@@ -407,6 +409,43 @@ void main() {
       expect(sizes, isNotEmpty, reason: 'the pinch grew the text');
       expect(sizes.first, greaterThan(13));
       expect(sizes.last, 13, reason: 'and brought it back');
+    });
+
+    testWidgets('a two-finger trackpad scroll scrolls, and leaves the size', (
+      tester,
+    ) async {
+      final scrolls = <int>[];
+      final sizes = <double>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: TerminalView(
+            tab: null,
+            fontSize: 13,
+            onScroll: (rows, _, _) => scrolls.add(rows),
+            onFontSize: sizes.add,
+          ),
+        ),
+      );
+      final center = tester.getCenter(byKey('terminal-canvas'));
+      final pad = TestPointer(1, PointerDeviceKind.trackpad);
+      await tester.sendEventToBinding(pad.panZoomStart(center));
+      for (var y = 10.0; y <= 200; y += 10) {
+        await tester.sendEventToBinding(
+          pad.panZoomUpdate(center, pan: Offset(0, y)),
+        );
+      }
+      await tester.sendEventToBinding(pad.panZoomEnd());
+      final cellHeight = CellMetrics.measure(
+        13,
+        tester.view.devicePixelRatio,
+      ).cellHeight;
+      final rows = scrolls.fold(0, (a, b) => a + b);
+      expect(scrolls.every((r) => r > 0), isTrue, reason: 'down: older lines');
+      // The recognizer takes the gesture once it moves past the pan slop
+      // (36 px), and the pan scrolls from there, once.
+      expect(rows, greaterThanOrEqualTo((150 / cellHeight).floor()));
+      expect(rows, lessThanOrEqualTo((200 / cellHeight).floor()));
+      expect(sizes, isEmpty, reason: 'not a pinch');
     });
 
     testWidgets('a size from another width class is advisory', (tester) async {

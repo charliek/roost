@@ -136,6 +136,14 @@ class _TerminalViewState extends State<TerminalView>
 
   /// The size this pinch last asked for, which a rebuild may not show yet.
   double _pinchFont = 0;
+
+  /// A trackpad's pan/zoom counts as two pointers, but its pan is a
+  /// two-finger scroll, not a pinch.
+  bool _trackpad = false;
+
+  /// Where the pointer sat when the trackpad gesture began: the focal point
+  /// moves with the pan, the pointer does not.
+  Offset? _panZoomAt;
   double _scrollCarry = 0;
   Size _size = Size.zero;
   Size? _gridArea;
@@ -269,6 +277,7 @@ class _TerminalViewState extends State<TerminalView>
     _pinchStartFont = widget.fontSize;
     _pinchFont = widget.fontSize;
     _scrollCarry = 0;
+    _trackpad = d.kind == PointerDeviceKind.trackpad;
   }
 
   void _onScaleUpdate(ScaleUpdateDetails d) {
@@ -282,6 +291,8 @@ class _TerminalViewState extends State<TerminalView>
         _pinchFont = rounded;
         widget.onFontSize?.call(rounded);
       }
+      if (!_trackpad) return;
+      _scrollBy(d.focalPointDelta.dy, _panZoomAt ?? d.localFocalPoint);
       return;
     }
     _scrollBy(d.focalPointDelta.dy, d.localFocalPoint);
@@ -335,6 +346,7 @@ class _TerminalViewState extends State<TerminalView>
         _reportGridArea(area);
         return Listener(
           onPointerSignal: _onPointerSignal,
+          onPointerPanZoomStart: (e) => _panZoomAt = e.localPosition,
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
             onTap: widget.onTap,
